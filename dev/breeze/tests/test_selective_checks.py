@@ -206,8 +206,8 @@ def assert_outputs_are_printed(expected_outputs: dict[str, str], stderr: str):
             pytest.param(
                 ("setup.py",),
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "needs-helm-tests": "true",
                     "run-tests": "true",
@@ -223,8 +223,8 @@ def assert_outputs_are_printed(expected_outputs: dict[str, str], stderr: str):
             pytest.param(
                 ("generated/provider_dependencies.json",),
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "needs-helm-tests": "true",
                     "run-tests": "true",
@@ -260,8 +260,8 @@ def test_expected_output_pull_request_main(
                 ("full tests needed",),
                 "main",
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "run-tests": "true",
                     "docs-build": "true",
@@ -282,8 +282,8 @@ def test_expected_output_pull_request_main(
                 ),
                 "main",
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "run-tests": "true",
                     "docs-build": "true",
@@ -302,8 +302,8 @@ def test_expected_output_pull_request_main(
                 ("full tests needed",),
                 "main",
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "run-tests": "true",
                     "docs-build": "true",
@@ -322,8 +322,8 @@ def test_expected_output_pull_request_main(
                 ("full tests needed",),
                 "v2-3-stable",
                 {
-                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                    "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                    "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                     "image-build": "true",
                     "run-tests": "true",
                     "docs-build": "true",
@@ -529,8 +529,8 @@ def test_expected_output_pull_request_target(
             (),
             "main",
             {
-                "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                 "image-build": "true",
                 "needs-helm-tests": "true",
                 "run-tests": "true",
@@ -545,8 +545,8 @@ def test_expected_output_pull_request_target(
             (),
             "v2-3-stable",
             {
-                "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                 "image-build": "true",
                 "needs-helm-tests": "false",
                 "run-tests": "true",
@@ -562,8 +562,8 @@ def test_expected_output_pull_request_target(
             (),
             "main",
             {
-                "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+                "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+                "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
                 "image-build": "true",
                 "needs-helm-tests": "true",
                 "run-tests": "true",
@@ -611,8 +611,8 @@ def test_no_commit_provided_trigger_full_build_for_any_event_type(github_event):
     )
     assert_outputs_are_printed(
         {
-            "all-python-versions": "['3.7', '3.8', '3.9', '3.10']",
-            "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10",
+            "all-python-versions": "['3.7', '3.8', '3.9', '3.10', '3.11']",
+            "all-python-versions-list-as-string": "3.7 3.8 3.9 3.10 3.11",
             "image-build": "true",
             "needs-helm-tests": "true",
             "run-tests": "true",

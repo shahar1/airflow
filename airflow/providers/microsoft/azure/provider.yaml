@@ -65,6 +65,14 @@ dependencies:
   - azure-servicebus>=7.6.1; platform_machine != "aarch64"
   - azure-synapse-spark
 
+# Excluded because azure-uamqp-python and azure-core and a number of dependent libraries are not compatible
+# with 3.11 yet See https://pyreadiness.org/3.11/.
+# See for issues that track it:
+# * https://github.com/Azure/azure-uamqp-python/issues/334
+# * https://github.com/Azure/azure-sdk-for-python/issues/27066
+excluded-python-versions:
+  - "3.11"
+
 integrations:
   - integration-name: Microsoft Azure Batch
     external-doc-url: https://azure.microsoft.com/en-us/services/batch/
