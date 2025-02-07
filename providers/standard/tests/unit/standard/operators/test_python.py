@@ -45,6 +45,7 @@ from airflow.config_templates.airflow_local_settings import DEFAULT_LOGGING_CONF
 from airflow.exceptions import (
     AirflowException,
     DeserializingResultError,
+    DownstreamTasksSkipped,
 )
 from airflow.models.baseoperator import BaseOperator
 from airflow.models.dag import DAG
@@ -460,12 +461,12 @@ class TestBranchOperator(BasePythonTest):
         else:
             pytest.fail(f"{self.task_id!r} not found.")
 
-    def test_clear_skipped_downstream_task(self):
+    def test_clear_skipped_downstream_task(self, dag_maker):
         """
         After a downstream task is skipped by BranchPythonOperator, clearing the skipped task
         should not cause it to be executed.
         """
-        with self.dag_non_serialized:
+        with dag_maker(serialized=False):
 
             def f():
                 return "branch_1"
@@ -474,31 +475,45 @@ class TestBranchOperator(BasePythonTest):
             branches = [self.branch_1, self.branch_2]
             branch_op >> branches
 
-        dr = self.create_dag_run()
-        branch_op.run(start_date=self.default_date, end_date=self.default_date)
-        for task in branches:
-            task.run(start_date=self.default_date, end_date=self.default_date)
+        dr = dag_maker.create_dagrun()
+        if AIRFLOW_V_3_0_PLUS:
+            with create_session() as session:
+                branch_ti = dr.get_task_instance(task_id=self.task_id, session=session)
+                with pytest.raises(DownstreamTasksSkipped) as exc_info:
+                    branch_ti.run()
+                assert exc_info.value.tasks == [("branch_2", -1)]
+                branch_ti.set_state(TaskInstanceState.SUCCESS, session=session)
+                dr.task_instance_scheduling_decisions(session=session)
+                branch_2_ti = dr.get_task_instance(task_id="branch_2", session=session)
+                assert branch_2_ti.state == TaskInstanceState.SKIPPED
+                branch_2_ti.set_state(None)
+                branch_2_ti.run()
+                assert branch_2_ti.state == TaskInstanceState.SKIPPED
+        else:
+            branch_op.run(start_date=self.default_date, end_date=self.default_date)
+            for task in branches:
+                task.run(start_date=self.default_date, end_date=self.default_date)
 
-        expected_states = {
-            self.task_id: State.SUCCESS,
-            "branch_1": State.SUCCESS,
-            "branch_2": State.SKIPPED,
-        }
+            expected_states = {
+                self.task_id: State.SUCCESS,
+                "branch_1": State.SUCCESS,
+                "branch_2": State.SKIPPED,
+            }
 
-        self.assert_expected_task_states(dr, expected_states)
+            self.assert_expected_task_states(dr, expected_states)
 
-        # Clear the children tasks.
-        tis = dr.get_task_instances()
-        children_tis = [ti for ti in tis if ti.task_id in branch_op.get_direct_relative_ids()]
-        with create_session() as session:
-            clear_task_instances(children_tis, session=session, dag=branch_op.dag)
+            # Clear the children tasks.
+            tis = dr.get_task_instances()
+            children_tis = [ti for ti in tis if ti.task_id in branch_op.get_direct_relative_ids()]
+            with create_session() as session:
+                clear_task_instances(children_tis, session=session, dag=branch_op.dag)
 
-        # Run the cleared tasks again.
-        for task in branches:
-            task.run(start_date=self.default_date, end_date=self.default_date)
+            # Run the cleared tasks again.
+            for task in branches:
+                task.run(start_date=self.default_date, end_date=self.default_date)
 
-        # Check if the states are correct after children tasks are cleared.
-        self.assert_expected_task_states(dr, expected_states)
+            # Check if the states are correct after children tasks are cleared.
+            self.assert_expected_task_states(dr, expected_states)
 
     def test_raise_exception_on_no_accepted_type_return(self):
         def f():
