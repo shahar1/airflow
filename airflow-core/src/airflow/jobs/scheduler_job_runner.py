@@ -916,7 +916,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
     def _execute(self) -> int | None:
         self.log.info("Starting the scheduler")
 
-        executor_class, _ = ExecutorLoader.import_default_executor_cls()
+        # executor_class, _ = ExecutorLoader.import_default_executor_cls()
 
         self.log.info("Processing each file at most %s times", self.num_times_parse_dags)
 

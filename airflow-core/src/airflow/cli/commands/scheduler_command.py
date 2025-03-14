@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from argparse import Namespace
 from contextlib import contextmanager
 from multiprocessing import Process
@@ -49,9 +51,44 @@ def scheduler(args: Namespace):
     """Start Airflow Scheduler."""
     print(settings.HEADER)
 
+    db_port = None
+    sql_alchemy_conn = conf.get("database", "sql_alchemy_conn")
+    if sql_alchemy_conn.startswith("postgres"):
+        db_port = 5432
+    elif sql_alchemy_conn.startswith("mysql"):
+        db_port = 3306
+    elif sql_alchemy_conn.startswith("mssql"):
+        db_port = 1433
+    elif sql_alchemy_conn.startswith("redis"):
+        db_port = 6379
+    elif sql_alchemy_conn.startswith("amqp"):
+        db_port = 5672
+    else:
+        raise ValueError(f"Unsupported database connection string: {sql_alchemy_conn}")
+
     run_command_with_daemon_option(
         args=args,
         process_name="scheduler",
+        # callback=lambda: subprocess.run(
+        #     ["./airflow-core/src/airflow/rust-scheduler/target/release/rust-scheduler",
+        #      "--scheduler_idle_sleep_time",
+        #      str(conf.getint("scheduler", "scheduler_idle_sleep_time")),
+        #      "--task_instance_heartbeat_timeout",
+        #         str(conf.getint("scheduler", "task_instance_heartbeat_timeout")),
+        #      "--dag_stale_not_seen_duration",
+        #         str(conf.getint("scheduler", "dag_stale_not_seen_duration")),
+        #      "--task_queued_timeout",
+        #         str(int(conf.getfloat("scheduler", "task_queued_timeout"))),
+        #      "--num_stuck_in_queued_retries",
+        #         str(conf.getint("scheduler", "num_stuck_in_queued_retries", fallback=2)),
+        #      "--max_dagruns_per_loop_to_schedule",
+        #      str(conf.getint("scheduler", "max_dagruns_per_loop_to_schedule", fallback=20)),
+        #      "--sql_alchemy_conn",
+        #         sql_alchemy_conn,
+        #      "--db_port",
+        #         str(db_port),
+        #      ], env=os.environ | {"RUST_LOG": "info"}
+        # ),
         callback=lambda: _run_scheduler_job(args),
         should_setup_logging=True,
     )
