@@ -21,16 +21,68 @@
   "createdAssetEvent_other": "تم إنشاء واقعات اصل",
   "dag_one": "Dag",
   "dag_other": "Dags",
+  "dagDetails": {
+    "catchup": "الحاق",
+    "concurrency": "التزامن",
+    "dagRunTimeout": "مهلة تشغيل Dag",
+    "defaultArgs": "المتغيرات التلقائية",
+    "description": "الوصف",
+    "documentation": "وثائق ال Dag",
+    "fileLocation": "موقع الملف",
+    "hasTaskConcurrencyLimits": "لديها مهمة تزامن نحدودة",
+    "lastExpired": "آخر منتهي الصلاحية",
+    "lastParsed": "آخر تحميل",
+    "latestDagVersion": "أحدث إصدار من ال Dag",
+    "latestRun": "أحدث تشغيل",
+    "maxActiveRuns": "الحد الأقصى للتشغيلات النشطة",
+    "maxActiveTasks": "الحد الأقصى للمهام النشطة",
+    "maxConsecutiveFailedDagRuns": "الحد الأقصى للتشغيلات الفاشلة المتتالية",
+    "nextRun": "التشغيل التالي",
+    "owner": "المالك",
+    "params": "المتغيرات",
+    "schedule": "الجدول الزمني",
+    "tags": "الوسوم"
+  },
+  "dagId": "معرف ال Dag",
+  "dagRun": {
+    "conf": "Conf",
+    "dagVersions": "إصدار ال Dag",
+    "dataIntervalEnd": "نهاية فترة البيانات",
+    "dataIntervalStart": "بداية فترة البيانات",
+    "lastSchedulingDecision": "آخر قرار جدولة",
+    "queuedAt": "تمت إضافته إلى قائمة الانتظار في",
+    "runAfter": "تشغيل بعد",
+    "runType": "نوع التشغيل",
+    "sourceAssetEvent": "مصدر حدث الأصل",
+    "triggeredBy": "تم تشغيله بواسطة"
+  },
   "dagRun_one": "مثيل تشغيل لDAG",
   "dagRun_other": "مثيل تشغيلات لDag",
+  "dagWarnings": "تحذيرات/أخطاء ال Dag",
   "defaultToGraphView": "عرض الرسم البياني تلقائياً",
   "defaultToGridView": "عرض الشبكة تلقائياً",
+  "direction": "الاتجاه",
   "docs": {
     "documentation": "توثيق",
     "githubRepo": "مستودع GitHub",
     "restApiReference": "مرجع REST API"
   },
   "duration": "المدة",
+  "endDate": "تاريخ الانتهاء",
+  "error": {
+    "back": "العودة",
+    "defaultMessage": "حدث خطأ غير متوقع",
+    "home": "الصفحة الرئيسية",
+    "notFound": "الصفحة غير موجودة",
+    "title": "خطأ"
+  },
+  "expression": {
+    "all": "الكل",
+    "and": "و",
+    "any": "أي شيء",
+    "or": "أو"
+  },
+  "logicalDate": "التاريخ المنطقي",
   "logout": "تسجيل الخروج",
   "logoutConfirmation": "أنت على وشك تسجيل الخروج.",
   "modal": {
@@ -52,6 +104,13 @@
     "security": "الأمان"
   },
   "noItemsFound": "لم يتم العثور على {{modelName}}",
+  "note": {
+    "add": "إضافة ملاحظة",
+    "dagRun": "إضافة ملاحظة لتشغيل ال Dag",
+    "label": "ملاحظة",
+    "placeholder": "أضف ملاحظة...",
+    "taskInstance": "إضافة ملاحظة لمثيل المهمة"
+  },
   "pools": {
     "deferred": "مؤجل",
     "open": "مفتوح",
@@ -61,12 +120,14 @@
     "running": "قيد التشغيل",
     "scheduled": "مجدول"
   },
+  "runId": "معرف التشغيل",
   "runTypes": {
     "asset_triggered": "مُشغل بواسطة الأصل",
     "backfill": "تعبئة رجعية",
     "manual": "يدوي",
     "scheduled": "مجدول"
   },
+  "seconds": "{{count}} ثواني/ثانية",
   "security": {
     "actions": "إجراءات",
     "permissions": "صلاحيات",
@@ -75,6 +136,10 @@
     "users": "مستخدمون"
   },
   "selectLanguage": "اختيار اللغة",
+  "sourceAssetEvent_one": "مصدر حدث الأصل",
+  "sourceAssetEvent_other": "مصدر أحداث الأصل",
+  "startDate": "تاريخ البدء",
+  "state": "الحالة",
   "states": {
     "deferred": "مؤجل",
     "failed": "فشِل",
@@ -94,19 +159,53 @@
   "switchToDarkMode": "تبديل إلى الوضع الداكن",
   "switchToLightMode": "تبديل إلى الوضع الفاتح",
   "table": {
+    "completedAt": "اكتمل في",
+    "createdAt": "تم إنشاؤه في",
     "filterByTag": "تصفية الDags حسب الوسم",
     "filterColumns": "تصفية أعمدة الجدول",
-    "filters": {
-      "filter_one": "فلتر",
-      "filter_other": "فلاتر",
-      "reset": "مسح الفلاتر"
-    },
+    "filterReset_one": "إعادة تعيين الفلتر",
+    "filterReset_other": "إعادة تعيين الفلاتر",
+    "from": "من",
+    "maxActiveRuns": "الحد الأقصى للتشغيلات النشطة",
     "noTagsFound": "لم يتم العثور على وسوم",
     "tagMode": {
       "all": "الكل",
       "any": "اي شيء"
     },
-    "tagPlaceholder": "تصفية حسب الوسم"
+    "tagPlaceholder": "تصفية حسب الوسم",
+    "to": "إلى"
+  },
+  "task": {
+    "documentation": "وثيقة المهمة",
+    "lastInstance": "آخر مثيل",
+    "operator": "المشغل",
+    "triggerRule": "قاعدة التشغيل"
+  },
+  "task_one": "مهمة",
+  "task_other": "مهام",
+  "taskId": "معرف المهمة",
+  "taskInstance": {
+    "dagVersion": "إصدار ال Dag",
+    "executor": "المشغل",
+    "executorConfig": "تكوين المشغل",
+    "hostname": "اسم المضيف",
+    "maxTries": "الحد الأقصى للمحاولات",
+    "pid": "PID",
+    "pool": "المجمع",
+    "poolSlots": "حصص مجموعة الموارد",
+    "priorityWeight": "وزن الأولوية",
+    "queue": "الطابور",
+    "queuedWhen": "تمت إضافته إلى قائمة الانتظار في",
+    "scheduledWhen": "مجدول في",
+    "triggerer": {
+      "assigned": "المُطلق المعين",
+      "class": "فئة المُطلق",
+      "createdAt": "تم إنشاؤه في",
+      "id": "معرف المُطلق",
+      "latestHeartbeat": "آخر نبضة للمُطلق",
+      "title": "معلومات المُطلق"
+    },
+    "unixname": "Unix اسم"
   },
   "taskInstance_one": "مثيل المهمة",
   "taskInstance_other": "مثيلات المهام",
@@ -123,6 +222,49 @@
     "title": "اختيار المنطقة الزمنية",
     "utc": "UTC (التوقيت العالمي المنسق)"
   },
+  "toaster": {
+    "bulkDelete": {
+      "error": "فشل طلب حذف جماعي ل{{resourceName}}",
+      "success": {
+        "description": "{{count}} {{resourceName}} تم حذفها بنجاح. المفاتيح: {{keys}}",
+        "title": "تم إرسال طلب حذف جماعي ل{{resourceName}}"
+      }
+    },
+    "create": {
+      "error": "فشل طلب إنشاء {{resourceName}}",
+      "success": {
+        "description": "{{resourceName}} تم إنشاؤه بنجاح.",
+        "title": "تم إرسال طلب إنشاء {{resourceName}}"
+      }
+    },
+    "delete": {
+      "error": "فشل طلب حذف {{resourceName}}",
+      "success": {
+        "description": "{{resourceName}} تم حذفه بنجاح.",
+        "title": "تم إرسال طلب حذف {{resourceName}}"
+      }
+    },
+    "import": {
+      "error": "فشل طلب تحميل {{resourceName}}",
+      "success": {
+        "description": "{{count}} {{resourceName}} تم تحميلها بنجاح.",
+        "title": "تم إرسال طلب تحميل {{resourceName}}"
+      }
+    },
+    "update": {
+      "error": "فشل طلب تحديث {{resourceName}}",
+      "success": {
+        "description": "{{resourceName}} تم تحديثه بنجاح.",
+        "title": "تم إرسال طلب تحديث {{resourceName}}"
+      }
+    }
+  },
   "triggered": "مُشغل",
-  "user": "المستخدم"
+  "tryNumber": "رقم المحاولة",
+  "user": "المستخدم",
+  "wrap": {
+    "tooltip": "اضغط على {{hotkey}} لتفعيل ال wrap",
+    "unwrap": "Unwrap",
+    "wrap": "Wrap"
+  }
 }
