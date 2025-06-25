@@ -108,7 +108,9 @@ function install_debian_dev_dependencies() {
 function install_debian_runtime_dependencies() {
     apt-get update
     apt-get install --no-install-recommends -yqq apt-utils >/dev/null 2>&1
-    apt-get install -y --no-install-recommends curl gnupg2 lsb-release
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg2 lsb-release
+    curl https://sh.rustup.rs -sSf | bash -s -- -y
+    export PATH="/root/.cargo/bin:${PATH}"
     # shellcheck disable=SC2086
     export ${ADDITIONAL_RUNTIME_APT_ENV?}
     if [[ "${RUNTIME_APT_COMMAND}" != "" ]]; then
