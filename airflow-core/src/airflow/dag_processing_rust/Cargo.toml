@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chrono = "0.4.41"
-# signal-hook = {version = "0.3.17", features = ["extended-siginfo"]}
+env_logger = "0.11.7"
+log = "0.4.26"
+pyo3 = "0.25.1"
+anyhow = "1.0.97"
+walkdir = "2.3.3"
+signal-hook = "0.3.17"
+futures = "0.3.28"
+tokio = { version = "1.28.2", features = ["full"] }
