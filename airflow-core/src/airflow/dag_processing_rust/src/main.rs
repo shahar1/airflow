@@ -1,16 +1,18 @@
+// Add this to use the `table!` macro from schema.rs
+#[macro_use]
+extern crate diesel;
 #[macro_use]
 extern crate log;
+
 use anyhow::{anyhow, Result};
 use chrono;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-// Add FromPyObject to the use statement for the derive macro
-use pyo3::{prelude::*, FromPyObject};
 use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::Bound;
+use pyo3::{prelude::*, FromPyObject};
 use serde_json;
 use std::collections::HashSet;
 use std::path::PathBuf;
-// SOLUTION: Add Arc and Mutex for thread-safe shared state.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal;
@@ -18,7 +20,12 @@ use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use walkdir::WalkDir;
 
-// FIX 1: Add #[derive(FromPyObject)] to allow pyo3 to convert Python dicts to this struct.
+
+// --- Add module declarations ---
+pub mod db;
+pub mod schema;
+
+// ... (Your existing EdgeInfoType and Dag structs are unchanged)
 #[derive(Debug, Clone, FromPyObject)]
 struct EdgeInfoType {
     label: Option<String>,
@@ -54,27 +61,19 @@ struct Dag {
     task_group: Option<String>,
 }
 
-// FIX 2: Helper function to convert a generic Python object to a serde_json::Value.
-// This works by using Python's own `json.dumps` to create a JSON string,
-// which Rust's `serde_json` can then parse.
+// ... (Your py_any_to_serde_json_value and python_executor_worker are unchanged)
 fn py_any_to_serde_json_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     let json = py.import("json")?;
     let result_str: String = json.call_method1("dumps", (obj,))?.extract()?;
     serde_json::from_str(&result_str)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to deserialize JSON: {}", e)))
 }
-
-
-/// Reads a Python file and executes its content as bytes using Python's `exec()`.
-///
-/// This worker runs in a dedicated thread. It receives full file paths, reads them,
-/// and executes the content within a fresh, isolated Python environment.
 fn python_executor_worker(
     dags_dir: String,
     mut rx: mpsc::Receiver<String>,
-    // SOLUTION: Accept the shared state as an argument.
     serialized_dags: Arc<Mutex<Vec<Dag>>>,
 ) -> Result<()> {
+    // ... (This function's implementation remains the same)
     Python::with_gil(|py| -> Result<()> {
         let builtins = py.import("builtins")?;
         let exec_func = builtins.getattr("exec")?;
@@ -174,6 +173,8 @@ fn python_executor_worker(
                             // The lock is released automatically when `dags_guard` goes out of scope.
                             {
                                 let mut dags_guard = serialized_dags.lock().unwrap();
+                                // To avoid duplicates if a file is processed multiple times
+                                dags_guard.retain(|d| d.dag_id != dag.dag_id);
                                 dags_guard.push(dag);
                             }
                             break;
@@ -197,6 +198,7 @@ fn python_executor_worker(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ... (Your main function setup is the same until the shutdown logic)
     pyo3::prepare_freethreaded_python();
     env_logger::init();
 
@@ -206,17 +208,13 @@ async fn main() -> Result<()> {
 
     info!("Using DAGs directory: {}", dags_dir);
 
-    // SOLUTION: Create the shared state, a vector of DAGs protected by a Mutex and an Arc.
     let serialized_dags = Arc::new(Mutex::new(Vec::<Dag>::new()));
 
     let (tx, rx) = mpsc::channel::<String>(100);
     let worker_handle = {
         let dags_dir_clone = dags_dir.to_string();
-        // SOLUTION: Clone the Arc for the worker thread.
-        // The `move` closure will take ownership of this clone.
         let worker_dags_handle = Arc::clone(&serialized_dags);
         spawn_blocking(move || {
-            // Renamed worker function for clarity
             if let Err(e) = python_executor_worker(dags_dir_clone, rx, worker_dags_handle) {
                 error!("Python executor worker thread failed: {:?}", e);
             }
@@ -267,36 +265,53 @@ async fn main() -> Result<()> {
     info!("Starting DAG processor. Press Ctrl+C to exit.");
 
     wait_for_shutdown_signal().await;
+
+    // --- MODIFIED SHUTDOWN LOGIC ---
+
     info!("Signal received. Shutting down gracefully...");
-    let dags = serialized_dags.lock().unwrap();
-    info!("Current length of serialized_dags: {}", dags.len());
-    drop(tx);
+    drop(tx); // Close the channel to signal the worker to stop
 
     let shutdown_timeout = Duration::from_secs(5);
     match tokio::time::timeout(shutdown_timeout, worker_handle).await {
-        Ok(Ok(_)) => {
-            info!("Python worker shut down gracefully.");
-            // SOLUTION: Lock the mutex to safely access the shared data from the main thread.
-            // .unwrap() will panic if the mutex was "poisoned" (if the worker thread panicked
-            // while holding the lock), which is often an acceptable failure mode.
+        Ok(Ok(_)) => info!("Python worker shut down gracefully."),
+        Ok(Err(e)) => error!("Python worker task failed during shutdown: {:?}", e),
+        Err(_) => warn!(
+            "Graceful shutdown timed out after {:?}. Exiting.",
+            shutdown_timeout
+        ),
+    }
 
+    // --- NEW DATABASE SAVE LOGIC ---
+    info!("Attempting to save all parsed DAGs to the database...");
+    let dags_to_save = serialized_dags.lock().unwrap();
+    if !dags_to_save.is_empty() {
+        match db::establish_connection() {
+            Ok(mut conn) => {
+                let mut success_count = 0;
+                for dag in dags_to_save.iter() {
+                    match db::save_dag(&mut conn, dag) {
+                        Ok(_) => {
+                            info!("Successfully saved/updated DAG '{}' in DB.", dag.dag_id);
+                            success_count += 1;
+                        }
+                        Err(e) => error!("Failed to save DAG '{}' to DB: {}", dag.dag_id, e),
+                    }
+                }
+                info!("DB sync complete. Saved/updated {} of {} DAGs.", success_count, dags_to_save.len());
+            }
+            Err(e) => {
+                error!("Failed to establish database connection, cannot save DAGs: {}", e)
+            }
         }
-        Ok(Err(e)) => {
-            error!("Python worker task failed during shutdown: {:?}", e);
-        }
-        Err(_) => {
-            warn!(
-                "Graceful shutdown timed out after {:?}. Exiting.",
-                shutdown_timeout
-            );
-        }
+    } else {
+        info!("No new or updated DAGs to save.");
     }
 
     info!("Shutdown complete.");
     Ok(())
 }
 
-/// Sets up signal handlers for graceful shutdown.
+// ... (Your wait_for_shutdown_signal function is unchanged)
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {

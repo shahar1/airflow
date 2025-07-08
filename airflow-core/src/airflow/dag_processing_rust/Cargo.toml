@@ -13,3 +13,5 @@ tokio = { version = "1.28.2", features = ["full"] }
 notify = "8.0"
 chrono = "0.4.40"
 serde_json = "1.0.140"
+diesel = { version = "2.2.11", features = ["postgres", "chrono", "serde_json", "r2d2"] }
+dotenvy = "0.15"
