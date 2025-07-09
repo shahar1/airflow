@@ -1,14 +1,11 @@
 #[macro_use]
-extern crate diesel;
-#[macro_use]
 extern crate log;
 
 pub mod db;
 pub mod schema;
 
-use crate::db::get_connection_pool;
+use crate::db::{get_connection_pool, Dag};
 use anyhow::{anyhow, Result};
-use chrono;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::PgConnection;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -29,37 +26,6 @@ pub type DbPool = Pool<ConnectionManager<PgConnection>>;
 #[derive(Debug, Clone, FromPyObject)]
 struct EdgeInfoType {
     label: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct Dag {
-    dag_id: String,
-    description: Option<String>,
-    start_date: Option<chrono::DateTime<chrono::Utc>>,
-    max_active_tasks: Option<u32>,
-    fail_fast: Option<bool>,
-    max_active_runs: Option<u32>,
-    doc_md: Option<String>,
-    fileloc: Option<String>,
-    edge_info:
-        Option<std::collections::HashMap<String, std::collections::HashMap<String, EdgeInfoType>>>,
-    max_consecutive_failed_dag_runs: Option<u32>,
-    render_template_as_native_obj: Option<bool>,
-    owner_links: Option<std::collections::HashMap<String, String>>,
-    tags: Option<Vec<String>>,
-    is_paused_upon_creation: Option<bool>,
-    default_args: Option<std::collections::HashMap<String, serde_json::Value>>,
-    end_date: Option<chrono::DateTime<chrono::Utc>>,
-    disable_bundle_versioning: bool,
-    relative_fileloc: Option<String>,
-    catchup: bool,
-    dag_display_name: Option<String>,
-    deadline: Option<std::collections::HashMap<String, serde_json::Value>>,
-    timetable: Option<String>,
-    timezone: Option<String>,
-    access_control: Option<String>,
-    dagrun_timeout: Option<String>,
-    task_group: Option<String>,
 }
 
 fn py_any_to_serde_json_value(
@@ -123,7 +89,7 @@ fn python_executor_worker(
                 Ok(_) => {
                     info!(
                         "Successfully executed file '{}' in {:?}.",
-                        file_path_str,
+                        file_path_str.clone(),
                         gil_start_time.elapsed(),
                     );
                     let mut dag_found = false;
@@ -153,7 +119,7 @@ fn python_executor_worker(
                                     .ok()
                                     .and_then(|v| v.extract().ok()),
                                 doc_md: obj.getattr("doc_md").ok().and_then(|v| v.extract().ok()),
-                                fileloc: obj.getattr("fileloc").ok().and_then(|v| v.extract().ok()),
+                                fileloc: Some(file_path_str.clone()),
                                 edge_info: obj
                                     .getattr("edge_info")
                                     .ok()
@@ -184,10 +150,12 @@ fn python_executor_worker(
                                     .ok()
                                     .and_then(|v| v.extract().ok())
                                     .unwrap_or(false),
-                                relative_fileloc: obj
-                                    .getattr("relative_fileloc")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
+                                relative_fileloc: Some(
+                                    PathBuf::from(&file_path_str)
+                                        .strip_prefix(&dags_dir)
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|_| file_path_str.clone()),
+                                ),
                                 catchup: obj
                                     .getattr("catchup")
                                     .ok()

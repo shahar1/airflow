@@ -201,6 +201,7 @@ dependencies = [
  "log",
  "notify",
  "pyo3",
+ "serde",
  "serde_json",
  "tokio",
  "walkdir",
