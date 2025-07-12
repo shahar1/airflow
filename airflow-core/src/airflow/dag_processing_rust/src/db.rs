@@ -1,21 +1,21 @@
-use crate::schema::dag as dags;
-use crate::{EdgeInfoType};
+use crate::schema::{dag as dags, dag_bundle, dag_code, dag_version, serialized_dag};
+use crate::EdgeInfoType;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use chrono;
+use chrono::{DateTime, Utc};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use dotenvy::dotenv;
-use std::env;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
+use std::env;
 use uuid::Uuid;
-use crate::schema::serialized_dag;
 
 mod serde_helpers {
-    use super::*; // Make types from parent module available
-    use serde::de;
+    use super::*;
+    // Make types from parent module available
+        use serde::de;
 
     /// Deserializes an optional floating-point Unix timestamp into an `Option<DateTime<Utc>>`.
     ///
@@ -388,7 +388,7 @@ pub fn save_dag_version(conn: &mut PgConnection, p_dag_id: &str) -> Result<Uuid>
 // in db.rs
 
 // Add the new table to your 'use' statements
-use crate::schema::{dag_code, dag_version};
+
 
 // Define a new struct for inserting into the dag_code table
 #[derive(Insertable, Debug)]
@@ -430,6 +430,42 @@ pub fn save_dag_code(
         .values(&new_dag_code)
         .execute(conn)
         .with_context(|| "while inserting new DagCode")?;
+
+    Ok(())
+}
+
+#[derive(Insertable, AsChangeset)]
+#[diesel(table_name = dag_bundle)]
+pub struct DagBundle<'a> {
+    pub name: &'a str,
+    pub active: bool,
+    pub version: Option<&'a str>,
+    pub last_refreshed: DateTime<Utc>,
+}
+
+/// Inserts a new dag_bundle row or updates an existing one on conflict.
+pub fn upsert_dag_bundle(
+    conn: &mut PgConnection,
+    bundle_name: &str,
+    is_active: bool,
+    bundle_version: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let bundle = DagBundle {
+        name: bundle_name,
+        active: is_active,
+        version: Some(bundle_version),
+        last_refreshed: now,
+    };
+
+    diesel::insert_into(dag_bundle::table)
+        .values(&bundle)
+        .on_conflict(dag_bundle::name)
+        // If the row already exists, update these fields
+        .do_update()
+        .set(&bundle)
+        .execute(conn)
+        .with_context(|| format!("Error upserting DagBundle '{}'", bundle_name))?;
 
     Ok(())
 }

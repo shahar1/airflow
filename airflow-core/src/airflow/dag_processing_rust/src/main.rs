@@ -5,8 +5,8 @@ pub mod db;
 pub mod schema;
 
 use crate::db::{
-    get_connection_pool, save_dag_code, save_dag_version, save_serialized_dag, Dag, SerializedDag,
-    SerializedDagData,
+    get_connection_pool, save_dag_code, save_dag_version, save_serialized_dag, upsert_dag_bundle,
+    Dag, SerializedDag, SerializedDagData,
 };
 use anyhow::{anyhow, Context, Result};
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -21,11 +21,14 @@ use serde_json;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+use std::thread;
 
 pub type DbPool = Pool<ConnectionManager<PgConnection>>;
 
@@ -69,6 +72,14 @@ fn python_executor_worker(
         let dag_class = dag_module.getattr("DAG")?;
         info!("Successfully imported 'airflow.sdk.definitions.dag.DAG' class.");
 
+        // ========== THIS IS THE NEW BLOCK ==========
+        info!("Upserting 'dags-folder' entry in dag_bundle table...");
+        let mut conn = pool.get().context("Failed to get DB connection for bundle setup")?;
+        db::upsert_dag_bundle(&mut conn, "dags-folder", true, "1")
+            .context("Failed to upsert 'dags-folder' bundle")?;
+        info!("DagBundle entry is up to date.");
+        // ===========================================
+
         while let Some(file_path_str) = rx.blocking_recv() {
             info!(
                 "[PYTHON] Received request to execute file: {}",
@@ -102,7 +113,7 @@ fn python_executor_worker(
                     for (_name, obj) in globals.iter() {
                         if obj.is_instance(&dag_class)? {
                             dag_found = true;
-                            // This struct populates the `dag` table. It contains our known file paths.
+                            // This struct populates the `dag` table.
                             let dag = Dag {
                                 dag_id: obj.getattr("dag_id")?.extract()?,
                                 description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
@@ -146,19 +157,16 @@ fn python_executor_worker(
                                     let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
                                         db::save_dag(conn, &dag).with_context(|| format!("while saving DAG '{}'", dag.dag_id))?;
 
-                                        let new_dag_version_id = db::save_dag_version(conn, &dag.dag_id).with_context(|| format!("while saving DagVersion for '{}'", dag.dag_id))?;
+                                        let new_dag_version_id = save_dag_version(conn, &dag.dag_id).with_context(|| format!("while saving DagVersion for '{}'", dag.dag_id))?;
                                         info!("Successfully created DagVersion with id: {}", new_dag_version_id);
 
                                         let file_content_str = String::from_utf8_lossy(&file_content).to_string();
-                                        save_dag_code(conn, &dag.dag_id, new_dag_version_id, &file_path_str, &file_content_str).with_context(|| "while saving DagCode")?;
+                                        db::save_dag_code(conn, &dag.dag_id, new_dag_version_id, &file_path_str, &file_content_str).with_context(|| "while saving DagCode")?;
                                         info!("Successfully saved DagCode for '{}'", dag.dag_id);
 
                                         let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
                                         let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
 
-                                        // ========== THIS IS THE FIX ==========
-                                        // The JSON from Python might be missing fileloc/relative_fileloc.
-                                        // We manually patch the JSON object to ensure these values are present.
                                         let mut data_dict = match serialized_json_val {
                                             serde_json::Value::Object(d) => Ok(d),
                                             _ => Err(anyhow!("Serialized DAG was not a JSON object as expected.")),
@@ -170,7 +178,6 @@ fn python_executor_worker(
                                         if let Some(relative_fileloc) = &dag.relative_fileloc {
                                             data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone()));
                                         }
-                                        // =====================================
 
                                         let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))
                                             .with_context(|| "Failed to deserialize JSON object into SerializedDagData struct")?;
@@ -231,7 +238,8 @@ async fn main() -> Result<()> {
     info!("Database connection pool initialized successfully.");
     info!("Using DAGs directory: {}", dags_dir);
     let (tx, rx) = mpsc::channel::<String>(100);
-    let worker_handle = {
+
+    let mut worker_handle = {
         let dags_dir_clone = dags_dir.to_string();
         let pool_clone = pool.clone();
         spawn_blocking(move || {
@@ -240,6 +248,7 @@ async fn main() -> Result<()> {
             }
         })
     };
+
     info!("Performing initial scan of '{}'...", dags_dir);
     let mut initial_files = HashSet::new();
     for entry in WalkDir::new(dags_dir).into_iter().filter_map(Result::ok) {
@@ -253,6 +262,7 @@ async fn main() -> Result<()> {
         tx.send(file_path).await?;
     }
     info!("Initial scan complete.");
+
     let watcher_tx = tx.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
@@ -275,38 +285,38 @@ async fn main() -> Result<()> {
     watcher.watch(&dags_dir_path, RecursiveMode::Recursive)?;
     info!("Now watching for file changes in '{}'", dags_dir);
     info!("Starting DAG processor. Press Ctrl+C to exit.");
-    wait_for_shutdown_signal().await;
-    info!("Signal received. Shutting down gracefully...");
+
+    let (signal_tx, signal_rx) = oneshot::channel();
+
+    thread::spawn(move || {
+        let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+        for sig in signals.forever() {
+            info!("Signal handler thread caught signal: {}", sig);
+            let _ = signal_tx.send(());
+            break;
+        }
+    });
+
+    tokio::select! {
+        _ = signal_rx => {
+            info!("Received shutdown signal, initiating graceful shutdown...");
+        },
+        res = &mut worker_handle => {
+            error!("Worker thread exited unexpectedly: {:?}", res);
+            info!("Initiating shutdown due to worker exit...");
+        }
+    };
+
+    info!("Shutting down gracefully...");
     drop(tx);
-    let shutdown_timeout = Duration::from_secs(5);
+
+    let shutdown_timeout = Duration::from_secs(10);
     match tokio::time::timeout(shutdown_timeout, worker_handle).await {
         Ok(Ok(_)) => info!("Python worker shut down gracefully."),
         Ok(Err(e)) => error!("Python worker task failed during shutdown: {:?}", e),
-        Err(_) => warn!(
-            "Graceful shutdown timed out after {:?}. Exiting.",
-            shutdown_timeout
-        ),
+        Err(_) => warn!("Graceful shutdown timed out after {:?}. Forcing exit.", shutdown_timeout),
     }
+
     info!("Shutdown complete.");
     Ok(())
-}
-
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("Failed to install SIGINT handler");
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => info!("SIGINT received."),
-            _ = sigterm.recv() => info!("SIGTERM received."),
-        };
-    }
-    #[cfg(not(unix))]
-    {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl-C handler");
-    }
 }
