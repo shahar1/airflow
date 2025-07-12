@@ -4,14 +4,19 @@ extern crate log;
 pub mod db;
 pub mod schema;
 
-use crate::db::{get_connection_pool, Dag};
-use anyhow::{anyhow, Result};
+use crate::db::{
+    get_connection_pool, save_dag_code, save_dag_version, save_serialized_dag, Dag, SerializedDag,
+    SerializedDagData,
+};
+use anyhow::{anyhow, Context, Result};
 use diesel::r2d2::{ConnectionManager, Pool};
-use diesel::PgConnection;
+use diesel::{Connection, PgConnection};
+use md5;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::Bound;
 use pyo3::{prelude::*, FromPyObject};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,11 +24,12 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub type DbPool = Pool<ConnectionManager<PgConnection>>;
 
-#[derive(Debug, Clone, FromPyObject)]
+#[derive(Debug, Clone, FromPyObject, Serialize, Deserialize)]
 struct EdgeInfoType {
     label: Option<String>,
 }
@@ -96,118 +102,101 @@ fn python_executor_worker(
                     for (_name, obj) in globals.iter() {
                         if obj.is_instance(&dag_class)? {
                             dag_found = true;
+                            // This struct populates the `dag` table. It contains our known file paths.
                             let dag = Dag {
                                 dag_id: obj.getattr("dag_id")?.extract()?,
-                                description: obj
-                                    .getattr("description")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                start_date: obj
-                                    .getattr("start_date")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                max_active_tasks: obj
-                                    .getattr("max_active_tasks")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                fail_fast: obj
-                                    .getattr("fail_fast")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                max_active_runs: obj
-                                    .getattr("max_active_runs")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                doc_md: obj.getattr("doc_md").ok().and_then(|v| v.extract().ok()),
+                                description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
+                                start_date: obj.getattr("start_date").ok().and_then(|v| v.extract().ok()),
+                                max_active_tasks: obj.getattr("max_active_tasks").ok().and_then(|v| v.extract().ok()),
+                                max_active_runs: obj.getattr("max_active_runs").ok().and_then(|v| v.extract().ok()),
                                 fileloc: Some(file_path_str.clone()),
-                                edge_info: obj
-                                    .getattr("edge_info")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                max_consecutive_failed_dag_runs: obj
-                                    .getattr("max_consecutive_failed_dag_runs")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                render_template_as_native_obj: obj
-                                    .getattr("render_template_as_native_obj")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                owner_links: obj
-                                    .getattr("owner_links")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                tags: obj.getattr("tags").ok().and_then(|v| v.extract().ok()),
-                                is_paused_upon_creation: obj
-                                    .getattr("is_paused_upon_creation")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                end_date: obj
-                                    .getattr("end_date")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                disable_bundle_versioning: obj
-                                    .getattr("disable_bundle_versioning")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok())
-                                    .unwrap_or(false),
+                                disable_bundle_versioning: obj.getattr("disable_bundle_versioning").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
                                 relative_fileloc: Some(
                                     PathBuf::from(&file_path_str)
                                         .strip_prefix(&dags_dir)
                                         .map(|p| p.to_string_lossy().into_owned())
                                         .unwrap_or_else(|_| file_path_str.clone()),
                                 ),
-                                catchup: obj
-                                    .getattr("catchup")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok())
-                                    .unwrap_or(false),
-                                dag_display_name: obj
-                                    .getattr("dag_display_name")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                timetable: obj
-                                    .getattr("timetable")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                timezone: obj
-                                    .getattr("timezone")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                access_control: obj
-                                    .getattr("access_control")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                dagrun_timeout: obj
-                                    .getattr("dagrun_timeout")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
-                                task_group: obj
-                                    .getattr("task_group")
-                                    .ok()
-                                    .and_then(|v| v.extract().ok()),
+                                catchup: obj.getattr("catchup").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
+                                dag_display_name: obj.getattr("dag_display_name").ok().and_then(|v| v.extract().ok()),
+                                timetable: obj.getattr("timetable").ok().and_then(|v| v.extract().ok()),
                                 default_args: obj.getattr("default_args").ok().and_then(|v| {
                                     py_any_to_serde_json_value(py, &v)
                                         .ok()
                                         .and_then(|json_val| serde_json::from_value(json_val).ok())
                                 }),
-                                deadline: obj.getattr("deadline").ok().and_then(|v| {
-                                    py_any_to_serde_json_value(py, &v)
-                                        .ok()
-                                        .and_then(|json_val| serde_json::from_value(json_val).ok())
-                                }),
+                                fail_fast: None,
+                                doc_md: None,
+                                edge_info: None,
+                                max_consecutive_failed_dag_runs: None,
+                                owner_links: None,
+                                tags: None,
+                                is_paused_upon_creation: None,
+                                timezone: None,
+                                task_group: None,
+                                deadline: None,
                             };
 
-                            info!("Attempting to save DAG '{}' to the database...", dag.dag_id);
+                            info!("Attempting to serialize and save DAG '{}'...", dag.dag_id);
+                            let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
+                            let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
+
                             match pool.get() {
-                                Ok(mut conn) => match db::save_dag(&mut conn, &dag) {
-                                    Ok(_) => info!(
-                                        "Successfully saved/updated DAG '{}' in DB.",
-                                        dag.dag_id
-                                    ),
-                                    Err(e) => {
-                                        error!("Failed to save DAG '{}' to DB: {}", dag.dag_id, e)
+                                Ok(mut conn) => {
+                                    let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
+                                        db::save_dag(conn, &dag).with_context(|| format!("while saving DAG '{}'", dag.dag_id))?;
+
+                                        let new_dag_version_id = db::save_dag_version(conn, &dag.dag_id).with_context(|| format!("while saving DagVersion for '{}'", dag.dag_id))?;
+                                        info!("Successfully created DagVersion with id: {}", new_dag_version_id);
+
+                                        let file_content_str = String::from_utf8_lossy(&file_content).to_string();
+                                        save_dag_code(conn, &dag.dag_id, new_dag_version_id, &file_path_str, &file_content_str).with_context(|| "while saving DagCode")?;
+                                        info!("Successfully saved DagCode for '{}'", dag.dag_id);
+
+                                        let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
+                                        let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
+
+                                        // ========== THIS IS THE FIX ==========
+                                        // The JSON from Python might be missing fileloc/relative_fileloc.
+                                        // We manually patch the JSON object to ensure these values are present.
+                                        let mut data_dict = match serialized_json_val {
+                                            serde_json::Value::Object(d) => Ok(d),
+                                            _ => Err(anyhow!("Serialized DAG was not a JSON object as expected.")),
+                                        }?;
+
+                                        if let Some(fileloc) = &dag.fileloc {
+                                            data_dict.insert("fileloc".to_string(), serde_json::Value::String(fileloc.clone()));
+                                        }
+                                        if let Some(relative_fileloc) = &dag.relative_fileloc {
+                                            data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone()));
+                                        }
+                                        // =====================================
+
+                                        let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))
+                                            .with_context(|| "Failed to deserialize JSON object into SerializedDagData struct")?;
+
+                                        let json_string_for_hash = serde_json::to_string(&serialized_data)?;
+                                        let digest = md5::compute(json_string_for_hash.as_bytes());
+                                        let dag_hash = format!("{:x}", digest);
+
+                                        let s_dag = SerializedDag {
+                                            id: Uuid::new_v4(),
+                                            dag_id: serialized_data.dag_id.clone(),
+                                            dag_hash,
+                                            data: serialized_data,
+                                            dag_version_id: new_dag_version_id,
+                                        };
+
+                                        db::save_serialized_dag(conn, &s_dag).with_context(|| format!("while saving SerializedDAG for '{}'", s_dag.dag_id))?;
+
+                                        Ok(())
+                                    });
+
+                                    match transaction_result {
+                                        Ok(_) => info!("Successfully processed and saved all data for DAG '{}'.", dag.dag_id),
+                                        Err(e) => error!("A database transaction failed for DAG '{}': {:?}", dag.dag_id, e),
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     error!("Could not get DB connection from pool: {}", e);
                                 }
@@ -234,16 +223,13 @@ fn python_executor_worker(
 async fn main() -> Result<()> {
     pyo3::prepare_freethreaded_python();
     env_logger::init();
-
     let dags_dir = "/files/dags";
     std::fs::create_dir_all(dags_dir)?;
     let dags_dir_path = PathBuf::from(dags_dir);
-
     info!("Initializing db pool...");
     let pool = get_connection_pool();
     info!("Database connection pool initialized successfully.");
     info!("Using DAGs directory: {}", dags_dir);
-
     let (tx, rx) = mpsc::channel::<String>(100);
     let worker_handle = {
         let dags_dir_clone = dags_dir.to_string();
@@ -254,7 +240,6 @@ async fn main() -> Result<()> {
             }
         })
     };
-
     info!("Performing initial scan of '{}'...", dags_dir);
     let mut initial_files = HashSet::new();
     for entry in WalkDir::new(dags_dir).into_iter().filter_map(Result::ok) {
@@ -268,7 +253,6 @@ async fn main() -> Result<()> {
         tx.send(file_path).await?;
     }
     info!("Initial scan complete.");
-
     let watcher_tx = tx.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
@@ -288,16 +272,12 @@ async fn main() -> Result<()> {
             },
             Err(e) => error!("File watcher error: {:?}", e),
         })?;
-
     watcher.watch(&dags_dir_path, RecursiveMode::Recursive)?;
     info!("Now watching for file changes in '{}'", dags_dir);
     info!("Starting DAG processor. Press Ctrl+C to exit.");
-
     wait_for_shutdown_signal().await;
-
     info!("Signal received. Shutting down gracefully...");
     drop(tx);
-
     let shutdown_timeout = Duration::from_secs(5);
     match tokio::time::timeout(shutdown_timeout, worker_handle).await {
         Ok(Ok(_)) => info!("Python worker shut down gracefully."),
@@ -307,7 +287,6 @@ async fn main() -> Result<()> {
             shutdown_timeout
         ),
     }
-
     info!("Shutdown complete.");
     Ok(())
 }
@@ -319,13 +298,11 @@ async fn wait_for_shutdown_signal() {
             .expect("Failed to install SIGINT handler");
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
             .expect("Failed to install SIGTERM handler");
-
         tokio::select! {
             _ = sigint.recv() => info!("SIGINT received."),
             _ = sigterm.recv() => info!("SIGTERM received."),
         };
     }
-
     #[cfg(not(unix))]
     {
         signal::ctrl_c()
