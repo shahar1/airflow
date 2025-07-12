@@ -331,7 +331,7 @@ pub fn save_serialized_dag(conn: &mut PgConnection, s_dag: &SerializedDag) -> Re
             // An existing record was found, so we update it.
             let changeset = SerializedDagChangeset {
                 dag_id: s_dag.dag_id.clone(),
-                data: serde_json::to_value(&s_dag.data).ok(),
+                data: create_wrapped_dag_json(&s_dag.data),
                 data_compressed: None, // Or implement compression
                 last_updated: Utc::now(),
                 dag_hash: s_dag.dag_hash.clone(),
@@ -361,29 +361,14 @@ pub struct NewDagVersion {
     pub id: Uuid,
     pub version_number: i32,
     pub dag_id: String,
+    pub bundle_name: String,
+    pub bundle_version: String,
     pub created_at: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
 }
 
 // This function creates a new DAG version record and returns its UUID.
 // It should be placed alongside your other DB functions like `save_dag`.
-pub fn save_dag_version(conn: &mut PgConnection, p_dag_id: &str) -> Result<Uuid> {
-    let new_version = NewDagVersion {
-        id: Uuid::new_v4(),
-        version_number: 1, // Using a static version number for simplicity
-        dag_id: p_dag_id.to_string(),
-        created_at: Utc::now(),
-        last_updated: Utc::now(),
-    };
-
-    let version_id = diesel::insert_into(dag_version::table)
-        .values(&new_version)
-        .returning(dag_version::id) // Ask the DB to return the ID of the new row
-        .get_result(conn)
-        .with_context(|| format!("Error saving new DagVersion for DAG '{}'", p_dag_id))?;
-
-    Ok(version_id)
-}
 
 // in db.rs
 
@@ -391,7 +376,7 @@ pub fn save_dag_version(conn: &mut PgConnection, p_dag_id: &str) -> Result<Uuid>
 
 
 // Define a new struct for inserting into the dag_code table
-#[derive(Insertable, Debug)]
+#[derive(Insertable, AsChangeset, Debug)]
 #[diesel(table_name = dag_code)]
 pub struct NewDagCode {
     pub id: Uuid,
@@ -416,10 +401,10 @@ pub fn save_dag_code(
     let hash = format!("{:x}", md5::compute(p_source_code.as_bytes()));
 
     let new_dag_code = NewDagCode {
-        id: Uuid::new_v4(),
+        id: Uuid::new_v4(), // Note: `id` is ignored on conflict/update.
         dag_id: p_dag_id.to_string(),
         fileloc: p_fileloc.to_string(),
-        created_at: Utc::now(),
+        created_at: Utc::now(), // Note: `created_at` is ignored on conflict/update.
         last_updated: Utc::now(),
         source_code: p_source_code.to_string(),
         source_code_hash: hash,
@@ -428,8 +413,13 @@ pub fn save_dag_code(
 
     diesel::insert_into(dag_code::table)
         .values(&new_dag_code)
+        // On conflict with the unique key `dag_version_id`...
+        .on_conflict(dag_code::dag_version_id)
+        // ...do an update instead of failing.
+        .do_update()
+        .set(&new_dag_code)
         .execute(conn)
-        .with_context(|| "while inserting new DagCode")?;
+        .with_context(|| "while upserting DagCode")?;
 
     Ok(())
 }
@@ -468,4 +458,64 @@ pub fn upsert_dag_bundle(
         .with_context(|| format!("Error upserting DagBundle '{}'", bundle_name))?;
 
     Ok(())
+}
+
+// Add a new helper struct to query existing hash and version info.
+#[derive(Queryable, Debug)]
+struct DagCodeInfo {
+    pub source_code_hash: String,
+    pub dag_version_id: Uuid,
+}
+
+// Replace the entire `save_dag_version` function with this new, more intelligent version.
+pub fn ensure_dag_version_and_get_id(
+    conn: &mut PgConnection,
+    p_dag_id: &str,
+    new_source_hash: &str,
+) -> Result<Uuid> {
+    // 1. Find the most recent DagCode record for this DAG.
+    let latest_dag_code: Option<DagCodeInfo> = dag_code::table
+        .filter(dag_code::dag_id.eq(p_dag_id))
+        .order(dag_code::last_updated.desc())
+        .select((dag_code::source_code_hash, dag_code::dag_version_id))
+        .first::<DagCodeInfo>(conn)
+        .optional()?;
+
+    // 2. Check if the source code has changed.
+    if let Some(existing_code) = latest_dag_code {
+        if existing_code.source_code_hash == new_source_hash {
+            // Hashes are the same, no changes. Reuse the existing version ID.
+            info!("DAG '{}' source code has not changed. Reusing version_id: {}", p_dag_id, existing_code.dag_version_id);
+            return Ok(existing_code.dag_version_id);
+        }
+    }
+
+    // 3. If code has changed (or this is the first time), create a new version.
+    info!("DAG '{}' source code has changed. Creating new version.", p_dag_id);
+
+    // Find the current max version number for this DAG.
+    let max_version: Option<i32> = dag_version::table
+        .filter(dag_version::dag_id.eq(p_dag_id))
+        .select(diesel::dsl::max(dag_version::version_number))
+        .get_result(conn)?; // Using get_result which is clearer for single-value queries.
+    // --- END FIX ---
+
+    let new_version_number = max_version.unwrap_or(0) + 1;
+
+    let new_version = NewDagVersion {
+        id: Uuid::new_v4(),
+        version_number: new_version_number,
+        dag_id: p_dag_id.to_string(),
+        bundle_version: String::from("1"),
+        bundle_name: String::from("dags-folder"),
+        created_at: Utc::now(),
+        last_updated: Utc::now(),
+    };
+
+    // 4. Insert the new version and return its ID.
+    diesel::insert_into(dag_version::table)
+        .values(&new_version)
+        .returning(dag_version::id)
+        .get_result(conn)
+        .with_context(|| format!("Error saving new DagVersion for DAG '{}'", p_dag_id))
 }
