@@ -5,7 +5,7 @@ pub mod db;
 pub mod schema;
 
 use crate::db::{
-    get_connection_pool, save_dag_code, save_dag_version, save_serialized_dag, upsert_dag_bundle,
+    get_connection_pool, save_dag_code, save_serialized_dag, upsert_dag_bundle,
     Dag, SerializedDag, SerializedDagData,
 };
 use anyhow::{anyhow, Context, Result};
@@ -148,6 +148,8 @@ fn python_executor_worker(
                                 deadline: None,
                             };
 
+                            let file_hash = format!("{:x}", md5::compute(&file_content));
+
                             info!("Attempting to serialize and save DAG '{}'...", dag.dag_id);
                             let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
                             let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
@@ -157,7 +159,9 @@ fn python_executor_worker(
                                     let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
                                         db::save_dag(conn, &dag).with_context(|| format!("while saving DAG '{}'", dag.dag_id))?;
 
-                                        let new_dag_version_id = save_dag_version(conn, &dag.dag_id).with_context(|| format!("while saving DagVersion for '{}'", dag.dag_id))?;
+                                        let new_dag_version_id = db::ensure_dag_version_and_get_id(conn, &dag.dag_id, &file_hash)
+                                            .with_context(|| format!("while ensuring DagVersion for '{}'", dag.dag_id))?;
+
                                         info!("Successfully created DagVersion with id: {}", new_dag_version_id);
 
                                         let file_content_str = String::from_utf8_lossy(&file_content).to_string();
@@ -310,7 +314,7 @@ async fn main() -> Result<()> {
     info!("Shutting down gracefully...");
     drop(tx);
 
-    let shutdown_timeout = Duration::from_secs(10);
+    let shutdown_timeout = Duration::from_secs(2);
     match tokio::time::timeout(shutdown_timeout, worker_handle).await {
         Ok(Ok(_)) => info!("Python worker shut down gracefully."),
         Ok(Err(e)) => error!("Python worker task failed during shutdown: {:?}", e),
