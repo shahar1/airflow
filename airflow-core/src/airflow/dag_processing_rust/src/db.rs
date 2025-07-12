@@ -8,35 +8,88 @@ use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use dotenvy::dotenv;
 use std::env;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::json;
+use uuid::Uuid;
+use crate::schema::serialized_dag;
+
+mod serde_helpers {
+    use super::*; // Make types from parent module available
+    use serde::de;
+
+    /// Deserializes an optional floating-point Unix timestamp into an `Option<DateTime<Utc>>`.
+    ///
+    /// This function correctly handles a JSON value that is either a number (f64)
+    /// or `null`.
+    pub fn deserialize_f64_timestamp_option<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // First, deserialize into an Option<f64> to handle the JSON `null` case.
+        let opt_float = Option::<f64>::deserialize(deserializer)?;
+
+        // Match on the result.
+        match opt_float {
+            Some(float_val) => {
+                // If we got a float, convert it to i64 seconds.
+                let seconds = float_val as i64;
+                // Use the valid `from_timestamp` function. It returns an Option
+                // itself, so we handle the case of an out-of-range timestamp.
+                match DateTime::from_timestamp(seconds, 0) {
+                    Some(dt) => Ok(Some(dt)),
+                    None => Err(de::Error::custom(format!(
+                        "Invalid or out-of-range Unix timestamp: {}",
+                        float_val
+                    ))),
+                }
+            }
+            // If the JSON was `null`, we get `None`, which we pass through.
+            None => Ok(None),
+        }
+    }
+
+    pub fn serialize_f64_timestamp_option<S>(
+        date: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(dt) => serializer.serialize_f64(dt.timestamp() as f64),
+            None => serializer.serialize_none(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Dag {
-    pub dag_id: String,
-    pub description: Option<String>,
-    pub start_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub max_active_tasks: Option<u32>,
-    pub fail_fast: Option<bool>,
-    pub max_active_runs: Option<u32>,
-    pub doc_md: Option<String>,
-    pub fileloc: Option<String>,
-    pub edge_info:Option<std::collections::HashMap<String, std::collections::HashMap<String, EdgeInfoType>>>,
-    pub max_consecutive_failed_dag_runs: Option<u32>,
-    pub render_template_as_native_obj: Option<bool>,
-    pub owner_links: Option<std::collections::HashMap<String, String>>,
-    pub tags: Option<Vec<String>>,
-    pub is_paused_upon_creation: Option<bool>,
-    pub default_args: Option<std::collections::HashMap<String, serde_json::Value>>,
-    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub disable_bundle_versioning: bool,
-    pub relative_fileloc: Option<String>,
+    // pub access_control: Option<String>,
     pub catchup: bool,
     pub dag_display_name: Option<String>,
+    pub dag_id: String,
     pub deadline: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub default_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub description: Option<String>,
+    pub disable_bundle_versioning: bool,
+    pub doc_md: Option<String>,
+    pub edge_info: Option<std::collections::HashMap<String, std::collections::HashMap<String, EdgeInfoType>>>,
+    pub fail_fast: Option<bool>,
+    pub fileloc: Option<String>,
+    pub is_paused_upon_creation: Option<bool>,
+    pub max_active_runs: Option<u32>,
+    pub max_active_tasks: Option<u32>,
+    pub max_consecutive_failed_dag_runs: Option<u32>,
+    pub owner_links: Option<std::collections::HashMap<String, String>>,
+    pub relative_fileloc: Option<String>,
+    // pub render_template_as_native_obj: bool,
+    pub start_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub tags: Option<Vec<String>>,
+    pub task_group: Option<String>,
     pub timetable: Option<String>,
     pub timezone: Option<String>,
-    pub access_control: Option<String>,
-    pub dagrun_timeout: Option<String>,
-    pub task_group: Option<String>,
 }
 
 #[derive(Queryable, Insertable, AsChangeset, Debug)]
@@ -123,7 +176,7 @@ impl From<&Dag> for NewDag {
             max_consecutive_failed_dag_runs: dag.max_consecutive_failed_dag_runs.map(|v| v as i32).unwrap_or(0),
             has_task_concurrency_limits: false,
             has_import_errors: Option::from(false),
-            bundle_name: None,
+            bundle_name: Some("dags-folder".to_string()), // Parametrize later
             bundle_version: None,
             asset_expression: None,
             next_dagrun: None,
@@ -132,4 +185,251 @@ impl From<&Dag> for NewDag {
             next_dagrun_create_after: None,
         }
     }
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SerializedDagData {
+    // These fields are present in the sample JSON
+    pub _processor_dags_folder: String,
+    pub catchup: bool,
+    pub dag_dependencies: Vec<serde_json::Value>,
+    pub dag_id: String,
+    pub deadline: Option<serde_json::Value>,
+    pub disable_bundle_versioning: bool,
+    pub edge_info: serde_json::Value,
+    pub fileloc: String,
+    pub params: Vec<serde_json::Value>,
+    pub relative_fileloc: String,
+    pub tags: Vec<String>,
+    pub task_group: serde_json::Value,
+    pub tasks: Vec<serde_json::Value>,
+    pub timetable: serde_json::Value,
+    pub timezone: String,
+
+    // This field uses our custom serializer/deserializer
+    #[serde(
+        deserialize_with = "serde_helpers::deserialize_f64_timestamp_option",
+        serialize_with = "serde_helpers::serialize_f64_timestamp_option"
+    )]
+    pub start_date: Option<DateTime<Utc>>,
+
+    // --- REMOVED FIELDS ---
+    // The following fields were in the Rust struct but are NOT in the sample JSON.
+    // They must be removed to prevent deserialization errors.
+    //
+    // pub description: Option<String>,
+    // pub max_active_tasks: Option<u32>,
+    // pub fail_fast: Option<bool>,
+    // pub max_active_runs: Option<u32>,
+    // pub doc_md: Option<String>,
+    // pub max_consecutive_failed_dag_runs: Option<u32>,
+    // pub render_template_as_native_obj: bool,
+    // pub owner_links: Option<std::collections::HashMap<String, String>>,
+    // pub is_paused_upon_creation: Option<bool>,
+    // pub default_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+    // pub end_date: Option<DateTime<Utc>>,
+    // pub dag_display_name: Option<String>,
+    // pub access_control: Option<String>,
+    // pub dagrun_timeout: Option<serde_json::Value>,
+    // pub has_on_success_callback: bool,
+    // pub has_on_failure_callback: bool,
+}
+
+fn create_wrapped_dag_json(data: &SerializedDagData) -> Option<serde_json::Value> {
+    // First, convert the content struct to a serde_json::Value
+    serde_json::to_value(data)
+        .ok()
+        .map(|content| {
+            // Then, use the json! macro to create the wrapper object
+            json!({
+                "__version": 2,
+                "dag": content
+            })
+        })
+}
+
+/// 1. A "pure" struct for storing a complete serialized DAG entity.
+///
+/// This struct holds both the serializable data (`SerializedDagData`) and the
+/// metadata required to create a record in the database, such as the `dag_hash`
+/// and various IDs.
+#[derive(Debug, Clone)]
+pub struct SerializedDag {
+    pub id: Uuid,
+    pub dag_id: String,
+    pub dag_hash: String,
+    pub data: SerializedDagData,
+    pub dag_version_id: Uuid,
+}
+
+
+/// 2. Diesel-specific struct for inserting or updating records in the `serialized_dag` table.
+///
+/// This struct maps directly to the `serialized_dag` table schema and is used in
+/// Diesel operations. It can be created from the pure `SerializedDag` struct.
+#[derive(Insertable, AsChangeset, Debug)]
+#[diesel(table_name = serialized_dag)]
+pub struct NewSerializedDag {
+    pub id: Uuid,
+    pub dag_id: String,
+    pub data: Option<serde_json::Value>,
+    pub data_compressed: Option<Vec<u8>>,
+    pub created_at: DateTime<Utc>,
+    pub last_updated: DateTime<Utc>,
+    pub dag_hash: String,
+    pub dag_version_id: Uuid,
+}
+
+impl From<&SerializedDag> for NewSerializedDag {
+    /// Converts the pure `SerializedDag` struct into a `NewSerializedDag` struct
+    /// that is ready for database insertion or update.
+    fn from(s_dag: &SerializedDag) -> Self {
+        // The `s_dag.data` struct is serialized into a `serde_json::Value`
+        // which corresponds to the `JSON` type in the database.
+        // let data_json = serde_json::to_value(&s_dag.data).ok();
+
+        NewSerializedDag {
+            id: s_dag.id,
+            dag_id: s_dag.dag_id.clone(),
+            data: create_wrapped_dag_json(&s_dag.data),
+            data_compressed: None, // Compression can be implemented here if needed
+            created_at: Utc::now(),
+            last_updated: Utc::now(),
+            dag_hash: s_dag.dag_hash.clone(),
+            dag_version_id: s_dag.dag_version_id,
+        }
+    }
+}
+
+// in db.rs
+
+// This struct is used specifically for updating an existing serialized_dag record.
+// It omits fields that should not be changed on update, like `id` and `created_at`.
+#[derive(AsChangeset, Debug)]
+#[diesel(table_name = serialized_dag)]
+pub struct SerializedDagChangeset {
+    pub dag_id: String,
+    pub data: Option<serde_json::Value>,
+    pub data_compressed: Option<Vec<u8>>,
+    pub last_updated: DateTime<Utc>,
+    pub dag_hash: String,
+    pub dag_version_id: Uuid,
+}
+
+pub fn save_serialized_dag(conn: &mut PgConnection, s_dag: &SerializedDag) -> Result<()> {
+    conn.transaction(|conn| {
+        // Find the ID of the most recently updated serialized_dag for this dag_id
+        let maybe_target_id: Option<Uuid> = serialized_dag::table
+            .filter(serialized_dag::dag_id.eq(&s_dag.dag_id))
+            .order(serialized_dag::last_updated.desc())
+            .select(serialized_dag::id)
+            .first::<Uuid>(conn)
+            .optional()?;
+
+        if let Some(target_id) = maybe_target_id {
+            // An existing record was found, so we update it.
+            let changeset = SerializedDagChangeset {
+                dag_id: s_dag.dag_id.clone(),
+                data: serde_json::to_value(&s_dag.data).ok(),
+                data_compressed: None, // Or implement compression
+                last_updated: Utc::now(),
+                dag_hash: s_dag.dag_hash.clone(),
+                dag_version_id: s_dag.dag_version_id,
+            };
+
+            diesel::update(serialized_dag::table.find(target_id))
+                .set(&changeset)
+                .execute(conn)
+                .with_context(|| format!("Error updating SerializedDAG for '{}'", s_dag.dag_id))?;
+        } else {
+            // No existing record was found, so we insert a new one.
+            let new_s_dag = NewSerializedDag::from(s_dag);
+            diesel::insert_into(serialized_dag::table)
+                .values(&new_s_dag)
+                .execute(conn)
+                .with_context(|| format!("Error inserting new SerializedDAG for '{}'", s_dag.id))?;
+        }
+        Ok(())
+    })
+}
+
+// Define a new struct for inserting into the dag_version table
+#[derive(Insertable, Debug)]
+#[diesel(table_name = dag_version)]
+pub struct NewDagVersion {
+    pub id: Uuid,
+    pub version_number: i32,
+    pub dag_id: String,
+    pub created_at: DateTime<Utc>,
+    pub last_updated: DateTime<Utc>,
+}
+
+// This function creates a new DAG version record and returns its UUID.
+// It should be placed alongside your other DB functions like `save_dag`.
+pub fn save_dag_version(conn: &mut PgConnection, p_dag_id: &str) -> Result<Uuid> {
+    let new_version = NewDagVersion {
+        id: Uuid::new_v4(),
+        version_number: 1, // Using a static version number for simplicity
+        dag_id: p_dag_id.to_string(),
+        created_at: Utc::now(),
+        last_updated: Utc::now(),
+    };
+
+    let version_id = diesel::insert_into(dag_version::table)
+        .values(&new_version)
+        .returning(dag_version::id) // Ask the DB to return the ID of the new row
+        .get_result(conn)
+        .with_context(|| format!("Error saving new DagVersion for DAG '{}'", p_dag_id))?;
+
+    Ok(version_id)
+}
+
+// in db.rs
+
+// Add the new table to your 'use' statements
+use crate::schema::{dag_code, dag_version};
+
+// Define a new struct for inserting into the dag_code table
+#[derive(Insertable, Debug)]
+#[diesel(table_name = dag_code)]
+pub struct NewDagCode {
+    pub id: Uuid,
+    pub dag_id: String,
+    pub fileloc: String,
+    pub created_at: DateTime<Utc>,
+    pub last_updated: DateTime<Utc>,
+    pub source_code: String,
+    pub source_code_hash: String,
+    pub dag_version_id: Uuid,
+}
+
+// This function creates a new dag_code record.
+// Place it alongside your other database functions like `save_dag`.
+pub fn save_dag_code(
+    conn: &mut PgConnection,
+    p_dag_id: &str,
+    p_dag_version_id: Uuid,
+    p_fileloc: &str,
+    p_source_code: &str,
+) -> Result<()> {
+    let hash = format!("{:x}", md5::compute(p_source_code.as_bytes()));
+
+    let new_dag_code = NewDagCode {
+        id: Uuid::new_v4(),
+        dag_id: p_dag_id.to_string(),
+        fileloc: p_fileloc.to_string(),
+        created_at: Utc::now(),
+        last_updated: Utc::now(),
+        source_code: p_source_code.to_string(),
+        source_code_hash: hash,
+        dag_version_id: p_dag_version_id,
+    };
+
+    diesel::insert_into(dag_code::table)
+        .values(&new_dag_code)
+        .execute(conn)
+        .with_context(|| "while inserting new DagCode")?;
+
+    Ok(())
 }
