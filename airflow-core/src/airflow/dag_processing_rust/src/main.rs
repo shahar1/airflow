@@ -51,139 +51,141 @@ fn py_any_to_serde_json_value(
 }
 
 /// The core parsing logic for a single DAG file. Reused by the worker.
-fn process_dag_file(py: Python, dags_dir: &str, file_path_str: &str, pool: &DbPool) -> Result<()> {
-    let builtins = py.import("builtins")?;
-    let exec_func = builtins.getattr("exec")?;
+// CHANGED: Signature no longer takes `py: Python`. The function now acquires the GIL itself.
+fn process_dag_file(dags_dir: &str, file_path_str: &str, pool: &DbPool) -> Result<()> {
+    // CHANGED: The entire function body is wrapped in `with_gil` to acquire the Python lock.
+    Python::with_gil(|py| {
+        let builtins = py.import("builtins")?;
+        let exec_func = builtins.getattr("exec")?;
 
-    let sys = py.import("sys")?;
-    let sys_path_obj = sys.getattr("path")?;
-    let sys_path: &Bound<'_, PyList> = sys_path_obj
-        .downcast()
-        .map_err(|e| anyhow!("sys.path was not a list: {}", e))?;
-    sys_path.insert(0, &dags_dir)?;
+        let sys = py.import("sys")?;
+        let sys_path_obj = sys.getattr("path")?;
+        let sys_path: &Bound<'_, PyList> = sys_path_obj
+            .downcast()
+            .map_err(|e| anyhow!("sys.path was not a list: {}", e))?;
+        sys_path.insert(0, &dags_dir)?;
 
-    let dag_module = py.import("airflow.sdk.definitions.dag")?;
-    let dag_class = dag_module.getattr("DAG")?;
+        let dag_module = py.import("airflow.sdk.definitions.dag")?;
+        let dag_class = dag_module.getattr("DAG")?;
 
-    let file_content =
-        std::fs::read(&file_path_str).with_context(|| format!("[WORKER] Failed to read file {}", file_path_str))?;
+        let file_content = std::fs::read(&file_path_str)
+            .with_context(|| format!("[WORKER] Failed to read file {}", file_path_str))?;
 
-    let code_bytes = PyBytes::new(py, &file_content);
-    let globals = PyDict::new(py);
-    globals.set_item("__name__", "__main__")?;
-    globals.set_item("__file__", file_path_str)?;
+        let code_bytes = PyBytes::new(py, &file_content);
+        let globals = PyDict::new(py);
+        globals.set_item("__name__", "__main__")?;
+        globals.set_item("__file__", file_path_str)?;
 
-    let result = exec_func.call((code_bytes, globals.clone(), globals.clone()), None);
+        let result = exec_func.call((code_bytes, globals.clone(), globals.clone()), None);
 
-    match result {
-        Ok(_) => {
-            let mut dag_found = false;
-            for (_name, obj) in globals.iter() {
-                if obj.is_instance(&dag_class)? {
-                    dag_found = true;
-                    let dag = Dag {
-                        dag_id: obj.getattr("dag_id")?.extract()?,
-                        description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
-                        start_date: obj.getattr("start_date").ok().and_then(|v| v.extract().ok()),
-                        max_active_tasks: obj.getattr("max_active_tasks").ok().and_then(|v| v.extract().ok()),
-                        max_active_runs: obj.getattr("max_active_runs").ok().and_then(|v| v.extract().ok()),
-                        fileloc: Some(file_path_str.to_string()),
-                        disable_bundle_versioning: obj.getattr("disable_bundle_versioning").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
-                        relative_fileloc: Some(
-                            PathBuf::from(&file_path_str)
-                                .strip_prefix(&dags_dir)
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_else(|_| file_path_str.to_string()),
-                        ),
-                        catchup: obj.getattr("catchup").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
-                        dag_display_name: obj.getattr("dag_display_name").ok().and_then(|v| v.extract().ok()),
-                        timetable: obj.getattr("timetable").ok().and_then(|v| v.extract().ok()),
-                        default_args: obj.getattr("default_args").ok().and_then(|v| {
-                            py_any_to_serde_json_value(py, &v)
-                                .ok()
-                                .and_then(|json_val| serde_json::from_value(json_val).ok())
-                        }),
-                        fail_fast: None,
-                        doc_md: None,
-                        edge_info: None,
-                        max_consecutive_failed_dag_runs: None,
-                        owner_links: None,
-                        tags: None,
-                        is_paused_upon_creation: None,
-                        timezone: None,
-                        task_group: None,
-                        deadline: None,
-                    };
-                    let file_hash = format!("{:x}", md5::compute(&file_content));
+        match result {
+            Ok(_) => {
+                let mut dag_found = false;
+                for (_name, obj) in globals.iter() {
+                    if obj.is_instance(&dag_class)? {
+                        dag_found = true;
+                        let dag = Dag {
+                            dag_id: obj.getattr("dag_id")?.extract()?,
+                            description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
+                            start_date: obj.getattr("start_date").ok().and_then(|v| v.extract().ok()),
+                            max_active_tasks: obj.getattr("max_active_tasks").ok().and_then(|v| v.extract().ok()),
+                            max_active_runs: obj.getattr("max_active_runs").ok().and_then(|v| v.extract().ok()),
+                            fileloc: Some(file_path_str.to_string()),
+                            disable_bundle_versioning: obj.getattr("disable_bundle_versioning").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
+                            relative_fileloc: Some(
+                                PathBuf::from(&file_path_str)
+                                    .strip_prefix(&dags_dir)
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| file_path_str.to_string()),
+                            ),
+                            catchup: obj.getattr("catchup").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
+                            dag_display_name: obj.getattr("dag_display_name").ok().and_then(|v| v.extract().ok()),
+                            timetable: obj.getattr("timetable").ok().and_then(|v| v.extract().ok()),
+                            default_args: obj.getattr("default_args").ok().and_then(|v| {
+                                py_any_to_serde_json_value(py, &v)
+                                    .ok()
+                                    .and_then(|json_val| serde_json::from_value(json_val).ok())
+                            }),
+                            fail_fast: None,
+                            doc_md: None,
+                            edge_info: None,
+                            max_consecutive_failed_dag_runs: None,
+                            owner_links: None,
+                            tags: None,
+                            is_paused_upon_creation: None,
+                            timezone: None,
+                            task_group: None,
+                            deadline: None,
+                        };
+                        let file_hash = format!("{:x}", md5::compute(&file_content));
 
-                    info!("[WORKER] Saving DAG '{}' from file '{}'", dag.dag_id, file_path_str);
-                    let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
-                    let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
+                        info!("[WORKER] Saving DAG '{}' from file '{}'", dag.dag_id, file_path_str);
+                        let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
+                        let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
 
-                    let mut conn = pool.get().context("[WORKER] could not get DB connection from pool")?;
-                    let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
-                        db::save_dag(conn, &dag)?;
-                        let new_dag_version_id = db::ensure_dag_version_and_get_id(conn, &dag.dag_id, &file_hash)?;
-                        let file_content_str = String::from_utf8_lossy(&file_content).to_string();
-                        db::save_dag_code(conn, &dag.dag_id, new_dag_version_id, file_path_str, &file_content_str)?;
-                        let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
-                        let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
-                        let mut data_dict = match serialized_json_val {
-                            serde_json::Value::Object(d) => Ok(d),
-                            _ => Err(anyhow!("Serialized DAG was not a JSON object")),
-                        }?;
-                        if let Some(fileloc) = &dag.fileloc { data_dict.insert("fileloc".to_string(), serde_json::Value::String(fileloc.clone())); }
-                        if let Some(relative_fileloc) = &dag.relative_fileloc { data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone())); }
-                        let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))?;
-                        let json_string_for_hash = serde_json::to_string(&serialized_data)?;
-                        let dag_hash = format!("{:x}", md5::compute(json_string_for_hash.as_bytes()));
-                        let s_dag = SerializedDag { id: Uuid::new_v4(), dag_id: serialized_data.dag_id.clone(), dag_hash, data: serialized_data, dag_version_id: new_dag_version_id };
-                        db::save_serialized_dag(conn, &s_dag)?;
-                        Ok(())
-                    });
+                        let mut conn = pool.get().context("[WORKER] could not get DB connection from pool")?;
+                        let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
+                            db::save_dag(conn, &dag)?;
+                            let new_dag_version_id = db::ensure_dag_version_and_get_id(conn, &dag.dag_id, &file_hash)?;
+                            let file_content_str = String::from_utf8_lossy(&file_content).to_string();
+                            db::save_dag_code(conn, &dag.dag_id, new_dag_version_id, file_path_str, &file_content_str)?;
+                            let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
+                            let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
+                            let mut data_dict = match serialized_json_val {
+                                serde_json::Value::Object(d) => Ok(d),
+                                _ => Err(anyhow!("Serialized DAG was not a JSON object")),
+                            }?;
+                            if let Some(fileloc) = &dag.fileloc { data_dict.insert("fileloc".to_string(), serde_json::Value::String(fileloc.clone())); }
+                            if let Some(relative_fileloc) = &dag.relative_fileloc { data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone())); }
+                            let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))?;
+                            let json_string_for_hash = serde_json::to_string(&serialized_data)?;
+                            let dag_hash = format!("{:x}", md5::compute(json_string_for_hash.as_bytes()));
+                            let s_dag = SerializedDag { id: Uuid::new_v4(), dag_id: serialized_data.dag_id.clone(), dag_hash, data: serialized_data, dag_version_id: new_dag_version_id };
+                            db::save_serialized_dag(conn, &s_dag)?;
+                            Ok(())
+                        });
 
-                    if let Err(e) = transaction_result {
-                        error!("[WORKER] DB transaction failed for DAG '{}': {:?}", dag.dag_id, e);
+                        if let Err(e) = transaction_result {
+                            error!("[WORKER] DB transaction failed for DAG '{}': {:?}", dag.dag_id, e);
+                        }
+                        break;
                     }
-                    break;
+                }
+                if !dag_found {
+                    warn!("[WORKER] No instance of DAG found in file '{}'", file_path_str);
                 }
             }
-            if !dag_found {
-                warn!("[WORKER] No instance of DAG found in file '{}'", file_path_str);
+            Err(e) => {
+                error!("[WORKER] Python error executing file '{}':", file_path_str);
+                e.print(py);
             }
         }
-        Err(e) => {
-            error!("[WORKER] Python error executing file '{}':", file_path_str);
-            e.print(py);
-        }
-    }
-    Ok(())
+        Ok(())
+    }) // The `anyhow::Result` from the closure is returned by `with_gil`
 }
 
 /// A long-lived worker process that processes files sent via stdin.
-// NEW: Accepts pool_size as an argument
 fn run_long_lived_worker(dags_dir: String, pool_size: u32) -> Result<()> {
+    // NOTE: This MUST be called only once per process, so it stays here.
     pyo3::prepare_freethreaded_python();
-    // NEW: Use the passed-in pool_size
     let pool = get_connection_pool_with_size(pool_size);
     info!("[WORKER] Long-lived worker process started with pool size {}. Waiting for file paths on stdin...", pool_size);
 
     let stdin = std::io::stdin();
     let reader = stdin.lock();
 
-    Python::with_gil(|py| -> Result<()> {
-        for line in reader.lines() {
-            let file_path_str = line.context("[WORKER] Failed to read line from stdin")?;
-            if file_path_str.is_empty() {
-                continue;
-            }
-            info!("[WORKER] Received job for: {}", &file_path_str);
-            if let Err(e) = process_dag_file(py, &dags_dir, &file_path_str, &pool) {
-                error!("[WORKER] Failed to process file '{}': {:?}", file_path_str, e);
-            }
+    // CHANGED: Removed the `Python::with_gil` wrapper from here.
+    for line in reader.lines() {
+        let file_path_str = line.context("[WORKER] Failed to read line from stdin")?;
+        if file_path_str.is_empty() {
+            continue;
         }
-        Ok(())
-    })?;
+        info!("[WORKER] Received job for: {}", &file_path_str);
+        // CHANGED: Call `process_dag_file` directly. It now manages the GIL itself.
+        if let Err(e) = process_dag_file(&dags_dir, &file_path_str, &pool) {
+            error!("[WORKER] Failed to process file '{}': {:?}", file_path_str, e);
+        }
+    }
 
     info!("[WORKER] Stdin closed. Shutting down gracefully.");
     Ok(())
@@ -197,14 +199,9 @@ async fn run_scheduler() -> Result<()> {
     let dags_dir_path = PathBuf::from(dags_dir);
 
     let num_workers = num_cpus::get();
-    // let num_workers = 2;
     let num_processes = (num_workers + 1) as u32; // +1 for the scheduler itself
 
-    // --- NEW: Calculate pool size ---
-    // Total connections to keep below the typical DB limit of 100.
-    // Leaving a small buffer for other clients (e.g. psql).
     let total_db_connections_limit = 90;
-    // Divide the limit among all our processes. Ensure at least 2 connections per pool.
     let pool_size_per_process = (total_db_connections_limit / num_processes).max(2);
 
     info!(
@@ -213,7 +210,6 @@ async fn run_scheduler() -> Result<()> {
     );
 
     info!("[SCHEDULER] Upserting 'dags-folder' entry...");
-    // NEW: Use the calculated size for the scheduler's own pool
     let mut conn = get_connection_pool_with_size(pool_size_per_process).get()?;
     db::upsert_dag_bundle(&mut conn, "dags-folder", true, "1")?;
     info!("[SCHEDULER] DagBundle entry is up to date.");
@@ -225,7 +221,6 @@ async fn run_scheduler() -> Result<()> {
     for i in 0..num_workers {
         let exe = std::env::current_exe()?;
         let mut cmd = Command::new(exe);
-        // NEW: Add the calculated pool size as a command-line argument for the worker
         cmd.arg("--long-lived-worker")
             .arg(dags_dir)
             .arg(pool_size_per_process.to_string())
@@ -347,7 +342,6 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // NEW: Logic updated to parse the pool size argument for workers.
     // The worker now expects 4 arguments: <executable> --long-lived-worker <dags_dir> <pool_size>
     if args.len() == 4 && args[1] == "--long-lived-worker" {
         let dags_dir = args[2].clone();
