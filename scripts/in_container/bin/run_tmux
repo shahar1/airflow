@@ -121,7 +121,7 @@ if [[ ${STANDALONE_DAG_PROCESSOR} == "true" ]]; then
     tmux split-window -h
     tmux set-option -p @airflow_component "DAG Processor"
 #     tmux send-keys 'airflow dag-processor' C-m
-    tmux send-keys 'cd airflow-core/src/airflow/dag_processing_rust && RUST_LOG=info cargo run --release' C-m
+    tmux send-keys 'cd airflow-core/src/airflow/dag_processing_rust && RUST_LOG=info cargo run --release -- --long-lived-worker' C-m
 fi
 
 # Attach Session, on the Main window

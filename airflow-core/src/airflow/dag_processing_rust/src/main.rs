@@ -5,12 +5,13 @@ pub mod db;
 pub mod schema;
 
 use crate::db::{
-    get_connection_pool, save_dag_code, save_serialized_dag, upsert_dag_bundle,
-    Dag, SerializedDag, SerializedDagData,
+    get_connection_pool_with_size, save_dag_code, save_serialized_dag, upsert_dag_bundle, Dag,
+    SerializedDag, SerializedDagData,
 };
 use anyhow::{anyhow, Context, Result};
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{Connection, PgConnection};
+use dotenvy::dotenv;
 use md5;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -18,17 +19,17 @@ use pyo3::Bound;
 use pyo3::{prelude::*, FromPyObject};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::spawn_blocking;
-use uuid::Uuid;
-use walkdir::WalkDir;
-
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::thread;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
+use walkdir::WalkDir;
 
 pub type DbPool = Pool<ConnectionManager<PgConnection>>;
 
@@ -37,6 +38,7 @@ struct EdgeInfoType {
     label: Option<String>,
 }
 
+/// Utility function to convert a PyAny object to a serde_json::Value.
 fn py_any_to_serde_json_value(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
@@ -48,279 +50,319 @@ fn py_any_to_serde_json_value(
     })
 }
 
-fn python_executor_worker(
-    dags_dir: String,
-    mut rx: mpsc::Receiver<String>,
-    pool: DbPool,
-) -> Result<()> {
-    Python::with_gil(|py| -> Result<()> {
-        let builtins = py.import("builtins")?;
-        let exec_func = builtins.getattr("exec")?;
+/// The core parsing logic for a single DAG file. Reused by the worker.
+fn process_dag_file(py: Python, dags_dir: &str, file_path_str: &str, pool: &DbPool) -> Result<()> {
+    let builtins = py.import("builtins")?;
+    let exec_func = builtins.getattr("exec")?;
 
-        let sys = py.import("sys")?;
-        let sys_path_obj = sys.getattr("path")?;
-        let sys_path: &Bound<'_, PyList> = sys_path_obj
-            .downcast()
-            .map_err(|e| anyhow!("sys.path was not a list: {}", e))?;
-        sys_path.insert(0, &dags_dir)?;
+    let sys = py.import("sys")?;
+    let sys_path_obj = sys.getattr("path")?;
+    let sys_path: &Bound<'_, PyList> = sys_path_obj
+        .downcast()
+        .map_err(|e| anyhow!("sys.path was not a list: {}", e))?;
+    sys_path.insert(0, &dags_dir)?;
 
-        info!(
-            "Python executor worker started. sys.path extended with: {}",
-            dags_dir
-        );
-        let dag_module = py.import("airflow.sdk.definitions.dag")?;
-        let dag_class = dag_module.getattr("DAG")?;
-        info!("Successfully imported 'airflow.sdk.definitions.dag.DAG' class.");
+    let dag_module = py.import("airflow.sdk.definitions.dag")?;
+    let dag_class = dag_module.getattr("DAG")?;
 
-        // ========== THIS IS THE NEW BLOCK ==========
-        info!("Upserting 'dags-folder' entry in dag_bundle table...");
-        let mut conn = pool.get().context("Failed to get DB connection for bundle setup")?;
-        db::upsert_dag_bundle(&mut conn, "dags-folder", true, "1")
-            .context("Failed to upsert 'dags-folder' bundle")?;
-        info!("DagBundle entry is up to date.");
-        // ===========================================
+    let file_content =
+        std::fs::read(&file_path_str).with_context(|| format!("[WORKER] Failed to read file {}", file_path_str))?;
 
-        while let Some(file_path_str) = rx.blocking_recv() {
-            info!(
-                "[PYTHON] Received request to execute file: {}",
-                file_path_str
-            );
-            let gil_start_time = std::time::Instant::now();
+    let code_bytes = PyBytes::new(py, &file_content);
+    let globals = PyDict::new(py);
+    globals.set_item("__name__", "__main__")?;
+    globals.set_item("__file__", file_path_str)?;
 
-            let file_content = match std::fs::read(&file_path_str) {
-                Ok(content) => content,
-                Err(e) => {
-                    error!("Failed to read file {}: {}. Skipping.", file_path_str, e);
-                    continue;
-                }
-            };
+    let result = exec_func.call((code_bytes, globals.clone(), globals.clone()), None);
 
-            let code_bytes = PyBytes::new(py, &file_content);
-            let globals = PyDict::new(py);
-            globals.set_item("__name__", "__main__")?;
-            globals.set_item("__file__", &file_path_str)?;
+    match result {
+        Ok(_) => {
+            let mut dag_found = false;
+            for (_name, obj) in globals.iter() {
+                if obj.is_instance(&dag_class)? {
+                    dag_found = true;
+                    let dag = Dag {
+                        dag_id: obj.getattr("dag_id")?.extract()?,
+                        description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
+                        start_date: obj.getattr("start_date").ok().and_then(|v| v.extract().ok()),
+                        max_active_tasks: obj.getattr("max_active_tasks").ok().and_then(|v| v.extract().ok()),
+                        max_active_runs: obj.getattr("max_active_runs").ok().and_then(|v| v.extract().ok()),
+                        fileloc: Some(file_path_str.to_string()),
+                        disable_bundle_versioning: obj.getattr("disable_bundle_versioning").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
+                        relative_fileloc: Some(
+                            PathBuf::from(&file_path_str)
+                                .strip_prefix(&dags_dir)
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| file_path_str.to_string()),
+                        ),
+                        catchup: obj.getattr("catchup").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
+                        dag_display_name: obj.getattr("dag_display_name").ok().and_then(|v| v.extract().ok()),
+                        timetable: obj.getattr("timetable").ok().and_then(|v| v.extract().ok()),
+                        default_args: obj.getattr("default_args").ok().and_then(|v| {
+                            py_any_to_serde_json_value(py, &v)
+                                .ok()
+                                .and_then(|json_val| serde_json::from_value(json_val).ok())
+                        }),
+                        fail_fast: None,
+                        doc_md: None,
+                        edge_info: None,
+                        max_consecutive_failed_dag_runs: None,
+                        owner_links: None,
+                        tags: None,
+                        is_paused_upon_creation: None,
+                        timezone: None,
+                        task_group: None,
+                        deadline: None,
+                    };
+                    let file_hash = format!("{:x}", md5::compute(&file_content));
 
-            let result = exec_func.call((code_bytes, globals.clone(), globals.clone()), None);
+                    info!("[WORKER] Saving DAG '{}' from file '{}'", dag.dag_id, file_path_str);
+                    let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
+                    let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
 
-            match result {
-                Ok(_) => {
-                    info!(
-                        "Successfully executed file '{}' in {:?}.",
-                        file_path_str.clone(),
-                        gil_start_time.elapsed(),
-                    );
-                    let mut dag_found = false;
-                    for (_name, obj) in globals.iter() {
-                        if obj.is_instance(&dag_class)? {
-                            dag_found = true;
-                            // This struct populates the `dag` table.
-                            let dag = Dag {
-                                dag_id: obj.getattr("dag_id")?.extract()?,
-                                description: obj.getattr("description").ok().and_then(|v| v.extract().ok()),
-                                start_date: obj.getattr("start_date").ok().and_then(|v| v.extract().ok()),
-                                max_active_tasks: obj.getattr("max_active_tasks").ok().and_then(|v| v.extract().ok()),
-                                max_active_runs: obj.getattr("max_active_runs").ok().and_then(|v| v.extract().ok()),
-                                fileloc: Some(file_path_str.clone()),
-                                disable_bundle_versioning: obj.getattr("disable_bundle_versioning").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
-                                relative_fileloc: Some(
-                                    PathBuf::from(&file_path_str)
-                                        .strip_prefix(&dags_dir)
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|_| file_path_str.clone()),
-                                ),
-                                catchup: obj.getattr("catchup").ok().and_then(|v| v.extract().ok()).unwrap_or(false),
-                                dag_display_name: obj.getattr("dag_display_name").ok().and_then(|v| v.extract().ok()),
-                                timetable: obj.getattr("timetable").ok().and_then(|v| v.extract().ok()),
-                                default_args: obj.getattr("default_args").ok().and_then(|v| {
-                                    py_any_to_serde_json_value(py, &v)
-                                        .ok()
-                                        .and_then(|json_val| serde_json::from_value(json_val).ok())
-                                }),
-                                fail_fast: None,
-                                doc_md: None,
-                                edge_info: None,
-                                max_consecutive_failed_dag_runs: None,
-                                owner_links: None,
-                                tags: None,
-                                is_paused_upon_creation: None,
-                                timezone: None,
-                                task_group: None,
-                                deadline: None,
-                            };
+                    let mut conn = pool.get().context("[WORKER] could not get DB connection from pool")?;
+                    let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
+                        db::save_dag(conn, &dag)?;
+                        let new_dag_version_id = db::ensure_dag_version_and_get_id(conn, &dag.dag_id, &file_hash)?;
+                        let file_content_str = String::from_utf8_lossy(&file_content).to_string();
+                        db::save_dag_code(conn, &dag.dag_id, new_dag_version_id, file_path_str, &file_content_str)?;
+                        let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
+                        let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
+                        let mut data_dict = match serialized_json_val {
+                            serde_json::Value::Object(d) => Ok(d),
+                            _ => Err(anyhow!("Serialized DAG was not a JSON object")),
+                        }?;
+                        if let Some(fileloc) = &dag.fileloc { data_dict.insert("fileloc".to_string(), serde_json::Value::String(fileloc.clone())); }
+                        if let Some(relative_fileloc) = &dag.relative_fileloc { data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone())); }
+                        let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))?;
+                        let json_string_for_hash = serde_json::to_string(&serialized_data)?;
+                        let dag_hash = format!("{:x}", md5::compute(json_string_for_hash.as_bytes()));
+                        let s_dag = SerializedDag { id: Uuid::new_v4(), dag_id: serialized_data.dag_id.clone(), dag_hash, data: serialized_data, dag_version_id: new_dag_version_id };
+                        db::save_serialized_dag(conn, &s_dag)?;
+                        Ok(())
+                    });
 
-                            let file_hash = format!("{:x}", md5::compute(&file_content));
-
-                            info!("Attempting to serialize and save DAG '{}'...", dag.dag_id);
-                            let serialized_dag_module = py.import("airflow.serialization.serialized_objects")?;
-                            let serialized_dag_class = serialized_dag_module.getattr("SerializedDAG")?;
-
-                            match pool.get() {
-                                Ok(mut conn) => {
-                                    let transaction_result = conn.transaction(|conn| -> anyhow::Result<()> {
-                                        db::save_dag(conn, &dag).with_context(|| format!("while saving DAG '{}'", dag.dag_id))?;
-
-                                        let new_dag_version_id = db::ensure_dag_version_and_get_id(conn, &dag.dag_id, &file_hash)
-                                            .with_context(|| format!("while ensuring DagVersion for '{}'", dag.dag_id))?;
-
-                                        info!("Successfully created DagVersion with id: {}", new_dag_version_id);
-
-                                        let file_content_str = String::from_utf8_lossy(&file_content).to_string();
-                                        db::save_dag_code(conn, &dag.dag_id, new_dag_version_id, &file_path_str, &file_content_str).with_context(|| "while saving DagCode")?;
-                                        info!("Successfully saved DagCode for '{}'", dag.dag_id);
-
-                                        let serialized_data_py_obj = serialized_dag_class.call_method1("serialize_dag", (obj,))?;
-                                        let serialized_json_val = py_any_to_serde_json_value(py, &serialized_data_py_obj)?;
-
-                                        let mut data_dict = match serialized_json_val {
-                                            serde_json::Value::Object(d) => Ok(d),
-                                            _ => Err(anyhow!("Serialized DAG was not a JSON object as expected.")),
-                                        }?;
-
-                                        if let Some(fileloc) = &dag.fileloc {
-                                            data_dict.insert("fileloc".to_string(), serde_json::Value::String(fileloc.clone()));
-                                        }
-                                        if let Some(relative_fileloc) = &dag.relative_fileloc {
-                                            data_dict.insert("relative_fileloc".to_string(), serde_json::Value::String(relative_fileloc.clone()));
-                                        }
-
-                                        let serialized_data: SerializedDagData = serde_json::from_value(serde_json::Value::Object(data_dict))
-                                            .with_context(|| "Failed to deserialize JSON object into SerializedDagData struct")?;
-
-                                        let json_string_for_hash = serde_json::to_string(&serialized_data)?;
-                                        let digest = md5::compute(json_string_for_hash.as_bytes());
-                                        let dag_hash = format!("{:x}", digest);
-
-                                        let s_dag = SerializedDag {
-                                            id: Uuid::new_v4(),
-                                            dag_id: serialized_data.dag_id.clone(),
-                                            dag_hash,
-                                            data: serialized_data,
-                                            dag_version_id: new_dag_version_id,
-                                        };
-
-                                        db::save_serialized_dag(conn, &s_dag).with_context(|| format!("while saving SerializedDAG for '{}'", s_dag.dag_id))?;
-
-                                        Ok(())
-                                    });
-
-                                    match transaction_result {
-                                        Ok(_) => info!("Successfully processed and saved all data for DAG '{}'.", dag.dag_id),
-                                        Err(e) => error!("A database transaction failed for DAG '{}': {:?}", dag.dag_id, e),
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Could not get DB connection from pool: {}", e);
-                                }
-                            }
-                            break;
-                        }
+                    if let Err(e) = transaction_result {
+                        error!("[WORKER] DB transaction failed for DAG '{}': {:?}", dag.dag_id, e);
                     }
-                    if !dag_found {
-                        warn!("No instance of DAG found in file '{}'", file_path_str);
-                    }
-                }
-                Err(e) => {
-                    error!("Python error executing file '{}':", file_path_str);
-                    e.print(py);
+                    break;
                 }
             }
+            if !dag_found {
+                warn!("[WORKER] No instance of DAG found in file '{}'", file_path_str);
+            }
         }
-        info!("Python worker channel closed. Shutting down.");
-        Ok(())
-    })
+        Err(e) => {
+            error!("[WORKER] Python error executing file '{}':", file_path_str);
+            e.print(py);
+        }
+    }
+    Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// A long-lived worker process that processes files sent via stdin.
+// NEW: Accepts pool_size as an argument
+fn run_long_lived_worker(dags_dir: String, pool_size: u32) -> Result<()> {
     pyo3::prepare_freethreaded_python();
-    env_logger::init();
+    // NEW: Use the passed-in pool_size
+    let pool = get_connection_pool_with_size(pool_size);
+    info!("[WORKER] Long-lived worker process started with pool size {}. Waiting for file paths on stdin...", pool_size);
+
+    let stdin = std::io::stdin();
+    let reader = stdin.lock();
+
+    Python::with_gil(|py| -> Result<()> {
+        for line in reader.lines() {
+            let file_path_str = line.context("[WORKER] Failed to read line from stdin")?;
+            if file_path_str.is_empty() {
+                continue;
+            }
+            info!("[WORKER] Received job for: {}", &file_path_str);
+            if let Err(e) = process_dag_file(py, &dags_dir, &file_path_str, &pool) {
+                error!("[WORKER] Failed to process file '{}': {:?}", file_path_str, e);
+            }
+        }
+        Ok(())
+    })?;
+
+    info!("[WORKER] Stdin closed. Shutting down gracefully.");
+    Ok(())
+}
+
+
+/// The main scheduler process that manages the worker pool.
+async fn run_scheduler() -> Result<()> {
     let dags_dir = "/files/dags";
     std::fs::create_dir_all(dags_dir)?;
     let dags_dir_path = PathBuf::from(dags_dir);
-    info!("Initializing db pool...");
-    let pool = get_connection_pool();
-    info!("Database connection pool initialized successfully.");
-    info!("Using DAGs directory: {}", dags_dir);
-    let (tx, rx) = mpsc::channel::<String>(100);
 
-    let mut worker_handle = {
-        let dags_dir_clone = dags_dir.to_string();
-        let pool_clone = pool.clone();
-        spawn_blocking(move || {
-            if let Err(e) = python_executor_worker(dags_dir_clone, rx, pool_clone) {
-                error!("Python executor worker thread failed: {:?}", e);
+    let num_workers = num_cpus::get();
+    // let num_workers = 2;
+    let num_processes = (num_workers + 1) as u32; // +1 for the scheduler itself
+
+    // --- NEW: Calculate pool size ---
+    // Total connections to keep below the typical DB limit of 100.
+    // Leaving a small buffer for other clients (e.g. psql).
+    let total_db_connections_limit = 90;
+    // Divide the limit among all our processes. Ensure at least 2 connections per pool.
+    let pool_size_per_process = (total_db_connections_limit / num_processes).max(2);
+
+    info!(
+        "[SCHEDULER] Total processes: {}. Calculated pool size per process: {}",
+        num_processes, pool_size_per_process
+    );
+
+    info!("[SCHEDULER] Upserting 'dags-folder' entry...");
+    // NEW: Use the calculated size for the scheduler's own pool
+    let mut conn = get_connection_pool_with_size(pool_size_per_process).get()?;
+    db::upsert_dag_bundle(&mut conn, "dags-folder", true, "1")?;
+    info!("[SCHEDULER] DagBundle entry is up to date.");
+
+
+    info!("[SCHEDULER] Spawning {} long-lived worker processes...", num_workers);
+
+    let mut workers: Vec<(Child, ChildStdin)> = Vec::new();
+    for i in 0..num_workers {
+        let exe = std::env::current_exe()?;
+        let mut cmd = Command::new(exe);
+        // NEW: Add the calculated pool size as a command-line argument for the worker
+        cmd.arg("--long-lived-worker")
+            .arg(dags_dir)
+            .arg(pool_size_per_process.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("Failed to spawn worker process")?;
+
+        let stdin = child.stdin.take().context("Failed to get worker stdin")?;
+        let stdout = child.stdout.take().context("Failed to get worker stdout")?;
+        let stderr = child.stderr.take().context("Failed to get worker stderr")?;
+
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                info!("[WORKER-{}] {}", i, line);
             }
-        })
-    };
+        });
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                error!("[WORKER-{}] {}", i, line);
+            }
+        });
 
-    info!("Performing initial scan of '{}'...", dags_dir);
-    let mut initial_files = HashSet::new();
-    for entry in WalkDir::new(dags_dir).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "py") {
-            initial_files.insert(path.to_string_lossy().into_owned());
-        }
+        workers.push((child, stdin));
     }
-    for file_path in initial_files {
-        info!("[INIT] Queuing existing file for execution: {}", file_path);
-        tx.send(file_path).await?;
+
+    let (tx, mut rx) = mpsc::channel::<String>(1000);
+
+    info!("[SCHEDULER] Performing initial scan of '{}'...", dags_dir);
+    let initial_files: Vec<String> = WalkDir::new(dags_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file() && e.path().extension().map_or(false, |ext| ext == "py"))
+        .map(|e| e.path().to_string_lossy().into_owned())
+        .collect();
+
+    info!("[SCHEDULER] Found {} initial files to process.", initial_files.len());
+
+    for (i, file_path) in initial_files.into_iter().enumerate() {
+        let worker_index = i % num_workers;
+        let (_, stdin) = &mut workers[worker_index];
+        let line_with_newline = format!("{}\n", file_path);
+        stdin
+            .write_all(line_with_newline.as_bytes())
+            .await
+            .context("Failed to write to worker stdin")?;
     }
-    info!("Initial scan complete.");
+    info!("[SCHEDULER] Initial file distribution complete.");
 
     let watcher_tx = tx.clone();
-    let mut watcher =
-        notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
-            Ok(event) => match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) => {
-                    for path in event.paths {
-                        if path.is_file() && path.extension().map_or(false, |ext| ext == "py") {
-                            info!("[FS WATCH] Detected change in: {:?}", path);
-                            let path_str = path.to_string_lossy().into_owned();
-                            if let Err(e) = watcher_tx.blocking_send(path_str) {
-                                error!("Failed to send file update to worker: {}", e);
-                            }
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            if let EventKind::Create(_) | EventKind::Modify(_) = event.kind {
+                for path in event.paths {
+                    if path.is_file() && path.extension().map_or(false, |ext| ext == "py") {
+                        if let Err(e) = watcher_tx.blocking_send(path.to_string_lossy().into_owned()) {
+                            error!("[FS WATCH] Failed to queue file update: {}", e);
                         }
                     }
                 }
-                _ => (),
-            },
-            Err(e) => error!("File watcher error: {:?}", e),
-        })?;
+            }
+        }
+    })?;
     watcher.watch(&dags_dir_path, RecursiveMode::Recursive)?;
-    info!("Now watching for file changes in '{}'", dags_dir);
-    info!("Starting DAG processor. Press Ctrl+C to exit.");
+    info!("[SCHEDULER] Now watching for file changes...");
 
-    let (signal_tx, signal_rx) = oneshot::channel();
-
-    thread::spawn(move || {
+    let (signal_tx, mut signal_rx) = oneshot::channel();
+    let _signal_thread = thread::spawn(move || {
         let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
-        for sig in signals.forever() {
-            info!("Signal handler thread caught signal: {}", sig);
+        if let Some(sig) = signals.forever().next() {
+            info!("[SCHEDULER] Signal handler caught signal: {}", sig);
             let _ = signal_tx.send(());
-            break;
         }
     });
 
-    tokio::select! {
-        _ = signal_rx => {
-            info!("Received shutdown signal, initiating graceful shutdown...");
-        },
-        res = &mut worker_handle => {
-            error!("Worker thread exited unexpectedly: {:?}", res);
-            info!("Initiating shutdown due to worker exit...");
+    let mut next_worker_index = 0;
+    loop {
+        tokio::select! {
+            biased;
+
+            Some(file_path) = rx.recv() => {
+                info!("[SCHEDULER] Assigning updated file '{}' to worker {}", file_path, next_worker_index);
+                let (_, stdin) = &mut workers[next_worker_index];
+
+                let line_with_newline = format!("{}\n", file_path);
+                if let Err(e) = stdin.write_all(line_with_newline.as_bytes()).await {
+                    error!("Failed to write to worker {}: {}. It may have crashed.", next_worker_index, e);
+                }
+                next_worker_index = (next_worker_index + 1) % num_workers;
+            },
+            _ = &mut signal_rx => {
+                info!("[SCHEDULER] Received shutdown signal.");
+                break;
+            }
         }
-    };
-
-    info!("Shutting down gracefully...");
-    drop(tx);
-
-    let shutdown_timeout = Duration::from_secs(2);
-    match tokio::time::timeout(shutdown_timeout, worker_handle).await {
-        Ok(Ok(_)) => info!("Python worker shut down gracefully."),
-        Ok(Err(e)) => error!("Python worker task failed during shutdown: {:?}", e),
-        Err(_) => warn!("Graceful shutdown timed out after {:?}. Forcing exit.", shutdown_timeout),
     }
 
-    info!("Shutdown complete.");
+    info!("[SCHEDULER] Shutting down workers...");
+    for (child, stdin) in &mut workers {
+        drop(stdin);
+        if let Err(e) = child.wait().await {
+            error!("Worker failed to shut down cleanly: {}", e);
+        }
+    }
+
+    info!("[SCHEDULER] Shutdown complete.");
+    Ok(())
+}
+
+/// Entry point of the application.
+fn main() -> Result<()> {
+    // Load .env file for all processes.
+    dotenv().ok();
+    // Initialize logger.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // NEW: Logic updated to parse the pool size argument for workers.
+    // The worker now expects 4 arguments: <executable> --long-lived-worker <dags_dir> <pool_size>
+    if args.len() == 4 && args[1] == "--long-lived-worker" {
+        let dags_dir = args[2].clone();
+        let pool_size: u32 = args[3]
+            .parse()
+            .context("Failed to parse pool_size argument for worker")?;
+        if let Err(e) = run_long_lived_worker(dags_dir, pool_size) {
+            error!("[WORKER] Worker process exited with error: {:?}", e);
+            std::process::exit(1);
+        }
+    } else {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(run_scheduler())?;
+    }
     Ok(())
 }

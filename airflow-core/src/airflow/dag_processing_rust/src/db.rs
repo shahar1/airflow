@@ -12,10 +12,23 @@ use serde_json::json;
 use std::env;
 use uuid::Uuid;
 
+pub type DbPool = diesel::r2d2::Pool<ConnectionManager<PgConnection>>;
+
+// Change this function to accept a size
+pub fn get_connection_pool_with_size(size: u32) -> DbPool {
+    dotenv().ok();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let manager = ConnectionManager::<PgConnection>::new(database_url);
+    diesel::r2d2::Pool::builder()
+        .max_size(size) // Use the provided size
+        .build(manager)
+        .expect("Failed to create pool.")
+}
+
 mod serde_helpers {
     use super::*;
     // Make types from parent module available
-        use serde::de;
+    use serde::de;
 
     /// Deserializes an optional floating-point Unix timestamp into an `Option<DateTime<Utc>>`.
     ///
@@ -122,17 +135,9 @@ pub struct NewDag {
     pub next_dagrun_create_after: Option<DateTime<Utc>>,
 }
 
-pub fn get_connection_pool() -> Pool<ConnectionManager<PgConnection>> {
-    dotenv().ok(); // Load .env file
-    let url = env::var("DATABASE_URL")
-        .context("DATABASE_URL must be set")
-        .unwrap();
-    let manager = ConnectionManager::<PgConnection>::new(url);
-    Pool::builder()
-        .test_on_check_out(true)
-        .build(manager)
-        .expect("Could not build connection pool")
-}
+// NOTE: The unsized `get_connection_pool` function has been removed
+// to prevent accidental creation of oversized pools. Always use
+// `get_connection_pool_with_size`.
 
 pub fn save_dag(conn: &mut PgConnection, dag: &Dag) -> Result<()> {
     let new_dag = NewDag::from(dag);
