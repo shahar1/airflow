@@ -1,0 +1,97 @@
+{
+  "assetSchedule": "TODO: translate: {{count}} of {{total}} assets updated",
+  "dagActions": {
+    "delete": {
+      "button": "TODO: translate: Delete Dag",
+      "warning": "TODO: translate: This will remove all metadata related to the Dag, including Runs and Tasks."
+    }
+  },
+  "favoriteDag": "TODO: translate: Favorite Dag",
+  "filters": {
+    "allRunTypes": "TODO: translate: All Run Types",
+    "allStates": "TODO: translate: All States",
+    "favorite": {
+      "all": "TODO: translate: All",
+      "favorite": "TODO: translate: Favorite",
+      "unfavorite": "TODO: translate: Unfavorite"
+    },
+    "paused": {
+      "active": "TODO: translate: Active",
+      "all": "TODO: translate: All",
+      "paused": "TODO: translate: Paused"
+    },
+    "runIdPatternFilter": "TODO: translate: Search Dag Runs",
+    "triggeringUserNameFilter": "TODO: translate: Search by Triggering User"
+  },
+  "ownerLink": "TODO: translate: Owner link for {{owner}}",
+  "runAndTaskActions": {
+    "affectedTasks": {
+      "noItemsFound": "TODO: translate: No tasks found.",
+      "title": "TODO: translate: Affected Tasks: {{count}}"
+    },
+    "clear": {
+      "button": "TODO: translate: Clear {{type}}",
+      "buttonTooltip": "TODO: translate: Press shift+c to clear",
+      "error": "TODO: translate: Failed to clear {{type}}",
+      "title": "TODO: translate: Clear {{type}}"
+    },
+    "delete": {
+      "button": "TODO: translate: Delete {{type}}",
+      "dialog": {
+        "resourceName": "TODO: translate: {{type}} {{id}}",
+        "title": "TODO: translate: Delete {{type}}",
+        "warning": "TODO: translate: This will remove all metadata related to the {{type}}."
+      },
+      "error": "TODO: translate: Error deleting {{type}}",
+      "success": {
+        "description": "TODO: translate: The {{type}} deletion request was successful.",
+        "title": "TODO: translate: {{type}} Deleted Successfully"
+      }
+    },
+    "markAs": {
+      "button": "TODO: translate: Mark {{type}} as...",
+      "buttonTooltip": {
+        "failed": "TODO: translate: Press shift+f to mark as failed",
+        "success": "TODO: translate: Press shift+s to mark as success"
+      },
+      "title": "TODO: translate: Mark {{type}} as {{state}}"
+    },
+    "options": {
+      "downstream": "TODO: translate: Downstream",
+      "existingTasks": "TODO: translate: Clear existing tasks",
+      "future": "TODO: translate: Future",
+      "onlyFailed": "TODO: translate: Clear only failed tasks",
+      "past": "TODO: translate: Past",
+      "queueNew": "TODO: translate: Queue up new tasks",
+      "runOnLatestVersion": "TODO: translate: Run with latest bundle version",
+      "upstream": "TODO: translate: Upstream"
+    }
+  },
+  "search": {
+    "advanced": "TODO: translate: Advanced Search",
+    "clear": "TODO: translate: Clear search",
+    "dags": "TODO: translate: Search Dags",
+    "hotkey": "TODO: translate: +K",
+    "tasks": "TODO: translate: Search Tasks"
+  },
+  "sort": {
+    "displayName": {
+      "asc": "TODO: translate: Sort by Display Name (A-Z)",
+      "desc": "TODO: translate: Sort by Display Name (Z-A)"
+    },
+    "lastRunStartDate": {
+      "asc": "TODO: translate: Sort by Latest Run Start Date (Earliest-Latest)",
+      "desc": "TODO: translate: Sort by Latest Run Start Date (Latest-Earliest)"
+    },
+    "lastRunState": {
+      "asc": "TODO: translate: Sort by Latest Run State (A-Z)",
+      "desc": "TODO: translate: Sort by Latest Run State (Z-A)"
+    },
+    "nextDagRun": {
+      "asc": "TODO: translate: Sort by Next Dag Run (Earliest-Latest)",
+      "desc": "TODO: translate: Sort by Next Dag Run (Latest-Earliest)"
+    },
+    "placeholder": "TODO: translate: Sort by"
+  },
+  "unfavoriteDag": "TODO: translate: Unfavorite Dag"
+}

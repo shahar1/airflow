@@ -1,0 +1,30 @@
+{
+  "consumingDags": "TODO: translate: Consuming Dags",
+  "createEvent": {
+    "button": "TODO: translate: Create Event",
+    "manual": {
+      "description": "TODO: translate: Manually create an Asset Event",
+      "extra": "TODO: translate: Asset Event Extra",
+      "label": "TODO: translate: Manual"
+    },
+    "materialize": {
+      "description": "TODO: translate: Trigger the Dag upstream of this asset",
+      "descriptionWithDag": "TODO: translate: Trigger the Dag upstream of this asset: {{dagName}}",
+      "label": "TODO: translate: Materialize",
+      "unpauseDag": "TODO: translate: Unpause {{dagName}} on trigger"
+    },
+    "success": {
+      "manualDescription": "TODO: translate: Manual asset event creation was successful.",
+      "manualTitle": "TODO: translate: Asset Event Created",
+      "materializeDescription": "TODO: translate: Upstream Dag {{dagId}} was triggered successfully.",
+      "materializeTitle": "TODO: translate: Materializing Asset"
+    },
+    "title": "TODO: translate: Create Asset Event for {{name}}"
+  },
+  "group": "TODO: translate: Group",
+  "lastAssetEvent": "TODO: translate: Last Asset Event",
+  "name": "TODO: translate: Name",
+  "producingTasks": "TODO: translate: Producing Tasks",
+  "scheduledDags": "TODO: translate: Scheduled Dags",
+  "searchPlaceholder": "TODO: translate: Search Assets"
+}

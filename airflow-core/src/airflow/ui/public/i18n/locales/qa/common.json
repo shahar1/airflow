@@ -1,0 +1,317 @@
+{
+  "admin": {
+    "Config": "TODO: translate: Config",
+    "Connections": "TODO: translate: Connections",
+    "Plugins": "TODO: translate: Plugins",
+    "Pools": "TODO: translate: Pools",
+    "Providers": "TODO: translate: Providers",
+    "Variables": "TODO: translate: Variables"
+  },
+  "allOperators": "TODO: translate: All Operators",
+  "appearance": {
+    "appearance": "TODO: translate: Appearance",
+    "darkMode": "TODO: translate: Dark Mode",
+    "lightMode": "TODO: translate: Light Mode",
+    "systemMode": "TODO: translate: Follow System Setting"
+  },
+  "asset_one": "TODO: translate: Asset",
+  "asset_other": "TODO: translate: Assets",
+  "assetEvent_one": "TODO: translate: Asset Event",
+  "assetEvent_other": "TODO: translate: Asset Events",
+  "backfill_one": "TODO: translate: Backfill",
+  "backfill_other": "TODO: translate: Backfills",
+  "browse": {
+    "auditLog": "TODO: translate: Audit Log",
+    "requiredActions": "TODO: translate: Required Actions",
+    "xcoms": "TODO: translate: XComs"
+  },
+  "collapseDetailsPanel": "TODO: translate: Collapse Details Panel",
+  "createdAssetEvent_one": "TODO: translate: Created Asset Event",
+  "createdAssetEvent_other": "TODO: translate: Created Asset Events",
+  "dag_one": "TODO: translate: Dag",
+  "dag_other": "TODO: translate: Dags",
+  "dagDetails": {
+    "catchup": "TODO: translate: Catchup",
+    "dagRunTimeout": "TODO: translate: Dag Run Timeout",
+    "defaultArgs": "TODO: translate: Default Args",
+    "description": "TODO: translate: Description",
+    "documentation": "TODO: translate: Dag Documentation",
+    "fileLocation": "TODO: translate: File Location",
+    "hasTaskConcurrencyLimits": "TODO: translate: Has Task Concurrency Limits",
+    "lastExpired": "TODO: translate: Last Expired",
+    "lastParsed": "TODO: translate: Last Parsed",
+    "lastParseDuration": "TODO: translate: Last Parse Duration",
+    "latestDagVersion": "TODO: translate: Latest Dag Version",
+    "latestRun": "TODO: translate: Latest Run",
+    "maxActiveRuns": "TODO: translate: Max Active Runs",
+    "maxActiveTasks": "TODO: translate: Max Active Tasks",
+    "maxConsecutiveFailedDagRuns": "TODO: translate: Max Consecutive Failed Dag Runs",
+    "nextRun": "TODO: translate: Next Run",
+    "owner": "TODO: translate: Owner",
+    "params": "TODO: translate: Params",
+    "schedule": "TODO: translate: Schedule",
+    "tags": "TODO: translate: Tags"
+  },
+  "dagId": "TODO: translate: Dag ID",
+  "dagRun": {
+    "conf": "TODO: translate: Conf",
+    "dagVersions": "TODO: translate: Dag Version(s)",
+    "dataIntervalEnd": "TODO: translate: Data Interval End",
+    "dataIntervalStart": "TODO: translate: Data Interval Start",
+    "lastSchedulingDecision": "TODO: translate: Last Scheduling Decision",
+    "queuedAt": "TODO: translate: Queued At",
+    "runAfter": "TODO: translate: Run After",
+    "runType": "TODO: translate: Run Type",
+    "sourceAssetEvent": "TODO: translate: Source Asset Event",
+    "triggeredBy": "TODO: translate: Triggered By",
+    "triggeringUser": "TODO: translate: Triggering User Name"
+  },
+  "dagRun_one": "TODO: translate: Dag Run",
+  "dagRun_other": "TODO: translate: Dag Runs",
+  "dagRunId": "TODO: translate: Dag Run ID",
+  "dagWarnings": "TODO: translate: Dag warnings/errors",
+  "defaultToGraphView": "TODO: translate: Default to graph view",
+  "defaultToGridView": "TODO: translate: Default to grid view",
+  "direction": "TODO: translate: Direction",
+  "docs": {
+    "documentation": "TODO: translate: Documentation",
+    "githubRepo": "TODO: translate: GitHub Repo",
+    "restApiReference": "TODO: translate: REST API Reference"
+  },
+  "duration": "TODO: translate: Duration",
+  "endDate": "TODO: translate: End Date",
+  "error": {
+    "back": "TODO: translate: Back",
+    "defaultMessage": "TODO: translate: An unexpected error occurred",
+    "home": "TODO: translate: Home",
+    "notFound": "TODO: translate: Page Not Found",
+    "title": "TODO: translate: Error"
+  },
+  "expand": {
+    "collapse": "TODO: translate: Collapse",
+    "expand": "TODO: translate: Expand",
+    "hotkey": "TODO: translate: e",
+    "tooltip": "TODO: translate: Press {{hotkey}} to toggle expand"
+  },
+  "expression": {
+    "all": "TODO: translate: All",
+    "and": "TODO: translate: AND",
+    "any": "TODO: translate: Any",
+    "or": "TODO: translate: OR"
+  },
+  "filter": "TODO: translate: Filter",
+  "filters": {
+    "logicalDateFrom": "TODO: translate: Logical Date From",
+    "logicalDateTo": "TODO: translate: Logical Date To",
+    "runAfterFrom": "TODO: translate: Run After From",
+    "runAfterTo": "TODO: translate: Run After To"
+  },
+  "logicalDate": "TODO: translate: Logical Date",
+  "logout": "TODO: translate: Logout",
+  "logoutConfirmation": "TODO: translate: You are about to logout from the application.",
+  "mapIndex": "TODO: translate: Map Index",
+  "modal": {
+    "cancel": "TODO: translate: Cancel",
+    "confirm": "TODO: translate: Confirm",
+    "delete": {
+      "button": "TODO: translate: Delete",
+      "confirmation": "TODO: translate: Are you sure you want to delete {{resourceName}}? This action cannot be undone."
+    }
+  },
+  "nav": {
+    "admin": "TODO: translate: Admin",
+    "assets": "TODO: translate: Assets",
+    "browse": "TODO: translate: Browse",
+    "dags": "TODO: translate: Dags",
+    "docs": "TODO: translate: Docs",
+    "home": "TODO: translate: Home",
+    "legacyFabViews": "TODO: translate: Legacy Views",
+    "plugins": "TODO: translate: Plugins",
+    "security": "TODO: translate: Security"
+  },
+  "noItemsFound": "TODO: translate: No {{modelName}} found",
+  "note": {
+    "add": "TODO: translate: Add a note",
+    "dagRun": "TODO: translate: Dag Run Note",
+    "label": "TODO: translate: Note",
+    "placeholder": "TODO: translate: Add a note...",
+    "taskInstance": "TODO: translate: Task Instance Note"
+  },
+  "pools": {
+    "deferred": "TODO: translate: Deferred",
+    "open": "TODO: translate: Open",
+    "pools_one": "TODO: translate: pool",
+    "pools_other": "TODO: translate: pools",
+    "queued": "TODO: translate: Queued",
+    "running": "TODO: translate: Running",
+    "scheduled": "TODO: translate: Scheduled"
+  },
+  "reset": "TODO: translate: Reset",
+  "runId": "TODO: translate: Run ID",
+  "runTypes": {
+    "asset_triggered": "TODO: translate: Asset Triggered",
+    "backfill": "TODO: translate: Backfill",
+    "manual": "TODO: translate: Manual",
+    "scheduled": "TODO: translate: Scheduled"
+  },
+  "scroll": {
+    "direction": {
+      "bottom": "TODO: translate: bottom",
+      "top": "TODO: translate: top"
+    },
+    "tooltip": "TODO: translate: Press {{hotkey}} to scroll to {{direction}}"
+  },
+  "seconds": "TODO: translate: {{count}}s",
+  "security": {
+    "actions": "TODO: translate: Actions",
+    "permissions": "TODO: translate: Permissions",
+    "resources": "TODO: translate: Resources",
+    "roles": "TODO: translate: Roles",
+    "users": "TODO: translate: Users"
+  },
+  "selectLanguage": "TODO: translate: Select Language",
+  "showDetailsPanel": "TODO: translate: Show Details Panel",
+  "source": {
+    "hide": "TODO: translate: Hide Source",
+    "hotkey": "TODO: translate: s",
+    "show": "TODO: translate: Show Source"
+  },
+  "sourceAssetEvent_one": "TODO: translate: Source Asset Event",
+  "sourceAssetEvent_other": "TODO: translate: Source Asset Events",
+  "startDate": "TODO: translate: Start Date",
+  "state": "TODO: translate: State",
+  "states": {
+    "deferred": "TODO: translate: Deferred",
+    "failed": "TODO: translate: Failed",
+    "no_status": "TODO: translate: No Status",
+    "none": "TODO: translate: No Status",
+    "planned": "TODO: translate: Planned",
+    "queued": "TODO: translate: Queued",
+    "removed": "TODO: translate: Removed",
+    "restarting": "TODO: translate: Restarting",
+    "running": "TODO: translate: Running",
+    "scheduled": "TODO: translate: Scheduled",
+    "skipped": "TODO: translate: Skipped",
+    "success": "TODO: translate: Success",
+    "up_for_reschedule": "TODO: translate: Up For Reschedule",
+    "up_for_retry": "TODO: translate: Up For Retry",
+    "upstream_failed": "TODO: translate: Upstream Failed"
+  },
+  "table": {
+    "completedAt": "TODO: translate: Completed at",
+    "createdAt": "TODO: translate: Created at",
+    "filterByTag": "TODO: translate: Filter Dags by tag",
+    "filterColumns": "TODO: translate: Filter table columns",
+    "filterReset_one": "TODO: translate: Reset filter",
+    "filterReset_other": "TODO: translate: Reset filters",
+    "from": "TODO: translate: From",
+    "maxActiveRuns": "TODO: translate: Max Active Runs",
+    "noTagsFound": "TODO: translate: No tags found",
+    "tagMode": {
+      "all": "TODO: translate: All",
+      "any": "TODO: translate: Any"
+    },
+    "tagPlaceholder": "TODO: translate: Filter by tag",
+    "to": "TODO: translate: To"
+  },
+  "task": {
+    "documentation": "TODO: translate: Task Documentation",
+    "lastInstance": "TODO: translate: Last Instance",
+    "operator": "TODO: translate: Operator",
+    "triggerRule": "TODO: translate: Trigger Rule"
+  },
+  "task_one": "TODO: translate: Task",
+  "task_other": "TODO: translate: Tasks",
+  "taskGroup": "TODO: translate: Task Group",
+  "taskId": "TODO: translate: Task ID",
+  "taskInstance": {
+    "dagVersion": "TODO: translate: Dag Version",
+    "executor": "TODO: translate: Executor",
+    "executorConfig": "TODO: translate: Executor Config",
+    "hostname": "TODO: translate: Hostname",
+    "maxTries": "TODO: translate: Max Tries",
+    "pid": "TODO: translate: PID",
+    "pool": "TODO: translate: Pool",
+    "poolSlots": "TODO: translate: Pool Slots",
+    "priorityWeight": "TODO: translate: Priority Weight",
+    "queue": "TODO: translate: Queue",
+    "queuedWhen": "TODO: translate: Queued At",
+    "scheduledWhen": "TODO: translate: Scheduled At",
+    "triggerer": {
+      "assigned": "TODO: translate: Assigned triggerer",
+      "class": "TODO: translate: Trigger class",
+      "createdAt": "TODO: translate: Trigger creation time",
+      "id": "TODO: translate: Trigger ID",
+      "latestHeartbeat": "TODO: translate: Latest triggerer heartbeat",
+      "title": "TODO: translate: Triggerer Info"
+    },
+    "unixname": "TODO: translate: Unix Name"
+  },
+  "taskInstance_one": "TODO: translate: Task Instance",
+  "taskInstance_other": "TODO: translate: Task Instances",
+  "timeRange": {
+    "last12Hours": "TODO: translate: Last 12 Hours",
+    "last24Hours": "TODO: translate: Last 24 Hours",
+    "lastHour": "TODO: translate: Last Hour",
+    "pastWeek": "TODO: translate: Past Week"
+  },
+  "timestamp": {
+    "hide": "TODO: translate: Hide Timestamps",
+    "hotkey": "TODO: translate: t",
+    "show": "TODO: translate: Show Timestamps"
+  },
+  "timezone": "TODO: translate: Timezone",
+  "timezoneModal": {
+    "current-timezone": "TODO: translate: Current time in",
+    "placeholder": "TODO: translate: Select a timezone",
+    "title": "TODO: translate: Select Timezone",
+    "utc": "TODO: translate: UTC (Coordinated Universal Time)"
+  },
+  "toaster": {
+    "bulkDelete": {
+      "error": "TODO: translate: Bulk Delete {{resourceName}} Request Failed",
+      "success": {
+        "description": "TODO: translate: {{count}} {{resourceName}} have been successfully deleted. Keys: {{keys}}",
+        "title": "TODO: translate: Bulk Delete {{resourceName}} Request Submitted"
+      }
+    },
+    "create": {
+      "error": "TODO: translate: Create {{resourceName}} Request Failed",
+      "success": {
+        "description": "TODO: translate: {{resourceName}} has been successfully created.",
+        "title": "TODO: translate: Create {{resourceName}} Request Submitted"
+      }
+    },
+    "delete": {
+      "error": "TODO: translate: Delete {{resourceName}} Request Failed",
+      "success": {
+        "description": "TODO: translate: {{resourceName}} has been successfully deleted.",
+        "title": "TODO: translate: Delete {{resourceName}} Request Submitted"
+      }
+    },
+    "import": {
+      "error": "TODO: translate: Import {{resourceName}} Request Failed",
+      "success": {
+        "description": "TODO: translate: {{count}} {{resourceName}} have been successfully imported.",
+        "title": "TODO: translate: Import {{resourceName}} Request Submitted"
+      }
+    },
+    "update": {
+      "error": "TODO: translate: Update {{resourceName}} Request Failed",
+      "success": {
+        "description": "TODO: translate: {{resourceName}} has been successfully updated.",
+        "title": "TODO: translate: Update {{resourceName}} Request Submitted"
+      }
+    }
+  },
+  "total": "TODO: translate: Total {{state}}",
+  "triggered": "TODO: translate: Triggered",
+  "tryNumber": "TODO: translate: Try Number",
+  "user": "TODO: translate: User",
+  "wrap": {
+    "hotkey": "TODO: translate: w",
+    "tooltip": "TODO: translate: Press {{hotkey}} to toggle wrap",
+    "unwrap": "TODO: translate: Unwrap",
+    "wrap": "TODO: translate: Wrap"
+  }
+}

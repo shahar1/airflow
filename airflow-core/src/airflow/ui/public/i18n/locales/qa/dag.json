@@ -1,0 +1,152 @@
+{
+  "allRuns": "TODO: translate: All Runs",
+  "blockingDeps": {
+    "dependency": "TODO: translate: Dependency",
+    "reason": "TODO: translate: Reason",
+    "title": "TODO: translate: Dependencies Blocking Task From Getting Scheduled"
+  },
+  "calendar": {
+    "daily": "TODO: translate: Daily",
+    "hourly": "TODO: translate: Hourly",
+    "legend": {
+      "less": "TODO: translate: Less",
+      "more": "TODO: translate: More"
+    },
+    "navigation": {
+      "nextMonth": "TODO: translate: Next month",
+      "nextYear": "TODO: translate: Next year",
+      "previousMonth": "TODO: translate: Previous month",
+      "previousYear": "TODO: translate: Previous year"
+    },
+    "noData": "TODO: translate: No data available",
+    "noRuns": "TODO: translate: No runs",
+    "totalRuns": "TODO: translate: Total Runs",
+    "week": "TODO: translate: Week {{weekNumber}}",
+    "weekdays": {
+      "friday": "TODO: translate: Fri",
+      "monday": "TODO: translate: Mon",
+      "saturday": "TODO: translate: Sat",
+      "sunday": "TODO: translate: Sun",
+      "thursday": "TODO: translate: Thu",
+      "tuesday": "TODO: translate: Tue",
+      "wednesday": "TODO: translate: Wed"
+    }
+  },
+  "code": {
+    "bundleUrl": "TODO: translate: Bundle Url",
+    "noCode": "TODO: translate: No Code Found",
+    "parsedAt": "TODO: translate: Parsed at:",
+    "parseDuration": "TODO: translate: Parse Duration:"
+  },
+  "extraLinks": "TODO: translate: Extra Links",
+  "grid": {
+    "buttons": {
+      "resetToLatest": "TODO: translate: Reset to latest",
+      "toggleGroup": "TODO: translate: Toggle group"
+    }
+  },
+  "header": {
+    "buttons": {
+      "advanced": "TODO: translate: Advanced",
+      "dagDocs": "TODO: translate: Dag Docs"
+    }
+  },
+  "logs": {
+    "allLevels": "TODO: translate: All Log Levels",
+    "allSources": "TODO: translate: All Sources",
+    "critical": "TODO: translate: CRITICAL",
+    "debug": "TODO: translate: DEBUG",
+    "error": "TODO: translate: ERROR",
+    "fullscreen": {
+      "button": "TODO: translate: Full screen",
+      "tooltip": "TODO: translate: Press {{hotkey}} for fullscreen"
+    },
+    "info": "TODO: translate: INFO",
+    "noTryNumber": "TODO: translate: No try number",
+    "settings": "TODO: translate: Log Settings",
+    "viewInExternal": "TODO: translate: View logs in {{name}} (attempt {{attempt}})",
+    "warning": "TODO: translate: WARNING"
+  },
+  "navigation": {
+    "navigation": "TODO: translate: Navigation: Shift+{{arrow}}",
+    "toggleGroup": "TODO: translate: Toggle group: Space"
+  },
+  "overview": {
+    "buttons": {
+      "failedRun_one": "TODO: translate: Failed Run",
+      "failedRun_other": "TODO: translate: Failed Runs",
+      "failedTask_one": "TODO: translate: Failed Task",
+      "failedTask_other": "TODO: translate: Failed Tasks",
+      "failedTaskInstance_one": "TODO: translate: Failed Task Instance",
+      "failedTaskInstance_other": "TODO: translate: Failed Task Instances"
+    },
+    "charts": {
+      "assetEvent_one": "TODO: translate: Created Asset Event",
+      "assetEvent_other": "TODO: translate: Created Asset Events"
+    },
+    "failedLogs": {
+      "hideLogs": "TODO: translate: Hide Logs",
+      "showLogs": "TODO: translate: Show Logs",
+      "title": "TODO: translate: Recent Failed Task Logs",
+      "viewFullLogs": "TODO: translate: View full logs"
+    }
+  },
+  "panel": {
+    "buttons": {
+      "options": "TODO: translate: Options",
+      "showGantt": "TODO: translate: Show Gantt",
+      "showGraphShortcut": "TODO: translate: Show Graph (Press g)",
+      "showGridShortcut": "TODO: translate: Show Grid (Press g)"
+    },
+    "dagRuns": {
+      "label": "TODO: translate: Number of Dag Runs"
+    },
+    "dependencies": {
+      "label": "TODO: translate: Dependencies",
+      "options": {
+        "allDagDependencies": "TODO: translate: All Dag Dependencies",
+        "externalConditions": "TODO: translate: External conditions",
+        "onlyTasks": "TODO: translate: Only tasks"
+      },
+      "placeholder": "TODO: translate: Dependencies"
+    },
+    "graphDirection": {
+      "label": "TODO: translate: Graph Direction"
+    }
+  },
+  "paramsFailed": "TODO: translate: Failed to load params",
+  "parse": {
+    "toaster": {
+      "error": {
+        "description": "TODO: translate: Dag parsing request failed. There could be pending parsing requests yet to be processed.",
+        "title": "TODO: translate: Dag Failed to Reparse"
+      },
+      "success": {
+        "description": "TODO: translate: Dag should reparse soon.",
+        "title": "TODO: translate: Reparsing request submitted successfully"
+      }
+    }
+  },
+  "tabs": {
+    "assetEvents": "TODO: translate: Asset Events",
+    "auditLog": "TODO: translate: Audit Log",
+    "backfills": "TODO: translate: Backfills",
+    "calendar": "TODO: translate: Calendar",
+    "code": "TODO: translate: Code",
+    "details": "TODO: translate: Details",
+    "logs": "TODO: translate: Logs",
+    "mappedTaskInstances_one": "TODO: translate: Task Instance [{{count}}]",
+    "mappedTaskInstances_other": "TODO: translate: Task Instances [{{count}}]",
+    "overview": "TODO: translate: Overview",
+    "renderedTemplates": "TODO: translate: Rendered Templates",
+    "requiredActions": "TODO: translate: Required Actions",
+    "runs": "TODO: translate: Runs",
+    "taskInstances": "TODO: translate: Task Instances",
+    "tasks": "TODO: translate: Tasks",
+    "xcom": "TODO: translate: XCom"
+  },
+  "taskGroups": {
+    "collapseAll": "TODO: translate: Collapse all task groups",
+    "expandAll": "TODO: translate: Expand all task groups"
+  }
+}

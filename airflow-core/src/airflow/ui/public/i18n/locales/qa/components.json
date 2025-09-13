@@ -1,0 +1,132 @@
+{
+  "backfill": {
+    "affected_one": "TODO: translate: 1 run will be triggered.",
+    "affected_other": "TODO: translate: {{count}} runs will be triggered.",
+    "affectedNone": "TODO: translate: No runs matching selected criteria.",
+    "allRuns": "TODO: translate: All Runs",
+    "backwards": "TODO: translate: Run Backwards",
+    "dateRange": "TODO: translate: Date Range",
+    "errorStartDateBeforeEndDate": "TODO: translate: Start Date must be before the End Date",
+    "maxRuns": "TODO: translate: Max Active Runs",
+    "missingAndErroredRuns": "TODO: translate: Missing and Errored Runs",
+    "missingRuns": "TODO: translate: Missing Runs",
+    "reprocessBehavior": "TODO: translate: Reprocess Behavior",
+    "run": "TODO: translate: Run Backfill",
+    "selectDescription": "TODO: translate: Run this Dag for a range of dates",
+    "selectLabel": "TODO: translate: Backfill",
+    "title": "TODO: translate: Run Backfill",
+    "toaster": {
+      "success": {
+        "description": "TODO: translate: Backfill jobs have been successfully triggered.",
+        "title": "TODO: translate: Backfill generated"
+      }
+    },
+    "tooltip": "TODO: translate: Backfill requires a schedule",
+    "unpause": "TODO: translate: Unpause {{dag_display_name}} on trigger",
+    "validation": {
+      "datesRequired": "TODO: translate: Both Data Interval Start Date and End Date must be provided.",
+      "startBeforeEnd": "TODO: translate: Data Interval Start Date must be less than or equal to Data Interval End Date."
+    }
+  },
+  "banner": {
+    "backfillInProgress": "TODO: translate: Backfill in progress",
+    "cancel": "TODO: translate: Cancel backfill",
+    "pause": "TODO: translate: Pause backfill",
+    "unpause": "TODO: translate: Unpause backfill"
+  },
+  "clipboard": {
+    "copy": "TODO: translate: Copy"
+  },
+  "close": "TODO: translate: Close",
+  "configForm": {
+    "advancedOptions": "TODO: translate: Advanced Options",
+    "configJson": "TODO: translate: Configuration JSON",
+    "invalidJson": "TODO: translate: Invalid JSON format: {{errorMessage}}"
+  },
+  "dagWarnings": {
+    "error_one": "TODO: translate: 1 Error",
+    "errorAndWarning": "TODO: translate: 1 Error and {{warningText}}",
+    "warning_one": "TODO: translate: 1 Warning",
+    "warning_other": "TODO: translate: {{count}} Warnings"
+  },
+  "durationChart": {
+    "duration": "TODO: translate: Duration (seconds)",
+    "lastDagRun_one": "TODO: translate: Last Dag Run",
+    "lastDagRun_other": "TODO: translate: Last {{count}} Dag Runs",
+    "lastTaskInstance_one": "TODO: translate: Last Task Instance",
+    "lastTaskInstance_other": "TODO: translate: Last {{count}} Task Instances",
+    "queuedDuration": "TODO: translate: Queued Duration",
+    "runAfter": "TODO: translate: Run After",
+    "runDuration": "TODO: translate: Run Duration"
+  },
+  "fileUpload": {
+    "files_other": "TODO: translate: {{count}} files"
+  },
+  "flexibleForm": {
+    "placeholder": "TODO: translate: Select Value",
+    "placeholderArray": "TODO: translate: Enter each string on a new line",
+    "placeholderExamples": "TODO: translate: Start typing to see options",
+    "placeholderMulti": "TODO: translate: Select one or multiple values",
+    "validationErrorArrayNotArray": "TODO: translate: Value must be an array.",
+    "validationErrorArrayNotNumbers": "TODO: translate: All elements in the array must be numbers.",
+    "validationErrorArrayNotObject": "TODO: translate: All elements in the array must be objects.",
+    "validationErrorRequired": "TODO: translate: This field is required"
+  },
+  "graph": {
+    "directionDown": "TODO: translate: Top to Bottom",
+    "directionLeft": "TODO: translate: Right to Left",
+    "directionRight": "TODO: translate: Left to Right",
+    "directionUp": "TODO: translate: Bottom to Top",
+    "downloadImage": "TODO: translate: Download graph image",
+    "downloadImageError": "TODO: translate: Failed to download graph image.",
+    "downloadImageErrorTitle": "TODO: translate: Download Failed",
+    "otherDagRuns": "TODO: translate: +Other Dag Runs",
+    "taskCount_one": "TODO: translate: {{count}} Task",
+    "taskCount_other": "TODO: translate: {{count}} Tasks",
+    "taskGroup": "TODO: translate: Task Group"
+  },
+  "limitedList": "TODO: translate: +{{count}} more",
+  "logs": {
+    "file": "TODO: translate: File",
+    "location": "TODO: translate: line {{line}} in {{name}}"
+  },
+  "reparseDag": "TODO: translate: Reparse Dag",
+  "sortedAscending": "TODO: translate: sorted ascending",
+  "sortedDescending": "TODO: translate: sorted descending",
+  "sortedUnsorted": "TODO: translate: unsorted",
+  "taskTries": "TODO: translate: Task Tries",
+  "toggleCardView": "TODO: translate: Show card view",
+  "toggleTableView": "TODO: translate: Show table view",
+  "triggerDag": {
+    "button": "TODO: translate: Trigger",
+    "loading": "TODO: translate: Loading Dag information...",
+    "loadingFailed": "TODO: translate: Failed to load Dag information. Please try again.",
+    "runIdHelp": "TODO: translate: Optional - will be generated if not provided",
+    "selectDescription": "TODO: translate: Trigger a single run of this Dag",
+    "selectLabel": "TODO: translate: Single Run",
+    "title": "TODO: translate: Trigger Dag",
+    "toaster": {
+      "success": {
+        "description": "TODO: translate: Dag run has been successfully triggered.",
+        "title": "TODO: translate: Dag Run Triggered"
+      }
+    },
+    "unpause": "TODO: translate: Unpause {{dagDisplayName}} on trigger"
+  },
+  "trimText": {
+    "details": "TODO: translate: Details",
+    "empty": "TODO: translate: Empty",
+    "noContent": "TODO: translate: No content available."
+  },
+  "versionDetails": {
+    "bundleLink": "TODO: translate: Bundle Link",
+    "bundleName": "TODO: translate: Bundle Name",
+    "bundleVersion": "TODO: translate: Bundle Version",
+    "createdAt": "TODO: translate: Created At",
+    "versionId": "TODO: translate: Version ID"
+  },
+  "versionSelect": {
+    "dagVersion": "TODO: translate: Dag Version",
+    "versionCode": "TODO: translate: v{{versionCode}}"
+  }
+}

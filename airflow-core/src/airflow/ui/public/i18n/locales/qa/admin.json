@@ -1,0 +1,166 @@
+{
+  "columns": {
+    "description": "TODO: translate: Description",
+    "key": "TODO: translate: Key",
+    "name": "TODO: translate: Name",
+    "value": "TODO: translate: Value"
+  },
+  "config": {
+    "columns": {
+      "section": "TODO: translate: Section"
+    },
+    "title": "TODO: translate: Airflow Configuration"
+  },
+  "connections": {
+    "add": "TODO: translate: Add Connection",
+    "columns": {
+      "connectionId": "TODO: translate: Connection ID",
+      "connectionType": "TODO: translate: Connection Type",
+      "host": "TODO: translate: Host",
+      "port": "TODO: translate: Port"
+    },
+    "connection_one": "TODO: translate: Connection",
+    "connection_other": "TODO: translate: Connections",
+    "delete": {
+      "deleteConnection_one": "TODO: translate: Delete 1 connection",
+      "deleteConnection_other": "TODO: translate: Delete {{count}} connections",
+      "firstConfirmMessage_one": "TODO: translate: You are about to delete the following connection:",
+      "firstConfirmMessage_other": "TODO: translate: You are about to delete the following connections:",
+      "title": "TODO: translate: Delete Connection"
+    },
+    "edit": "TODO: translate: Edit Connection",
+    "form": {
+      "connectionIdRequired": "TODO: translate: Connection ID is required",
+      "connectionIdRequirement": "TODO: translate: Connection ID cannot contain only spaces",
+      "connectionTypeRequired": "TODO: translate: Connection Type is required",
+      "extraFields": "TODO: translate: Extra Fields",
+      "extraFieldsJson": "TODO: translate: Extra Fields JSON",
+      "helperText": "TODO: translate: Connection type missing? Make sure you have installed the corresponding Airflow Providers Package.",
+      "helperTextForRedactedFields": "TODO: translate: Redacted fields ('***') will remain unchanged if not modified.",
+      "selectConnectionType": "TODO: translate: Select Connection Type",
+      "standardFields": "TODO: translate: Standard Fields"
+    },
+    "nothingFound": {
+      "description": "TODO: translate: Connections defined via environment variables or secrets managers are not listed here.",
+      "documentationLink": "TODO: translate: Learn more in the Airflow documentation.",
+      "learnMore": "TODO: translate: These are resolved at runtime and are not visible in the UI.",
+      "title": "TODO: translate: No connection found!"
+    },
+    "searchPlaceholder": "TODO: translate: Search Connections",
+    "test": "TODO: translate: Test Connection",
+    "testDisabled": "TODO: translate: Test connection feature is disabled. Please contact an administrator to enable it.",
+    "typeMeta": {
+      "error": "TODO: translate: Failed to retrieve Connection Type Meta",
+      "standardFields": {
+        "description": "TODO: translate: Description",
+        "host": "TODO: translate: Host",
+        "login": "TODO: translate: Login",
+        "password": "TODO: translate: Password",
+        "port": "TODO: translate: Port",
+        "url_schema": "TODO: translate: Schema"
+      }
+    }
+  },
+  "deleteActions": {
+    "button": "TODO: translate: Delete",
+    "modal": {
+      "confirmButton": "TODO: translate: Yes, Delete",
+      "secondConfirmMessage": "TODO: translate: This action is permanent and cannot be undone.",
+      "thirdConfirmMessage": "TODO: translate:  Are you sure you want to proceed?"
+    },
+    "selected": "TODO: translate: Selected",
+    "tooltip": "TODO: translate: Delete selected connections"
+  },
+  "formActions": {
+    "save": "TODO: translate: Save"
+  },
+  "plugins": {
+    "columns": {
+      "source": "TODO: translate: Source"
+    },
+    "importError_one": "TODO: translate: Plugin Import Error",
+    "importError_other": "TODO: translate: Plugin Import Errors",
+    "searchPlaceholder": "TODO: translate: Search by file"
+  },
+  "pools": {
+    "add": "TODO: translate: Add Pool",
+    "deferredSlotsIncluded": "TODO: translate: Deferred Slots Included",
+    "delete": {
+      "title": "TODO: translate: Delete Pool",
+      "warning": "TODO: translate: This will remove all metadata related to the pool and may affect tasks using this pool."
+    },
+    "edit": "TODO: translate: Edit Pool",
+    "form": {
+      "checkbox": "TODO: translate: Check to include deferred tasks when calculating open pool slots",
+      "description": "TODO: translate: Description",
+      "includeDeferred": "TODO: translate: Include Deferred",
+      "nameMaxLength": "TODO: translate: Name can contain a maximum of 256 characters",
+      "nameRequired": "TODO: translate: Name is required",
+      "slots": "TODO: translate: Slots"
+    },
+    "noPoolsFound": "TODO: translate: No pools found",
+    "pool_one": "TODO: translate: Pool",
+    "pool_other": "TODO: translate: Pools",
+    "searchPlaceholder": "TODO: translate: Search Pools",
+    "sort": {
+      "asc": "TODO: translate: Name (A-Z)",
+      "desc": "TODO: translate: Name (Z-A)",
+      "placeholder": "TODO: translate: Sort by"
+    }
+  },
+  "providers": {
+    "columns": {
+      "packageName": "TODO: translate: Package Name",
+      "version": "TODO: translate: Version"
+    }
+  },
+  "variables": {
+    "add": "TODO: translate: Add Variable",
+    "columns": {
+      "isEncrypted": "TODO: translate: Is Encrypted"
+    },
+    "delete": {
+      "deleteVariable_one": "TODO: translate: Delete 1 Variable",
+      "deleteVariable_other": "TODO: translate: Delete {{count}} Variables",
+      "firstConfirmMessage_one": "TODO: translate: You are about to delete the following variable:",
+      "firstConfirmMessage_other": "TODO: translate: You are about to delete the following variables:",
+      "title": "TODO: translate: Delete Variable",
+      "tooltip": "TODO: translate: Delete selected variables"
+    },
+    "edit": "TODO: translate: Edit Variable",
+    "export": "TODO: translate: Export",
+    "exportTooltip": "TODO: translate: Export selected variables",
+    "form": {
+      "invalidJson": "TODO: translate: Invalid JSON",
+      "keyMaxLength": "TODO: translate: Key can contain a maximum of 250 characters",
+      "keyRequired": "TODO: translate: Key is required",
+      "valueRequired": "TODO: translate: Value is required"
+    },
+    "import": {
+      "button": "TODO: translate: Import",
+      "conflictResolution": "TODO: translate: Select Variable Conflict Resolution",
+      "errorParsingJsonFile": "TODO: translate: Error Parsing JSON File: Upload a JSON file containing variables (e.g., {\"key\": \"value\", ...}).",
+      "options": {
+        "fail": {
+          "description": "TODO: translate: Fails the import if any existing variables are detected.",
+          "title": "TODO: translate: Fail"
+        },
+        "overwrite": {
+          "description": "TODO: translate: Overwrites the variable in case of a conflict.",
+          "title": "TODO: translate: Overwrite"
+        },
+        "skip": {
+          "description": "TODO: translate: Skips importing variables that already exist.",
+          "title": "TODO: translate: Skip"
+        }
+      },
+      "title": "TODO: translate: Import Variables",
+      "upload": "TODO: translate: Upload a JSON File",
+      "uploadPlaceholder": "TODO: translate: Upload a JSON file containing variables (e.g., {\"key\": \"value\", ...})"
+    },
+    "noRowsMessage": "TODO: translate: No variables found",
+    "searchPlaceholder": "TODO: translate: Search Keys",
+    "variable_one": "TODO: translate: Variable",
+    "variable_other": "TODO: translate: Variables"
+  }
+}
