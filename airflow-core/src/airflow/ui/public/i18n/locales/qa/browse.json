@@ -1,0 +1,26 @@
+{
+  "auditLog": {
+    "actions": {
+      "collapseAllExtra": "TODO: translate: Collapse all extra json",
+      "expandAllExtra": "TODO: translate: Expand all extra json"
+    },
+    "columns": {
+      "event": "TODO: translate: Event",
+      "extra": "TODO: translate: Extra",
+      "user": "TODO: translate: User",
+      "when": "TODO: translate: When"
+    },
+    "filters": {
+      "eventType": "TODO: translate: Event Type"
+    },
+    "title": "TODO: translate: Audit Log"
+  },
+  "xcom": {
+    "columns": {
+      "dag": "TODO: translate: Dag",
+      "key": "TODO: translate: Key",
+      "value": "TODO: translate: Value"
+    },
+    "title": "TODO: translate: XCom"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "favorite": {
+    "favoriteDags_one": "TODO: translate: First {{count}} favorite Dag",
+    "favoriteDags_other": "TODO: translate: First {{count}} favorite Dags",
+    "noDagRuns": "TODO: translate: There is no DagRun for this dag yet.",
+    "noFavoriteDags": "TODO: translate: No favorites yet. Click the star icon next to a Dag in the list to add it to your favorites."
+  },
+  "group": "TODO: translate: Group",
+  "health": {
+    "dagProcessor": "TODO: translate: Dag Processor",
+    "health": "TODO: translate: Health",
+    "healthy": "TODO: translate: Healthy",
+    "lastHeartbeat": "TODO: translate: Last Heartbeat",
+    "metaDatabase": "TODO: translate: MetaDatabase",
+    "scheduler": "TODO: translate: Scheduler",
+    "status": "TODO: translate: Status",
+    "triggerer": "TODO: translate: Triggerer",
+    "unhealthy": "TODO: translate: Unhealthy"
+  },
+  "history": "TODO: translate: History",
+  "importErrors": {
+    "dagImportError_one": "TODO: translate: Dag Import Error",
+    "dagImportError_other": "TODO: translate: Dag Import Errors",
+    "searchByFile": "TODO: translate: Search by file",
+    "timestamp": "TODO: translate: Timestamp"
+  },
+  "managePools": "TODO: translate: Manage Pools",
+  "noAssetEvents": "TODO: translate: No Asset Events found.",
+  "poolSlots": "TODO: translate: Pool Slots",
+  "sortBy": {
+    "newestFirst": "TODO: translate: Newest First",
+    "oldestFirst": "TODO: translate: Oldest First"
+  },
+  "source": "TODO: translate: Source",
+  "stats": {
+    "activeDags": "TODO: translate: Active Dags",
+    "failedDags": "TODO: translate: Failed Dags",
+    "queuedDags": "TODO: translate: Queued Dags",
+    "requiredActions": "TODO: translate: Required Actions",
+    "runningDags": "TODO: translate: Running Dags",
+    "stats": "TODO: translate: Stats"
+  },
+  "uri": "TODO: translate: Uri",
+  "welcome": "TODO: translate: Welcome"
+}

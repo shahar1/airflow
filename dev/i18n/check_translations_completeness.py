@@ -67,6 +67,7 @@ PLURAL_SUFFIXES = {
     "tr": MOST_COMMON_PLURAL_SUFFIXES,
     "zh-CN": ["_other"],
     "zh-TW": ["_other"],
+    "qa": ["_other"],  # pseudo-language for testing
 }
 
 

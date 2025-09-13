@@ -1,0 +1,34 @@
+{
+  "filters": {
+    "response": {
+      "all": "TODO: translate: All",
+      "pending": "TODO: translate: Pending",
+      "received": "TODO: translate: Reviewed"
+    }
+  },
+  "requiredAction_one": "TODO: translate: Required Action",
+  "requiredAction_other": "TODO: translate: Required Actions",
+  "requiredActionCount_one": "TODO: translate: Required Action ({{count}})",
+  "requiredActionCount_other": "TODO: translate: Required Actions ({{count}})",
+  "requiredActionState": "TODO: translate: Required Action State",
+  "response": {
+    "error": "TODO: translate: Response failed",
+    "optionsDescription": "TODO: translate: Choose your options for this task instance",
+    "optionsLabel": "TODO: translate: Options",
+    "received": "TODO: translate: Response received at ",
+    "respond": "TODO: translate: Respond",
+    "success": "TODO: translate: {{taskId}} response successful",
+    "title": "TODO: translate: Human Task Instance - {{taskId}}"
+  },
+  "state": {
+    "approvalReceived": "TODO: translate: Approval Received",
+    "approvalRequired": "TODO: translate: Approval Required",
+    "choiceReceived": "TODO: translate: Choice Received",
+    "choiceRequired": "TODO: translate: Choice Required",
+    "noResponseReceived": "TODO: translate: No Response Received",
+    "rejectionReceived": "TODO: translate: Rejection Received",
+    "responseReceived": "TODO: translate: Response Received",
+    "responseRequired": "TODO: translate: Response Required"
+  },
+  "subject": "TODO: translate: Subject"
+}
