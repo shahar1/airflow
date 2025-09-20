@@ -62,7 +62,8 @@ if [[ ${BREEZE_DEBUG_SCHEDULER} == "true" ]]; then
     tmux send-keys "debugpy --listen 0.0.0.0:${BREEZE_DEBUG_SCHEDULER_PORT} --wait-for-client -m airflow scheduler" C-m
 else
 tmux set-option -p @airflow_component Scheduler
-    tmux send-keys "airflow scheduler" C-m
+    # tmux send-keys "airflow scheduler" C-m
+    tmux send-keys "RUST_LOG=debug cargo run --manifest-path airflow-core/src/airflow/rust-jobs/Cargo.toml" C-m
 fi
 
 if [[ ! ${USE_AIRFLOW_VERSION=} =~ ^2\..*  ]]; then
