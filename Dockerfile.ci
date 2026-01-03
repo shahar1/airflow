@@ -16,21 +16,10 @@
 #
 # WARNING: THIS DOCKERFILE IS NOT INTENDED FOR PRODUCTION USE OR DEPLOYMENT.
 #
-# PYTHON_LTO: Controls whether Python is built with Link-Time Optimization (LTO).
+# This Dockerfile uses a hardened base image with Python 3.12 pre-installed.
+# Python version is fixed to the version provided by the hardened image.
 #
-# Link-Time Optimization uses MD5 checksums during the compilation process to verify
-# object files and intermediate representations. In FIPS-compliant environments, MD5
-# is blocked as it's not an approved cryptographic algorithm (see FIPS 140-2/140-3).
-# This can cause Python builds with LTO to fail when FIPS mode is enabled.
-#
-# When building FIPS-compliant images, set this to "false" to disable LTO:
-#   docker build --build-arg PYTHON_LTO="false" ...
-#
-# Default: "true" (LTO enabled for better performance)
-#
-# Related: https://github.com/apache/airflow/issues/58337
-ARG PYTHON_LTO="true"
-ARG BASE_IMAGE="debian:bookworm-slim"
+ARG BASE_IMAGE="dhi.io/python:3.12-debian13-dev"
 
 ##############################################################################################
 # This is the script image where we keep all inlined bash scripts needed in other segments
@@ -50,6 +39,9 @@ COPY <<"EOF" /install_os_dependencies.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This script is adapted for use with hardened base image (dhi.io/python:3.12-debian13-dev)
+# Python is pre-installed in the hardened image, so we skip building Python from source.
+
 if [[ "$#" != 1 ]]; then
     echo
     echo "ERROR! There should be 'runtime', 'ci' or 'dev' parameter passed as argument.".
@@ -57,8 +49,8 @@ if [[ "$#" != 1 ]]; then
     exit 1
 fi
 
-AIRFLOW_PYTHON_VERSION=${AIRFLOW_PYTHON_VERSION:-3.10.18}
-PYTHON_LTO=${PYTHON_LTO:-true}
+# Python version is fixed by the hardened image - detect it from installed python
+AIRFLOW_PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')
 GOLANG_MAJOR_MINOR_VERSION=${GOLANG_MAJOR_MINOR_VERSION:-1.24.4}
 
 if [[ "${1}" == "runtime" ]]; then
@@ -75,64 +67,47 @@ else
 fi
 
 function get_dev_apt_deps() {
+    # For hardened image, many packages are already installed or not available.
+    # We install only the additional development dependencies needed for building Python extensions.
+    # The hardened image already includes: openssl, sqlite3, bzip2, xz-utils, zlib, libffi, readline, ncurses
     if [[ "${DEV_APT_DEPS=}" == "" ]]; then
         DEV_APT_DEPS="\
 apt-transport-https \
 apt-utils \
 build-essential \
-dirmngr \
+curl \
 freetds-bin \
 freetds-dev \
 git \
+gnupg \
 graphviz \
 graphviz-dev \
+gzip \
 krb5-user \
 lcov \
 ldap-utils \
-libbluetooth-dev \
-libbz2-dev \
-libc6-dev \
-libdb-dev \
 libev-dev \
 libev4 \
-libffi-dev \
-libgdbm-compat-dev \
-libgdbm-dev \
-libgdbm-dev \
 libgeos-dev \
 libkrb5-dev \
 libldap2-dev \
 libleveldb-dev \
 libleveldb1d \
-liblzma-dev \
-libncurses5-dev \
-libreadline6-dev \
 libsasl2-2 \
 libsasl2-dev \
 libsasl2-modules \
-libsqlite3-dev \
-libssl-dev \
 libxmlsec1 \
 libxmlsec1-dev \
-libzstd-dev \
 locales \
 lsb-release \
-lzma \
-lzma-dev \
 openssh-client \
-openssl \
 pkg-config \
 pkgconf \
 sasl2-bin \
-sqlite3 \
 sudo \
-tk-dev \
 unixodbc \
 unixodbc-dev \
-uuid-dev \
 wget \
-xz-utils \
-zlib1g-dev \
 "
         export DEV_APT_DEPS
     fi
@@ -147,10 +122,9 @@ function get_runtime_apt_deps() {
     echo
     echo "DEBIAN CODENAME: ${debian_version}"
     echo
+    # For hardened image on Debian 13 (trixie), some packages have different names
+    # libffi8 and libssl3 are already in the hardened image
     debian_version_apt_deps="\
-libffi8 \
-libldap-2.5-0 \
-libssl3 \
 netcat-openbsd\
 "
     echo
@@ -179,7 +153,6 @@ lsb-release \
 openssh-client \
 rsync \
 sasl2-bin \
-sqlite3 \
 sudo \
 unixodbc \
 wget\
@@ -207,6 +180,11 @@ function install_debian_dev_dependencies() {
     apt-get update
     apt-get install -yqq --no-install-recommends apt-utils >/dev/null 2>&1
     apt-get install -y --no-install-recommends wget curl gnupg2 lsb-release ca-certificates
+
+    # Create required groups/users for packages that expect them during post-install scripts
+    # sasl2-bin requires 'sasl' group
+    groupadd -f sasl || true
+
     # shellcheck disable=SC2086
     export ${ADDITIONAL_DEV_APT_ENV?}
     if [[ ${DEV_APT_COMMAND} != "" ]]; then
@@ -236,30 +214,37 @@ function install_additional_dev_dependencies() {
 }
 
 function link_python() {
-    # link python binaries to /usr/local/bin and /usr/python/bin with and without 3 suffix
-    # Links in /usr/local/bin are needed for tools that expect python to be there
-    # Links in /usr/python/bin are needed for tools that are detecting home of python installation including
-    # lib/site-packages. The /usr/python/bin should be first in PATH in order to help with the last part.
-    for dst in pip3 python3 python3-config; do
-        src="$(echo "${dst}" | tr -d 3)"
-        echo "Linking ${dst} in /usr/local/bin and /usr/python/bin"
-        ln -sv "/usr/python/bin/${dst}" "/usr/local/bin/${dst}"
-        for dir in /usr/local/bin /usr/python/bin; do
-            if [[ ! -e "${dir}/${src}" ]]; then
-                echo "Creating ${src} - > ${dst} link in ${dir}"
-                ln -sv "${dir}/${dst}" "${dir}/${src}"
+    # For hardened image, Python is pre-installed at /usr/local
+    # We create symlinks to maintain compatibility with scripts expecting /usr/python paths
+    # and ensure python/pip are accessible in standard locations
+
+    # Create /usr/python directory structure for compatibility
+    mkdir -p /usr/python/bin /usr/python/lib
+
+    # Get Python version for lib directory
+    local python_version
+    python_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+
+    # Link Python binaries from /usr/local/bin to /usr/python/bin for compatibility
+    for src in python3 pip3 python3-config; do
+        if [[ -e "/usr/local/bin/${src}" ]]; then
+            ln -sfv "/usr/local/bin/${src}" "/usr/python/bin/${src}" || true
+            # Also create version-less links if they don't exist
+            local dst="$(echo "${src}" | tr -d 3)"
+            if [[ ! -e "/usr/local/bin/${dst}" ]]; then
+                ln -sfv "/usr/local/bin/${src}" "/usr/local/bin/${dst}" || true
             fi
-        done
-    done
-    for dst in /usr/python/lib/*
-    do
-        src="/usr/local/lib/$(basename "${dst}")"
-        if [[ -e "${src}" ]]; then
-            rm -rf "${src}"
+            if [[ ! -e "/usr/python/bin/${dst}" ]]; then
+                ln -sfv "/usr/python/bin/${src}" "/usr/python/bin/${dst}" || true
+            fi
         fi
-        echo "Linking ${dst} to ${src}"
-        ln -sv "${dst}" "${src}"
     done
+
+    # Link Python lib directory for compatibility
+    if [[ -d "/usr/local/lib/python${python_version}" ]]; then
+        ln -sfv "/usr/local/lib/python${python_version}" "/usr/python/lib/python${python_version}" || true
+    fi
+
     ldconfig
 }
 
@@ -285,86 +270,28 @@ function install_debian_runtime_dependencies() {
 }
 
 function install_python() {
-    # If system python (3.11 in bookworm) is installed (via automatic installation of some dependencies for example), we need
-    # to fail and make sure that it is not there, because there can be strange interactions if we install
-    # newer version and system libraries are installed, because
-    # when you create a virtualenv part of the shared libraries of Python can be taken from the system
-    # Installation leading to weird errors when you want to install some modules - for example when you install ssl:
-    # /usr/python/lib/python3.11/lib-dynload/_ssl.cpython-311-aarch64-linux-gnu.so: undefined symbol: _PyModule_Add
-    if dpkg -l | grep '^ii' | grep '^ii  libpython' >/dev/null; then
-        echo
-        echo "ERROR! System python is installed by one of the previous steps"
-        echo
-        echo "Please make sure that no python packages are installed by default. Displaying the reason why libpython3.11 is installed:"
-        echo
-        apt-get install -yqq aptitude >/dev/null
-        aptitude why libpython3.11
-        echo
-        exit 1
-    else
-        echo
-        echo "GOOD! System python is not installed - OK"
-        echo
-    fi
-    wget -O python.tar.xz "https://www.python.org/ftp/python/${AIRFLOW_PYTHON_VERSION%%[a-z]*}/Python-${AIRFLOW_PYTHON_VERSION}.tar.xz"
-    wget -O python.tar.xz.asc "https://www.python.org/ftp/python/${AIRFLOW_PYTHON_VERSION%%[a-z]*}/Python-${AIRFLOW_PYTHON_VERSION}.tar.xz.asc";
-    declare -A keys=(
-        # gpg: key B26995E310250568: public key "\xc5\x81ukasz Langa (GPG langa.pl) <lukasz@langa.pl>" imported
-        # https://peps.python.org/pep-0596/#release-manager-and-crew
-        [3.9]="E3FF2839C048B25C084DEBE9B26995E310250568"
-        # gpg: key 64E628F8D684696D: public key "Pablo Galindo Salgado <pablogsal@gmail.com>" imported
-        # https://peps.python.org/pep-0619/#release-manager-and-crew
-        [3.10]="A035C8C19219BA821ECEA86B64E628F8D684696D"
-        # gpg: key 64E628F8D684696D: public key "Pablo Galindo Salgado <pablogsal@gmail.com>" imported
-        # https://peps.python.org/pep-0664/#release-manager-and-crew
-        [3.11]="A035C8C19219BA821ECEA86B64E628F8D684696D"
-        # gpg: key A821E680E5FA6305: public key "Thomas Wouters <thomas@python.org>" imported
-        # https://peps.python.org/pep-0693/#release-manager-and-crew
-        [3.12]="7169605F62C751356D054A26A821E680E5FA6305"
-        # gpg: key A821E680E5FA6305: public key "Thomas Wouters <thomas@python.org>" imported
-        # https://peps.python.org/pep-0719/#release-manager-and-crew
-        [3.13]="7169605F62C751356D054A26A821E680E5FA6305"
-    )
-    major_minor_version="${AIRFLOW_PYTHON_VERSION%.*}"
-    echo "Verifying Python ${AIRFLOW_PYTHON_VERSION} (${major_minor_version})"
-    GNUPGHOME="$(mktemp -d)"; export GNUPGHOME;
-    gpg_key="${keys[${major_minor_version}]}"
-    echo "Using GPG key ${gpg_key}"
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "${gpg_key}"
-    gpg --batch --verify python.tar.xz.asc python.tar.xz;
-    gpgconf --kill all
-    rm -rf "$GNUPGHOME" python.tar.xz.asc
-    mkdir -p /usr/src/python
-    tar --extract --directory /usr/src/python --strip-components=1 --file python.tar.xz
-    rm python.tar.xz
-    cd /usr/src/python
-    arch="$(dpkg --print-architecture)"; arch="${arch##*-}"
-    gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"
-    EXTRA_CFLAGS="$(dpkg-buildflags --get CFLAGS)"
-    EXTRA_CFLAGS="${EXTRA_CFLAGS:-} -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer";
-    LDFLAGS="$(dpkg-buildflags --get LDFLAGS)"
-    LDFLAGS="${LDFLAGS:--Wl},--strip-all"
-    # Link-Time Optimization (LTO) uses MD5 checksums for object file verification during
-    # compilation. In FIPS mode, MD5 is blocked as a non-approved algorithm, causing builds
-    # to fail. The PYTHON_LTO variable allows disabling LTO for FIPS-compliant builds.
-    # See: https://github.com/apache/airflow/issues/58337
-    local lto_option=""
-    if [[ "${PYTHON_LTO:-true}" == "true" ]]; then
-        lto_option="--with-lto"
-    fi
-    ./configure --enable-optimizations --prefix=/usr/python/ --with-ensurepip --build="$gnuArch" \
-        --enable-loadable-sqlite-extensions --enable-option-checking=fatal \
-            --enable-shared ${lto_option}
-    make -s -j "$(nproc)" "EXTRA_CFLAGS=${EXTRA_CFLAGS:-}" \
-        "LDFLAGS=${LDFLAGS:--Wl},-rpath='\$\$ORIGIN/../lib'" python
-    make -s -j "$(nproc)" install
-    cd /
-    rm -rf /usr/src/python
-    find /usr/python -depth \
-      \( \
-        \( -type d -a \( -name test -o -name tests -o -name idle_test \) \) \
-        -o \( -type f -a \( -name 'libpython*.a' \) \) \
-    \) -exec rm -rf '{}' +
+    # For hardened image: Python is pre-installed, no need to build from source.
+    # We just verify it's available and set up the necessary links for compatibility.
+    echo
+    echo "Using pre-installed Python from hardened image"
+    echo "Python version: $(python3 --version)"
+    echo "Python location: $(which python3)"
+    echo
+
+    # Verify Python has required modules compiled
+    echo "Verifying Python extensions are available..."
+    python3 -c "import ssl; print(f'  ssl: OK (OpenSSL {ssl.OPENSSL_VERSION})')"
+    python3 -c "import sqlite3; print('  sqlite3: OK')"
+    python3 -c "import ctypes; print('  ctypes (ffi): OK')"
+    python3 -c "import readline; print('  readline: OK')"
+    python3 -c "import zlib; print('  zlib: OK')"
+    python3 -c "import bz2; print('  bz2: OK')"
+    python3 -c "import lzma; print('  lzma: OK')"
+    python3 -c "import _hashlib; print('  hashlib: OK')"
+    echo "All required Python extensions are available."
+    echo
+
+    # Set up symlinks for compatibility
     link_python
 }
 
@@ -406,7 +333,7 @@ set -euo pipefail
 common::get_colors
 declare -a packages
 
-readonly MARIADB_LTS_VERSION="10.11"
+readonly MARIADB_LTS_VERSION="11.8"
 
 : "${INSTALL_MYSQL_CLIENT:?Should be true or false}"
 : "${INSTALL_MYSQL_CLIENT_TYPE:-mariadb}"
@@ -525,7 +452,8 @@ function install_mssql_client() {
     fi
     packages=("msodbcsql18")
 
-    common::import_trusted_gpg "EB3E94ADBE1229CF" "microsoft"
+    # Import the new Microsoft GPG key for Debian 13+ (yearly rotation strategy)
+    common::import_trusted_gpg "EE4D7792F748182B" "microsoft"
 
     echo
     echo "${COLOR_BLUE}Installing mssql client${COLOR_RESET}"
@@ -1552,9 +1480,10 @@ RUN echo "Base image version: ${BASE_IMAGE}"
 ARG DEV_APT_COMMAND=""
 ARG ADDITIONAL_DEV_APT_COMMAND=""
 ARG ADDITIONAL_DEV_ENV_VARS=""
+# For Debian 13 (trixie) hardened image, libgcc-11-dev is replaced with libgcc-14-dev (or omit if not needed)
 ARG ADDITIONAL_DEV_APT_DEPS="bash-completion dumb-init git gdb graphviz krb5-user \
-    less libenchant-2-2 libgcc-11-dev libgeos-dev libpq-dev net-tools netcat-openbsd \
-    openssh-server postgresql-client software-properties-common rsync tmux unzip vim xxd"
+    less libenchant-2-2 libgeos-dev libpq-dev net-tools netcat-openbsd \
+    openssh-server postgresql-client rsync tmux unzip vim xxd"
 
 ARG ADDITIONAL_DEV_APT_ENV=""
 
@@ -1562,20 +1491,19 @@ ENV DEV_APT_COMMAND=${DEV_APT_COMMAND} \
     ADDITIONAL_DEV_APT_DEPS=${ADDITIONAL_DEV_APT_DEPS} \
     ADDITIONAL_DEV_APT_COMMAND=${ADDITIONAL_DEV_APT_COMMAND}
 
-ARG AIRFLOW_PYTHON_VERSION="3.12.12"
+# Python version is fixed by the hardened base image (3.12.x)
+# We detect it at runtime in install_os_dependencies.sh
+ARG AIRFLOW_PYTHON_VERSION="3.12"
 ENV AIRFLOW_PYTHON_VERSION=${AIRFLOW_PYTHON_VERSION}
 ENV GOLANG_MAJOR_MINOR_VERSION="1.25.5"
 
-ARG PYTHON_LTO
-
 COPY --from=scripts install_os_dependencies.sh /scripts/docker/
 
-RUN PYTHON_LTO=${PYTHON_LTO} bash /scripts/docker/install_os_dependencies.sh ci
+# Install OS dependencies - Python is already pre-installed in the hardened image
+RUN bash /scripts/docker/install_os_dependencies.sh ci
 
-# In case system python is installed, setting LD_LIBRARY_PATH prevents any case the system python
-# libraries will be accidentally used before the library installed from sources (which is newer and
-# python interpreter might break if accidentally the old system libraries are used.
-ENV LD_LIBRARY_PATH="/usr/python/lib"
+# LD_LIBRARY_PATH for compatibility with scripts expecting /usr/python layout
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/python/lib"
 
 COPY --from=scripts common.sh /scripts/docker/
 
@@ -1587,7 +1515,7 @@ ARG HOME=/root
 ARG AIRFLOW_IMAGE_TYPE="ci"
 ARG AIRFLOW_HOME=/root/airflow
 ARG AIRFLOW_SOURCES=/opt/airflow
-ARG INSTALL_MYSQL_CLIENT_TYPE="mysql"
+ARG INSTALL_MYSQL_CLIENT_TYPE="mariadb"
 
 ENV HOME=${HOME} \
     AIRFLOW_IMAGE_TYPE=${AIRFLOW_IMAGE_TYPE} \
@@ -1721,7 +1649,8 @@ ENV AIRFLOW_PIP_VERSION=${AIRFLOW_PIP_VERSION} \
     AIRFLOW_PREK_VERSION=${AIRFLOW_PREK_VERSION}
 
 # The PATH is needed for python to find installed and cargo to build the wheels
-ENV PATH="/usr/python/bin:/root/.local/bin:/root/.cargo/bin:${PATH}"
+# For hardened image, Python is installed in /usr/local, /usr/python is symlinked for compatibility
+ENV PATH="/usr/local/bin:/usr/python/bin:/root/.local/bin:/root/.cargo/bin:${PATH}"
 # Useful for creating a cache id based on the underlying architecture, preventing the use of cached python packages from
 # an incorrect architecture.
 ARG TARGETARCH
