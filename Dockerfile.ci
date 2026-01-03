@@ -83,6 +83,7 @@ gnupg \
 graphviz \
 graphviz-dev \
 gzip \
+bsdutils \
 krb5-user \
 lcov \
 ldap-utils \
@@ -1534,7 +1535,7 @@ RUN bash /scripts/docker/install_mysql.sh prod \
     # The user is added to allow ssh debugging (you can connect with airflow/airflow over ssh)
     && adduser --gecos "First Last,RoomNumber,WorkPhone,HomePhone" --disabled-password \
     --quiet "airflow" --home "/home/airflow" \
-    && echo -e "airflow\nairflow" | passwd airflow 2>&1 \
+    && echo "airflow:airflow" | chpasswd \
     && echo "airflow ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/airflow \
     && chmod 0440 /etc/sudoers.d/airflow
 
