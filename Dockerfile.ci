@@ -30,7 +30,7 @@
 #
 # Related: https://github.com/apache/airflow/issues/58337
 ARG PYTHON_LTO="true"
-ARG BASE_IMAGE="debian:bookworm-slim"
+ARG BASE_IMAGE="dhi.io/python:3.12-debian12-dev"
 
 ##############################################################################################
 # This is the script image where we keep all inlined bash scripts needed in other segments
@@ -86,6 +86,7 @@ freetds-dev \
 git \
 graphviz \
 graphviz-dev \
+gzip \
 krb5-user \
 lcov \
 ldap-utils \
@@ -98,7 +99,6 @@ libev4 \
 libffi-dev \
 libgdbm-compat-dev \
 libgdbm-dev \
-libgdbm-dev \
 libgeos-dev \
 libkrb5-dev \
 libldap2-dev \
@@ -106,7 +106,7 @@ libleveldb-dev \
 libleveldb1d \
 liblzma-dev \
 libncurses5-dev \
-libreadline6-dev \
+libreadline-dev \
 libsasl2-2 \
 libsasl2-dev \
 libsasl2-modules \
@@ -120,18 +120,15 @@ lsb-release \
 lzma \
 lzma-dev \
 openssh-client \
-openssl \
 pkg-config \
 pkgconf \
 sasl2-bin \
-sqlite3 \
 sudo \
 tk-dev \
 unixodbc \
 unixodbc-dev \
 uuid-dev \
 wget \
-xz-utils \
 zlib1g-dev \
 "
         export DEV_APT_DEPS
@@ -204,6 +201,12 @@ function install_docker_cli() {
 }
 
 function install_debian_dev_dependencies() {
+    if [[ ! -f /etc/shells ]]; then
+        # The hardened image does not have /etc/shells, but tmux needs it.
+        # We populate it with the shells available in the image.
+        echo "/bin/bash" > /etc/shells
+        echo "/bin/sh" >> /etc/shells
+    fi
     apt-get update
     apt-get install -yqq --no-install-recommends apt-utils >/dev/null 2>&1
     apt-get install -y --no-install-recommends wget curl gnupg2 lsb-release ca-certificates
@@ -225,7 +228,9 @@ function install_debian_dev_dependencies() {
     echo "DEBIAN CODENAME: ${debian_version}"
     echo
     # shellcheck disable=SC2086
-    apt-get install -y --no-install-recommends ${DEV_APT_DEPS}
+    groupadd -r sasl
+    # shellcheck disable=SC2086
+    apt-get install -y --no-install-recommends "${DEV_APT_DEPS}"
 }
 
 function install_additional_dev_dependencies() {
@@ -240,6 +245,7 @@ function link_python() {
     # Links in /usr/local/bin are needed for tools that expect python to be there
     # Links in /usr/python/bin are needed for tools that are detecting home of python installation including
     # lib/site-packages. The /usr/python/bin should be first in PATH in order to help with the last part.
+    mkdir -p /usr/local/bin
     for dst in pip3 python3 python3-config; do
         src="$(echo "${dst}" | tr -d 3)"
         echo "Linking ${dst} in /usr/local/bin and /usr/python/bin"
@@ -251,6 +257,7 @@ function link_python() {
             fi
         done
     done
+    mkdir -p /usr/local/lib
     for dst in /usr/python/lib/*
     do
         src="/usr/local/lib/$(basename "${dst}")"
@@ -285,86 +292,14 @@ function install_debian_runtime_dependencies() {
 }
 
 function install_python() {
-    # If system python (3.11 in bookworm) is installed (via automatic installation of some dependencies for example), we need
-    # to fail and make sure that it is not there, because there can be strange interactions if we install
-    # newer version and system libraries are installed, because
-    # when you create a virtualenv part of the shared libraries of Python can be taken from the system
-    # Installation leading to weird errors when you want to install some modules - for example when you install ssl:
-    # /usr/python/lib/python3.11/lib-dynload/_ssl.cpython-311-aarch64-linux-gnu.so: undefined symbol: _PyModule_Add
-    if dpkg -l | grep '^ii' | grep '^ii  libpython' >/dev/null; then
-        echo
-        echo "ERROR! System python is installed by one of the previous steps"
-        echo
-        echo "Please make sure that no python packages are installed by default. Displaying the reason why libpython3.11 is installed:"
-        echo
-        apt-get install -yqq aptitude >/dev/null
-        aptitude why libpython3.11
-        echo
-        exit 1
+    echo "Using pre-installed Python from base image"
+    if [[ -d "/opt/python" ]]; then
+        echo "Linking /opt/python to /usr/python"
+        ln -snf /opt/python /usr/python
     else
-        echo
-        echo "GOOD! System python is not installed - OK"
-        echo
+        echo "ERROR: /opt/python not found in base image"
+        exit 1
     fi
-    wget -O python.tar.xz "https://www.python.org/ftp/python/${AIRFLOW_PYTHON_VERSION%%[a-z]*}/Python-${AIRFLOW_PYTHON_VERSION}.tar.xz"
-    wget -O python.tar.xz.asc "https://www.python.org/ftp/python/${AIRFLOW_PYTHON_VERSION%%[a-z]*}/Python-${AIRFLOW_PYTHON_VERSION}.tar.xz.asc";
-    declare -A keys=(
-        # gpg: key B26995E310250568: public key "\xc5\x81ukasz Langa (GPG langa.pl) <lukasz@langa.pl>" imported
-        # https://peps.python.org/pep-0596/#release-manager-and-crew
-        [3.9]="E3FF2839C048B25C084DEBE9B26995E310250568"
-        # gpg: key 64E628F8D684696D: public key "Pablo Galindo Salgado <pablogsal@gmail.com>" imported
-        # https://peps.python.org/pep-0619/#release-manager-and-crew
-        [3.10]="A035C8C19219BA821ECEA86B64E628F8D684696D"
-        # gpg: key 64E628F8D684696D: public key "Pablo Galindo Salgado <pablogsal@gmail.com>" imported
-        # https://peps.python.org/pep-0664/#release-manager-and-crew
-        [3.11]="A035C8C19219BA821ECEA86B64E628F8D684696D"
-        # gpg: key A821E680E5FA6305: public key "Thomas Wouters <thomas@python.org>" imported
-        # https://peps.python.org/pep-0693/#release-manager-and-crew
-        [3.12]="7169605F62C751356D054A26A821E680E5FA6305"
-        # gpg: key A821E680E5FA6305: public key "Thomas Wouters <thomas@python.org>" imported
-        # https://peps.python.org/pep-0719/#release-manager-and-crew
-        [3.13]="7169605F62C751356D054A26A821E680E5FA6305"
-    )
-    major_minor_version="${AIRFLOW_PYTHON_VERSION%.*}"
-    echo "Verifying Python ${AIRFLOW_PYTHON_VERSION} (${major_minor_version})"
-    GNUPGHOME="$(mktemp -d)"; export GNUPGHOME;
-    gpg_key="${keys[${major_minor_version}]}"
-    echo "Using GPG key ${gpg_key}"
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "${gpg_key}"
-    gpg --batch --verify python.tar.xz.asc python.tar.xz;
-    gpgconf --kill all
-    rm -rf "$GNUPGHOME" python.tar.xz.asc
-    mkdir -p /usr/src/python
-    tar --extract --directory /usr/src/python --strip-components=1 --file python.tar.xz
-    rm python.tar.xz
-    cd /usr/src/python
-    arch="$(dpkg --print-architecture)"; arch="${arch##*-}"
-    gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"
-    EXTRA_CFLAGS="$(dpkg-buildflags --get CFLAGS)"
-    EXTRA_CFLAGS="${EXTRA_CFLAGS:-} -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer";
-    LDFLAGS="$(dpkg-buildflags --get LDFLAGS)"
-    LDFLAGS="${LDFLAGS:--Wl},--strip-all"
-    # Link-Time Optimization (LTO) uses MD5 checksums for object file verification during
-    # compilation. In FIPS mode, MD5 is blocked as a non-approved algorithm, causing builds
-    # to fail. The PYTHON_LTO variable allows disabling LTO for FIPS-compliant builds.
-    # See: https://github.com/apache/airflow/issues/58337
-    local lto_option=""
-    if [[ "${PYTHON_LTO:-true}" == "true" ]]; then
-        lto_option="--with-lto"
-    fi
-    ./configure --enable-optimizations --prefix=/usr/python/ --with-ensurepip --build="$gnuArch" \
-        --enable-loadable-sqlite-extensions --enable-option-checking=fatal \
-            --enable-shared ${lto_option}
-    make -s -j "$(nproc)" "EXTRA_CFLAGS=${EXTRA_CFLAGS:-}" \
-        "LDFLAGS=${LDFLAGS:--Wl},-rpath='\$\$ORIGIN/../lib'" python
-    make -s -j "$(nproc)" install
-    cd /
-    rm -rf /usr/src/python
-    find /usr/python -depth \
-      \( \
-        \( -type d -a \( -name test -o -name tests -o -name idle_test \) \) \
-        -o \( -type f -a \( -name 'libpython*.a' \) \) \
-    \) -exec rm -rf '{}' +
     link_python
 }
 
@@ -1591,7 +1526,7 @@ ARG HOME=/root
 ARG AIRFLOW_IMAGE_TYPE="ci"
 ARG AIRFLOW_HOME=/root/airflow
 ARG AIRFLOW_SOURCES=/opt/airflow
-ARG INSTALL_MYSQL_CLIENT_TYPE="mysql"
+ARG INSTALL_MYSQL_CLIENT_TYPE="mariadb"
 
 ENV HOME=${HOME} \
     AIRFLOW_IMAGE_TYPE=${AIRFLOW_IMAGE_TYPE} \

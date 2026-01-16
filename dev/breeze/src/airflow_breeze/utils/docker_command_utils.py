@@ -446,7 +446,7 @@ def prepare_docker_build_command(
     final_command.extend(["docker"])
     final_command.extend(build_command)
     final_command.extend(image_params.common_docker_build_flags)
-    final_command.extend(["--pull"])
+    # final_command.extend(["--pull"])
     final_command.extend(image_params.prepare_arguments_for_docker_build_command())
     final_command.extend(["-t", image_params.airflow_image_name, "--target", "main", "."])
     final_command.extend(

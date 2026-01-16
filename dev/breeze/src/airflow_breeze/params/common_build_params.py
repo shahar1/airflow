@@ -116,7 +116,7 @@ class CommonBuildParams:
         """Construct Python Base Image"""
         if self.python_image is not None:
             return self.python_image
-        return f"debian:{self.debian_version}-slim"
+        return f"dhi.io/python:{self.python}-{self.debian_version}-dev"
 
     @property
     def airflow_image_repository(self):
