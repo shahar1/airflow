@@ -291,7 +291,7 @@ function install_debian_dev_dependencies() {
     # shellcheck disable=SC2086
     groupadd -r sasl
     # shellcheck disable=SC2086
-    apt-get install -y --no-install-recommends "${DEV_APT_DEPS}"
+    apt-get install -y --no-install-recommends ${DEV_APT_DEPS}
 }
 
 function install_additional_dev_dependencies() {
