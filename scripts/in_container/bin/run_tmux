@@ -160,6 +160,14 @@ if [[ ${STANDALONE_DAG_PROCESSOR} == "true" ]]; then
 fi
 fi
 
+# Airy MCP sidecar (optional — requires ENABLE_AIRY_MCP=true)
+if [[ ${ENABLE_AIRY_MCP:-} == "true" ]]; then
+    tmux select-pane -t 0
+    tmux split-window -h
+    tmux set-option -p @airflow_component "Airy MCP"
+    tmux send-keys "echo 'Waiting for Airflow API server…' && while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && echo 'API server ready' && astro-airflow-mcp --transport http --host 0.0.0.0 --port 8000 --airflow-url \${AIRFLOW_API_URL:-http://localhost:8080} --username \${AIRFLOW_USERNAME:-admin} --password \${AIRFLOW_PASSWORD:-admin}" C-m
+fi
+
 # Attach Session, on the Main window
 tmux select-pane -t 0
 tmux send-keys "/opt/airflow/scripts/in_container/run_tmux_welcome.sh" C-m

@@ -172,6 +172,33 @@ def generate_mprocs_config() -> str:
             "scrollback": 100000,
         }
 
+    # Airy MCP sidecar (optional — requires ENABLE_AIRY_MCP=true)
+    if get_env_bool("ENABLE_AIRY_MCP"):
+        # Wait for the API server to be listening before starting the MCP
+        # sidecar, then launch it.  The env vars AIRFLOW_API_URL,
+        # AIRFLOW_USERNAME, AIRFLOW_PASSWORD are expected to be set
+        # (e.g. via environment_variables.env).
+        mcp_cmd = get_env(
+            "AIRY_MCP_CMD",
+            (
+                "echo 'Waiting for Airflow API server…' && "
+                "while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && "
+                "echo 'API server ready — starting MCP sidecar' && "
+                "astro-airflow-mcp"
+                " --transport http"
+                " --host 0.0.0.0"
+                " --port 8000"
+                " --airflow-url ${AIRFLOW_API_URL:-http://localhost:8080}"
+                " --username ${AIRFLOW_USERNAME:-admin}"
+                " --password ${AIRFLOW_PASSWORD:-admin}"
+            ),
+        )
+        procs["airy_mcp"] = {
+            "shell": mcp_cmd,
+            "restart": "always",
+            "scrollback": 100000,
+        }
+
     procs["shell"] = {
         "shell": "bash",
         "restart": "always",
