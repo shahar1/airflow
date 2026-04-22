@@ -15,7 +15,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-16T22:02:56.820389756Z"
+exclude-newer = "2026-04-18T09:02:41.879151167Z"
 exclude-newer-span = "P4D"
 
 [options.exclude-newer-package]
@@ -7852,6 +7852,7 @@ dev = [
     { name = "apache-airflow-devel-common" },
 ]
 mypy = [
+    { name = "apache-airflow-core" },
     { name = "apache-airflow-devel-common", extra = ["mypy"] },
 ]
 
@@ -7873,7 +7874,10 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "apache-airflow-devel-common", editable = "devel-common" }]
-mypy = [{ name = "apache-airflow-devel-common", extras = ["mypy"], editable = "devel-common" }]
+mypy = [
+    { name = "apache-airflow-core", editable = "airflow-core" },
+    { name = "apache-airflow-devel-common", extras = ["mypy"], editable = "devel-common" },
+]
 
 [[package]]
 name = "apache-airflow-shared-configuration"
