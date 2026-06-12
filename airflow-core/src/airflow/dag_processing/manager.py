@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 import gc
+import hashlib
 import inspect
 import logging
 import os
@@ -120,6 +121,8 @@ class DagFileStat:
     last_duration: float | None = None
     run_count: int = 0
     last_num_of_db_queries: int = 0
+    file_hash: str | None = None
+
 
 
 @dataclass(frozen=True)
@@ -1169,6 +1172,7 @@ class DagFileProcessorManager(LoggingMixin):
             parsing_result=proc.parsing_result,
             is_callback_only=is_callback_only,
             relative_fileloc=str(file.rel_path),
+            file_path=str(file.absolute_path),
         )
 
         if proc.parsing_result is not None:
@@ -1198,6 +1202,7 @@ class DagFileProcessorManager(LoggingMixin):
                     last_duration=run_duration,
                     run_count=current_stat.run_count + 1,
                     last_num_of_db_queries=current_stat.last_num_of_db_queries,
+                    file_hash=current_stat.file_hash,
                 )
                 return
 
@@ -1398,12 +1403,26 @@ class DagFileProcessorManager(LoggingMixin):
                 modified_timestamp = os.path.getmtime(file.absolute_path)
                 modified_datetime = datetime.fromtimestamp(modified_timestamp, tz=timezone.utc)
                 files_with_mtime[file] = modified_timestamp
+
                 stat = file_stats_by_presence_key.get(file.presence_key)
                 last_time = stat.last_finish_time if stat else None
+
                 if not last_time:
                     continue
-                if modified_datetime > last_time:
+
+                if modified_datetime <= last_time:
+                    continue
+
+                # File mtime changed — only re-queue if content actually changed (hash check)
+                try:
+                    with open(file.absolute_path, "rb") as f:
+                        new_hash = hashlib.sha256(f.read()).hexdigest()
+                    if stat is None or stat.file_hash is None or stat.file_hash != new_hash:
+                        changed_recently.add(file)
+                except OSError:
+                    # If we can't read the file, conservatively re-queue it
                     changed_recently.add(file)
+
             except FileNotFoundError:
                 self.log.warning("Skipping processing of missing file: %s", file)
                 stats_to_remove = [
@@ -1414,6 +1433,7 @@ class DagFileProcessorManager(LoggingMixin):
                 for tracked_file in stats_to_remove:
                     self._file_stats.pop(tracked_file, None)
                 continue
+
         file_infos = [info for info, ts in sorted(files_with_mtime.items(), key=itemgetter(1), reverse=True)]
         return file_infos, changed_recently
 
@@ -1535,6 +1555,7 @@ class DagFileProcessorManager(LoggingMixin):
                     last_duration=duration,
                     run_count=self._file_stats[file].run_count + 1,
                     last_num_of_db_queries=0,
+                    file_hash=self._file_stats[file].file_hash,
                 )
                 self._file_stats[file] = stat
 
@@ -1620,6 +1641,7 @@ def process_parse_results(
     *,
     is_callback_only: bool = False,
     relative_fileloc: str | None = None,
+    file_path: str | None = None,
 ) -> DagFileStat:
     """
     Create a DagFileStat from parsing results and emit metrics.
@@ -1648,6 +1670,13 @@ def process_parse_results(
         file_name = normalize_name_for_stats(Path(relative_fileloc).stem)
         # bundle_name is included to distinguish files with the same name across different bundles
         normalized_bundle = normalize_name_for_stats(bundle_name)
+        if file_path is not None:
+            try:
+                with open(file_path, "rb") as f:
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+            except (FileNotFoundError, TypeError):
+                file_hash = None
+            stat.file_hash = file_hash
         stats.timing(
             "dag_processing.last_duration",
             stat.last_duration,
