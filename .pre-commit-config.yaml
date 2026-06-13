@@ -248,13 +248,17 @@ repos:
           ^pyproject\.toml$
         pass_filenames: false
         require_serial: true
-      - id: check-ci-workflows-in-sync
-        name: Check ci-arm.yml and ci-amd.yml stay in sync
-        entry: ./scripts/ci/prek/check_ci_workflows_in_sync.py
-        language: python
-        files: ^\.github/workflows/ci-(arm|amd)\.yml$
-        pass_filenames: false
-        require_serial: true
+      # FORK / CodeBuild-runner test: ci-arm.yml and ci-amd.yml intentionally
+      # diverge on this branch (ci-arm auto-triggers disabled, ci-amd runs-on
+      # repointed to CodeBuild), so this in-sync check fails by design. Disabled
+      # for the duration of the fork test. Re-enable before merging upstream.
+      # - id: check-ci-workflows-in-sync
+      #   name: Check ci-arm.yml and ci-amd.yml stay in sync
+      #   entry: ./scripts/ci/prek/check_ci_workflows_in_sync.py
+      #   language: python
+      #   files: ^\.github/workflows/ci-(arm|amd)\.yml$
+      #   pass_filenames: false
+      #   require_serial: true
       - id: check-java-sdk-version-in-sync
         name: Check Java SDK JDK version is consistent across build files
         entry: ./scripts/ci/prek/check_java_sdk_version_in_sync.py

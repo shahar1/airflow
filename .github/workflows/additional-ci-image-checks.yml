@@ -121,7 +121,9 @@ jobs:
   check-that-image-builds-quickly:
     timeout-minutes: 25
     name: Check that image builds quickly
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       UPGRADE_TO_NEWER_DEPENDENCIES: false
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"

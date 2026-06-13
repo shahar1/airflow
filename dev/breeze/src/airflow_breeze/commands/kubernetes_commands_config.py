@@ -76,6 +76,7 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--rebuild-base-image",
                 "--copy-local-sources",
                 "--use-uv",
+                "--github-repository",
             ],
         },
         {
@@ -235,7 +236,13 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
         },
         {
             "name": "K8S tests flags",
-            "options": ["--python", "--kubernetes-version", "--executor", "--force-venv-setup"],
+            "options": [
+                "--python",
+                "--kubernetes-version",
+                "--executor",
+                "--force-venv-setup",
+                "--github-repository",
+            ],
         },
         {
             "name": "Parallel options",
@@ -276,7 +283,15 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--force-venv-setup",
             ],
         },
-        {"name": "Build image flags", "options": ["--rebuild-base-image", "--use-uv", "--skip-image-build"]},
+        {
+            "name": "Build image flags",
+            "options": [
+                "--rebuild-base-image",
+                "--use-uv",
+                "--skip-image-build",
+                "--github-repository",
+            ],
+        },
         {"name": "UI flags", "options": ["--skip-compile-ui-assets"]},
     ],
 }

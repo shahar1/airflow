@@ -35,7 +35,9 @@ concurrency:
 jobs:
   detect-languages:
     name: Detect languages to scan
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     permissions:
       contents: read
       pull-requests: read
@@ -97,7 +99,9 @@ jobs:
     needs: detect-languages
     # Skip entirely when no scannable language changed (e.g. docs-only PRs).
     if: needs.detect-languages.outputs.languages != '[]'
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       matrix:
