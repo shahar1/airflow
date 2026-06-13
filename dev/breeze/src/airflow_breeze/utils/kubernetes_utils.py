@@ -379,6 +379,41 @@ def _get_kind_cluster_config_content(python: str, kubernetes_version: str) -> di
     return yaml.safe_load(config_path.read_text())
 
 
+def _collapse_to_single_node_config(config: str, output: Output | None) -> str:
+    """Collapse the kind cluster config to a single control-plane node.
+
+    On Docker-in-Docker hosts such as AWS CodeBuild runners, the worker node's
+    kubelet never becomes healthy during ``kubeadm join`` (it times out on
+    ``/healthz``), so cluster creation fails at "Joining worker nodes". The
+    control-plane node itself comes up fine. kind removes the control-plane
+    ``node-role.kubernetes.io/control-plane`` NoSchedule taint when the cluster
+    has no worker nodes, so task pods (including KubernetesExecutor pods) still
+    schedule. The worker's ``extraPortMappings`` are moved onto the control-plane
+    so the NodePort that forwards the Airflow API server keeps working.
+    """
+    import yaml
+
+    parsed = yaml.safe_load(config)
+    nodes = parsed.get("nodes", [])
+    control_plane = next((node for node in nodes if node.get("role") == "control-plane"), None)
+    if control_plane is None:
+        return config
+    worker_port_mappings = [
+        mapping
+        for node in nodes
+        if node.get("role") == "worker"
+        for mapping in node.get("extraPortMappings", [])
+    ]
+    if worker_port_mappings:
+        control_plane.setdefault("extraPortMappings", []).extend(worker_port_mappings)
+    parsed["nodes"] = [control_plane]
+    get_console(output=output).print(
+        "[warning]CODEBUILD_BUILD_ID detected — using a single-node kind cluster because the "
+        "worker kubelet fails to join under Docker-in-Docker.[/]"
+    )
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
 def set_random_cluster_ports(python: str, kubernetes_version: str, output: Output | None) -> None:
     """
     Creates cluster config file and returns sockets keeping the ports bound.
@@ -396,6 +431,8 @@ def set_random_cluster_ports(python: str, kubernetes_version: str, output: Outpu
         .replace("{{FORWARDED_PORT_NUMBER}}", str(forwarded_port_number))
         .replace("{{API_SERVER_PORT}}", str(k8s_api_server_port))
     )
+    if os.environ.get("CODEBUILD_BUILD_ID"):
+        config = _collapse_to_single_node_config(config, output)
     cluster_conf_path.write_text(config)
     get_console(output=output).print(f"[info]Config created in {cluster_conf_path}:\n")
     get_console(output=output).print(config)
@@ -407,7 +444,12 @@ def get_kubernetes_port_numbers(python: str, kubernetes_version: str) -> tuple[i
     if not conf:
         return 0, 0
     k8s_api_server_port = conf["networking"]["apiServerPort"]
-    api_server_port = conf["nodes"][1]["extraPortMappings"][0]["hostPort"]
+    # The NodePort forwarding the Airflow API server is normally on the worker node, but on a
+    # single-node cluster (CodeBuild, see _collapse_to_single_node_config) it is on the
+    # control-plane. Find it on whichever node carries the mapping rather than assuming an index.
+    api_server_port = next(
+        mapping["hostPort"] for node in conf["nodes"] for mapping in node.get("extraPortMappings", [])
+    )
     return k8s_api_server_port, api_server_port
 
 
