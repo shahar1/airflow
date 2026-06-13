@@ -96,7 +96,9 @@ jobs:
   test-e2e-integration-tests:
     timeout-minutes: 60
     name: ${{ inputs.workflow-name }}
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       GITHUB_REPOSITORY: ${{ github.repository }}

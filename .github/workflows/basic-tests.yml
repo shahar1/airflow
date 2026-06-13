@@ -82,7 +82,9 @@ jobs:
   run-breeze-tests:
     timeout-minutes: 10
     name: Breeze unit tests
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - name: "Cleanup repo"
         shell: bash
@@ -100,7 +102,9 @@ jobs:
   run-breeze-integration-tests:
     timeout-minutes: 120
     name: Breeze integration tests
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.run-breeze-integration-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -131,7 +135,9 @@ jobs:
       fail-fast: false
       matrix:
         shared-distribution: ${{ fromJSON(inputs.shared-distributions-as-json) }}
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -155,7 +161,9 @@ jobs:
   tests-scripts:
     timeout-minutes: 10
     name: Scripts tests
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.run-scripts-tests == 'true'
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
@@ -181,7 +189,9 @@ jobs:
   tests-ui:
     timeout-minutes: 15
     name: React UI tests
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.run-ui-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -191,19 +201,20 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271  # v6.0.9
-        with:
-          version: 9
-          run_install: false
       - name: "Setup node"
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 24
-          cache: 'pnpm'
-          cache-dependency-path: 'airflow-core/src/airflow/**/pnpm-lock.yaml'
+      # FORK / CodeBuild-runner test: pnpm/action-setup's self-installer crashes
+      # (`paths[0] ... undefined`) running as root on the CodeBuild container.
+      # Install pnpm via npm instead (node provided by setup-node above). This
+      # is why setup-node above can no longer use cache: 'pnpm' (pnpm isn't
+      # present when it runs) — that was only a download-speed optimisation.
+      - name: "Setup pnpm"
+        shell: bash
+        run: npm install -g pnpm@9  # zizmor: ignore[adhoc-packages]
       - name: "Restore eslint cache (ui)"
-        uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-restore
         with:
           path: airflow-core/src/airflow/ui/node_modules/
           # yamllint disable-line rule:line-length
@@ -214,7 +225,7 @@ jobs:
         env:
           FORCE_COLOR: 2
       - name: "Save eslint cache (ui)"
-        uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-save
         with:
           path: airflow-core/src/airflow/ui/node_modules/
           key: cache-ui-node-modules-v1-${{ runner.os }}-${{ hashFiles('airflow/ui/**/pnpm-lock.yaml') }}
@@ -222,7 +233,7 @@ jobs:
           retention-days: '2'
         if: steps.restore-eslint-cache-ui.outputs.stash-hit != 'true'
       - name: "Restore eslint cache (simple auth manager UI)"
-        uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-restore
         with:
           path: airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/node_modules/
           key: >
@@ -234,7 +245,7 @@ jobs:
         env:
           FORCE_COLOR: 2
       - name: "Save eslint cache (ui)"
-        uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-save
         with:
           path: airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/node_modules/
           key: >
@@ -247,7 +258,9 @@ jobs:
   check-translation-completness:
     timeout-minutes: 15
     name: "Check translation completeness"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -264,7 +277,9 @@ jobs:
   static-checks-basic-checks-only:
     timeout-minutes: 30
     name: "Static checks: basic checks only"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.basic-checks-only == 'true'
     steps:
       - name: "Cleanup repo"
@@ -300,21 +315,26 @@ jobs:
           SKIP: ${{ inputs.skip-prek-hooks }}
           COLUMNS: "202"
 
-  test-git-clone-on-windows:
-    timeout-minutes: 5
-    name: "Test git clone on Windows"
-    runs-on: ["windows-2025"]
-    steps:
-      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          fetch-depth: 2
-          persist-credentials: false
+  # FORK / CodeBuild-runner test: the CodeBuild project is x86/Ubuntu and cannot
+  # serve Windows jobs, so this Windows-only smoke test is disabled on the fork.
+  # Nothing else `needs` it. Re-enable before merging back to apache/airflow.
+  # test-git-clone-on-windows:
+  #   timeout-minutes: 5
+  #   name: "Test git clone on Windows"
+  #   runs-on: ["windows-2025"]
+  #   steps:
+  #     - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+  #       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+  #       with:
+  #         fetch-depth: 2
+  #         persist-credentials: false
 
   test-airflow-release-commands:
     timeout-minutes: 80
     name: "Test Airflow release commands"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -368,7 +388,9 @@ jobs:
   test-airflow-standalone:
     timeout-minutes: 30
     name: "Test Airflow standalone commands"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       AIRFLOW_HOME: ~/airflow
       FORCE_COLOR: 1

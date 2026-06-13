@@ -30,4 +30,8 @@ python -m pip install --upgrade "pip==${PIP_VERSION}"
 uv tool uninstall apache-airflow-breeze >/dev/null 2>&1 || true
 # shellcheck disable=SC2086
 uv tool install ${PYTHON_ARG} --force --editable ./dev/breeze/
-echo '/home/runner/.local/bin' >> "${GITHUB_PATH}"
+# Use $HOME/.local/bin (uv's default tool bin dir) rather than a hardcoded
+# /home/runner/.local/bin: GitHub-hosted runners run as the `runner` user, but
+# self-hosted runners (e.g. AWS CodeBuild) run as root, so breeze lands in
+# /root/.local/bin. $HOME resolves correctly on both.
+echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"

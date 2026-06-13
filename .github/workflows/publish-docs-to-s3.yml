@@ -75,7 +75,9 @@ jobs:
   build-info:
     timeout-minutes: 10
     name: "Build Info"
-    runs-on: ["ubuntu-24.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       VERBOSE: true
       REF: ${{ inputs.ref }}
@@ -230,7 +232,9 @@ jobs:
     needs: [build-info]
     timeout-minutes: 150
     name: "Build documentation"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     permissions:
       contents: read
       packages: read
@@ -317,7 +321,7 @@ jobs:
           -t "ghcr.io/apache/airflow/main/ci/python${PYTHON_MAJOR_MINOR_VERSION}:latest" --target main .
           -f Dockerfile.ci --platform linux/amd64
       - name: "Restore docs inventory cache"
-        uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-restore
         with:
           path: ./generated/_inventory_cache/
           key: cache-docs-inventory-v1
@@ -347,7 +351,7 @@ jobs:
             breeze build-docs ${SPHINX_INCLUDE_DOCS} --docs-only ${FAIL_ON_INVENTORIES}
           fi
       - name: "Save docs inventory cache"
-        uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-save
         if: >-
           steps.restore-docs-inventory-cache.outputs.stash-hit != 'true' &&
           steps.build-sphinx-docs.outputs.sphinx-build-skipped != 'true'
@@ -408,7 +412,9 @@ jobs:
     needs: [build-info]
     timeout-minutes: 30
     name: "Build Java SDK Javadoc"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     permissions:
       contents: read
       packages: read
@@ -469,7 +475,9 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

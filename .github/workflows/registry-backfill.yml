@@ -79,7 +79,9 @@ jobs:
       disable-airflow-repo-cache: "false"
 
   prepare:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       bucket: ${{ steps.destination.outputs.bucket }}
@@ -116,7 +118,9 @@ jobs:
 
   backfill:
     needs: [prepare, build-ci-image]
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -281,7 +285,9 @@ jobs:
 
   publish-versions:
     needs: [prepare, backfill]
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     name: "Publish versions.json"
     steps:
       - name: "Checkout repository"

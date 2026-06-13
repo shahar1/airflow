@@ -1,0 +1,86 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+---
+# FORK / CodeBuild-runner test only.
+#
+# Self-owned, S3-backed drop-in for apache/infrastructure-actions/stash/restore.
+# Self-hosted AWS CodeBuild runners can read/write an in-region S3 bucket for
+# essentially free (no GitHub 10 GB cache cap, no cross-cloud egress), so we
+# stash CI caches there instead of GitHub artifacts. Uses only bash + the AWS
+# CLI (present in the CodeBuild image, authenticated by the runner's service
+# role) — no third-party actions.
+#
+# Contract matches the original stash/restore: inputs `key` + `path`, output
+# `stash-hit`, and `fail-on-download`. `path` is accepted for compatibility;
+# the tarball is created with `tar -P` so entries restore to their original
+# (absolute or workspace-relative) locations regardless of `path`.
+name: 'Restore stash from S3'
+description: 'S3-backed drop-in for stash/restore (CodeBuild fork test).'
+inputs:
+  key:
+    description: 'Stash key; used as the S3 object name (slashes allowed).'
+    required: true
+  path:
+    description: 'Compatibility only — restore location is encoded in the archive.'
+    required: false
+    default: ''
+  bucket:
+    description: 'S3 bucket holding the stashes.'
+    required: false
+    default: 'airflow-ci-runner-cache'
+  only-current-branch:
+    description: 'Compatibility only — ignored (exact-key match).'
+    required: false
+    default: 'false'
+  fail-on-download:
+    description: 'Fail the step when the stash is not found.'
+    required: false
+    default: 'false'
+outputs:
+  stash-hit:
+    description: 'true if a stash was found and restored, false otherwise.'
+    value: ${{ steps.restore.outputs.stash-hit }}
+runs:
+  using: 'composite'
+  steps:
+    - id: restore
+      shell: bash
+      env:
+        STASH_KEY: ${{ inputs.key }}
+        STASH_BUCKET: ${{ inputs.bucket }}
+        FAIL_ON_DOWNLOAD: ${{ inputs.fail-on-download }}
+      run: |
+        set -uo pipefail
+        payload="${RUNNER_TEMP:-/tmp}/stash-restore-$$.tar.gz"
+        object="${STASH_KEY}.tar.gz"
+        # Probe existence first so a normal cold-cache miss doesn't dump an
+        # alarming `aws s3 cp` "fatal error: ... 404 ... HeadObject" into the log.
+        if aws s3api head-object --bucket "${STASH_BUCKET}" --key "${object}" >/dev/null 2>&1; then
+          aws s3 cp --only-show-errors "s3://${STASH_BUCKET}/${object}" "${payload}"
+          tar -xPzf "${payload}"
+          rm -f "${payload}"
+          echo "stash-hit=true" >> "${GITHUB_OUTPUT}"
+          echo "✅ Restored stash '${STASH_KEY}' from s3://${STASH_BUCKET}"
+        else
+          echo "stash-hit=false" >> "${GITHUB_OUTPUT}"
+          echo "Cache miss for '${STASH_KEY}' (normal until a run completes and saves it)"
+          if [ "${FAIL_ON_DOWNLOAD}" = "true" ]; then
+            echo "::error::fail-on-download is set and no stash was found for '${STASH_KEY}'"
+            exit 1
+          fi
+        fi

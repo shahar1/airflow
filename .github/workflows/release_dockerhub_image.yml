@@ -44,7 +44,9 @@ jobs:
   build-info:
     timeout-minutes: 10
     name: "Build Info"
-    runs-on: ["ubuntu-24.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     outputs:
       pythonVersions: ${{ steps.determine-python-versions.outputs.python-versions }}
       platformMatrix: ${{ steps.determine-matrix.outputs.platformMatrix }}
