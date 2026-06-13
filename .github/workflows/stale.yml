@@ -27,7 +27,9 @@ permissions:
   issues: write
 jobs:
   stale:
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       # Handle all PRs (45-day stale) and pending-response issues (14-day stale)
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0

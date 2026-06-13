@@ -40,7 +40,9 @@ jobs:
         # Track AMD; ARM is the canary slot and is reported separately by
         # `ci-arm.yml`'s notify-slack job on schedule events.
         workflow-id: ["ci-amd.yml"]
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

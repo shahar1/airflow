@@ -97,7 +97,9 @@ jobs:
     timeout-minutes: 45
     name: "Build & Publish Registry"
     needs: [build-ci-image]
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       SCARF_ANALYTICS: "false"
       DO_NOT_TRACK: "1"

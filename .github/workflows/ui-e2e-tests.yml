@@ -88,7 +88,9 @@ jobs:
   test-ui-e2e-tests:
     timeout-minutes: 90
     name: ${{ inputs.workflow-name || 'UI E2E Tests' }}
-    runs-on: ${{ fromJSON(inputs.runners || '["ubuntu-24.04"]') }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version || '3.10' }}"
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -120,15 +122,16 @@ jobs:
       - name: "Install Breeze (manual trigger)"
         uses: ./.github/actions/breeze
         if: github.event_name == 'workflow_dispatch'
-      - name: "Setup pnpm"
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271  # v6.0.9
-        with:
-          version: 9
-          run_install: false
       - name: "Setup node"
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 24
+      # FORK / CodeBuild-runner test: pnpm/action-setup's self-installer crashes
+      # (`paths[0] ... undefined`) running as root on the CodeBuild container.
+      # Install pnpm via npm instead (node provided by setup-node above).
+      - name: "Setup pnpm"
+        shell: bash
+        run: npm install -g pnpm@9  # zizmor: ignore[adhoc-packages]
       - name: "Compile UI assets (for image build fallback)"
         if: github.event_name == 'workflow_dispatch'
         run: |

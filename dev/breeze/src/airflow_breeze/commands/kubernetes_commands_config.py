@@ -95,6 +95,7 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--rebuild-base-image",
                 "--copy-local-sources",
                 "--use-uv",
+                "--github-repository",
             ],
         },
         {
@@ -260,6 +261,7 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--executor",
                 "--lang-sdk-test",
                 "--force-venv-setup",
+                "--github-repository",
             ],
         },
         {
@@ -316,7 +318,15 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--force-venv-setup",
             ],
         },
-        {"name": "Build image flags", "options": ["--rebuild-base-image", "--use-uv", "--skip-image-build"]},
+        {
+            "name": "Build image flags",
+            "options": [
+                "--rebuild-base-image",
+                "--use-uv",
+                "--skip-image-build",
+                "--github-repository",
+            ],
+        },
         {"name": "UI flags", "options": ["--skip-compile-ui-assets"]},
     ],
 }

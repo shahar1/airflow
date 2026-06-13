@@ -48,7 +48,9 @@ permissions:
   pull-requests: write
 jobs:
   backport:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
 
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"

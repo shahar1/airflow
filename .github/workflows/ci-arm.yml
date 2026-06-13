@@ -25,23 +25,28 @@
 # print-platform job. Edit both files together when changing pipeline shape.
 name: Tests (ARM)
 on:  # yamllint disable-line rule:truthy
-  schedule:
-    # ARM canary runs 2x/day (07:28, 19:28), interleaved with AMD's 2x/day (01:58, 13:58)
-    # in `ci-amd.yml` so a full-matrix canary still runs roughly every ~6h (alternating
-    # architecture). The `:28` vs AMD's `:58` offset keeps the two from competing for
-    # runners at exactly the same minute.
-    - cron: '28 7,19 * * *'
-  push:
-    # Post-merge pushes to release-prep / providers branches run on both
-    # AMD and ARM (the matching block lives in the other wrapper too —
-    # `check-ci-workflows-in-sync` enforces they stay identical). `main` is
-    # intentionally NOT in this list: main pushes stay AMD-only via
-    # `ci-amd.yml`; ARM main coverage is the cron-driven canary above.
-    branches:
-      - v[0-9]+-[0-9]+-test
-      - providers-[a-z]+-?[a-z]*/v[0-9]+-[0-9]+
-      - chart/v[0-9]+-[0-9]+x-test
-      - airflow-ctl/v[0-9]+-[0-9]+-test
+  # FORK / CodeBuild-runner test: the CodeBuild project is x86/Ubuntu and cannot
+  # serve ARM jobs, so the auto-triggers below are disabled on the fork. Only the
+  # manual `workflow_dispatch` is kept (it still uses the original GitHub-hosted
+  # ARM runners if you choose to run it). Re-enable schedule/push before merging
+  # any of this back to apache/airflow.
+  # schedule:
+  #   # ARM canary runs 2x/day (07:28, 19:28), interleaved with AMD's 2x/day (01:58, 13:58)
+  #   # in `ci-amd.yml` so a full-matrix canary still runs roughly every ~6h (alternating
+  #   # architecture). The `:28` vs AMD's `:58` offset keeps the two from competing for
+  #   # runners at exactly the same minute.
+  #   - cron: '28 7,19 * * *'
+  # push:
+  #   # Post-merge pushes to release-prep / providers branches run on both
+  #   # AMD and ARM (the matching block lives in the other wrapper too —
+  #   # `check-ci-workflows-in-sync` enforces they stay identical). `main` is
+  #   # intentionally NOT in this list: main pushes stay AMD-only via
+  #   # `ci-amd.yml`; ARM main coverage is the cron-driven canary above.
+  #   branches:
+  #     - v[0-9]+-[0-9]+-test
+  #     - providers-[a-z]+-?[a-z]*/v[0-9]+-[0-9]+
+  #     - chart/v[0-9]+-[0-9]+x-test
+  #     - airflow-ctl/v[0-9]+-[0-9]+-test
   workflow_dispatch:
 permissions:
   # All other permissions are set to none by default

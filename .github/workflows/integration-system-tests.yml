@@ -75,7 +75,9 @@ jobs:
     timeout-minutes: 30
     if: inputs.testable-core-integrations != '[]'
     name: "Integration core ${{ matrix.integration }}"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -126,7 +128,9 @@ jobs:
     timeout-minutes: 30
     if: inputs.testable-providers-integrations != '[]' && inputs.skip-providers-tests != 'true'
     name: "Integration: providers ${{ matrix.integration }}"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -176,7 +180,9 @@ jobs:
     timeout-minutes: 30
     if: inputs.run-system-tests == 'true'
     name: "System Tests"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       BACKEND: "postgres"
       BACKEND_VERSION: ${{ inputs.default-postgres-version }}

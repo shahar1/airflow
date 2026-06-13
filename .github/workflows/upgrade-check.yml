@@ -41,7 +41,9 @@ jobs:
     timeout-minutes: 45
     name: >-
       [${{ inputs.target-branch }}] Upgrade checks and PR
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - name: >-
           [${{ inputs.target-branch }}] Cleanup repo

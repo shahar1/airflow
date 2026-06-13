@@ -25,7 +25,16 @@ DOCKER_COMPOSE_HOST_PORT = os.environ.get("HOST_PORT", "localhost:8080")
 DEFAULT_PYTHON_MAJOR_MINOR_VERSION = "3.10"
 DEFAULT_DOCKER_IMAGE = f"ghcr.io/apache/airflow/main/prod/python{DEFAULT_PYTHON_MAJOR_MINOR_VERSION}:latest"
 DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE") or DEFAULT_DOCKER_IMAGE
-os.environ["AIRFLOW_UID"] = str(os.getuid())
+
+# Run the airflow containers as this uid. Normally the host user's uid so bind-mounted files
+# stay writable. But when CI runs as root (e.g. CodeBuild self-hosted runners) os.getuid() is 0,
+# which would make the containers run as root — and the image's `pip` wrapper refuses to run as
+# root (it exits 1). With `set -e` in the entrypoint that turns any _PIP_ADDITIONAL_REQUIREMENTS
+# startup install into a crash loop (the container exits before the server starts), so
+# `docker compose up --wait` fails. Fall back to the image's default `airflow` user (50000) so
+# the containers are non-root; bind-mounted dirs are made writable for it in conftest.
+AIRFLOW_UID = os.getuid() or 50000
+os.environ["AIRFLOW_UID"] = str(AIRFLOW_UID)
 
 DOCKER_COMPOSE_PATH = (
     AIRFLOW_ROOT_PATH / "airflow-core" / "docs" / "howto" / "docker-compose" / "docker-compose.yaml"

@@ -80,7 +80,9 @@ permissions:
   contents: read
 jobs:
   update-constraints:
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     timeout-minutes: 80
     name: "Update constraints"
     permissions:
@@ -124,7 +126,9 @@ jobs:
   # Constraint commits are now handled by the dedicated update-constraints-on-push workflow
   # triggered when uv.lock changes are pushed to main/test branches.
   dependency-upgrade-summary:
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     needs: [update-constraints]
     if: inputs.upgrade-to-newer-dependencies == 'true' && inputs.platform == 'linux/amd64'
     name: "Deps ${{ matrix.python-version }}:${{ matrix.constraints-mode }}"

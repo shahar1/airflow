@@ -52,7 +52,9 @@ jobs:
     name: >-
       Unit tests Helm: ${{ matrix.helm-test-package }}
       (K8S ${{ matrix.kubernetes-version }})
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -98,7 +100,9 @@ jobs:
   tests-helm-release:
     timeout-minutes: 80
     name: "Release Helm"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{inputs.default-python-version}}"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,6 +124,13 @@ jobs:
         run: rm -rf dist/*
       - name: "Setup k8s/helm environment"
         run: breeze k8s setup-env
+      # FORK / CodeBuild-runner test: breeze installs helm to
+      # $GITHUB_WORKSPACE/.venv/bin, but the host-level chart lint step
+      # (verify_helm_chart_package.py) needs `helm` on PATH. GitHub-hosted
+      # runners ship helm preinstalled; the CodeBuild container does not.
+      - name: "Put breeze helm on PATH"
+        run: |  # zizmor: ignore[github-env]
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "${GITHUB_PATH}"
       - name: "Install helm gpg plugin"
         run: >
           breeze k8s shell -c "helm plugin install https://github.com/technosophos/helm-gpg
@@ -142,7 +153,13 @@ jobs:
         env:
           SIGN_WITH: dev@airflow.apache.org
       - name: "Fetch Git Tags"
-        run: git fetch --tags
+        # FORK / CodeBuild-runner test: the helm-chart release tags
+        # (helm-chart/1.15.0, /1.16.0, ...) that the issue-content step diffs
+        # live in apache/airflow, not the fork, so fetch them explicitly here.
+        run: |
+          git fetch --tags
+          apache_url=https://github.com/apache/airflow.git
+          git fetch "${apache_url}" "refs/tags/helm-chart/*:refs/tags/helm-chart/*" || true
       - name: "Test helm chart issue generation"
         run: >
           breeze release-management generate-issue-content-helm-chart --limit-pr-count 2

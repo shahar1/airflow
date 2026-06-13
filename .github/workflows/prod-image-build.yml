@@ -115,7 +115,9 @@ jobs:
   build-prod-packages:
     name: "Build Airflow and provider distributions"
     timeout-minutes: 10
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.prod-image-build == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
@@ -195,7 +197,9 @@ jobs:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     timeout-minutes: 80
     name: "Build PROD ${{ inputs.build-type }} image ${{ matrix.python-version }}"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     needs:
       - build-prod-packages
     env:
@@ -284,7 +288,7 @@ jobs:
           breeze prod-image save --platform "${PLATFORM}" --image-file-dir "/mnt"
         if: inputs.upload-image-artifact == 'true'
       - name: "Stash PROD docker image ${{ env.PYTHON_MAJOR_MINOR_VERSION }}"
-        uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-save
         with:
           key: prod-image-save-v3-${{ inputs.platform }}-${{ env.PYTHON_MAJOR_MINOR_VERSION }}
           path: "/mnt/prod-image-save-*-${{ env.PYTHON_MAJOR_MINOR_VERSION }}.tar"
