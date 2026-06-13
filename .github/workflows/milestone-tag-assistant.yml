@@ -34,7 +34,9 @@ permissions:
 jobs:
   get-pr-info:
     name: "Get PR information"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     outputs:
       should-run: ${{ steps.pr-info.outputs.should-run }}
       pr-number: ${{ steps.pr-info.outputs.pr-number }}
@@ -94,7 +96,9 @@ jobs:
 
   set-milestone:
     name: "Set milestone on merged PR"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     needs: get-pr-info
     if: ${{ needs.get-pr-info.outputs.should-run == 'true' }}
 

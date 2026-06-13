@@ -25,17 +25,22 @@
 # print-platform job. Edit both files together when changing pipeline shape.
 name: Tests (ARM)
 on:  # yamllint disable-line rule:truthy
-  schedule:
-    - cron: '28 1,3,7,9,13,15,19,21 * * *'
-  push:
-    # Post-merge pushes to release-prep / providers branches run on both
-    # AMD and ARM (the matching block lives in the other wrapper too —
-    # `check-ci-workflows-in-sync` enforces they stay identical). `main` is
-    # intentionally NOT in this list: main pushes stay AMD-only via
-    # `ci-amd.yml`; ARM main coverage is the cron-driven canary above.
-    branches:
-      - v[0-9]+-[0-9]+-test
-      - providers-[a-z]+-?[a-z]*/v[0-9]+-[0-9]+
+  # FORK / CodeBuild-runner test: the CodeBuild project is x86/Ubuntu and cannot
+  # serve ARM jobs, so the auto-triggers below are disabled on the fork. Only the
+  # manual `workflow_dispatch` is kept (it still uses the original GitHub-hosted
+  # ARM runners if you choose to run it). Re-enable schedule/push before merging
+  # any of this back to apache/airflow.
+  # schedule:
+  #   - cron: '28 1,3,7,9,13,15,19,21 * * *'
+  # push:
+  #   # Post-merge pushes to release-prep / providers branches run on both
+  #   # AMD and ARM (the matching block lives in the other wrapper too —
+  #   # `check-ci-workflows-in-sync` enforces they stay identical). `main` is
+  #   # intentionally NOT in this list: main pushes stay AMD-only via
+  #   # `ci-amd.yml`; ARM main coverage is the cron-driven canary above.
+  #   branches:
+  #     - v[0-9]+-[0-9]+-test
+  #     - providers-[a-z]+-?[a-z]*/v[0-9]+-[0-9]+
   workflow_dispatch:
 permissions:
   # All other permissions are set to none by default

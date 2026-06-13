@@ -133,7 +133,12 @@ permissions:
   contents: read
 jobs:
   tests:
-    timeout-minutes: 65
+    # Fork CI on CodeBuild: runners are slower and more CPU-contended than
+    # GitHub-hosted, so serial DB suites (e.g. MySQL API...CLI with
+    # use_xdist=False) exceed the upstream 65-min budget. The Postgres
+    # equivalent finishes ~58m; MySQL crosses 65m and GitHub cancels it.
+    # Headroom for CodeBuild; revert before upstreaming.
+    timeout-minutes: 120
     # yamllint disable rule:line-length
     name: "\
       ${{ inputs.test-scope == 'All' && '' || inputs.test-scope == 'Quarantined' && 'Qrnt' || inputs.test-scope }}\
@@ -141,7 +146,9 @@ jobs:
       ${{ inputs.test-group == 'providers' && 'prov' || inputs.test-group}}:\
       ${{ inputs.test-name }}${{ inputs.test-name-separator }}${{ matrix.backend-version }}:\
       ${{ matrix.python-version}}:${{ matrix.test-types.description }}"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       max-parallel: 20

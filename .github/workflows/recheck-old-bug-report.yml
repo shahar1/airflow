@@ -26,7 +26,9 @@ permissions:
   issues: write
 jobs:
   recheck-old-bug-report:
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     steps:
       - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899  # v10.3.0
         with:

@@ -52,11 +52,17 @@ runs:
       run: ./scripts/ci/install_breeze.sh
       env:
         PYTHON_VERSION: "${{ inputs.python-version }}"
-    - name: "Free space"
-      shell: bash
-      run: breeze ci free-space
-      env:
-        AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
+    # FORK / CodeBuild-runner test: disabled. `breeze ci free-space` runs
+    # `docker system prune --all --force --volumes`, which on the CodeBuild
+    # Docker-in-Docker daemon leaves /var/lib/docker/tmp broken and makes the
+    # next `docker pull` fail (`open /var/lib/docker/tmp/GetImageBlob...: no such
+    # file or directory`). Ephemeral CodeBuild instances start with ample disk,
+    # so freeing space is unnecessary here. Re-enable before merging upstream.
+    # - name: "Free space"
+    #   shell: bash
+    #   run: breeze ci free-space
+    #   env:
+    #     AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
     - name: "Get Python version"
       shell: bash
       run: >

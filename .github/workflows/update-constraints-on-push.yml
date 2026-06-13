@@ -38,7 +38,9 @@ env:
 jobs:
   build-info:
     name: "Build info"
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     outputs:
       default-branch: ${{ steps.selective-checks.outputs.default-branch }}
       default-constraints-branch: ${{ steps.selective-checks.outputs.default-constraints-branch }}
@@ -116,7 +118,9 @@ jobs:
       use-uv: "true"
 
   update-constraints:
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     timeout-minutes: 20
     name: "Commit and push constraints"
     needs: [build-info, generate-constraints]
@@ -160,7 +164,9 @@ jobs:
 
   notify-on-failure:
     name: "Notify on failure"
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     needs: [build-info, build-ci-images, generate-constraints, update-constraints]
     if: failure()
     env:
