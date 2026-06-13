@@ -64,6 +64,31 @@ class _AbsolutePriorityWeightStrategy(PriorityWeightStrategy):
         return ti.task.priority_weight
 
 
+def _get_relative_weight_sum(task, *, upstream: bool) -> int:
+    """
+    Return the summed priority weight of ``task``'s transitive relatives.
+
+    The per-task sums are computed once for the whole Dag (see
+    ``GenericDAGNode.get_relative_weight_sums``) and memoized on the Dag object.
+    Computing the priority weight of every task in a Dag run otherwise traverses
+    the task graph once per task (``O(n * (V + E))``); sharing the result turns
+    that into a single pass. A Dag's topology and per-task priority weights are
+    fixed once the Dag is built, so the memo stays valid for the Dag object's
+    lifetime and is recomputed for free whenever a fresh Dag is deserialized.
+    """
+    dag = task.get_dag()
+    cache_attr = "_upstream_weight_sums" if upstream else "_downstream_weight_sums"
+    sums = getattr(dag, cache_attr, None)
+    if sums is None:
+        weights = {task_id: t.priority_weight for task_id, t in dag.task_dict.items()}
+        sums = task.get_relative_weight_sums(weights, upstream=upstream)
+        # If the Dag uses __slots__ and cannot hold the memo, fall back to
+        # recomputing each call (still correct, just not shared).
+        with suppress(AttributeError, TypeError):
+            setattr(dag, cache_attr, sums)
+    return sums.get(task.task_id, 0)
+
+
 class _DownstreamPriorityWeightStrategy(PriorityWeightStrategy):
     """Priority weight strategy that uses the sum of the priority weights of all downstream tasks."""
 
@@ -73,10 +98,7 @@ class _DownstreamPriorityWeightStrategy(PriorityWeightStrategy):
         dag = ti.task.get_dag()
         if dag is None:
             return ti.task.priority_weight
-        return ti.task.priority_weight + sum(
-            dag.task_dict[task_id].priority_weight
-            for task_id in ti.task.get_flat_relative_ids(upstream=False)
-        )
+        return ti.task.priority_weight + _get_relative_weight_sum(ti.task, upstream=False)
 
 
 class _UpstreamPriorityWeightStrategy(PriorityWeightStrategy):
@@ -88,9 +110,7 @@ class _UpstreamPriorityWeightStrategy(PriorityWeightStrategy):
         dag = ti.task.get_dag()
         if dag is None:
             return ti.task.priority_weight
-        return ti.task.priority_weight + sum(
-            dag.task_dict[task_id].priority_weight for task_id in ti.task.get_flat_relative_ids(upstream=True)
-        )
+        return ti.task.priority_weight + _get_relative_weight_sum(ti.task, upstream=True)
 
 
 @cache
