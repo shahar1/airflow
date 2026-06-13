@@ -26,13 +26,96 @@
 # `docker run ...` (the "Cleanup repo" step) no longer hits Docker Hub's
 # anonymous pull rate limit on AWS's shared egress IPs.
 #
+# NOTE: a buildspec-override runner build does NOT check out the repository
+# (only this buildspec file is downloaded), so every command here must be
+# self-contained -- it cannot call a script committed under scripts/.
+#
 # Requires two project environment variables:
 #   DOCKERHUB_USERNAME - Plaintext
 #   DOCKERHUB_TOKEN    - Secrets Manager (a Docker Hub access token)
 version: 0.2
+
+env:
+  # Commands below use bash features (set -o pipefail); the CodeBuild default
+  # Linux shell is /bin/sh (dash), which does not support them.
+  shell: bash
 
 phases:
   pre_build:
     commands:
       - echo "Logging in to Docker Hub as ${DOCKERHUB_USERNAME}"
       - echo "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+      # Widen Docker's bridge-network address pools. Parallel breeze chunks each
+      # create their own docker-compose network; Docker's default pools only give
+      # ~31 networks, so on this high-core instance the extra chunks fail with
+      # "all predefined address pools have been fully subnetted". We carve a /14
+      # into /24s (1024 networks). The base stays inside 172.16.0.0/12 (Docker's
+      # own default range, known to work here) and uses 172.16.0.0/14, which
+      # avoids the AWS default VPC range 172.31.0.0/16. If this runner is ever
+      # attached to a VPC inside 172.16.0.0/14, change the base below.
+      - |
+        set -euo pipefail
+        pools='[{"base":"172.16.0.0/14","size":24}]'
+        sudo mkdir -p /etc/docker
+        # Optional: move Docker's data-root onto a RAM-backed tmpfs to speed up the
+        # heavy in-container I/O (provider installs, image layers). Enable by
+        # setting the project env var DOCKER_DATA_ROOT_TMPFS_GB to a size in GB;
+        # leave it unset/0 to keep the data-root on disk. tmpfs is real RAM, so
+        # size it well below total RAM (leave headroom for the parallel build
+        # processes) -- an explicit cap makes overflow a recoverable ENOSPC rather
+        # than an OOM kill. overlay2-on-tmpfs is unsupported-but-works on modern
+        # kernels; this is an experiment, so validate before relying on it.
+        data_root=""
+        if [ "${DOCKER_DATA_ROOT_TMPFS_GB:-0}" -gt 0 ] 2>/dev/null; then
+          echo "Mounting ${DOCKER_DATA_ROOT_TMPFS_GB}G tmpfs for Docker data-root"
+          sudo mkdir -p /mnt/docker-ram
+          sudo mount -t tmpfs -o "size=${DOCKER_DATA_ROOT_TMPFS_GB}g,mode=0711" \
+            tmpfs /mnt/docker-ram
+          data_root=',"data-root":"/mnt/docker-ram"'
+        fi
+        merge="{\"default-address-pools\":${pools}${data_root}}"
+        if [ -s /etc/docker/daemon.json ] && command -v jq >/dev/null 2>&1; then
+          tmp="$(mktemp)"
+          sudo jq --argjson m "${merge}" '. + $m' /etc/docker/daemon.json >"${tmp}"
+          sudo mv "${tmp}" /etc/docker/daemon.json
+        else
+          echo "${merge}" | sudo tee /etc/docker/daemon.json >/dev/null
+        fi
+        echo "Wrote /etc/docker/daemon.json:"
+        sudo cat /etc/docker/daemon.json
+        # CodeBuild images have no systemd, so restart dockerd directly,
+        # preserving the args the agent started it with. default-address-pools
+        # is only read at daemon startup, so a restart is required.
+        dockerd_args="$(ps -o args= -C dockerd 2>/dev/null | head -n1 | sed -E 's#^[^ ]*dockerd##' || true)"
+        echo "Stopping dockerd (args:${dockerd_args})"
+        sudo pkill -TERM -x dockerd || true
+        # Wait for the dockerd PROCESS to exit -- the API stops responding on the
+        # first SIGTERM, so polling `docker info` returns too early and the new
+        # dockerd then races a still-alive PID and a stale pidfile.
+        for _ in $(seq 1 60); do pgrep -x dockerd >/dev/null 2>&1 || break; sleep 1; done
+        if pgrep -x dockerd >/dev/null 2>&1; then
+          echo "dockerd still alive after SIGTERM; sending SIGKILL"
+          sudo pkill -KILL -x dockerd || true
+          sleep 3
+        fi
+        sudo rm -f /var/run/docker.pid
+        echo "Starting dockerd with widened address pools"
+        sudo bash -c "nohup dockerd ${dockerd_args} >/var/log/dockerd-codebuild.log 2>&1 &"
+        for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+        if ! docker info >/dev/null 2>&1; then
+          echo "ERROR: dockerd did not restart" >&2
+          sudo tail -n 50 /var/log/dockerd-codebuild.log >&2 || true
+          exit 1
+        fi
+        docker info --format 'Configured address pools: {{json .DefaultAddressPools}}'
+      # Raise kernel limits needed to run multiple kind (Kubernetes-in-Docker)
+      # clusters. GitHub-hosted runners ship these; self-hosted ones don't.
+      # `sysctl -w` applies them now -- appending to /etc/sysctl.conf alone has
+      # no effect during an ephemeral build. Failures are tolerated (|| true) so
+      # a read-only/namespaced sysctl can never fail pre_build and hang the job.
+      - |
+        sudo modprobe nf_conntrack 2>/dev/null || true
+        sudo sysctl -w fs.inotify.max_user_watches=524288 || true
+        sudo sysctl -w fs.inotify.max_user_instances=512 || true
+        sudo sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 || true
+        echo "Applied kind-related kernel limits"
