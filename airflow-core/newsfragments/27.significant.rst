@@ -1,0 +1,8 @@
+New asset-triggered Dags no longer receive historical asset events
+
+Previously, when an asset-triggered Dag was added to a deployment whose assets
+already had event history, its first run consumed every asset event ever
+recorded for those assets. A newly added Dag now only receives events that
+occurred after it started scheduling on the asset. Although this may change the
+first run of Dags added to assets with existing history, the previous behavior
+is considered a bug (see issue #39456).
