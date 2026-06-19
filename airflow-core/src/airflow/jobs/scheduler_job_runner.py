@@ -2592,7 +2592,18 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                             ),
                         ),
                         AssetEvent.timestamp <= triggered_date,
-                        AssetEvent.timestamp > func.coalesce(cte.c.previous_dag_run_run_after, date.min),
+                        # On the first ever run there is no previous run to bound the window, so fall
+                        # back to when the Dag started scheduling on its assets. This stops a newly
+                        # added Dag from consuming the whole historical backlog of events that predate
+                        # it (#39456). created_at survives re-parsing: references are updated in place.
+                        AssetEvent.timestamp
+                        > func.coalesce(
+                            cte.c.previous_dag_run_run_after,
+                            select(func.min(DagScheduleAssetReference.created_at))
+                            .where(DagScheduleAssetReference.dag_id == dag.dag_id)
+                            .scalar_subquery(),
+                            date.min,
+                        ),
                     )
                     .order_by(AssetEvent.timestamp.asc(), AssetEvent.id.asc())
                 )
