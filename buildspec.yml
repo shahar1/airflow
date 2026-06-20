@@ -60,10 +60,18 @@ phases:
         # operator tests (providers/standard) open many fds (venvs + subprocesses) and
         # exhaust the CodeBuild container's low default nofile, failing the compat job with
         # "OSError: [Errno 24] Too many open files" (then pytest cannot even write its junit
-        # XML). GitHub-hosted runners ship a high limit; match it via the daemon's
-        # default-ulimits so every test container inherits it. (System-wide caps are raised
-        # in the kernel-limits block below so the daemon can grant this.)
-        ulimits='{"nofile":{"Name":"nofile","Hard":1048576,"Soft":1048576}}'
+        # XML). Set this at the daemon's default-ulimits so every test container inherits it.
+        #
+        # Keep the SOFT limit moderate (65536) and the HARD limit high (1048576): a high *soft*
+        # limit is a known performance trap -- code that closes every fd up to the soft limit
+        # before fork/exec (RPM, old pexpect/ptyprocess, pinned in lowest-dependency runs) then
+        # makes ~1M close() calls per spawn. Measured locally: ~515 ms/spawn at soft=1048576 vs
+        # ~32 ms at 65536. Under the all-providers parallel run that saturates the daemon and
+        # times out unrelated container creates (e.g. the mongo testcontainers tests). 65536 is
+        # ample for the venv tests (64x the ~1024 default) while staying fast; anything needing
+        # more raises its own soft limit up to the hard cap. (System-wide caps are raised in the
+        # kernel-limits block below so the daemon can grant the hard limit.)
+        ulimits='{"nofile":{"Name":"nofile","Hard":1048576,"Soft":65536}}'
         # Route Docker Hub pulls through Google's public, unauthenticated mirror to dodge
         # Docker Hub's anonymous pull-rate limit on AWS's shared egress IPs. Tools that pull
         # from *inside* the test container (e.g. testcontainers' docker-py client for the mongo
