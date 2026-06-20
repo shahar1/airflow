@@ -317,8 +317,11 @@ def _setup_java_sdk_integration(dot_env_file, tmp_dir):
     # * HOME is set explicitly because --user runs as the host UID which has no
     #   entry in the container's /etc/passwd; Docker would otherwise inherit the
     #   image's HOME (/root) which the non-root process cannot write to.
-    # * files/m2 is mounted directly as ~/.m2 so publishToMavenLocal writes
-    #   there without nesting, and its contents are visible on the host.
+    # * files/m2 is mounted at /workspace-home/.m2, and both Gradle runs pin
+    #   -Dmaven.repo.local to it so the published plugin survives between the two
+    #   --rm containers. The pin is required because a root (uid 0) runner resolves
+    #   the JVM user.home to /root regardless of HOME, so mavenLocal() would
+    #   otherwise default to an ephemeral /root/.m2 and the bundle step would fail.
     console.print("[yellow]Publishing Java SDK artifacts to local Maven repository...")
     JAVA_SDK_MAVEN_CACHE_PATH.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -342,6 +345,11 @@ def _setup_java_sdk_integration(dot_env_file, tmp_dir):
             "./gradlew",
             "publishToMavenLocal",
             "-PskipSigning=true",
+            # Pin the Maven local repo to the mounted .m2 explicitly. On a root (uid 0) runner
+            # the JVM resolves user.home to /root (passwd) regardless of HOME, so mavenLocal()
+            # would default to /root/.m2 (ephemeral per --rm container) and the published plugin
+            # would be lost before the `bundle` step below could find it.
+            "-Dmaven.repo.local=/workspace-home/.m2/repository",
             "--no-daemon",
         ],
         check=True,
@@ -367,6 +375,9 @@ def _setup_java_sdk_integration(dot_env_file, tmp_dir):
             "eclipse-temurin:17-jdk",
             "../gradlew",
             "bundle",
+            # Resolve the plugin published above from the mounted .m2 (see publishToMavenLocal);
+            # required so a root runner does not look in an empty /root/.m2.
+            "-Dmaven.repo.local=/workspace-home/.m2/repository",
             "--no-daemon",
         ],
         check=True,
