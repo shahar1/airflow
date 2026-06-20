@@ -371,7 +371,12 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
       entry in the container's /etc/passwd; Docker would otherwise inherit the
       image's HOME (/root) which the non-root process cannot write to.
     * files/m2 is mounted directly as ~/.m2 so publishToMavenLocal writes
-      there without nesting, and its contents are visible on the host.
+      there without nesting, and its contents are visible on the host. The
+      -Dmaven.repo.local pin is required on top of HOME because a root (uid 0)
+      runner — as on the CodeBuild container — resolves the JVM user.home to
+      /root via /etc/passwd regardless of HOME, so mavenLocal() would otherwise
+      default to an ephemeral /root/.m2 and the published plugin would be lost
+      before the `bundle` step could find it.
     """
     if native:
         cwd = workdir
@@ -404,6 +409,7 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
             "eclipse-temurin:17-jdk",
             "/repo/java-sdk/gradlew",
             "--no-daemon",
+            "-Dmaven.repo.local=/workspace-home/.m2/repository",
             *gradle_argv,
         ]
     return subprocess.run(argv, cwd=cwd, check=True, capture_output=capture_output, text=True)
