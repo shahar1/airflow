@@ -131,3 +131,11 @@ phases:
         sudo sysctl -w fs.nr_open=2097152 || true
         sudo sysctl -w fs.file-max=2097152 || true
         echo "Applied kind-related kernel limits"
+      # Pre-pull images that provider tests launch via testcontainers. Inside the test
+      # container, testcontainers' docker-py client pulls anonymously (it has no
+      # logged-in Docker Hub creds) and hits the anonymous rate limit, failing the
+      # container create with "No such image". Pulling here on the authenticated host
+      # daemon puts the image in the shared local store so testcontainers finds it
+      # without pulling. Only the mongo provider tests use testcontainers (mongo:8.0).
+      - |
+        docker pull mongo:8.0 || true
