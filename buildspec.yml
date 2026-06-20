@@ -64,6 +64,13 @@ phases:
         # default-ulimits so every test container inherits it. (System-wide caps are raised
         # in the kernel-limits block below so the daemon can grant this.)
         ulimits='{"nofile":{"Name":"nofile","Hard":1048576,"Soft":1048576}}'
+        # Route Docker Hub pulls through Google's public, unauthenticated mirror to dodge
+        # Docker Hub's anonymous pull-rate limit on AWS's shared egress IPs. Tools that pull
+        # from *inside* the test container (e.g. testcontainers' docker-py client for the mongo
+        # provider tests) cannot use the host's `docker login`, so their anonymous pulls/manifest
+        # checks otherwise stall and time out. The mirror only affects docker.io; other registries
+        # are untouched, and it falls back to Docker Hub if the mirror lacks an image.
+        mirrors='["https://mirror.gcr.io"]'
         sudo mkdir -p /etc/docker
         # Optional: move Docker's data-root onto a RAM-backed tmpfs to speed up the
         # heavy in-container I/O (provider installs, image layers). Enable by
@@ -81,7 +88,7 @@ phases:
             tmpfs /mnt/docker-ram
           data_root=',"data-root":"/mnt/docker-ram"'
         fi
-        merge="{\"default-address-pools\":${pools},\"default-ulimits\":${ulimits}${data_root}}"
+        merge="{\"default-address-pools\":${pools},\"default-ulimits\":${ulimits},\"registry-mirrors\":${mirrors}${data_root}}"
         if [ -s /etc/docker/daemon.json ] && command -v jq >/dev/null 2>&1; then
           tmp="$(mktemp)"
           sudo jq --argjson m "${merge}" '. + $m' /etc/docker/daemon.json >"${tmp}"
