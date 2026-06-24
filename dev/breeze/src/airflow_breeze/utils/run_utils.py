@@ -198,6 +198,24 @@ def run_command(
             return ex
 
 
+# Env vars whose *values* must never be printed to logs — the VERBOSE command dump is
+# world-readable in CI. Matched case-insensitively against the variable NAME so the verbose
+# output stays useful for debugging while secrets are hidden. Note: we deliberately do not
+# match a bare "PAT" (it would also redact PATH); DOCKERHUB_TOKEN etc. are caught by "TOKEN".
+SENSITIVE_ENV_KEY_PATTERN = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_?KEY", re.IGNORECASE
+)
+
+
+def _redacted_env_value(key: str, val: str) -> str:
+    """Return ``***`` for secret-looking variables (by name), the value otherwise.
+
+    Without this, ``VERBOSE`` runs print the full environment (e.g. ``DOCKERHUB_TOKEN``,
+    ``AWS_SECRET_ACCESS_KEY``) verbatim into CI logs — a credential leak on public repos.
+    """
+    return "***" if SENSITIVE_ENV_KEY_PATTERN.search(key) else val
+
+
 def get_environments_to_print(env: Mapping[str, str] | None):
     if not env:
         return ""
@@ -208,10 +226,14 @@ def get_environments_to_print(env: Mapping[str, str] | None):
             system_env[key] = val
         else:
             my_env[key] = val
-    env_to_print = "".join(f'{key}="{val}" \\\n' for (key, val) in sorted(system_env.items()))
+    env_to_print = "".join(
+        f'{key}="{_redacted_env_value(key, val)}" \\\n' for (key, val) in sorted(system_env.items())
+    )
     env_to_print += r"""\
 """
-    env_to_print += "".join(f'{key}="{val}" \\\n' for (key, val) in sorted(my_env.items()))
+    env_to_print += "".join(
+        f'{key}="{_redacted_env_value(key, val)}" \\\n' for (key, val) in sorted(my_env.items())
+    )
     return env_to_print
 
 

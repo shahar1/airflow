@@ -52,11 +52,31 @@ runs:
       run: ./scripts/ci/install_breeze.sh
       env:
         PYTHON_VERSION: "${{ inputs.python-version }}"
-    - name: "Free space"
+    # FORK / CodeBuild-runner test: `breeze ci free-space` runs
+    # `docker system prune --all --force --volumes`, which on the CodeBuild
+    # Docker-in-Docker daemon leaves /var/lib/docker/tmp broken and makes the
+    # next `docker pull` fail (`open /var/lib/docker/tmp/GetImageBlob...: no such
+    # file or directory`), so the upstream step stays disabled here. But the
+    # provider-distributions Compat install (~100 wheels + apache-airflow) does
+    # exhaust the root volume (`No space left on device`), so reclaim space the
+    # CodeBuild-safe way: clear the uv cache and prune docker BUILD CACHE ONLY
+    # (no `--volumes`/`--all`, which is what broke DinD above). Re-enable the
+    # upstream `breeze ci free-space` before merging upstream.
+    # - name: "Free space"
+    #   shell: bash
+    #   run: breeze ci free-space
+    #   env:
+    #     AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
+    - name: "Free space (CodeBuild-safe)"
       shell: bash
-      run: breeze ci free-space
-      env:
-        AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
+      run: |
+        # Guard in-shell on the runner's OS env var: the GHA `env` context does not
+        # expose CodeBuild's CODEBUILD_BUILD_ID (it is not workflow-defined), so this
+        # mirrors scripts/ci/make_mnt_writeable.sh / move_docker_to_mnt.sh.
+        if [[ -n "${CODEBUILD_BUILD_ID:-}" ]]; then
+          uv cache clean || true
+          docker builder prune --all --force || true
+        fi
     - name: "Get Python version"
       shell: bash
       run: >
