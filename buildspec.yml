@@ -66,11 +66,14 @@ phases:
         if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
           sudo mkdir -p /sys/fs/cgroup/init 2>/dev/null || true
           # move every process to the init sub-cgroup
-          while read -r _pid; do echo "${_pid}" | sudo tee /sys/fs/cgroup/init/cgroup.procs >/dev/null 2>&1 || true; done < /sys/fs/cgroup/cgroup.procs || true
+          for _pid in $(cat /sys/fs/cgroup/cgroup.procs 2>/dev/null); do
+            echo "${_pid}" | sudo tee /sys/fs/cgroup/init/cgroup.procs >/dev/null 2>&1 || true
+          done
           # enable all controllers for the root's children (+cpu +cpuset +io +memory +pids ...)
           _ctrls="$(sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers)"
           echo "${_ctrls}" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
-          echo "cgroup v2 delegation: subtree_control=$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo '?')"
+          _now="$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo '?')"
+          echo "cgroup v2 delegation: subtree_control=${_now}"
         fi
         pools='[{"base":"172.16.0.0/14","size":24}]'
         # Raise the per-container open-file limit. The PythonVirtualenv/ExternalPython
