@@ -159,6 +159,14 @@ jobs:
           SKIP_GROUP_OUTPUT: "true"
           DEFAULT_BRANCH: ${{ inputs.branch }}
           RUFF_FORMAT: "github"
+          # FORK / CodeBuild-runner test: prek runs breeze-backed hooks with
+          # concurrency == cpu_count (36 here). They share one generated docker
+          # env file (scripts/ci/docker-compose/_generated_docker.env); a concurrent
+          # hook regenerates it without PYTHONWARNINGS, so the provider-yaml /
+          # template-fields containers (which assert PYTHONWARNINGS=default) read a
+          # clobbered file and fail. Setting it for every hook keeps it in every
+          # invocation's keyset, so the shared file always carries it.
+          PYTHONWARNINGS: "default"
       - name: "Show prek log on failure"
         run: cat ~/.cache/prek/prek.log || true
         if: failure()
