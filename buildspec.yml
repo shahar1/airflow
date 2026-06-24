@@ -55,6 +55,23 @@ phases:
       # attached to a VPC inside 172.16.0.0/14, change the base below.
       - |
         set -euo pipefail
+        # cgroup v2 delegation for nested containers. KinD's node kubelet fails with
+        # "required cgroups disabled" because the controllers are not delegated down to
+        # the (doubly) nested node container -- docker:dind's entrypoint normally does
+        # this, but CodeBuild's standard image starts dockerd without it. Move processes
+        # out of the root cgroup (a cgroup with member procs cannot enable controllers in
+        # subtree_control) and enable every available controller for children. Heavily
+        # guarded: a failure here must never abort pre_build. Done before the dockerd
+        # restart below so the new daemon's containers inherit the delegated hierarchy.
+        if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+          sudo mkdir -p /sys/fs/cgroup/init 2>/dev/null || true
+          # move every process to the init sub-cgroup
+          while read -r _pid; do echo "${_pid}" | sudo tee /sys/fs/cgroup/init/cgroup.procs >/dev/null 2>&1 || true; done < /sys/fs/cgroup/cgroup.procs || true
+          # enable all controllers for the root's children (+cpu +cpuset +io +memory +pids ...)
+          _ctrls="$(sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers)"
+          echo "${_ctrls}" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
+          echo "cgroup v2 delegation: subtree_control=$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo '?')"
+        fi
         pools='[{"base":"172.16.0.0/14","size":24}]'
         # Raise the per-container open-file limit. The PythonVirtualenv/ExternalPython
         # operator tests (providers/standard) open many fds (venvs + subprocesses) and
