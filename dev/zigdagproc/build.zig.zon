@@ -1,0 +1,9 @@
+.{
+    .name = .zigdagproc,
+    .version = "0.17.0-dev.978+a078d55a2",
+    // zig-tree-sitter + tree-sitter core are vendored under vendor/ (their build.zig
+    // scripts use the removed `b.build_root` and don't build on this zig-dev).
+    .dependencies = .{},
+    .paths = .{""},
+    .fingerprint = 0xb5d8a70622e66597,
+}

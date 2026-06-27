@@ -350,3 +350,60 @@ def test_xcom_concat(run_ti, mock_supervisor_comms):
     states = [run_ti(dag, "pull_one", map_index) for map_index in range(5)]
     assert states == [TaskInstanceState.SUCCESS] * 5
     assert agg_results == {"a", "b", "c", 1, 2}
+
+
+class TestPlainXComArgResolveMappedGroup:
+    """Resolving a task inside a mapped task group from a task outside that group.
+
+    Regression tests for #69036 and #48005: the combined return value of a
+    mapped task group must always be a list (one element per expansion), even
+    when the group expanded only once or every expansion returned ``None``.
+    Previously this case was routed through ``xcom_pull`` pulling all map
+    indexes, which collapsed a single value to a bare scalar and an empty set
+    of values to ``None``.
+    """
+
+    @staticmethod
+    def _make_ti(*, upstream_map_indexes, computed):
+        ti = mock.MagicMock()
+        ti._upstream_map_indexes = upstream_map_indexes
+        ti._cached_template_context = {"expanded_ti_count": 1}
+        ti.get_relevant_upstream_map_indexes.return_value = computed
+        return ti
+
+    def test_resolve_returns_lazy_sequence_when_no_filtering(self):
+        from airflow.sdk.definitions.xcom_arg import PlainXComArg
+        from airflow.sdk.execution_time.lazy_sequence import LazyXComSequence
+
+        operator = mock.MagicMock()
+        operator.is_mapped = False
+        operator.task_id = "do_something"
+        operator.get_closest_mapped_task_group.return_value = mock.MagicMock()
+
+        arg = PlainXComArg(operator=operator, key="test")
+        ti = self._make_ti(upstream_map_indexes=None, computed=None)
+
+        resolved = arg.resolve({"ti": ti})
+
+        assert isinstance(resolved, LazyXComSequence)
+        assert resolved._xcom_arg is arg
+        assert resolved._ti is ti
+        ti.xcom_pull.assert_not_called()
+
+    def test_resolve_uses_xcom_pull_for_specific_index(self):
+        from airflow.sdk.definitions.xcom_arg import PlainXComArg
+
+        operator = mock.MagicMock()
+        operator.is_mapped = False
+        operator.task_id = "do_something"
+        operator.get_closest_mapped_task_group.return_value = mock.MagicMock()
+
+        arg = PlainXComArg(operator=operator, key="test")
+        ti = self._make_ti(upstream_map_indexes=None, computed=0)
+        ti.xcom_pull.return_value = "value-0"
+
+        resolved = arg.resolve({"ti": ti})
+
+        assert resolved == "value-0"
+        ti.xcom_pull.assert_called_once()
+        assert ti.xcom_pull.call_args.kwargs["map_indexes"] == 0

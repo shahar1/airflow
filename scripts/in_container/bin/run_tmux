@@ -156,7 +156,10 @@ fi
 if [[ ${STANDALONE_DAG_PROCESSOR} == "true" ]]; then
     tmux select-pane -t 3
     tmux split-window -h
-    if [[ ${BREEZE_DEBUG_DAG_PROCESSOR} == "true" ]]; then
+    if [[ ${USE_ZIG_DAG_PROCESSOR=} == "true" ]]; then
+        tmux set-option -p @airflow_component "DAG Processor (Zig, experimental)"
+        tmux send-keys '/opt/airflow/scripts/in_container/bin/run_zig_dag_processor' C-m
+    elif [[ ${BREEZE_DEBUG_DAG_PROCESSOR} == "true" ]]; then
         tmux set-option -p @airflow_component "DAG Processor(Debug Mode)"
         tmux send-keys "debugpy --listen 0.0.0.0:${BREEZE_DEBUG_DAG_PROCESSOR_PORT} --wait-for-client -m airflow dag-processor" C-m
     else

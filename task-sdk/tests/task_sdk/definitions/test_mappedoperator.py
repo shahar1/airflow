@@ -34,10 +34,14 @@ from airflow.sdk.definitions.xcom_arg import XComArg
 from airflow.sdk.execution_time.comms import (
     GetTICount,
     GetXCom,
+    GetXComCount,
+    GetXComSequenceItem,
     GetXComSequenceSlice,
     SetXCom,
     TICount,
+    XComCountResponse,
     XComResult,
+    XComSequenceIndexResult,
     XComSequenceSliceResult,
 )
 
@@ -659,6 +663,14 @@ def test_operator_mapped_task_group_receives_value(create_runtime_ti, mock_super
             task_id = msg.task_id
             values = [v for k, v in expected_values.items() if k[0] == task_id and k[1] is not None]
             return XComSequenceSliceResult(root=values)
+        elif isinstance(msg, GetXComCount):
+            # Length of the lazily-resolved aggregated XCom for a mapped task / group.
+            values = [v for k, v in expected_values.items() if k[0] == msg.task_id and k[1] is not None]
+            return XComCountResponse(len=len(values))
+        elif isinstance(msg, GetXComSequenceItem):
+            # Single element of the lazily-resolved aggregated XCom.
+            values = [v for k, v in expected_values.items() if k[0] == msg.task_id and k[1] is not None]
+            return XComSequenceIndexResult(root=values[msg.offset])
         elif isinstance(msg, GetTICount):
             # Handle TI count queries for upstream_map_indexes computation
             if msg.task_ids:

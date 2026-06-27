@@ -354,8 +354,17 @@ class PlainXComArg(XComArg):
                     ti_count=ti_count,
                     session=None,  # Not used in SDK implementation
                 )
-                # None means "no filtering needed" -> use NOTSET to pull all values
-                map_indexes = NOTSET if computed is None else computed
+                if computed is None:
+                    # The upstream lives in a mapped task group but the current task is
+                    # not part of that same expansion, so the group's per-index return
+                    # values must be combined into a single list (one element per
+                    # expansion). A LazyXComSequence always yields a list, including for
+                    # a single expansion (#69036) or when every value was None (#48005);
+                    # pulling all indexes via xcom_pull would instead collapse those to a
+                    # bare value or None. This mirrors the pre-3.2 server behaviour, which
+                    # returned ``list(range(mapped_ti_count))`` for this case.
+                    return LazyXComSequence(xcom_arg=self, ti=ti)
+                map_indexes = computed
         result = ti.xcom_pull(
             task_ids=task_id,
             key=self.key,

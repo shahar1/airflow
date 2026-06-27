@@ -191,7 +191,10 @@ def generate_mprocs_config() -> str:
 
     # Dag Processor (conditional)
     if get_env_bool("STANDALONE_DAG_PROCESSOR"):
-        if get_env_bool("BREEZE_DEBUG_DAG_PROCESSOR"):
+        if get_env_bool("USE_ZIG_DAG_PROCESSOR"):
+            # EXPERIMENTAL: native-Zig dag processor in place of `airflow dag-processor`.
+            dag_proc_cmd = "/opt/airflow/scripts/in_container/bin/run_zig_dag_processor"
+        elif get_env_bool("BREEZE_DEBUG_DAG_PROCESSOR"):
             port = get_env("BREEZE_DEBUG_DAG_PROCESSOR_PORT", "5685")
             dag_proc_cmd = f"debugpy --listen 0.0.0.0:{port} --wait-for-client -m airflow dag-processor"
         else:

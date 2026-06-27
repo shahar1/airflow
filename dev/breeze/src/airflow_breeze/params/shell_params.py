@@ -236,6 +236,7 @@ class ShellParams:
     skip_provider_dependencies_check: bool = False
     skip_ssh_setup: bool = os.environ.get("SKIP_SSH_SETUP", "false") == "true"
     standalone_dag_processor: bool = False
+    use_zig_dag_processor: bool = False
     start_airflow: bool = False
     test_type: str | None = None
     start_api_server_with_examples: bool = False
@@ -702,6 +703,7 @@ services:
         _set_var(_env, "SSH_PORT", None, SSH_PORT)
         _set_var(_env, "SKIP_ASSETS_COMPILATION", self.skip_assets_compilation)
         _set_var(_env, "STANDALONE_DAG_PROCESSOR", self.standalone_dag_processor)
+        _set_var(_env, "USE_ZIG_DAG_PROCESSOR", self.use_zig_dag_processor)
         _set_var(_env, "START_AIRFLOW", self.start_airflow)
         _set_var(_env, "TERMINAL_MULTIPLEXER", self.terminal_multiplexer)
         _set_var(_env, "SUSPENDED_PROVIDERS_FOLDERS", self.suspended_providers_folders)

@@ -422,6 +422,16 @@ option_standalone_dag_processor = click.option(
     help="Run standalone dag processor for start-airflow (required for Airflow 3).",
     envvar="STANDALONE_DAG_PROCESSOR",
 )
+option_use_zig_dag_processor = click.option(
+    "--use-zig-dag-processor",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="EXPERIMENTAL: use the native-Zig dag processor (dev/zigdagproc) instead of the "
+    "Python 'airflow dag-processor' in start-airflow. Build it first on the host: "
+    "(cd dev/zigdagproc && zig build).",
+    envvar="USE_ZIG_DAG_PROCESSOR",
+)
 option_terminal_multiplexer = click.option(
     "-t",
     "--terminal-multiplexer",

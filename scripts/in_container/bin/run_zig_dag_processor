@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# EXPERIMENTAL: run the native-Zig Dag processor (dev/zigdagproc) in place of
+# `airflow dag-processor`. Selected by `breeze start-airflow --use-zig-dag-processor`.
+# The host-built binary is mounted into the container and is ABI-compatible; it
+# writes the same serialized_dag rows (byte-identical dag_hash) the Python
+# processor would, so the scheduler/UI treat the Dags identically.
+set -euo pipefail
+
+BIN=/opt/airflow/dev/zigdagproc/zig-out/bin/zigdagproc
+DAGS="${AIRFLOW__CORE__DAGS_FOLDER:-/files/dags}"
+# In-container the metadata DB is the `postgres` compose service.
+DSN="${ZIGDAGPROC_DSN:-host=postgres port=5432 user=postgres password=airflow dbname=airflow}"
+
+if [[ ! -x "${BIN}" ]]; then
+    echo "============================================================================"
+    echo " EXPERIMENTAL Zig dag processor is not built."
+    echo " On the HOST run:   (cd dev/zigdagproc && zig build)"
+    echo " then restart breeze. Falling back to the Python 'airflow dag-processor'."
+    echo "============================================================================"
+    exec airflow dag-processor
+fi
+
+# Files outside the Zig subset (other operators, dynamic constructs) are handed to the
+# real Python processor so EVERY Dag still loads — Zig just fast-paths the ones it knows.
+FALLBACK=/opt/airflow/dev/zigdagproc/fallback.py
+
+echo "Starting EXPERIMENTAL native-Zig dag processor — watching ${DAGS} (Python fallback for the rest)"
+exec "${BIN}" \
+    --watch \
+    --dags-dir "${DAGS}" \
+    --dsn "${DSN}" \
+    --bundle dags-folder \
+    --processor-dags-folder "${DAGS}" \
+    --fallback "${FALLBACK}"

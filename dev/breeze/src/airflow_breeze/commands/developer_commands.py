@@ -78,6 +78,7 @@ from airflow_breeze.commands.common_options import (
     option_upgrade_sqlalchemy,
     option_use_airflow_version,
     option_use_uv,
+    option_use_zig_dag_processor,
     option_verbose,
     option_worker_types,
 )
@@ -579,6 +580,7 @@ option_executor_start_airflow = click.option(
 @option_python
 @option_restart
 @option_standalone_dag_processor
+@option_use_zig_dag_processor
 @option_terminal_multiplexer
 @option_use_uv
 @option_use_airflow_version
@@ -630,6 +632,7 @@ def start_airflow(
     restart: bool,
     skip_assets_compilation: bool,
     standalone_dag_processor: bool,
+    use_zig_dag_processor: bool,
     terminal_multiplexer: str,
     use_airflow_version: str | None,
     use_distributions_from_dist: bool,
@@ -735,6 +738,7 @@ def start_airflow(
         restart=restart,
         skip_assets_compilation=skip_assets_compilation,
         standalone_dag_processor=standalone_dag_processor,
+        use_zig_dag_processor=use_zig_dag_processor,
         start_airflow=True,
         terminal_multiplexer=terminal_multiplexer,
         use_airflow_version=use_airflow_version,
