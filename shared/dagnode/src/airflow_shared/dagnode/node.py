@@ -200,6 +200,92 @@ class GenericDAGNode(Generic[Dag, Task, TaskGroup]):
 
         return relatives
 
+    def get_relative_weight_sums(self, weights: dict[str, int], *, upstream: bool = False) -> dict[str, int]:
+        """
+        Sum ``weights`` over the transitive relatives of *every* task in the Dag.
+
+        Returns a mapping of ``task_id`` to the sum of ``weights`` over all of that
+        task's transitive relatives (upstream or downstream), excluding the task
+        itself. This is the batch equivalent of calling :meth:`get_flat_relative_ids`
+        once per task and summing, but it traverses the whole graph once instead of
+        once per task, turning ``n`` independent traversals (``O(n * (V + E))``) into
+        a single pass.
+
+        Reachable sets are deduplicated with integer bitsets -- one task per bit --
+        so each edge contributes a single C-level ``OR`` rather than a Python set
+        union. When every weight is equal (the common case: ``priority_weight``
+        defaults to 1 and is rarely customised) the per-task sum collapses to a
+        single C-level ``popcount``, which is dramatically faster than iterating the
+        reachable set.
+
+        Unlike :meth:`get_flat_relative_ids`, this always traverses to full depth.
+
+        :param weights: Mapping of ``task_id`` to its weight. Missing tasks count 0.
+        :param upstream: Whether to look for upstream or downstream relatives.
+        """
+        dag = self.get_dag()
+        if not dag:
+            return {}
+
+        # Assign each task a bit position so reachable sets can be deduped with int OR.
+        task_ids = list(dag.task_dict)
+        index = {task_id: i for i, task_id in enumerate(task_ids)}
+        children = [
+            [index[rel] for rel in dag.task_dict[task_id].get_direct_relative_ids(upstream)]
+            for task_id in task_ids
+        ]
+
+        reach = [0] * len(task_ids)  # reach[i] = bitset of i's transitive relatives
+        computed = bytearray(len(task_ids))
+        # Iterative post-order DFS with an explicit stack rather than recursion:
+        # Python's recursion limit makes a recursive walk blow up on very long
+        # routes (same reasoning as get_flat_relative_ids above). A node is only
+        # finalized once all of its direct relatives are, so its bitset is the OR of
+        # theirs. Each task is pushed once to expand its relatives and once
+        # (children_done) to assemble its bitset.
+        for root in range(len(task_ids)):
+            if computed[root]:
+                continue
+            stack: list[tuple[int, bool]] = [(root, False)]
+            # Tasks currently on the DFS path. A valid Dag is acyclic, so a relative
+            # is never re-encountered while on the path; guarding on it truncates
+            # back edges so a malformed (cyclic) graph still terminates.
+            on_path: set[int] = set()
+            while stack:
+                i, children_done = stack.pop()
+                if children_done:
+                    on_path.discard(i)
+                    bits = 0
+                    for child in children[i]:
+                        bits |= (1 << child) | reach[child]
+                    reach[i] = bits
+                    computed[i] = 1
+                elif not computed[i] and i not in on_path:
+                    on_path.add(i)
+                    stack.append((i, True))
+                    stack.extend(
+                        (child, False)
+                        for child in children[i]
+                        if not computed[child] and child not in on_path
+                    )
+
+        weight_list = [weights.get(task_id, 0) for task_id in task_ids]
+        uniform_weight = weight_list[0] if len(set(weight_list)) == 1 else None
+        sums: dict[str, int] = {}
+        for i, task_id in enumerate(task_ids):
+            bitset = reach[i]
+            if uniform_weight is not None:
+                # Every relative has the same weight, so the sum is weight * count.
+                sums[task_id] = uniform_weight * bitset.bit_count()
+            else:
+                total = 0
+                while bitset:
+                    low = bitset & -bitset
+                    total += weight_list[low.bit_length() - 1]
+                    bitset ^= low
+                sums[task_id] = total
+        return sums
+
     def get_flat_relatives(self, upstream: bool = False, depth: int | None = None) -> Collection[Task]:
         """
         Get a flat list of relatives, either upstream or downstream.
