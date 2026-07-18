@@ -76,6 +76,7 @@ _DEFAULT_SCOPESS = frozenset(
 
 LABEL_TASK_ID = "task_id"
 LABEL_DAG_ID = "dag_id"
+LABEL_RUN_ID = "run_id"
 LABEL_LOGICAL_DATE = "logical_date" if AIRFLOW_V_3_0_PLUS else "execution_date"
 LABEL_TRY_NUMBER = "try_number"
 
@@ -139,7 +140,8 @@ class StackdriverRemoteLogIO(LoggingMixin):
             method_name: str,
             event: structlog.typing.EventDict,
         ):
-            if not logger or not relative_path_from_logger(logger):
+            relative_path = relative_path_from_logger(logger) if logger else None
+            if not relative_path:
                 return event
 
             name = event.get("logger_name") or event.get("logger", "")
@@ -165,25 +167,20 @@ class StackdriverRemoteLogIO(LoggingMixin):
                 record.created = ct
                 record.msecs = int((ct - int(ct)) * 1000) + 0.0
 
-            ti = getattr(record, "task_instance", None)
+            # The supervisor writes this record, not the task subprocess, so
+            # ``record.task_instance`` is never set here; labels come from the log
+            # path template instead (dag_id=<x>/run_id=<x>/task_id=<x>/attempt=<N>.log).
             labels: dict[str, str] = {}
             if self.labels:
                 labels.update(self.labels)
-            if ti:
-                labels.update(_task_instance_to_labels(ti))
-            else:
-                if dag_id := event.get("dag_id"):
-                    labels[LABEL_DAG_ID] = str(dag_id)
-                if task_id := event.get("task_id"):
-                    labels[LABEL_TASK_ID] = str(task_id)
-                if run_id := event.get("run_id"):
-                    labels["run_id"] = str(run_id)
-                if try_number := event.get("try_number"):
-                    labels[LABEL_TRY_NUMBER] = str(try_number)
-                if map_index := event.get("map_index"):
-                    labels["map_index"] = str(map_index)
+            labels.update(_labels_from_relative_path(relative_path))
 
-            _transport.send(record, str(msg.get("event", "")), resource=self.resource, labels=labels)
+            try:
+                _transport.send(record, str(msg.get("event", "")), resource=self.resource, labels=labels)
+            except Exception as exc:
+                # Log delivery is best-effort: an IAM/gRPC/quota error from Cloud Logging must
+                # not crash the supervised process (scheduler, dag-processor, triggerer, worker).
+                _logger.warning("Failed to send log record to Stackdriver: %s", exc)
             return event
 
         return (proc,)
@@ -210,7 +207,15 @@ class StackdriverRemoteLogIO(LoggingMixin):
 
     def read(self, relative_path: str, ti: RuntimeTI) -> LogResponse:
         """Read logs from Stackdriver Logging using task instance labels."""
-        ti_labels = _task_instance_to_labels(ti)
+        # ``ti`` is a RuntimeTaskInstanceProtocol here (supervisor context, no DB access),
+        # which has no ``logical_date`` — filter on ``run_id`` instead, matching the labels
+        # written by ``proc()`` above.
+        ti_labels = {
+            LABEL_DAG_ID: ti.dag_id,
+            LABEL_TASK_ID: ti.task_id,
+            LABEL_RUN_ID: ti.run_id,
+            LABEL_TRY_NUMBER: str(ti.try_number),
+        }
         log_filter = self.prepare_log_filter(ti_labels)
         messages, end_of_log, _ = self.read_logs(log_filter, next_page_token=None, all_pages=True)
         return [f"Reading remote log from Stackdriver for {relative_path}"], [messages] if messages else []
@@ -276,6 +281,25 @@ class StackdriverRemoteLogIO(LoggingMixin):
             elif entry.text_payload:
                 messages.append(entry.text_payload)
         return "\n".join(messages), page.next_page_token
+
+
+def _labels_from_relative_path(relative_path: os.PathLike | str) -> dict[str, str]:
+    """
+    Parse dag_id/run_id/task_id/try_number labels out of the AF3 log path template.
+
+    AF3's default ``log_filename_template`` is
+    ``dag_id=<x>/run_id=<x>/task_id=<x>/[map_index=<x>/]attempt=<N>.log``, so every label
+    is recoverable from the path with no DB access.
+    """
+    labels: dict[str, str] = {}
+    for part in Path(relative_path).parts:
+        if part.startswith("attempt=") and part.endswith(".log"):
+            labels[LABEL_TRY_NUMBER] = part.removeprefix("attempt=").removesuffix(".log")
+            continue
+        key, sep, value = part.partition("=")
+        if sep:
+            labels[key] = value
+    return labels
 
 
 def _task_instance_to_labels(ti) -> dict[str, str]:

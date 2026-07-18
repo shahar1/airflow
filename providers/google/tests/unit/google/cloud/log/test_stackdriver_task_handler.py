@@ -111,6 +111,36 @@ class TestStackdriverRemoteLogIO:
         assert len(messages) == 1
         assert logs == []
 
+    @pytest.mark.skipif(
+        not AIRFLOW_V_3_0_PLUS, reason="run_id-only RuntimeTI filtering is an Airflow 3+ concept"
+    )
+    @mock.patch("airflow.providers.google.cloud.log.stackdriver_task_handler.get_credentials_and_project_id")
+    @mock.patch("airflow.providers.google.cloud.log.stackdriver_task_handler.LoggingServiceV2Client")
+    def test_read_logs_filters_by_run_id_without_logical_date(
+        self, mock_client, mock_get_creds_and_project_id
+    ):
+        """The supervisor's RuntimeTaskInstanceProtocol has no ``logical_date`` (no DB
+        access); ``read()`` must filter by ``run_id`` alone without touching it."""
+        mock_client.return_value.list_log_entries.return_value.pages = iter(
+            [_create_list_log_entries_response_mock(["MSG1"], None)]
+        )
+        mock_get_creds_and_project_id.return_value = ("creds", "project_id")
+
+        class _RuntimeTI:
+            task_id = "test_task"
+            dag_id = "test_dag"
+            run_id = "test_run"
+            try_number = 1
+
+        messages, logs = self.io.read(
+            "dag_id=test_dag/run_id=test_run/task_id=test_task/attempt=1.log", _RuntimeTI()
+        )
+
+        assert logs == ["MSG1"]
+        request = mock_client.return_value.list_log_entries.call_args.kwargs["request"]
+        assert 'labels.run_id="test_run"' in request.filter
+        assert "logical_date" not in request.filter
+
     @mock.patch("airflow.providers.google.cloud.log.stackdriver_task_handler.get_credentials_and_project_id")
     @mock.patch("airflow.providers.google.cloud.log.stackdriver_task_handler.gcp_logging.Client")
     def test_credentials(self, mock_client, mock_get_creds_and_project_id):
@@ -194,7 +224,9 @@ class TestStackdriverRemoteLogIO:
         "airflow.providers.google.cloud.log.stackdriver_task_handler.StackdriverRemoteLogIO.transport",
         new_callable=PropertyMock,
     )
-    def test_processors_fallback_to_event_labels(self, mock_transport_prop):
+    def test_processors_labels_from_relative_path(self, mock_transport_prop):
+        """Labels come from the log path template, since ``record.task_instance`` is
+        never set in supervisor context (the process writing the log record)."""
         mock_transport = mock.MagicMock()
         mock_transport_prop.return_value = mock_transport
 
@@ -203,20 +235,12 @@ class TestStackdriverRemoteLogIO:
             gcp_log_name="airflow",
         )
         logger = mock.MagicMock()
-        # Mock relative_path_from_logger to return something truthy
         with mock.patch(
             "airflow.sdk.log.relative_path_from_logger",
-            return_value="some/path.py",
+            return_value=Path("dag_id=test_dag_id/run_id=test_run_id/task_id=test_task_id/attempt=2.log"),
         ):
             proc = io.processors[0]
-            event = {
-                "event": "Test message",
-                "dag_id": "test_dag_id",
-                "task_id": "test_task_id",
-                "run_id": "test_run_id",
-                "try_number": 2,
-                "map_index": -1,
-            }
+            event = {"event": "Test message"}
 
             result = proc(logger, "info", event)
 
@@ -231,8 +255,35 @@ class TestStackdriverRemoteLogIO:
                 "task_id": "test_task_id",
                 "run_id": "test_run_id",
                 "try_number": "2",
-                "map_index": "-1",
             }
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_0_PLUS, reason="airflow.sdk.log only exists in Airflow 3+")
+    @mock.patch(
+        "airflow.providers.google.cloud.log.stackdriver_task_handler.StackdriverRemoteLogIO.transport",
+        new_callable=PropertyMock,
+    )
+    def test_processors_swallows_transport_send_errors(self, mock_transport_prop):
+        """A gRPC/IAM error from Cloud Logging must not crash the supervised process."""
+        mock_transport = mock.MagicMock()
+        mock_transport.send.side_effect = RuntimeError("permission denied")
+        mock_transport_prop.return_value = mock_transport
+
+        io = StackdriverRemoteLogIO(
+            base_log_folder=self.local_log_location,
+            gcp_log_name="airflow",
+        )
+        logger = mock.MagicMock()
+        with mock.patch(
+            "airflow.sdk.log.relative_path_from_logger",
+            return_value=Path("dag_id=d/run_id=r/task_id=t/attempt=1.log"),
+        ):
+            proc = io.processors[0]
+            event = {"event": "Test message"}
+
+            result = proc(logger, "info", event)
+
+        assert result == event
+        mock_transport.send.assert_called_once()
 
     @mock.patch("airflow.providers.google.cloud.log.stackdriver_task_handler.get_credentials_and_project_id")
     def test_prepare_log_filter(self, mock_get_creds_and_project_id):
