@@ -27,7 +27,9 @@ permissions:
 jobs:
   verify-release-calendar:
     name: "Verify release calendar"
-    runs-on: ["ubuntu-22.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     timeout-minutes: 10
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"

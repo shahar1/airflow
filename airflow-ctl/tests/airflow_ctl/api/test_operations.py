@@ -147,8 +147,13 @@ class TestBaseOperations:
 
     def test_server_connection_refused(self):
         client = make_api_client(base_url="http://localhost")
+        # FORK / CodeBuild-runner test: connecting to localhost yields
+        # "Connection refused" on GitHub-hosted runners but
+        # "[Errno 99] Cannot assign requested address" on the CodeBuild
+        # container, so accept either connection-failure message.
         with pytest.raises(
-            AirflowCtlConnectionException, match="Connection refused. Is the API server running?"
+            AirflowCtlConnectionException,
+            match="Connection refused. Is the API server running?|Cannot assign requested address",
         ):
             client.connections.get("1")
 

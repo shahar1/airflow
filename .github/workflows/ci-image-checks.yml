@@ -119,7 +119,9 @@ jobs:
   static-checks:
     timeout-minutes: 45
     name: "Static checks"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       UPGRADE_TO_NEWER_DEPENDENCIES: "${{ inputs.upgrade-to-newer-dependencies }}"
@@ -157,6 +159,14 @@ jobs:
           SKIP_GROUP_OUTPUT: "true"
           DEFAULT_BRANCH: ${{ inputs.branch }}
           RUFF_FORMAT: "github"
+          # FORK / CodeBuild-runner test: prek runs breeze-backed hooks with
+          # concurrency == cpu_count (36 here). They share one generated docker
+          # env file (scripts/ci/docker-compose/_generated_docker.env); a concurrent
+          # hook regenerates it without PYTHONWARNINGS, so the provider-yaml /
+          # template-fields containers (which assert PYTHONWARNINGS=default) read a
+          # clobbered file and fail. Setting it for every hook keeps it in every
+          # invocation's keyset, so the shared file always carries it.
+          PYTHONWARNINGS: "default"
       - name: "Show prek log on failure"
         run: cat ~/.cache/prek/prek.log || true
         if: failure()
@@ -176,7 +186,9 @@ jobs:
   build-docs:
     timeout-minutes: 150
     name: "Build documentation"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.docs-build == 'true'
     strategy:
       fail-fast: false
@@ -206,7 +218,7 @@ jobs:
           use-uv: ${{ inputs.use-uv }}
           make-mnt-writeable-and-cleanup: true
       - name: "Restore docs inventory cache"
-        uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-restore
         with:
           path: ./generated/_inventory_cache/
           key: cache-docs-inventory-v1
@@ -322,7 +334,7 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       - name: "Save docs inventory cache"
-        uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+        uses: ./.github/actions/stash-s3-save
         with:
           path: ./generated/_inventory_cache/
           key: cache-docs-inventory-v1
@@ -347,7 +359,9 @@ jobs:
       id-token: write
       contents: read
     needs: build-docs
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -470,7 +484,9 @@ jobs:
   test-python-api-client:
     timeout-minutes: 60
     name: "Test Python API client"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     if: inputs.run-api-codegen == 'true'
     env:
       BACKEND: "postgres"

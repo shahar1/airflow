@@ -72,7 +72,9 @@ jobs:
   prepare-install-verify-provider-distributions:
     timeout-minutes: 80
     name: "Providers ${{ matrix.package-format }} tests"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +181,9 @@ jobs:
     timeout-minutes: 80
     # yamllint disable rule:line-length
     name: Compat ${{ matrix.compat.airflow-version }}:P${{ matrix.compat.python-version }}:${{ matrix.compat.test-types.description }}
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     strategy:
       fail-fast: false
       matrix:
