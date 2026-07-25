@@ -70,7 +70,25 @@ runs:
         object="${STASH_KEY}.tar.gz"
         # Probe existence first so a normal cold-cache miss doesn't dump an
         # alarming `aws s3 cp` "fatal error: ... 404 ... HeadObject" into the log.
+        found=false
         if aws s3api head-object --bucket "${STASH_BUCKET}" --key "${object}" >/dev/null 2>&1; then
+          found=true
+        elif [ "${FAIL_ON_DOWNLOAD}" = "true" ]; then
+          # A required stash may still be seconds away: GitHub's re-run
+          # scheduling can release nested dependent jobs before the re-running
+          # producer job has saved its stash (upstream hardened the original
+          # stash action for the same race in apache/airflow#65268). Poll
+          # before hard-failing.
+          echo "Required stash '${STASH_KEY}' not there yet — retrying for up to 5 minutes..."
+          for _ in $(seq 1 30); do
+            sleep 10
+            if aws s3api head-object --bucket "${STASH_BUCKET}" --key "${object}" >/dev/null 2>&1; then
+              found=true
+              break
+            fi
+          done
+        fi
+        if [ "${found}" = "true" ]; then
           aws s3 cp --only-show-errors "s3://${STASH_BUCKET}/${object}" "${payload}"
           tar -xPzf "${payload}"
           rm -f "${payload}"
@@ -80,7 +98,7 @@ runs:
           echo "stash-hit=false" >> "${GITHUB_OUTPUT}"
           echo "Cache miss for '${STASH_KEY}' (normal until a run completes and saves it)"
           if [ "${FAIL_ON_DOWNLOAD}" = "true" ]; then
-            echo "::error::fail-on-download is set and no stash was found for '${STASH_KEY}'"
+            echo "::error::fail-on-download is set and no stash was found for '${STASH_KEY}' after retries"
             exit 1
           fi
         fi
