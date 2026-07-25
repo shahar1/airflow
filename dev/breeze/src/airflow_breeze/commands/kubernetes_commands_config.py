@@ -137,6 +137,7 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
             "options": [
                 "--python",
                 "--kubernetes-version",
+                "--github-repository",
             ],
         },
         {

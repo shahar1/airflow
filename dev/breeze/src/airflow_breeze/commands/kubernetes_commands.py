@@ -922,6 +922,7 @@ def build_k8s_image(
 @option_include_success_outputs
 @option_python_versions
 @option_kubernetes_versions
+@option_github_repository
 @option_verbose
 @option_dry_run
 def upload_k8s_image(
@@ -934,6 +935,7 @@ def upload_k8s_image(
     include_success_outputs: bool,
     python_versions: str,
     kubernetes_versions: str,
+    github_repository: str,
 ):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
@@ -961,6 +963,7 @@ def upload_k8s_image(
                             "python": combo.python_version,
                             "kubernetes_version": combo.kubernetes_version,
                             "output": outputs[index],
+                            "github_repository": github_repository,
                         },
                     )
                     for index, combo in enumerate(combos)
@@ -977,6 +980,7 @@ def upload_k8s_image(
             python=python,
             kubernetes_version=kubernetes_version,
             output=None,
+            github_repository=github_repository,
         )
         if return_code == 0:
             console_print("\n[warning]NEXT STEP:[/][info] You might now deploy airflow by:\n")

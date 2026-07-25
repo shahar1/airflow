@@ -148,7 +148,7 @@ jobs:
   tests-kubernetes-lang-sdk:
     timeout-minutes: 60
     name: "K8S Lang-SDK:${{ inputs.lang-sdk-kubernetes-combo }}"
-    runs-on: ${{ fromJSON(inputs.runners) }}
+    runs-on: airflow-runner-amd-xl
     env:
       DEBUG_RESOURCES: ${{ inputs.debug-resources }}
       INCLUDE_SUCCESS_OUTPUTS: ${{ inputs.include-success-outputs }}
