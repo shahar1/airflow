@@ -82,9 +82,7 @@ jobs:
   run-breeze-tests:
     timeout-minutes: 10
     name: Breeze unit tests
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     steps:
       - name: "Cleanup repo"
         shell: bash
@@ -102,9 +100,7 @@ jobs:
   run-breeze-integration-tests:
     timeout-minutes: 120
     name: Breeze integration tests
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: inputs.run-breeze-integration-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -135,9 +131,7 @@ jobs:
       fail-fast: false
       matrix:
         shared-distribution: ${{ fromJSON(inputs.shared-distributions-as-json) }}
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -161,9 +155,7 @@ jobs:
   tests-scripts:
     timeout-minutes: 10
     name: Scripts tests
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: inputs.run-scripts-tests == 'true'
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
@@ -189,9 +181,7 @@ jobs:
   tests-ui:
     timeout-minutes: 15
     name: React UI tests
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: inputs.run-ui-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -258,9 +248,7 @@ jobs:
   check-translation-completness:
     timeout-minutes: 15
     name: "Check translation completeness"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -277,9 +265,7 @@ jobs:
   static-checks-basic-checks-only:
     timeout-minutes: 30
     name: "Static checks: basic checks only"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: inputs.basic-checks-only == 'true'
     steps:
       - name: "Cleanup repo"
@@ -332,9 +318,7 @@ jobs:
   test-airflow-release-commands:
     timeout-minutes: 80
     name: "Test Airflow release commands"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -388,9 +372,7 @@ jobs:
   test-airflow-standalone:
     timeout-minutes: 30
     name: "Test Airflow standalone commands"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     env:
       AIRFLOW_HOME: ~/airflow
       FORCE_COLOR: 1

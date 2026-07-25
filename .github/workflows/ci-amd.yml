@@ -73,9 +73,7 @@ jobs:
   build-info:
     name: "Build info"
     # At build-info stage we do not yet have outputs so we need to hard-code the runs-on to public runners
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     outputs:
       all-python-versions-list-as-string: >-
         ${{ steps.selective-checks.outputs.all-python-versions-list-as-string }}
@@ -239,9 +237,7 @@ jobs:
   print-platform:
     name: "Platform: AMD"
     needs: [build-info]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     steps:
       - name: "Print architecture"
         run: "echo '## Architecture: AMD' >> $GITHUB_STEP_SUMMARY"
@@ -377,9 +373,7 @@ jobs:
     timeout-minutes: 45
     name: "MyPy providers checks"
     needs: [build-info, build-ci-images]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: needs.build-info.outputs.run-mypy-providers == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
@@ -421,9 +415,7 @@ jobs:
     timeout-minutes: 20
     name: "Migration round-trip check"
     needs: [build-info, build-ci-images]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: needs.build-info.outputs.has-migrations == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
@@ -997,9 +989,7 @@ jobs:
   tests-go-sdk:
     name: "Go SDK tests"
     needs: [build-info]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1036,9 +1026,7 @@ jobs:
   tests-java-sdk:
     name: "Java SDK tests"
     needs: [build-info]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1068,9 +1056,7 @@ jobs:
   build-java-sdk-docs:
     name: "Java SDK docs"
     needs: [build-info]
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1183,9 +1169,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'schedule' &&
       github.run_attempt == 1
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1294,9 +1278,7 @@ jobs:
       - tests-special
       - tests-with-lowest-direct-resolution-core
       - tests-with-lowest-direct-resolution-providers
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     if: needs.build-info.outputs.run-unit-tests == 'true'
     steps:
       - name: "Cleanup repo"

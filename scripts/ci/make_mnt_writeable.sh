@@ -17,11 +17,12 @@
 # under the License.
 function make_mnt_writeable {
     set -x
-    # FORK / CodeBuild-runner test: skip on AWS CodeBuild — there is no separate
-    # /mnt mount to prepare, and this is only needed for the GitHub-hosted
-    # docker-to-/mnt relocation, which is itself skipped on CodeBuild.
-    if [[ -n "${CODEBUILD_BUILD_ID:-}" ]]; then
-        echo "AWS CodeBuild detected — skipping /mnt preparation."
+    # FORK / self-hosted-runner test: skip on AWS self-hosted runners (CodeBuild or
+    # the EKS/ARC pods) — there is no separate /mnt mount to prepare, and this is
+    # only needed for the GitHub-hosted docker-to-/mnt relocation, which is itself
+    # skipped there.
+    if [[ -n "${CODEBUILD_BUILD_ID:-}${AIRFLOW_SELF_HOSTED_RUNNER:-}" ]]; then
+        echo "Self-hosted runner detected — skipping /mnt preparation."
         return 0
     fi
     echo "Investigating node disks"

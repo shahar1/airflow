@@ -636,8 +636,10 @@ services:
         _set_var(_env, "CELERY_FLOWER", self.celery_flower)
         _set_var(_env, "CLEAN_AIRFLOW_INSTALLATION", self.clean_airflow_installation)
         _set_var(_env, "CI", None, "false")
-        # Forwarded so in-container tests can detect a CodeBuild self-hosted runner
-        # (e.g. to skip testcontainers-backed tests that hang under nested DinD).
+        # Forwarded so in-container tests can detect an AWS self-hosted runner —
+        # CodeBuild or the EKS/ARC pods — (e.g. to skip testcontainers-backed
+        # tests that hang under nested DinD).
+        _set_var(_env, "AIRFLOW_SELF_HOSTED_RUNNER", None, None)
         _set_var(_env, "CODEBUILD_BUILD_ID", None, None)
         _set_var(_env, "CI_BUILD_ID", None, "0")
         _set_var(_env, "CI_EVENT_TYPE", None, GithubEvents.PULL_REQUEST.value)

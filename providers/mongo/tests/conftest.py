@@ -76,14 +76,14 @@ def _wait_for_mongo_ready(url: str, timeout: int = 60) -> None:
 
 @pytest.fixture(scope="session")
 def mongodb_container():
-    # FORK / CodeBuild-runner test: skip the testcontainers-backed MongoDB tests on the
-    # CodeBuild self-hosted runner. With pytest-xdist the session fixture runs per worker,
-    # so ~16 MongoDB containers are created at once; under nested Docker-in-Docker the
-    # daemon stops responding and `create_container` hangs past the setup timeout. These
-    # tests still run on GitHub-hosted runners. (CODEBUILD_BUILD_ID is forwarded into the
-    # container by breeze's ShellParams.)
-    if os.environ.get("CODEBUILD_BUILD_ID"):
-        pytest.skip("MongoDB testcontainers tests are skipped on the CodeBuild self-hosted runner")
+    # FORK / self-hosted-runner test: skip the testcontainers-backed MongoDB tests on the
+    # AWS self-hosted runners (CodeBuild or the EKS/ARC pods). With pytest-xdist the
+    # session fixture runs per worker, so ~16 MongoDB containers are created at once;
+    # under nested Docker-in-Docker the daemon stops responding and `create_container`
+    # hangs past the setup timeout. These tests still run on GitHub-hosted runners.
+    # (Both env vars are forwarded into the container by breeze's ShellParams.)
+    if os.environ.get("CODEBUILD_BUILD_ID") or os.environ.get("AIRFLOW_SELF_HOSTED_RUNNER"):
+        pytest.skip("MongoDB testcontainers tests are skipped on self-hosted AWS runners")
     # Retry container start to absorb transient Docker Hub failures (e.g.
     # registry-auth timeouts) so a single registry blip does not cascade
     # into setup errors across the whole mongo test suite.

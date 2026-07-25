@@ -408,8 +408,8 @@ def _collapse_to_single_node_config(config: str, output: Output | None) -> str:
         control_plane.setdefault("extraPortMappings", []).extend(worker_port_mappings)
     parsed["nodes"] = [control_plane]
     get_console(output=output).print(
-        "[warning]CODEBUILD_BUILD_ID detected — using a single-node kind cluster because the "
-        "worker kubelet fails to join under Docker-in-Docker.[/]"
+        "[warning]Self-hosted Docker-in-Docker runner detected — using a single-node kind "
+        "cluster because the worker kubelet fails to join under Docker-in-Docker.[/]"
     )
     return yaml.safe_dump(parsed, sort_keys=False)
 
@@ -431,7 +431,7 @@ def set_random_cluster_ports(python: str, kubernetes_version: str, output: Outpu
         .replace("{{FORWARDED_PORT_NUMBER}}", str(forwarded_port_number))
         .replace("{{API_SERVER_PORT}}", str(k8s_api_server_port))
     )
-    if os.environ.get("CODEBUILD_BUILD_ID"):
+    if os.environ.get("CODEBUILD_BUILD_ID") or os.environ.get("AIRFLOW_SELF_HOSTED_RUNNER"):
         config = _collapse_to_single_node_config(config, output)
     cluster_conf_path.write_text(config)
     get_console(output=output).print(f"[info]Config created in {cluster_conf_path}:\n")

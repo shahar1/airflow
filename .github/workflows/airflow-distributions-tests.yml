@@ -72,9 +72,7 @@ jobs:
   distributions-tests:
     timeout-minutes: ${{ fromJSON(inputs.test-timeout) }}
     name: ${{ inputs.distribution-name }}:P${{ matrix.python-version }} tests
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     strategy:
       fail-fast: false
       max-parallel: 20

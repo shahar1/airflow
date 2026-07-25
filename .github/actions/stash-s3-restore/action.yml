@@ -42,7 +42,7 @@ inputs:
   bucket:
     description: 'S3 bucket holding the stashes.'
     required: false
-    default: 'airflow-ci-runner-cache'
+    default: 'airflow-ci-runner-cache-us-east-2'
   only-current-branch:
     description: 'Compatibility only — ignored (exact-key match).'
     required: false

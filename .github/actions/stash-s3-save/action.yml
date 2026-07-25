@@ -35,7 +35,7 @@ inputs:
   bucket:
     description: 'S3 bucket to store the stash in.'
     required: false
-    default: 'airflow-ci-runner-cache'
+    default: 'airflow-ci-runner-cache-us-east-2'
   if-no-files-found:
     description: "'error' to fail when path matches nothing, otherwise 'warn'."
     required: false

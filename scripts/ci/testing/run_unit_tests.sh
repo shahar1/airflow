@@ -30,13 +30,13 @@ fi
 TEST_GROUP=${1}
 TEST_SCOPE=${2}
 
-# FORK / CodeBuild-runner test: the `--use-xdist` Non-DB suites default the pytest-xdist
-# worker count to `multiprocessing.cpu_count()` (36 on the GENERAL1_XLARGE box). 36 workers
-# each importing the full provider set OOM-kill the 72 GB box (exit 137). Cap PARALLELISM so
+# FORK / self-hosted-runner test: the `--use-xdist` Non-DB suites default the pytest-xdist
+# worker count to `multiprocessing.cpu_count()` (32-36 on the self-hosted boxes). That many
+# workers each importing the full provider set OOM-kill the box (exit 137). Cap PARALLELISM so
 # `breeze testing ... --use-xdist` runs `-n 16` instead. 16 (not the wasteful 8) keeps the box
 # busy while staying well under the memory ceiling; tune upward in follow-up runs. Re-enable a
 # proper memory-aware cap upstream before merging.
-if [[ -n "${CODEBUILD_BUILD_ID:-}" && -z "${PARALLELISM:-}" ]]; then
+if [[ -n "${CODEBUILD_BUILD_ID:-}${AIRFLOW_SELF_HOSTED_RUNNER:-}" && -z "${PARALLELISM:-}" ]]; then
     export PARALLELISM=16
 fi
 

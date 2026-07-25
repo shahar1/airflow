@@ -146,9 +146,7 @@ jobs:
       ${{ inputs.test-group == 'providers' && 'prov' || inputs.test-group}}:\
       ${{ inputs.test-name }}${{ inputs.test-name-separator }}${{ matrix.backend-version }}:\
       ${{ matrix.python-version}}:${{ matrix.test-types.description }}"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     strategy:
       fail-fast: false
       max-parallel: 20

@@ -88,9 +88,7 @@ jobs:
   test-ui-e2e-tests:
     timeout-minutes: 90
     name: ${{ inputs.workflow-name || 'UI E2E Tests' }}
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: airflow-runner-amd-xl
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version || '3.10' }}"
       GITHUB_REPOSITORY: ${{ github.repository }}

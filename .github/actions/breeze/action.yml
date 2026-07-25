@@ -67,13 +67,14 @@ runs:
     #   run: breeze ci free-space
     #   env:
     #     AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
-    - name: "Free space (CodeBuild-safe)"
+    - name: "Free space (self-hosted-safe)"
       shell: bash
       run: |
-        # Guard in-shell on the runner's OS env var: the GHA `env` context does not
+        # Guard in-shell on the runner's OS env vars: the GHA `env` context does not
         # expose CodeBuild's CODEBUILD_BUILD_ID (it is not workflow-defined), so this
-        # mirrors scripts/ci/make_mnt_writeable.sh / move_docker_to_mnt.sh.
-        if [[ -n "${CODEBUILD_BUILD_ID:-}" ]]; then
+        # mirrors scripts/ci/make_mnt_writeable.sh / move_docker_to_mnt.sh. The EKS/ARC
+        # runner pods export AIRFLOW_SELF_HOSTED_RUNNER instead.
+        if [[ -n "${CODEBUILD_BUILD_ID:-}${AIRFLOW_SELF_HOSTED_RUNNER:-}" ]]; then
           uv cache clean || true
           docker builder prune --all --force || true
         fi
