@@ -193,6 +193,7 @@ KUBERNETES_PARAMETERS: dict[str, list[dict[str, str | list[str]]]] = {
                 "--dags-path",
                 "--dags-dest",
                 "--deploy",
+                "--github-repository",
             ],
         },
     ],

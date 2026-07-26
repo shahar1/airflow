@@ -1008,10 +1008,11 @@ def _build_skaffold_config(
     dags_relative_path: str,
     dags_dest: str,
     log_level: str,
+    github_repository: str = "apache/airflow",
 ) -> dict[str, Any]:
     from packaging.version import Version
 
-    params = BuildProdParams(python=python)
+    params = BuildProdParams(python=python, github_repository=github_repository)
     use_flask_appbuilder = Version(python) < Version("3.13")
     auth_manager = (
         "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
@@ -1694,6 +1695,7 @@ def deploy_airflow(
 @option_dags_path
 @option_dags_dest
 @option_skaffold_deploy
+@option_github_repository
 @option_verbose
 @option_dry_run
 @click.argument("skaffold_args", nargs=-1, type=click.UNPROCESSED)
@@ -1708,6 +1710,7 @@ def dev(
     dags_dest: str,
     deploy: bool,
     skaffold_args: tuple[str, ...],
+    github_repository: str = "apache/airflow",
 ):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
@@ -1761,6 +1764,7 @@ def dev(
         dags_relative_path=dags_relative_path,
         dags_dest=dags_dest,
         log_level=log_level,
+        github_repository=github_repository,
     )
     if not deploy:
         console_print(
@@ -2986,8 +2990,10 @@ def _lang_sdk_build_java_worker_image(
     return LANG_SDK_JAVA_WORKER_IMAGE
 
 
-def _lang_sdk_deploy_airflow(python: str, kubernetes_version: str, output: Output | None) -> None:
-    params = BuildProdParams(python=python)
+def _lang_sdk_deploy_airflow(
+    python: str, kubernetes_version: str, output: Output | None, github_repository: str = "apache/airflow"
+) -> None:
+    params = BuildProdParams(python=python, github_repository=github_repository)
     image = params.airflow_image_kubernetes
     get_console(output=output).print("[info]Upgrading airflow Helm release with lang-SDK values")
     run_command_with_k8s_env(
@@ -3115,7 +3121,7 @@ def _setup_lang_sdk_test(
         _run_lang_sdk_parallel(steps, output=output)
         _lang_sdk_upload_artifacts(staging, python, kubernetes_version, output)
     _lang_sdk_apply_configmaps_and_secret(python, kubernetes_version, go_image, java_image, output)
-    _lang_sdk_deploy_airflow(python, kubernetes_version, output)
+    _lang_sdk_deploy_airflow(python, kubernetes_version, output, github_repository=github_repository)
 
 
 @kubernetes_group.command(
