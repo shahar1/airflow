@@ -60,7 +60,6 @@ permissions:
   contents: read
 jobs:
   tests-kubernetes:
-    if: false  # TEMP fast-validation trim - revert immediately after
     timeout-minutes: 60
     name: "K8S System:${{ matrix.executor }}-${{ matrix.kubernetes-combo }}-${{ matrix.use-standard-naming }}"
     runs-on: airflow-runner-amd-xl

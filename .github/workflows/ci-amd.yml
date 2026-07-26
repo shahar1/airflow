@@ -235,7 +235,6 @@ jobs:
           PR_LABELS: ${{ steps.source-run-info.outputs.pr-labels }}
 
   print-platform:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Platform: AMD"
     needs: [build-info]
     runs-on: airflow-runner-amd-xl
@@ -244,7 +243,6 @@ jobs:
         run: "echo '## Architecture: AMD' >> $GITHUB_STEP_SUMMARY"
 
   basic-tests:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Basic tests"
     needs: [build-info]
     uses: ./.github/workflows/basic-tests.yml
@@ -294,7 +292,6 @@ jobs:
     if: needs.build-info.outputs.ci-image-build == 'true'
 
   additional-ci-image-checks:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Additional CI image checks"
     needs: [build-info, build-ci-images]
     uses: ./.github/workflows/additional-ci-image-checks.yml
@@ -339,7 +336,6 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   ci-image-checks:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "CI image checks"
     needs: [build-info, build-ci-images]
     uses: ./.github/workflows/ci-image-checks.yml
@@ -374,11 +370,11 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   mypy-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     timeout-minutes: 45
     name: "MyPy providers checks"
     needs: [build-info, build-ci-images]
     runs-on: airflow-runner-amd-xl
+    if: needs.build-info.outputs.run-mypy-providers == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -416,11 +412,11 @@ jobs:
           INCLUDE_MYPY_VOLUME: "false"
 
   migration-round-trip:
-    if: false  # TEMP fast-validation trim - revert immediately after
     timeout-minutes: 20
     name: "Migration round-trip check"
     needs: [build-info, build-ci-images]
     runs-on: airflow-runner-amd-xl
+    if: needs.build-info.outputs.has-migrations == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -456,13 +452,16 @@ jobs:
           DEFAULT_BRANCH: ${{ needs.build-info.outputs.default-branch }}
 
   providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Provider distributions tests"
     uses: ./.github/workflows/test-providers.yml
     needs: [build-info, build-ci-images]
     permissions:
       contents: read
       packages: read
+    if: >
+      needs.build-info.outputs.skip-providers-tests != 'true' &&
+      needs.build-info.outputs.latest-versions-only != 'true' &&
+      needs.build-info.outputs.run-unit-tests == 'true'
     with:
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
@@ -480,7 +479,6 @@ jobs:
       use-uv: ${{ needs.build-info.outputs.use-uv }}
 
   tests-helm:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Helm tests"
     uses: ./.github/workflows/helm-tests.yml
     needs: [build-info, build-ci-images]
@@ -494,6 +492,11 @@ jobs:
       helm-test-kubernetes-versions: ${{ needs.build-info.outputs.helm-test-kubernetes-versions }}
       default-python-version: "${{ needs.build-info.outputs.default-python-version }}"
       use-uv: ${{ needs.build-info.outputs.use-uv }}
+    if: >
+      needs.build-info.outputs.run-helm-tests == 'true' &&
+      needs.build-info.outputs.default-branch == 'main' &&
+      needs.build-info.outputs.latest-versions-only != 'true'
+
   tests-kustomize-overlays:
     name: "Kustomize overlays smoke tests"
     uses: ./.github/workflows/kustomize-overlays-tests.yml
@@ -528,7 +531,6 @@ jobs:
 
 
   tests-postgres-core:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Postgres tests: core"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -555,9 +557,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-postgres-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Postgres tests: providers"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -584,9 +586,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-mysql-core:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "MySQL tests: core"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -613,9 +615,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true' && needs.build-info.outputs.platform == 'linux/amd64'
 
   tests-mysql-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "MySQL tests: providers"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -642,9 +644,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true' && needs.build-info.outputs.platform == 'linux/amd64'
 
   tests-sqlite-core:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Sqlite tests: core"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -673,9 +675,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-sqlite-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Sqlite tests: providers"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -704,9 +706,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-non-db-core:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Non-DB tests: core"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -734,9 +736,9 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-non-db-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Non-DB tests: providers"
     uses: ./.github/workflows/run-unit-tests.yml
     needs: [build-info, build-ci-images]
@@ -764,15 +766,20 @@ jobs:
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-special:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Special tests"
     uses: ./.github/workflows/special-tests.yml
     needs: [build-info, build-ci-images]
     permissions:
       contents: read
       packages: read
+    if: >
+      needs.build-info.outputs.run-unit-tests == 'true' &&
+      (needs.build-info.outputs.canary-run == 'true' ||
+       needs.build-info.outputs.upgrade-to-newer-dependencies != 'false' ||
+       needs.build-info.outputs.full-tests-needed == 'true')
     with:
       default-branch: ${{ needs.build-info.outputs.default-branch }}
       runners: ${{ needs.build-info.outputs.runner-type }}
@@ -794,7 +801,6 @@ jobs:
       use-uv: ${{ needs.build-info.outputs.use-uv }}
 
   tests-integration-system:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: Integration and System Tests
     needs: [build-info, build-ci-images]
     uses: ./.github/workflows/integration-system-tests.yml
@@ -814,15 +820,17 @@ jobs:
       debug-resources: ${{ needs.build-info.outputs.debug-resources }}
       skip-providers-tests: ${{ needs.build-info.outputs.skip-providers-tests }}
       use-uv: ${{ needs.build-info.outputs.use-uv }}
+    if: needs.build-info.outputs.run-unit-tests == 'true'
 
   tests-with-lowest-direct-resolution-core:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Low dep tests:core"
     needs: [build-info, build-ci-images]
     uses: ./.github/workflows/run-unit-tests.yml
     permissions:
       contents: read
       packages: read
+    if: >
+      needs.build-info.outputs.run-unit-tests == 'true'
     with:
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
@@ -846,13 +854,13 @@ jobs:
       default-branch: ${{ needs.build-info.outputs.default-branch }}
 
   tests-with-lowest-direct-resolution-providers:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Low dep tests: providers"
     needs: [build-info, build-ci-images]
     uses: ./.github/workflows/run-unit-tests.yml
     permissions:
       contents: read
       packages: read
+    if: needs.build-info.outputs.run-unit-tests == 'true'
     with:
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
@@ -902,7 +910,6 @@ jobs:
       prod-image-build: ${{ needs.build-info.outputs.prod-image-build }}
 
   additional-prod-image-tests:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Additional PROD image tests"
     needs: [build-info, build-prod-images, generate-constraints]
     uses: ./.github/workflows/additional-prod-image-tests.yml
@@ -933,6 +940,7 @@ jobs:
       use-uv: ${{ needs.build-info.outputs.use-uv }}
       run-ui-e2e-tests: ${{ needs.build-info.outputs.run-ui-e2e-tests }}
       run-airflow-ctl-integration-tests: ${{ needs.build-info.outputs.run-airflow-ctl-integration-tests }}
+    if: needs.build-info.outputs.prod-image-build == 'true'
 
   tests-kubernetes:
     name: "Kubernetes tests"
@@ -958,7 +966,6 @@ jobs:
 
 
   tests-task-sdk:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Task SDK tests"
     uses: ./.github/workflows/airflow-distributions-tests.yml
     needs: [build-info, build-ci-images]
@@ -977,9 +984,9 @@ jobs:
       test-type: "task-sdk-tests"
       use-local-venv: 'false'
       test-timeout: 20
+    if: needs.build-info.outputs.run-task-sdk-tests == 'true'
 
   tests-go-sdk:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Go SDK tests"
     needs: [build-info]
     runs-on: airflow-runner-amd-xl
@@ -987,6 +994,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+    if: needs.build-info.outputs.run-go-sdk-tests == 'true'
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1016,7 +1024,6 @@ jobs:
         run: gotestsum --format github-actions ./...
 
   tests-java-sdk:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Java SDK tests"
     needs: [build-info]
     runs-on: airflow-runner-amd-xl
@@ -1024,6 +1031,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+    if: needs.build-info.outputs.run-java-sdk-tests == 'true'
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1046,7 +1054,6 @@ jobs:
         run: ./gradlew test
 
   build-java-sdk-docs:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Java SDK docs"
     needs: [build-info]
     runs-on: airflow-runner-amd-xl
@@ -1054,6 +1061,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+    if: needs.build-info.outputs.run-java-sdk-tests == 'true'
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1078,7 +1086,6 @@ jobs:
           overwrite: 'true'
 
   tests-airflow-ctl:
-    if: false  # TEMP fast-validation trim - revert immediately after
     name: "Airflow CTL tests"
     uses: ./.github/workflows/airflow-distributions-tests.yml
     needs: [build-info]
@@ -1097,6 +1104,7 @@ jobs:
       test-type: "airflow-ctl-tests"
       use-local-venv: 'true'
       test-timeout: 20
+    if: needs.build-info.outputs.run-airflow-ctl-tests == 'true'
 
   finalize-tests:
     name: Finalize tests
