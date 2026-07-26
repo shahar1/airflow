@@ -1594,6 +1594,7 @@ def _deploy_airflow(
 @option_multi_namespace_mode
 @option_python_versions
 @option_kubernetes_versions
+@option_github_repository
 @option_verbose
 @option_dry_run
 @click.argument("extra_options", nargs=-1, type=click.UNPROCESSED)
@@ -1613,6 +1614,7 @@ def deploy_airflow(
     kubernetes_versions: str,
     extra_options: tuple[str, ...],
     multi_namespace_mode: bool = False,
+    github_repository: str = "apache/airflow",
 ):
     if run_in_parallel:
         python_version_array: list[str] = python_versions.split(" ")
@@ -1642,6 +1644,7 @@ def deploy_airflow(
                             "extra_options": extra_options,
                             "output": outputs[index],
                             "multi_namespace_mode": multi_namespace_mode,
+                            "github_repository": github_repository,
                         },
                     )
                     for index, combo in enumerate(combos)
@@ -1664,6 +1667,7 @@ def deploy_airflow(
             wait_time_in_seconds=wait_time_in_seconds,
             extra_options=extra_options,
             multi_namespace_mode=multi_namespace_mode,
+            github_repository=github_repository,
         )
         if return_code == 0:
             console_print(
