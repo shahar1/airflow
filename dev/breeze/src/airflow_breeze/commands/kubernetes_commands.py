@@ -2235,7 +2235,12 @@ def _run_complete_tests(
                 f"\n[info]Provisioning lang-SDK test env for Python {python}, "
                 f"Kubernetes {kubernetes_version}\n"
             )
-            _setup_lang_sdk_test(python=python, kubernetes_version=kubernetes_version, output=output)
+            _setup_lang_sdk_test(
+                python=python,
+                kubernetes_version=kubernetes_version,
+                output=output,
+                github_repository=github_repository,
+            )
         get_console(output=output).print(
             f"\n[info]Running tests Python {python}, Kubernetes {kubernetes_version}\n"
         )
@@ -3066,6 +3071,7 @@ def _setup_lang_sdk_test(
     go_image: str | None = None,
     java_image: str | None = None,
     output: Output | None = None,
+    github_repository: str = "apache/airflow",
 ) -> None:
     """Provision the lang-SDK coordinator env on an already-deployed KubernetesExecutor cluster.
 
@@ -3073,7 +3079,10 @@ def _setup_lang_sdk_test(
     image and deploys localstack in parallel, then serially uploads the artifacts, applies the
     config + secret, and helm-upgrades Airflow with the lang-SDK values.
     """
-    go_image = go_image or f"{BuildProdParams(python=python).airflow_image_kubernetes}:latest"
+    go_image = (
+        go_image
+        or f"{BuildProdParams(python=python, github_repository=github_repository).airflow_image_kubernetes}:latest"
+    )
     build_java_image = java_image is None
     if java_image is None:
         # The worker-image build below produces this fixed tag; resolve it up-front so the config
@@ -3128,9 +3137,12 @@ def _setup_lang_sdk_test(
     help="Image for the Java (JavaCoordinator) worker pod. Must include a JRE. Defaults to building "
     "the prod image plus a headless JRE (Dockerfile.java) and loading it into the kind cluster.",
 )
+@option_github_repository
 @option_verbose
 @option_dry_run
-def setup_lang_sdk_test(python: str, kubernetes_version: str, go_image: str | None, java_image: str | None):
+def setup_lang_sdk_test(
+    python: str, kubernetes_version: str, go_image: str | None, java_image: str | None, github_repository: str
+):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
         sys.exit(result.returncode)
@@ -3141,6 +3153,7 @@ def setup_lang_sdk_test(python: str, kubernetes_version: str, go_image: str | No
         go_image=go_image,
         java_image=java_image,
         output=None,
+        github_repository=github_repository,
     )
     console_print(
         "\n[success]lang-SDK test environment is ready.[/]\n"
