@@ -98,7 +98,7 @@ jobs:
   tests-helm-release:
     timeout-minutes: 80
     name: "Release Helm"
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{inputs.default-python-version}}"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

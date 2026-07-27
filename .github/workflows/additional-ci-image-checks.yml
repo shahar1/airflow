@@ -121,7 +121,7 @@ jobs:
   check-that-image-builds-quickly:
     timeout-minutes: 25
     name: Check that image builds quickly
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     env:
       UPGRADE_TO_NEWER_DEPENDENCIES: false
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"

@@ -355,7 +355,7 @@ jobs:
       id-token: write
       contents: read
     needs: build-docs
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -478,7 +478,7 @@ jobs:
   test-python-api-client:
     timeout-minutes: 60
     name: "Test Python API client"
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-small
     if: inputs.run-api-codegen == 'true'
     env:
       BACKEND: "postgres"

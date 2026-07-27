@@ -67,7 +67,7 @@ jobs:
       contents: read
     timeout-minutes: 70
     name: Generate constraints for ${{ matrix.python-version }} on ${{ inputs.platform }}
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     strategy:
       fail-fast: false
       max-parallel: 20

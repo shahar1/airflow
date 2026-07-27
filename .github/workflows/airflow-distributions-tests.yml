@@ -72,7 +72,7 @@ jobs:
   distributions-tests:
     timeout-minutes: ${{ fromJSON(inputs.test-timeout) }}
     name: ${{ inputs.distribution-name }}:P${{ matrix.python-version }} tests
-    runs-on: airflow-runner-amd-xl
+    runs-on: ${{ fromJSON(inputs.runners) }}
     strategy:
       fail-fast: false
       max-parallel: 20

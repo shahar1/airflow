@@ -115,7 +115,7 @@ jobs:
   build-prod-packages:
     name: "Build Airflow and provider distributions"
     timeout-minutes: 10
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     if: inputs.prod-image-build == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
@@ -195,7 +195,7 @@ jobs:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     timeout-minutes: 80
     name: "Build PROD ${{ inputs.build-type }} image ${{ matrix.python-version }}"
-    runs-on: airflow-runner-amd-xl
+    runs-on: airflow-runner-amd-medium
     needs:
       - build-prod-packages
     env:
