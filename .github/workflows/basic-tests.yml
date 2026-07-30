@@ -181,7 +181,7 @@ jobs:
   tests-ui:
     timeout-minutes: 15
     name: React UI tests
-    runs-on: airflow-runner-amd-medium
+    runs-on: airflow-runner-amd-xl
     if: inputs.run-ui-tests == 'true'
     steps:
       - name: "Cleanup repo"
