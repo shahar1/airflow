@@ -24,6 +24,11 @@ permissions:
 on:  # yamllint disable-line rule:truthy
   workflow_dispatch:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       workflow-name:
         description: "Name of the test"
         type: string
@@ -88,7 +93,7 @@ jobs:
   test-ui-e2e-tests:
     timeout-minutes: 90
     name: ${{ inputs.workflow-name || 'UI E2E Tests' }}
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version || '3.10' }}"
       GITHUB_REPOSITORY: ${{ github.repository }}

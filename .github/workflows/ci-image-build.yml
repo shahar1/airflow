@@ -20,6 +20,11 @@ name: Build CI images
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -108,7 +113,7 @@ jobs:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     timeout-minutes: 110
     name: "Build CI ${{ inputs.platform }} image ${{ matrix.python-version }}"
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     env:
       BACKEND: sqlite
       PYTHON_MAJOR_MINOR_VERSION: ${{ matrix.python-version }}

@@ -20,6 +20,11 @@ name: Provider tests
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining public AMD runners."
         required: true
@@ -72,7 +77,7 @@ jobs:
   prepare-install-verify-provider-distributions:
     timeout-minutes: 80
     name: "Providers ${{ matrix.package-format }} tests"
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +184,7 @@ jobs:
     timeout-minutes: 80
     # yamllint disable rule:line-length
     name: Compat ${{ matrix.compat.airflow-version }}:P${{ matrix.compat.python-version }}:${{ matrix.compat.test-types.description }}
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     strategy:
       fail-fast: false
       matrix:

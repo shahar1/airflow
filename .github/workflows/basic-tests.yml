@@ -20,6 +20,11 @@ name: Basic tests
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -82,7 +87,7 @@ jobs:
   run-breeze-tests:
     timeout-minutes: 10
     name: Breeze unit tests
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     steps:
       - name: "Cleanup repo"
         shell: bash
@@ -100,7 +105,7 @@ jobs:
   run-breeze-integration-tests:
     timeout-minutes: 120
     name: Breeze integration tests
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     if: inputs.run-breeze-integration-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -131,7 +136,7 @@ jobs:
       fail-fast: false
       matrix:
         shared-distribution: ${{ fromJSON(inputs.shared-distributions-as-json) }}
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -155,7 +160,7 @@ jobs:
   tests-scripts:
     timeout-minutes: 10
     name: Scripts tests
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     if: inputs.run-scripts-tests == 'true'
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
@@ -181,7 +186,7 @@ jobs:
   tests-ui:
     timeout-minutes: 15
     name: React UI tests
-    runs-on: airflow-runner-amd-xl
+    runs-on: ${{ format('airflow-runner-{0}-xl', inputs.runner-arch) }}
     if: inputs.run-ui-tests == 'true'
     steps:
       - name: "Cleanup repo"
@@ -248,7 +253,7 @@ jobs:
   check-translation-completness:
     timeout-minutes: 15
     name: "Check translation completeness"
-    runs-on: airflow-runner-amd-xl
+    runs-on: ${{ format('airflow-runner-{0}-xl', inputs.runner-arch) }}
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -265,7 +270,7 @@ jobs:
   static-checks-basic-checks-only:
     timeout-minutes: 30
     name: "Static checks: basic checks only"
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     if: inputs.basic-checks-only == 'true'
     steps:
       - name: "Cleanup repo"
@@ -318,7 +323,7 @@ jobs:
   test-airflow-release-commands:
     timeout-minutes: 80
     name: "Test Airflow release commands"
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -372,7 +377,7 @@ jobs:
   test-airflow-standalone:
     timeout-minutes: 30
     name: "Test Airflow standalone commands"
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     env:
       AIRFLOW_HOME: ~/airflow
       FORCE_COLOR: 1

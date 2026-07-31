@@ -20,6 +20,11 @@ name: Additional CI image checks
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -99,6 +104,7 @@ jobs:
       # from forks. This is to prevent malicious PRs from creating images in the "apache/airflow" repo.
       packages: write
     with:
+      runner-arch: ${{ inputs.runner-arch }}
       runners: ${{ inputs.runners }}
       cache-type: "Early"
       include-prod-images: "false"
@@ -121,7 +127,7 @@ jobs:
   check-that-image-builds-quickly:
     timeout-minutes: 25
     name: Check that image builds quickly
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     env:
       UPGRADE_TO_NEWER_DEPENDENCIES: false
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"

@@ -67,7 +67,7 @@ jobs:
   build-info:
     name: "Build info"
     # At build-info stage we do not yet have outputs so we need to hard-code the runs-on to public runners
-    runs-on: ["ubuntu-22.04"]
+    runs-on: airflow-runner-arm-small
     outputs:
       all-python-versions-list-as-string: >-
         ${{ steps.selective-checks.outputs.all-python-versions-list-as-string }}
@@ -231,7 +231,7 @@ jobs:
   print-platform:
     name: "Platform: ARM"
     needs: [build-info]
-    runs-on: ["ubuntu-22.04"]
+    runs-on: airflow-runner-arm-medium
     steps:
       - name: "Print architecture"
         run: "echo '## Architecture: ARM' >> $GITHUB_STEP_SUMMARY"
@@ -241,6 +241,7 @@ jobs:
     needs: [build-info]
     uses: ./.github/workflows/basic-tests.yml
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       run-ui-tests: ${{needs.build-info.outputs.run-ui-tests}}
       run-www-tests: ${{needs.build-info.outputs.run-www-tests}}
@@ -266,6 +267,7 @@ jobs:
       # from forks. This is to prevent malicious PRs from creating images in the "apache/airflow" repo.
       packages: write
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       push-image: "false"
@@ -289,6 +291,7 @@ jobs:
       packages: write
       id-token: write
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       python-versions: ${{ needs.build-info.outputs.python-versions }}
@@ -311,6 +314,7 @@ jobs:
     uses: ./.github/workflows/generate-constraints.yml
     if: needs.build-info.outputs.ci-image-build == 'true'
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       python-versions-list-as-string: ${{ needs.build-info.outputs.python-versions-list-as-string }}
@@ -332,6 +336,7 @@ jobs:
       id-token: write
       contents: read
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       python-versions-list-as-string: ${{ needs.build-info.outputs.python-versions-list-as-string }}
@@ -362,7 +367,7 @@ jobs:
     timeout-minutes: 45
     name: "MyPy providers checks"
     needs: [build-info, build-ci-images]
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-small
     if: needs.build-info.outputs.run-mypy-providers == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
@@ -404,7 +409,7 @@ jobs:
     timeout-minutes: 20
     name: "Migration round-trip check"
     needs: [build-info, build-ci-images]
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-medium
     if: needs.build-info.outputs.has-migrations == 'true'
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ needs.build-info.outputs.default-python-version }}"
@@ -452,6 +457,7 @@ jobs:
       needs.build-info.outputs.latest-versions-only != 'true' &&
       needs.build-info.outputs.run-unit-tests == 'true'
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       canary-run: ${{ needs.build-info.outputs.canary-run }}
@@ -475,6 +481,7 @@ jobs:
       contents: read
       packages: read
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       helm-test-packages: ${{ needs.build-info.outputs.helm-test-packages }}
@@ -494,6 +501,7 @@ jobs:
       contents: read
       packages: read
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       default-python-version: "${{ needs.build-info.outputs.default-python-version }}"
@@ -527,7 +535,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "postgres"
       test-name: "Postgres"
@@ -556,7 +564,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "postgres"
       test-name: "Postgres"
@@ -585,7 +593,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "mysql"
       test-name: "MySQL"
@@ -614,7 +622,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "mysql"
       test-name: "MySQL"
@@ -643,7 +651,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "sqlite"
       test-name: "Sqlite"
@@ -674,7 +682,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-medium"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "sqlite"
       test-name: "Sqlite"
@@ -705,7 +713,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-xl"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "sqlite"
       test-name: ""
@@ -735,7 +743,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-xl"]'
       platform: ${{ needs.build-info.outputs.platform }}
       backend: "sqlite"
       test-name: ""
@@ -770,6 +778,7 @@ jobs:
        needs.build-info.outputs.upgrade-to-newer-dependencies != 'false' ||
        needs.build-info.outputs.full-tests-needed == 'true')
     with:
+      runner-arch: arm
       default-branch: ${{ needs.build-info.outputs.default-branch }}
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
@@ -797,6 +806,7 @@ jobs:
       contents: read
       packages: read
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       testable-core-integrations: ${{ needs.build-info.outputs.testable-core-integrations }}
@@ -821,7 +831,7 @@ jobs:
     if: >
       needs.build-info.outputs.run-unit-tests == 'true'
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-xl"]'
       platform: ${{ needs.build-info.outputs.platform }}
       test-name: "LowestDeps"
       force-lowest-dependencies: "true"
@@ -851,7 +861,7 @@ jobs:
       packages: read
     if: needs.build-info.outputs.run-unit-tests == 'true'
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-xl"]'
       platform: ${{ needs.build-info.outputs.platform }}
       test-name: "LowestDeps"
       force-lowest-dependencies: "true"
@@ -882,6 +892,7 @@ jobs:
       # from forks. This is to prevent malicious PRs from creating images in the "apache/airflow" repo.
       packages: write
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       build-type: "Regular"
@@ -903,6 +914,7 @@ jobs:
     needs: [build-info, build-prod-images, generate-constraints]
     uses: ./.github/workflows/additional-prod-image-tests.yml
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       default-branch: ${{ needs.build-info.outputs.default-branch }}
@@ -939,6 +951,7 @@ jobs:
       contents: read
       packages: read
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       python-versions-list-as-string: ${{ needs.build-info.outputs.python-versions-list-as-string }}
@@ -962,7 +975,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-xl"]'
       platform: ${{ needs.build-info.outputs.platform }}
       default-python-version: "${{ needs.build-info.outputs.default-python-version }}"
       python-versions: ${{ needs.build-info.outputs.python-versions }}
@@ -978,7 +991,7 @@ jobs:
   tests-go-sdk:
     name: "Go SDK tests"
     needs: [build-info]
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-medium
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1015,7 +1028,7 @@ jobs:
   tests-java-sdk:
     name: "Java SDK tests"
     needs: [build-info]
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-xl
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1045,7 +1058,7 @@ jobs:
   build-java-sdk-docs:
     name: "Java SDK docs"
     needs: [build-info]
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-medium
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1082,7 +1095,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: ${{ needs.build-info.outputs.runner-type }}
+      runners: '["airflow-runner-arm-small"]'
       platform: ${{ needs.build-info.outputs.platform }}
       default-python-version: "${{ needs.build-info.outputs.default-python-version }}"
       python-versions: ${{ needs.build-info.outputs.python-versions }}
@@ -1133,6 +1146,7 @@ jobs:
       - tests-with-lowest-direct-resolution-providers
     uses: ./.github/workflows/finalize-tests.yml
     with:
+      runner-arch: arm
       runners: ${{ needs.build-info.outputs.runner-type }}
       platform: ${{ needs.build-info.outputs.platform }}
       python-versions: ${{ needs.build-info.outputs.python-versions }}
@@ -1158,7 +1172,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'schedule' &&
       github.run_attempt == 1
-    runs-on: ["ubuntu-22.04"]
+    runs-on: airflow-runner-arm-small
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1267,7 +1281,7 @@ jobs:
       - tests-special
       - tests-with-lowest-direct-resolution-core
       - tests-with-lowest-direct-resolution-providers
-    runs-on: ${{ fromJSON(needs.build-info.outputs.runner-type) }}
+    runs-on: airflow-runner-arm-medium
     if: needs.build-info.outputs.run-unit-tests == 'true'
     steps:
       - name: "Cleanup repo"

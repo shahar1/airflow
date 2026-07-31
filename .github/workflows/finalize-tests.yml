@@ -20,6 +20,11 @@ name: Finalize tests
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -80,7 +85,7 @@ permissions:
   contents: read
 jobs:
   update-constraints:
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     timeout-minutes: 80
     name: "Update constraints"
     permissions:
@@ -124,7 +129,7 @@ jobs:
   # Constraint commits are now handled by the dedicated update-constraints-on-push workflow
   # triggered when uv.lock changes are pushed to main/test branches.
   dependency-upgrade-summary:
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     needs: [update-constraints]
     if: inputs.upgrade-to-newer-dependencies == 'true' && inputs.platform == 'linux/amd64'
     name: "Deps ${{ matrix.python-version }}:${{ matrix.constraints-mode }}"
@@ -170,6 +175,7 @@ jobs:
       # from forks. This is to prevent malicious PRs from creating images in the "apache/airflow" repo.
       packages: write
     with:
+      runner-arch: ${{ inputs.runner-arch }}
       runners: ${{ inputs.runners }}
       platform: ${{ inputs.platform }}
       cache-type: "Regular AMD"

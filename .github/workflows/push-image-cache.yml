@@ -20,6 +20,11 @@ name: Push image cache
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -79,7 +84,7 @@ on:  # yamllint disable-line rule:truthy
 jobs:
   push-ci-image-cache:
     name: "Push CI ${{ inputs.cache-type }}:${{ matrix.python }} image cache "
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     permissions:
       contents: read
       packages: write
@@ -149,7 +154,7 @@ jobs:
 
   push-prod-image-cache:
     name: "Push PROD ${{ inputs.cache-type }}:${{ matrix.python }} image cache"
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     permissions:
       contents: read
       packages: write

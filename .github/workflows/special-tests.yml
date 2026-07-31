@@ -20,6 +20,11 @@ name: Special tests
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -94,7 +99,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       downgrade-sqlalchemy: "true"
       test-name: "MinSQLAlchemy-Postgres"
@@ -119,7 +124,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       downgrade-sqlalchemy: "true"
       test-name: "MinSQLAlchemy-Postgres"
@@ -144,7 +149,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       upgrade-sqlalchemy: "true"
       test-name: "LatestSQLAlchemy-Postgres"
@@ -169,7 +174,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       upgrade-sqlalchemy: "true"
       test-name: "LatestSQLAlchemy-Postgres"
@@ -194,7 +199,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-xl"]'
+      runners: ${{ format('["airflow-runner-{0}-xl"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       upgrade-boto: "true"
       test-name: "LatestBoto-Postgres"
@@ -220,7 +225,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       upgrade-boto: "true"
       test-name: "LatestBoto-Postgres"
@@ -246,7 +251,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       downgrade-pendulum: "true"
       test-name: "Pendulum2-Postgres"
@@ -272,7 +277,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-medium"]'
+      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       downgrade-pendulum: "true"
       test-name: "Pendulum2-Postgres"
@@ -298,7 +303,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-small"]'
+      runners: ${{ format('["airflow-runner-{0}-small"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       test-name: "Postgres"
       test-scope: "Quarantined"
@@ -323,7 +328,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-small"]'
+      runners: ${{ format('["airflow-runner-{0}-small"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       test-name: "Postgres"
       test-scope: "Quarantined"
@@ -348,7 +353,7 @@ jobs:
       contents: read
       packages: read
     with:
-      runners: '["airflow-runner-amd-xl"]'
+      runners: ${{ format('["airflow-runner-{0}-xl"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       test-name: "SystemTest"
       test-scope: "System"

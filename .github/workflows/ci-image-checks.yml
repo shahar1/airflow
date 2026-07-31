@@ -20,6 +20,11 @@ name: CI Image Checks
 on:  # yamllint disable-line rule:truthy
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       runners:
         description: "The array of labels (in json form) determining runners."
         required: true
@@ -119,7 +124,7 @@ jobs:
   static-checks:
     timeout-minutes: 45
     name: "Static checks"
-    runs-on: airflow-runner-amd-xl
+    runs-on: ${{ format('airflow-runner-{0}-xl', inputs.runner-arch) }}
     env:
       PYTHON_MAJOR_MINOR_VERSION: "${{ inputs.default-python-version }}"
       UPGRADE_TO_NEWER_DEPENDENCIES: "${{ inputs.upgrade-to-newer-dependencies }}"
@@ -184,7 +189,7 @@ jobs:
   build-docs:
     timeout-minutes: 150
     name: "Build documentation"
-    runs-on: airflow-runner-amd-xl
+    runs-on: ${{ format('airflow-runner-{0}-xl', inputs.runner-arch) }}
     if: inputs.docs-build == 'true'
     strategy:
       fail-fast: false
@@ -355,7 +360,7 @@ jobs:
       id-token: write
       contents: read
     needs: build-docs
-    runs-on: airflow-runner-amd-medium
+    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -478,7 +483,7 @@ jobs:
   test-python-api-client:
     timeout-minutes: 60
     name: "Test Python API client"
-    runs-on: airflow-runner-amd-small
+    runs-on: ${{ format('airflow-runner-{0}-small', inputs.runner-arch) }}
     if: inputs.run-api-codegen == 'true'
     env:
       BACKEND: "postgres"
