@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 from types import SimpleNamespace
 
 import airflow_chatbot_plugin as plugin
@@ -213,6 +214,30 @@ def test_chat_endpoint_reports_a_mid_stream_failure_then_terminates(client, monk
 
     assert [f["type"] for f in frames] == ["text", "error", "done"]
     assert frames[1]["message"] == "stream died"
+
+
+def test_injected_script_is_versioned_by_the_built_bundle(monkeypatch, tmp_path):
+    # A static URL plus no Cache-Control means the browser keeps a stale bundle,
+    # which shows up as the frontend and backend disagreeing about the protocol.
+    bundle = tmp_path / "main.iife.js"
+    bundle.write_text("//")
+    monkeypatch.setattr(plugin, "STATIC_DIR", tmp_path)
+    middleware = plugin.ChatbotInjectionMiddleware(app=None, bundle_url="/chatbot/static/main.iife.js")
+
+    os.utime(bundle, (1, 1_000))
+    first = middleware._get_injection_script()
+    os.utime(bundle, (1, 2_000))
+    second = middleware._get_injection_script()
+
+    assert "main.iife.js?v=1000" in first
+    assert "main.iife.js?v=2000" in second
+
+
+def test_injected_script_survives_a_missing_bundle(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin, "STATIC_DIR", tmp_path / "nope")
+    middleware = plugin.ChatbotInjectionMiddleware(app=None, bundle_url="/chatbot/static/main.iife.js")
+
+    assert "main.iife.js?v=0" in middleware._get_injection_script()
 
 
 def test_chat_endpoint_rejects_an_empty_message(client):
