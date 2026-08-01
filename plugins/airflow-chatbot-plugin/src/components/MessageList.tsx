@@ -16,16 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 import { Box, Flex, Spinner, Text, VStack } from "@chakra-ui/react";
-import { FC, useEffect, useRef } from "react";
+import { FC, memo, useEffect, useRef } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { useColorMode } from "src/context/colorMode";
 
 import { SparkleIcon } from "./icons/SparkleIcon";
-import { Message } from "./types";
+import { Message, ToolCall } from "./types";
 
 /**
  * `[ACTION: Re-run sales_summary]` lines are stripped from the rendered text and
@@ -33,11 +32,14 @@ import { Message } from "./types";
  */
 const ACTION_RE = /^[\s>*-]*\**\[ACTION:\s*(.+?)\]\**\s*$/gmu;
 
-const splitActions = (content: string): { actions: string[]; text: string } => {
-  const actions = [...content.matchAll(ACTION_RE)]
-    .map((m) => m[1]?.trim() ?? "")
-    .filter(Boolean);
-  return { actions, text: content.replace(ACTION_RE, "").trimEnd() };
+export const splitActions = (content: string, streaming = false): { actions: string[]; text: string } => {
+  const actions = [...content.matchAll(ACTION_RE)].map((m) => m[1]?.trim() ?? "").filter(Boolean);
+  const stripped = content.replace(ACTION_RE, "");
+  // Mid-stream an action line arrives a few characters at a time, so hide the
+  // trailing "[ACTION: Re-run sa" until its "]" lands.  Only while streaming:
+  // a finished message may legitimately end in "values = [1, 2".
+  const text = (streaming ? stripped.replace(/\[[^\]\n]*$/u, "") : stripped).trimEnd();
+  return { actions, text };
 };
 
 interface MessageListProps {
@@ -50,11 +52,7 @@ interface MessageListProps {
  * Message list component displaying chat history.
  * Automatically scrolls to bottom on new messages.
  */
-export const MessageList: FC<MessageListProps> = ({
-  isLoading = false,
-  messages,
-  onSuggestionClick,
-}) => {
+export const MessageList: FC<MessageListProps> = ({ isLoading = false, messages, onSuggestionClick }) => {
   const { colorMode } = useColorMode();
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -63,24 +61,16 @@ export const MessageList: FC<MessageListProps> = ({
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({
+      behavior: isLoading ? "auto" : "smooth",
+    });
   }, [messages, isLoading]);
 
   if (messages.length === 0 && !isLoading) {
     return (
-      <Flex
-        height="100%"
-        align="center"
-        justify="center"
-        px={6}
-        py={8}
-      >
+      <Flex height="100%" align="center" justify="center" px={6} py={8}>
         <VStack gap={4} textAlign="center" color={isDark ? "gray.400" : "gray.600"}>
-          <Box
-            bg={isDark ? "gray.800" : "gray.200"}
-            p={4}
-            borderRadius="full"
-          >
+          <Box bg={isDark ? "gray.800" : "gray.200"} p={4} borderRadius="full">
             <SparkleIcon />
           </Box>
           <VStack gap={1}>
@@ -122,14 +112,18 @@ export const MessageList: FC<MessageListProps> = ({
       }}
     >
       <VStack gap={4} align="stretch">
-        {messages.map((message) => (
-          <MessageBubble
-            key={message.id}
-            message={message}
-            onActionClick={onSuggestionClick}
-          />
-        ))}
-        {isLoading && <LoadingIndicator />}
+        {messages.map((message, index) =>
+          isBlank(message) ? undefined : (
+            <MessageBubble
+              key={message.id}
+              message={message}
+              isStreaming={isLoading && index === messages.length - 1}
+              // Chips do nothing while a stream is in flight, so don't offer them.
+              onActionClick={isLoading ? undefined : onSuggestionClick}
+            />
+          ),
+        )}
+        {isLoading && isBlank(messages[messages.length - 1]) && <LoadingIndicator />}
         <div ref={bottomRef} />
       </VStack>
     </Box>
@@ -138,23 +132,30 @@ export const MessageList: FC<MessageListProps> = ({
 
 interface MessageBubbleProps {
   readonly message: Message;
+  readonly isStreaming?: boolean;
   readonly onActionClick?: (text: string) => void;
 }
 
-const MessageBubble: FC<MessageBubbleProps> = ({ message, onActionClick }) => {
+/** An assistant bubble that has streamed nothing yet is not worth showing. */
+const isBlank = (message?: Message): boolean =>
+  message !== undefined && message.role === "assistant" && message.content === "" && !message.tools?.length;
+
+const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, message, onActionClick }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
   const isUser = message.role === "user";
-  const { actions, text } = splitActions(message.content);
+  const { actions, text } = splitActions(message.content, isStreaming);
 
   const userBg = "brand.500";
   const userColor = "white";
-  const assistantBg = message.isError
-    ? isDark ? "red.900" : "red.50"
-    : isDark ? "gray.800" : "gray.100";
+  const assistantBg = message.isError ? (isDark ? "red.900" : "red.50") : isDark ? "gray.800" : "gray.100";
   const assistantColor = message.isError
-    ? isDark ? "red.200" : "red.700"
-    : isDark ? "gray.100" : "gray.800";
+    ? isDark
+      ? "red.200"
+      : "red.700"
+    : isDark
+      ? "gray.100"
+      : "gray.800";
 
   return (
     <Flex justify={isUser ? "flex-end" : "flex-start"}>
@@ -188,6 +189,9 @@ const MessageBubble: FC<MessageBubbleProps> = ({ message, onActionClick }) => {
           lineHeight="tall"
           css={markdownCss(isDark)}
         >
+          {(message.tools ?? []).map((tool) => (
+            <ToolChip key={tool.id} tool={tool} />
+          ))}
           <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
           <Text
             fontSize="xs"
@@ -198,15 +202,77 @@ const MessageBubble: FC<MessageBubbleProps> = ({ message, onActionClick }) => {
             {formatTime(message.timestamp)}
           </Text>
         </Box>
-        {actions.map((action, index) => (
-          <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
-            {action}
-          </SuggestionChip>
-        ))}
+        {onActionClick !== undefined &&
+          actions.map((action, index) => (
+            <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
+              {action}
+            </SuggestionChip>
+          ))}
       </VStack>
     </Flex>
   );
+});
+
+interface ToolChipProps {
+  readonly tool: ToolCall;
+}
+
+/** One MCP tool call, shown while it runs and then with how long it took. */
+const ToolChip: FC<ToolChipProps> = ({ tool }) => {
+  const { colorMode } = useColorMode();
+  const isDark = colorMode === "dark";
+  const running = tool.durationMs === undefined;
+
+  return (
+    <Flex
+      align="center"
+      gap={2}
+      fontSize="xs"
+      fontFamily="mono"
+      color={isDark ? "gray.400" : "gray.600"}
+      mb={1.5}
+    >
+      {running ? (
+        <Spinner size="xs" color="brand.500" flexShrink={0} />
+      ) : (
+        <Box boxSize="7px" borderRadius="full" bg="brand.500" flexShrink={0} />
+      )}
+      <Text as="span" color={isDark ? "gray.200" : "gray.800"}>
+        {tool.name}
+      </Text>
+      <Text as="span" truncate>
+        {formatArgs(tool.args)}
+      </Text>
+      {running ? undefined : (
+        <Text as="span" flexShrink={0}>
+          {((tool.durationMs ?? 0) / 1000).toFixed(1)}s
+        </Text>
+      )}
+    </Flex>
+  );
 };
+
+/** Compact one-line rendering of a tool's arguments. */
+const formatArgs = (args: unknown): string => {
+  const parsed = typeof args === "string" ? tryParse(args) : args;
+  if (parsed === undefined || parsed === null || typeof parsed !== "object") {
+    return "";
+  }
+  const pairs = Object.entries(parsed as Record<string, unknown>).map(
+    ([key, value]) => `${key}=${truncate(String(value))}`,
+  );
+  return `(${pairs.join(", ")})`;
+};
+
+const tryParse = (raw: string): unknown => {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+};
+
+const truncate = (value: string): string => (value.length > 40 ? `${value.slice(0, 39)}…` : value);
 
 /** Just enough spacing so rendered Markdown doesn't collapse inside the bubble. */
 const markdownCss = (isDark: boolean) => ({
@@ -252,13 +318,7 @@ const LoadingIndicator: FC = () => {
       >
         <SparkleIcon />
       </Flex>
-      <Box
-        bg={isDark ? "gray.800" : "gray.100"}
-        px={4}
-        py={3}
-        borderRadius="xl"
-        borderBottomLeftRadius="sm"
-      >
+      <Box bg={isDark ? "gray.800" : "gray.100"} px={4} py={3} borderRadius="xl" borderBottomLeftRadius="sm">
         <Flex align="center" gap={2}>
           <Spinner size="sm" color="brand.500" />
           <Text fontSize="sm" color="gray.500">

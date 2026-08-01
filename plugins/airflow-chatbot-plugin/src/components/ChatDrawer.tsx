@@ -64,6 +64,17 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   const { colorMode } = useColorMode();
   const drawerRef = useRef<HTMLDivElement>(null);
   const [inputValue, setInputValue] = useState("");
+
+  // A stable identity here is what lets MessageBubble's memo actually hold.
+  const handleSuggestionClick = useCallback(
+    (text: string) => {
+      if (!isLoading) {
+        onSendMessage(text);
+        setInputValue("");
+      }
+    },
+    [isLoading, onSendMessage],
+  );
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const isDragging = useRef(false);
 
@@ -308,12 +319,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
           <MessageList
             messages={messages}
             isLoading={isLoading}
-            onSuggestionClick={(text) => {
-              if (!isLoading) {
-                onSendMessage(text);
-                setInputValue("");
-              }
-            }}
+            onSuggestionClick={handleSuggestionClick}
           />
         </Box>
 

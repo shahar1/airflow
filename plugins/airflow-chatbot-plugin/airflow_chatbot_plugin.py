@@ -39,16 +39,19 @@ script installs the MCP sidecar.
 
 from __future__ import annotations
 
+import builtins
+import json
 import logging
 import os
 import socket
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -159,34 +162,32 @@ def _create_chatbot_api() -> dict[str, Any]:
 
     @app.post("/chat")
     async def chat_endpoint(body: ChatRequest):
-        """Chat API endpoint — forwards user messages to the PydanticAI agent."""
-        try:
-            message = body.message
-            history = body.history
+        """
+        Chat endpoint — server-sent events.
 
-            if not message.strip():
-                return JSONResponse(
-                    {"error": "Empty message", "status": "error"},
-                    status_code=400,
-                )
+        Streams the agent's tool calls and text as they happen, so the drawer can
+        show what Airy is doing instead of a spinner.  Frames are
+        ``data: {json}`` with a ``type`` of ``tool``, ``tool_result``, ``text``,
+        ``error`` or ``done``.
+        """
+        if not body.message.strip():
+            return JSONResponse({"error": "Empty message", "status": "error"}, status_code=400)
 
-            response_text = await _run_agent(message, history)
+        async def frames() -> AsyncIterator[str]:
+            try:
+                async for payload in _stream_agent(body.message, body.history):
+                    yield f"data: {json.dumps(payload)}\n\n"
+            except Exception as e:
+                log.exception("Airy chat endpoint error")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield 'data: {"type": "done"}\n\n'
 
-            return JSONResponse(
-                {
-                    "response": response_text,
-                    "status": "success",
-                }
-            )
-        except Exception as e:
-            log.exception("Airy chat endpoint error")
-            return JSONResponse(
-                {
-                    "error": str(e),
-                    "status": "error",
-                },
-                status_code=500,
-            )
+        return StreamingResponse(
+            frames(),
+            media_type="text/event-stream",
+            # Proxies that buffer would defeat the point of streaming at all.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     return {
         "app": app,
@@ -304,40 +305,52 @@ def _get_variable(key: str, default: str) -> str:
         return default
 
 
-async def _run_agent(message: str, history: list[dict[str, str]] | None = None) -> str:
-    """Run the PydanticAI agent and return the assistant reply."""
+_NOT_CONFIGURED = (
+    "**Airy is not configured yet.**\n\n"
+    "Provide an OpenAI API key via **one** of these methods:\n\n"
+    "**Option A** — Environment variable (simplest):\n"
+    "```\nexport OPENAI_API_KEY=sk-...\n```\n\n"
+    "**Option B** — Airflow Connection (encrypted at rest):\n"
+    "- **Conn ID**: `openai_default`\n"
+    "- **Conn Type**: `openai`\n"
+    "- **Password**: your OpenAI API key\n\n"
+    "In Breeze, just set `OPENAI_API_KEY` on your host before "
+    "running `breeze start-airflow` — everything else is automatic."
+)
+
+# BaseExceptionGroup is a builtin only from 3.11; an empty tuple makes the
+# isinstance check below a harmless no-op on older interpreters.
+_EXC_GROUP = getattr(builtins, "BaseExceptionGroup", ())
+
+
+def _root_cause(exc: BaseException) -> BaseException:
+    """Unwrap TaskGroup ExceptionGroups so the user sees the real error."""
+    while isinstance(exc, _EXC_GROUP) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return exc
+
+
+def _build_agent() -> tuple[Any, str | None]:
+    """Return ``(agent, None)``, or ``(None, markdown)`` explaining what is missing."""
     api_key = _get_llm_api_key()
     if not api_key:
-        return (
-            "**Airy is not configured yet.**\n\n"
-            "Provide an OpenAI API key via **one** of these methods:\n\n"
-            "**Option A** — Environment variable (simplest):\n"
-            "```\nexport OPENAI_API_KEY=sk-...\n```\n\n"
-            "**Option B** — Airflow Connection (encrypted at rest):\n"
-            "- **Conn ID**: `openai_default`\n"
-            "- **Conn Type**: `openai`\n"
-            "- **Password**: your OpenAI API key\n\n"
-            "In Breeze, just set `OPENAI_API_KEY` on your host before "
-            "running `breeze start-airflow` — everything else is automatic."
-        )
+        return None, _NOT_CONFIGURED
 
     try:
         from pydantic_ai import Agent
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
     except ImportError as e:
-        return (
+        return None, (
             "**Missing dependency.**\n\n"
             f"`pydantic-ai` (>= 1.0) import failed: `{e}`. Run:\n"
             "```\npip install 'pydantic-ai-slim[openai,mcp]'\n```"
         )
 
-    model_name = _get_variable("airy_model", "gpt-4o-mini")
+    model = OpenAIChatModel(
+        _get_variable("airy_model", "gpt-4o-mini"), provider=OpenAIProvider(api_key=api_key)
+    )
 
-    provider = OpenAIProvider(api_key=api_key)
-    model = OpenAIChatModel(model_name, provider=provider)
-
-    # ---------- optionally attach MCP tools ----------
     toolsets = []
     urls = _reachable_mcp_urls(_get_mcp_urls())
     if urls:
@@ -348,52 +361,75 @@ async def _run_agent(message: str, history: list[dict[str, str]] | None = None) 
         except ImportError:
             log.exception("pydantic-ai MCP extra missing — Airy is running without any tools")
 
-    agent = Agent(model=model, system_prompt=_SYSTEM_PROMPT, toolsets=toolsets)
+    return Agent(model=model, system_prompt=_SYSTEM_PROMPT, toolsets=toolsets), None
 
-    # ---------- build message history ----------
-    from pydantic_ai.messages import (
-        ModelRequest,
-        ModelResponse,
-        TextPart,
-        UserPromptPart,
-    )
 
-    message_history: list[ModelRequest | ModelResponse] = []
-    if history:
-        for entry in history:
-            role = entry.get("role", "")
-            text = entry.get("content", "")
-            if role == "user":
-                message_history.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-            elif role == "assistant":
-                message_history.append(ModelResponse(parts=[TextPart(content=text)]))
+def _to_message_history(history: list[dict[str, str]] | None) -> list[Any]:
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
-    # ---------- run ----------
+    message_history: list[Any] = []
+    for entry in history or []:
+        role, text = entry.get("role", ""), entry.get("content", "")
+        if role == "user":
+            message_history.append(ModelRequest(parts=[UserPromptPart(content=text)]))
+        elif role == "assistant":
+            message_history.append(ModelResponse(parts=[TextPart(content=text)]))
+    return message_history
+
+
+def _event_payload(event: Any) -> dict[str, Any] | None:
+    """
+    Translate one pydantic-ai stream event into a payload for the browser.
+
+    Returns ``None`` for the events the chat has nothing to show for.  Kept
+    separate from the streaming loop so it can be tested without an LLM.
+    """
+    kind = getattr(event, "event_kind", None)
+    if kind == "part_start":
+        part = getattr(event, "part", None)
+        # Tool-call and thinking parts also start here and are not for display.
+        if getattr(part, "part_kind", None) == "text" and part.content:
+            return {"type": "text", "delta": part.content}
+        return None
+    if kind == "function_tool_call":
+        return {
+            "type": "tool",
+            "id": event.part.tool_call_id,
+            "name": event.part.tool_name,
+            "args": event.part.args,
+        }
+    if kind == "function_tool_result":
+        return {"type": "tool_result", "id": event.part.tool_call_id, "name": event.part.tool_name}
+    if kind == "part_delta":
+        # Tool-call argument deltas share this event kind, and thinking deltas
+        # also carry `content_delta` — neither belongs in the reply.
+        if getattr(event.delta, "part_delta_kind", None) != "text":
+            return None
+        if event.delta.content_delta:
+            return {"type": "text", "delta": event.delta.content_delta}
+    return None
+
+
+async def _stream_agent(
+    message: str, history: list[dict[str, str]] | None = None
+) -> AsyncIterator[dict[str, Any]]:
+    """Run the agent, yielding tool calls and text as they happen."""
+    agent, problem = _build_agent()
+    if problem:
+        yield {"type": "text", "delta": problem}
+        return
+
     try:
-        result = await agent.run(
-            message,
-            message_history=message_history if message_history else None,
-        )
-        return result.output
-    except BaseException as e:
-        # Unwrap ExceptionGroup / TaskGroup errors to surface the real cause
-        real = e
-        eg_type = getattr(__builtins__, "BaseExceptionGroup", None) or getattr(
-            __builtins__, "ExceptionGroup", None
-        )
-        if eg_type is None:
-            try:
-                from exceptiongroup import BaseExceptionGroup as eg_type  # type: ignore[no-redef]
-            except ImportError:
-                eg_type = None
-        if eg_type and isinstance(e, eg_type):
-            leaves = list(e.exceptions)
-            if leaves:
-                real = leaves[0]
-                if isinstance(real, eg_type) and real.exceptions:
-                    real = real.exceptions[0]
+        async with agent.run_stream_events(
+            message, message_history=_to_message_history(history) or None
+        ) as stream:
+            async for event in stream:
+                payload = _event_payload(event)
+                if payload:
+                    yield payload
+    except Exception as e:
         log.exception("Agent execution failed")
-        return f"Sorry, I encountered an error: {real}"
+        yield {"type": "error", "message": str(_root_cause(e))}
 
 
 class ChatbotInjectionMiddleware(BaseHTTPMiddleware):
