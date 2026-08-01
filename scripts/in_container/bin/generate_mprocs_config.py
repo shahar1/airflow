@@ -229,6 +229,17 @@ def generate_mprocs_config() -> str:
             "restart": "always",
             "scrollback": 100000,
         }
+        # Self-healing sidecar: the write-capable tools (diagnose/fix/rerun) that
+        # astro-airflow-mcp deliberately does not expose.  See dev/airy_mcp/README.md.
+        procs["airy_selfheal_mcp"] = {
+            "shell": (
+                "while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && "
+                "{ python -c 'import fastmcp' 2>/dev/null || pip install --quiet fastmcp; } && "
+                "python /opt/airflow/dev/airy_mcp/server.py --port 8001"
+            ),
+            "restart": "always",
+            "scrollback": 100000,
+        }
 
     procs["shell"] = {
         "shell": "bash",

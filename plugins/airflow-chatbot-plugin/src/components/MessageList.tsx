@@ -19,11 +19,26 @@
 
 import { Box, Flex, Spinner, Text, VStack } from "@chakra-ui/react";
 import { FC, useEffect, useRef } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { useColorMode } from "src/context/colorMode";
 
 import { SparkleIcon } from "./icons/SparkleIcon";
 import { Message } from "./types";
+
+/**
+ * `[ACTION: Re-run sales_summary]` lines are stripped from the rendered text and
+ * turned into chips that send their own label as the next user message.
+ */
+const ACTION_RE = /^[\s>*-]*\**\[ACTION:\s*(.+?)\]\**\s*$/gmu;
+
+const splitActions = (content: string): { actions: string[]; text: string } => {
+  const actions = [...content.matchAll(ACTION_RE)]
+    .map((m) => m[1]?.trim() ?? "")
+    .filter(Boolean);
+  return { actions, text: content.replace(ACTION_RE, "").trimEnd() };
+};
 
 interface MessageListProps {
   readonly messages: Message[];
@@ -108,7 +123,11 @@ export const MessageList: FC<MessageListProps> = ({
     >
       <VStack gap={4} align="stretch">
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble
+            key={message.id}
+            message={message}
+            onActionClick={onSuggestionClick}
+          />
         ))}
         {isLoading && <LoadingIndicator />}
         <div ref={bottomRef} />
@@ -119,12 +138,14 @@ export const MessageList: FC<MessageListProps> = ({
 
 interface MessageBubbleProps {
   readonly message: Message;
+  readonly onActionClick?: (text: string) => void;
 }
 
-const MessageBubble: FC<MessageBubbleProps> = ({ message }) => {
+const MessageBubble: FC<MessageBubbleProps> = ({ message, onActionClick }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
   const isUser = message.role === "user";
+  const { actions, text } = splitActions(message.content);
 
   const userBg = "brand.500";
   const userColor = "white";
@@ -147,36 +168,72 @@ const MessageBubble: FC<MessageBubbleProps> = ({ message }) => {
           borderRadius="full"
           mr={2}
           flexShrink={0}
+          alignSelf="flex-start"
         >
           <SparkleIcon />
         </Flex>
       )}
-      <Box
-        bg={isUser ? userBg : assistantBg}
-        color={isUser ? userColor : assistantColor}
-        px={4}
-        py={2.5}
-        borderRadius="xl"
-        borderBottomRightRadius={isUser ? "sm" : "xl"}
-        borderBottomLeftRadius={isUser ? "xl" : "sm"}
-        maxWidth="85%"
-        wordBreak="break-word"
-      >
-        <Text fontSize="sm" lineHeight="tall" whiteSpace="pre-wrap">
-          {message.content}
-        </Text>
-        <Text
-          fontSize="xs"
-          color={isUser ? "whiteAlpha.700" : "gray.500"}
-          mt={1}
-          textAlign={isUser ? "right" : "left"}
+      <VStack align={isUser ? "flex-end" : "flex-start"} gap={2} maxWidth="85%">
+        <Box
+          bg={isUser ? userBg : assistantBg}
+          color={isUser ? userColor : assistantColor}
+          px={4}
+          py={2.5}
+          borderRadius="xl"
+          borderBottomRightRadius={isUser ? "sm" : "xl"}
+          borderBottomLeftRadius={isUser ? "xl" : "sm"}
+          width="100%"
+          wordBreak="break-word"
+          fontSize="sm"
+          lineHeight="tall"
+          css={markdownCss(isDark)}
         >
-          {formatTime(message.timestamp)}
-        </Text>
-      </Box>
+          <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
+          <Text
+            fontSize="xs"
+            color={isUser ? "whiteAlpha.700" : "gray.500"}
+            mt={1}
+            textAlign={isUser ? "right" : "left"}
+          >
+            {formatTime(message.timestamp)}
+          </Text>
+        </Box>
+        {actions.map((action, index) => (
+          <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
+            {action}
+          </SuggestionChip>
+        ))}
+      </VStack>
     </Flex>
   );
 };
+
+/** Just enough spacing so rendered Markdown doesn't collapse inside the bubble. */
+const markdownCss = (isDark: boolean) => ({
+  "& :last-child": { marginBottom: 0 },
+  "& a": { textDecoration: "underline" },
+  "& code": {
+    background: isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.08)",
+    borderRadius: "4px",
+    fontSize: "0.9em",
+    padding: "0.1em 0.3em",
+  },
+  "& li": { listStyle: "revert" },
+  "& p, & ul, & ol, & pre, & table": { marginBottom: "0.5em" },
+  "& pre": {
+    background: isDark ? "rgba(0,0,0,0.35)" : "rgba(0,0,0,0.06)",
+    borderRadius: "6px",
+    overflowX: "auto",
+    padding: "0.6em",
+  },
+  "& pre code": { background: "transparent", padding: 0 },
+  "& th, & td": {
+    borderBottom: isDark ? "1px solid rgba(255,255,255,0.15)" : "1px solid rgba(0,0,0,0.1)",
+    padding: "0.2em 0.5em",
+    textAlign: "left",
+  },
+  "& ul, & ol": { paddingLeft: "1.25em" },
+});
 
 const LoadingIndicator: FC = () => {
   const { colorMode } = useColorMode();
