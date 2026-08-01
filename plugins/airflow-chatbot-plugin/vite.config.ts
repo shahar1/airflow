@@ -26,6 +26,9 @@ import { defineConfig } from "vitest/config";
 // https://vitejs.dev/config/
 export default defineConfig(({ command }) => {
   const isLibraryBuild = command === 'build';
+  // React only ships `act` in development, so forcing production here would
+  // make every hook/component test unrunnable.
+  const nodeEnv = process.env.VITEST === "true" ? "development" : "production";
 
   return {
     base: "./",
@@ -52,7 +55,7 @@ export default defineConfig(({ command }) => {
       global: "globalThis",
       "process.env": "{}",
       // Define process.env for browser compatibility
-      "process.env.NODE_ENV": JSON.stringify("production"),
+      "process.env.NODE_ENV": JSON.stringify(nodeEnv),
     },
     plugins: [
       react(),

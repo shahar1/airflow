@@ -21,11 +21,24 @@
  * Type definitions for the chatbot plugin.
  */
 
+/** One MCP/agent tool call, shown in the bubble as it happens. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  args?: unknown;
+  /** Client clock when the call appeared, used to time it. */
+  startedAt: number;
+  /** Set when the result arrives; until then the call is still running. */
+  durationMs?: number;
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: Date;
+  /** Tool calls the assistant made while producing this message. */
+  tools?: ToolCall[];
   /** When true the message represents an error response. */
   isError?: boolean;
 }
