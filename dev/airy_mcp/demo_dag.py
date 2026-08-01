@@ -44,7 +44,7 @@ def summarize_sales(column: str) -> int:
 
 
 def report(total: str) -> None:
-    print(f"Reporting total of {total}")
+    print(f"Reporting total of {int(total):,}")
 
 
 with DAG(
@@ -63,7 +63,7 @@ with DAG(
     load = PythonOperator(
         task_id="report",
         python_callable=report,
-        op_kwargs={"total": "{{ ti.xcom_pull(task_ids='summarize') }}"},
+        op_kwargs={"total": "{{ ti.xcom_pull(task_ids='summarise') }}"},
     )
 
     extract >> summarize >> load

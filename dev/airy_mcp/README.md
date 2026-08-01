@@ -94,11 +94,22 @@ still errors.)
 
 ## Demo run-book
 
+The Dag carries **two** bugs, and the second only surfaces once the first is
+fixed — `report` never runs while `summarize` is failing. That is the point: a
+clean one-shot repair looks rehearsed, a recovery looks real.
+
 1. Trigger `sales_summary` — it fails on `summarize`.
 2. **"What's wrong with sales_summary?"** → `diagnose_dag` → Airy names the task,
    the `KeyError: 'ammount'`, and the offending `op_kwargs` line.
 3. Click **Apply the fix…** → `fix_dag_code` → diff + `reparsed — Dag version 1 → 2`.
-4. Click **Re-run…** → `rerun_dag` → green.
+4. Click **Re-run…** → `rerun_dag` → `summarize` goes green and **`report` fails**
+   with `ValueError: invalid literal for int() with base 10: 'None'`.
+5. Ask again → `diagnose_dag` → the XCom pull references `task_ids='summarise'`,
+   which matches no task, so the pull returned `None`.
+6. Fix and re-run → green.
+
+Both fixes are single unique strings, so `fix_dag_code` applies each cleanly:
+`"column": "ammount"` → `"amount"`, and `task_ids='summarise'` → `'summarize'`.
 
 Reset between rehearsals: ask Airy to *"revert sales_summary"* (or
 `mv files/dags/sales_summary.py.airy-bak files/dags/sales_summary.py`).
