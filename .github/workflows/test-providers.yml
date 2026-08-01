@@ -25,6 +25,11 @@ on:  # yamllint disable-line rule:truthy
         required: false
         default: "amd"
         type: string
+      compat-runner-class:
+        description: "Runner class for the compat matrix (contention-sensitive on shared nodes)"
+        required: false
+        default: "medium"
+        type: string
       runners:
         description: "The array of labels (in json form) determining public AMD runners."
         required: true
@@ -184,7 +189,7 @@ jobs:
     timeout-minutes: 80
     # yamllint disable rule:line-length
     name: Compat ${{ matrix.compat.airflow-version }}:P${{ matrix.compat.python-version }}:${{ matrix.compat.test-types.description }}
-    runs-on: ${{ format('airflow-runner-{0}-medium', inputs.runner-arch) }}
+    runs-on: ${{ format('airflow-runner-{0}-{1}', inputs.runner-arch, inputs.compat-runner-class) }}
     strategy:
       fail-fast: false
       matrix:
