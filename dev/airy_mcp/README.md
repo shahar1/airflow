@@ -61,11 +61,16 @@ cp -r plugins/airflow-chatbot-plugin/www files/plugins/
 #      AIRFLOW__DAG_PROCESSOR__MIN_FILE_PROCESS_INTERVAL=0
 ```
 
-`fastmcp` is installed by the sidecar command itself if missing — but **install it
-once ahead of time** (`pip install fastmcp` inside the container, then confirm
-`airflow api-server` still starts). It pulls `mcp`/`httpx`/`pydantic`/`starlette`
-into the live Airflow venv, and you do not want the resolver running for the first
-time seconds before the demo.
+The image already ships `fastmcp-slim[client]` at the version in `uv.lock` (it
+comes with pydantic-ai's MCP extra), so the sidecar only needs the **server**
+half. The launchers run `pip install 'fastmcp-slim[server]'` if
+`import fastmcp.server` fails — deliberately with no version specifier, so pip
+adds the extra's dependencies and leaves the installed version alone.
+
+Do **not** `pip install fastmcp` instead: the meta-package resolves to the latest
+release and drags `mcp` (1.28.1 → 1.29.0) and `uvicorn` (0.51 → 0.52) off
+Airflow's pins. Verified: `fastmcp-slim[server]` keeps `fastmcp-slim`, `mcp`,
+`uvicorn`, `httpx`, `pydantic` and `starlette` exactly where `uv.lock` has them.
 
 The sidecar binds **127.0.0.1** by default: the transport is unauthenticated and
 `fix_dag_code` writes Python that Airflow then executes. Do not expose it.
@@ -80,7 +85,12 @@ not a demo. **Treat the two env vars above as mandatory**, not optional.
 
 `ENABLE_AIRY_MCP=true` starts both sidecars (`astro-airflow-mcp` on :8000,
 this one on :8001). The plugin reads a comma-separated `airy_mcp_url` Variable
-and defaults to attaching both.
+and defaults to attaching both — but it TCP-probes each one first and attaches
+only those listening. That is load-bearing, not tidiness: pydantic-ai raises out
+of `agent.run()` if *any* attached toolset fails to initialise, so a dead sidecar
+would otherwise take down the whole chat rather than just its own tools.
+(Verified against pydantic-ai 2.13.0; a sidecar that is listening but broken
+still errors.)
 
 ## Demo run-book
 
