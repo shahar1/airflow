@@ -128,18 +128,8 @@ def _create_chatbot_api() -> dict[str, Any]:
             if not llm_source and os.environ.get("OPENAI_API_KEY"):
                 llm_source = "env"
 
-        # Check MCP — TCP connect per endpoint.  Faster and more reliable than an
-        # HTTP probe because an MCP server need not serve GET / with 200.  One
-        # endpoint being down must not lock the user out of the chat entirely.
         urls = _get_mcp_urls()
-        reachable = []
-        for url in urls:
-            parsed = urlparse(url)
-            try:
-                with socket.create_connection((parsed.hostname or "localhost", parsed.port or 8000), 2):
-                    reachable.append(url)
-            except OSError:
-                pass
+        reachable = _reachable_mcp_urls(urls)
         mcp_ok = bool(reachable)
         mcp_url_val = ",".join(urls)
 
@@ -270,6 +260,26 @@ def _get_llm_api_key() -> str | None:
 _DEFAULT_MCP_URLS = "http://localhost:8000/mcp,http://localhost:8001/mcp"
 
 
+def _reachable_mcp_urls(urls: list[str]) -> list[str]:
+    """
+    Filter MCP endpoints down to the ones actually listening.
+
+    TCP connect rather than an HTTP probe, because an MCP server need not serve
+    GET / with 200.  This is not cosmetic: pydantic-ai raises out of
+    ``agent.run()`` if *any* attached toolset fails to initialise, so attaching a
+    dead sidecar takes the whole chat down instead of just its tools.
+    """
+    reachable = []
+    for url in urls:
+        parsed = urlparse(url)
+        try:
+            with socket.create_connection((parsed.hostname or "localhost", parsed.port or 8000), 2):
+                reachable.append(url)
+        except OSError:
+            log.warning("MCP endpoint %s is not reachable — Airy will run without its tools", url)
+    return reachable
+
+
 def _mcp_toolset_importable() -> bool:
     """Whether pydantic-ai's MCP extra is installed at all."""
     try:
@@ -329,7 +339,7 @@ async def _run_agent(message: str, history: list[dict[str, str]] | None = None) 
 
     # ---------- optionally attach MCP tools ----------
     toolsets = []
-    urls = _get_mcp_urls()
+    urls = _reachable_mcp_urls(_get_mcp_urls())
     if urls:
         try:
             from pydantic_ai.mcp import MCPToolset
