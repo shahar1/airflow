@@ -28,8 +28,9 @@ Configuration
   store as an Airflow *Connection* (``conn_id='openai_default'``, key in the
   *password* field) for encrypted-at-rest storage.
 * **Model name** — Airflow *Variable* ``airy_model`` (default ``gpt-4o-mini``).
-* **MCP server URL** — Airflow *Variable* ``airy_mcp_url``
-  (default ``http://localhost:8000/mcp``).  Set to empty string to disable MCP.
+* **MCP server URLs** — Airflow *Variable* ``airy_mcp_url``, comma-separated
+  (default: the read-only sidecar on ``:8000`` plus the self-healing one on
+  ``:8001``).  Set to empty string to disable MCP.
 
 In Breeze, just ``export OPENAI_API_KEY=sk-...`` before ``breeze start-airflow``.
 The Breeze image already ships ``pydantic-ai-slim`` + ``openai``; the init
@@ -39,9 +40,12 @@ script installs the MCP sidecar.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
@@ -76,8 +80,6 @@ def _get_base_url_path(path: str) -> str:
     """Construct URL path with webserver base_url prefix."""
     base_url = conf.get("api", "base_url", fallback="/")
     if base_url.startswith(("http://", "https://")):
-        from urllib.parse import urlparse
-
         base_path = urlparse(base_url).path
     else:
         base_path = base_url
@@ -105,8 +107,6 @@ def _create_chatbot_api() -> dict[str, Any]:
     @app.get("/health")
     async def health_check():
         """Detailed health check — verifies LLM key availability and MCP reachability."""
-        import os
-
         llm_ok = False
         llm_source: str | None = None
         mcp_ok = False
@@ -128,33 +128,34 @@ def _create_chatbot_api() -> dict[str, Any]:
             if not llm_source and os.environ.get("OPENAI_API_KEY"):
                 llm_source = "env"
 
-        # Check MCP
-        mcp_url_val = _get_variable("airy_mcp_url", "http://localhost:8000/mcp")
-        if mcp_url_val:
+        # Check MCP — TCP connect per endpoint.  Faster and more reliable than an
+        # HTTP probe because an MCP server need not serve GET / with 200.  One
+        # endpoint being down must not lock the user out of the chat entirely.
+        urls = _get_mcp_urls()
+        reachable = []
+        for url in urls:
+            parsed = urlparse(url)
             try:
-                import socket
-
-                # Parse host:port from the MCP URL and do a TCP connect check.
-                # This is faster and more reliable than an HTTP probe because
-                # the MCP server might not serve GET / with 200.
-                from urllib.parse import urlparse
-
-                parsed = urlparse(mcp_url_val)
-                host = parsed.hostname or "localhost"
-                port = parsed.port or 8000
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                sock.connect((host, port))
-                sock.close()
-                mcp_ok = True
-            except Exception:
-                mcp_ok = False
+                with socket.create_connection((parsed.hostname or "localhost", parsed.port or 8000), 2):
+                    reachable.append(url)
+            except OSError:
+                pass
+        mcp_ok = bool(reachable)
+        mcp_url_val = ",".join(urls)
 
         return JSONResponse(
             {
                 "status": "ok" if llm_ok else "degraded",
                 "llm": {"configured": llm_ok, "source": llm_source},
-                "mcp": {"configured": bool(mcp_url_val), "reachable": mcp_ok, "url": mcp_url_val},
+                "mcp": {
+                    "configured": bool(urls),
+                    "reachable": mcp_ok,
+                    "url": mcp_url_val,
+                    "unreachable": [url for url in urls if url not in reachable],
+                    # A missing pydantic-ai[mcp] leaves Airy confidently tool-less
+                    # with every TCP probe still green — surface it here instead.
+                    "toolset_importable": _mcp_toolset_importable(),
+                },
             }
         )
 
@@ -223,6 +224,24 @@ up real data instead of giving generic advice.  For example, if a user asks
 before answering.
 
 Keep answers concise and actionable.  Use Markdown formatting.
+
+**Self-healing.**  You can diagnose a broken Dag (`diagnose_dag`), patch its
+source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Work one step at
+a time and never chain them without the user asking:
+
+1. After diagnosing, name the failing task, quote the offending line, and say
+   exactly what you would change — then stop.
+2. Only call `fix_dag_code` when the user asks you to apply the fix.  Pass the
+   smallest unique `old` snippet you can (it must occur exactly once in the file).
+3. After a successful fix, offer to re-run — do not re-run on your own.
+4. Call `revert_dag_code` **only** when the user explicitly asks to undo a fix.
+   Never call it to recover from a failed step or because a run still fails.
+
+**Follow-up buttons.**  When the obvious next step is a single action, end your
+reply with one or more lines of the form `[ACTION: <what the user should say>]`.
+They are rendered as clickable buttons, so write them as the user's own words,
+e.g. `[ACTION: Apply the fix to sales_summary]` or `[ACTION: Re-run sales_summary]`.
+Put nothing after them.
 """
 
 
@@ -245,9 +264,24 @@ def _get_llm_api_key() -> str | None:
         pass
 
     # 2. Fall back to plain env var
-    import os
-
     return os.environ.get("OPENAI_API_KEY") or None
+
+
+_DEFAULT_MCP_URLS = "http://localhost:8000/mcp,http://localhost:8001/mcp"
+
+
+def _mcp_toolset_importable() -> bool:
+    """Whether pydantic-ai's MCP extra is installed at all."""
+    try:
+        from pydantic_ai.mcp import MCPToolset  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _get_mcp_urls() -> list[str]:
+    """MCP endpoints to attach — the read-only sidecar plus the self-healing one."""
+    return [url.strip() for url in _get_variable("airy_mcp_url", _DEFAULT_MCP_URLS).split(",") if url.strip()]
 
 
 def _get_variable(key: str, default: str) -> str:
@@ -289,24 +323,22 @@ async def _run_agent(message: str, history: list[dict[str, str]] | None = None) 
         )
 
     model_name = _get_variable("airy_model", "gpt-4o-mini")
-    mcp_url = _get_variable("airy_mcp_url", "http://localhost:8000/mcp")
 
     provider = OpenAIProvider(api_key=api_key)
     model = OpenAIChatModel(model_name, provider=provider)
-    agent = Agent(model=model, system_prompt=_SYSTEM_PROMPT)
 
     # ---------- optionally attach MCP tools ----------
-    if mcp_url:
+    toolsets = []
+    urls = _get_mcp_urls()
+    if urls:
         try:
             from pydantic_ai.mcp import MCPToolset
 
-            agent = Agent(
-                model=model,
-                system_prompt=_SYSTEM_PROMPT,
-                toolsets=[MCPToolset(mcp_url)],
-            )
-        except Exception:
-            log.warning("Could not configure MCP server at %s — running without tools", mcp_url)
+            toolsets = [MCPToolset(url) for url in urls]
+        except ImportError:
+            log.exception("pydantic-ai MCP extra missing — Airy is running without any tools")
+
+    agent = Agent(model=model, system_prompt=_SYSTEM_PROMPT, toolsets=toolsets)
 
     # ---------- build message history ----------
     from pydantic_ai.messages import (

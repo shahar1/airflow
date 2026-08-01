@@ -171,6 +171,9 @@ if [[ ${ENABLE_AIRY_MCP:-} == "true" ]]; then
     tmux split-window -h
     tmux set-option -p @airflow_component "Airy MCP"
     tmux send-keys "echo 'Waiting for Airflow API server…' && while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && echo 'API server ready' && astro-airflow-mcp --transport http --host 0.0.0.0 --port 8000 --airflow-url \${AIRFLOW_API_URL:-http://localhost:8080} --username \${AIRFLOW_USERNAME:-admin} --password \${AIRFLOW_PASSWORD:-admin}" C-m
+    tmux split-window -h
+    tmux set-option -p @airflow_component "Airy self-healing MCP"
+    tmux send-keys "while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && { python -c 'import fastmcp' 2>/dev/null || pip install --quiet fastmcp; } && python /opt/airflow/dev/airy_mcp/server.py --port 8001" C-m
 fi
 
 if [[ ${GO_WORKER} == "true" ]]; then

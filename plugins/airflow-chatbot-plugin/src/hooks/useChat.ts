@@ -43,6 +43,8 @@ export interface HealthStatus {
   ok: boolean;
   llm: boolean;
   mcp: boolean;
+  /** Some MCP endpoints are down, or the MCP extra is missing: Airy answers, but tool-less. */
+  degraded: boolean;
   loading: boolean;
 }
 
@@ -56,6 +58,7 @@ export const useHealth = () => {
     ok: false,
     llm: false,
     mcp: false,
+    degraded: false,
     loading: true,
   });
 
@@ -70,10 +73,13 @@ export const useHealth = () => {
         ok: data.llm?.configured ?? false,
         llm: data.llm?.configured ?? false,
         mcp: data.mcp?.reachable ?? false,
+        degraded:
+          (data.mcp?.unreachable?.length ?? 0) > 0 ||
+          data.mcp?.toolset_importable === false,
         loading: false,
       });
     } catch {
-      setHealth({ ok: false, llm: false, mcp: false, loading: false });
+      setHealth({ ok: false, llm: false, mcp: false, degraded: false, loading: false });
     }
   }, []);
 

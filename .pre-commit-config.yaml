@@ -489,6 +489,7 @@ repos:
           ^airflow-core/src/airflow/ui/public/i18n/locales/(?!en/).+/|
           ^\.agents/skills/airflow-translations/|
           ^\.agents/skills/magpie-setup/|
+          ^dev/airy_mcp/(demo_dag\.py|test_server\.py|README\.md)$|
           ^scripts/docker/keys/.*\.asc$
         args:
           - --ignore-words=docs/spelling_wordlist.txt
@@ -761,6 +762,7 @@ repos:
           (?x)
           ^README\.md$|
           ^pyproject\.toml$|
+          ^.*pnpm-lock\.yaml$|
           ^generated/PYPI_README\.md$|
           ^airflow-core/src/airflow/ui/public/i18n/README\.md$|
           ^airflow-core/docs/.*commits\.rst$|

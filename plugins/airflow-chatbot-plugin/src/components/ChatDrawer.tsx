@@ -249,7 +249,8 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
                   health.loading
                     ? ""
                     : health.llm && health.mcp
-                      ? "LLM: configured \u2022 MCP: reachable"
+                      ? "LLM: configured \u2022 MCP: " +
+                        (health.degraded ? "partially reachable" : "reachable")
                       : health.llm
                         ? "LLM: configured \u2022 MCP: not reachable"
                         : "LLM: not configured \u2022 MCP: " + (health.mcp ? "reachable" : "not reachable")
@@ -259,8 +260,15 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
                   <Text fontSize="xs" color="gray.500">Connecting…</Text>
                 ) : health.llm && health.mcp ? (
                   <>
-                    <Box boxSize="7px" borderRadius="full" bg="green.400" flexShrink={0} />
-                    <Text fontSize="xs" color="gray.500">Connected</Text>
+                    <Box
+                      boxSize="7px"
+                      borderRadius="full"
+                      bg={health.degraded ? "orange.400" : "green.400"}
+                      flexShrink={0}
+                    />
+                    <Text fontSize="xs" color="gray.500">
+                      {health.degraded ? "Some tools unavailable" : "Connected"}
+                    </Text>
                   </>
                 ) : (
                   <>
@@ -300,7 +308,12 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
           <MessageList
             messages={messages}
             isLoading={isLoading}
-            onSuggestionClick={setInputValue}
+            onSuggestionClick={(text) => {
+              if (!isLoading) {
+                onSendMessage(text);
+                setInputValue("");
+              }
+            }}
           />
         </Box>
 
