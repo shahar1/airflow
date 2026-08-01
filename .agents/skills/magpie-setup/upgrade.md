@@ -313,16 +313,20 @@ silent on families). Compose the **effective family set**
 for this upgrade as:
 
 - **Opt-in families** the project recorded (`security`,
-  `pr-management`, `issue`, or any combination).
+  `pr-management`, `issue`, `release-management`, `repo-health`,
+  `pairing`, `mentoring`, `contributor-growth`, or any
+  combination).
 - **Newly-introduced opt-in families** — families the
   framework now ships that did not exist when the lock was
-  written. Detect by enumerating the prefixes of opt-in
-  families in the snapshot (`security-*`, `pr-management-*`,
-  `issue-*`) and comparing against the lock's recorded set.
-  Any family present in the snapshot but absent from the
-  lock is auto-added to the effective set on this run, and
-  the addition is **written back to `<committed-lock>`**
-  (same fields as
+  written. Detect by reading the distinct `family:` frontmatter
+  keys across the snapshot's `SKILL.md` files, dropping the
+  always-on families (`setup`, `utilities`), and comparing the
+  remaining opt-in set against the lock's recorded set — **not**
+  by name prefix, since families such as `repo-health` and
+  `contributor-growth` span several prefixes. Any family present
+  in the snapshot but absent from the lock is auto-added to the
+  effective set on this run, and the addition is **written back
+  to `<committed-lock>`** (same fields as
   [`adopt.md` Step 4](adopt.md#step-4--write-committed-lock-fresh-only)).
   Surface the added family in the upgrade summary so the
   operator sees it; do not prompt — per the framework's
@@ -332,14 +336,14 @@ for this upgrade as:
 - **Always-on families** (always added — never read from
   the lock, never user-configurable, per
   [`SKILL.md` Golden rule 8](SKILL.md#golden-rules)):
-  - every `setup-*` skill in the new snapshot *except*
+  - every `family: setup` skill in the new snapshot *except*
     `setup` itself, and
-  - every `list-*` skill in the new snapshot.
+  - every `family: utilities` skill in the new snapshot.
 
-Compute the always-on set fresh from the snapshot contents
-on disk — it expands automatically when the framework adds
-a new `setup-*` or `list-*` skill in a release, and
-contracts on a rename / removal without code changes here.
+Compute the always-on set fresh from the snapshot's `family:`
+keys on disk — it expands automatically when the framework adds
+a new `family: setup` or `family: utilities` skill in a release,
+and contracts on a rename / removal without code changes here.
 
 Before creating symlinks for a newly-introduced opt-in
 family — or for a newly-present active target dir — reconcile
@@ -446,6 +450,11 @@ rather than pulls in via symlink. Examples:
   in the snapshot. Re-syncing it is how a new skill — or a skill
   that newly adds a guard — reaches an already-adopted repo; the
   `settings.json` `hooks.PreToolUse` wiring is unchanged.
+- The committed `.codex/config.toml` and `.codex/rules/magpie.rules`:
+  compare them with the current snapshot policy. Preserve unrelated
+  Codex settings; surface conflicts and hand edits rather than
+  overwriting them. Run `sandbox-lint --codex .codex` after the merge
+  and never modify Codex project trust.
 - Any future hook or local config the framework adds.
 
 These can drift independently of the snapshot — an
@@ -707,6 +716,19 @@ newly-`provides`-d source skill picks up its per-worktree symlink
 on its next `worktree-init` or
 `/magpie-setup verify --auto-fix-symlinks`.
 
+## Step 6g — Re-derive auto-sourced configuration fields (drift reconciliation)
+
+If live metadata is accessible via `gh repo view`:
+1. **Re-derive the stable fields**, following the same organization split as
+   [`adopt.md` Step 4b](adopt.md#step-4b--read-fit-signals-fresh-only):
+   - *Organization-agnostic* (any adopter): repo name, default branch,
+     homepage/product URL, labels — from GitHub repo metadata.
+   - *ASF-specific* (**only when `organization: ASF`**): mailing lists from
+     `.asf.yaml`. Skip the `.asf.yaml`/mailing-list re-derivation for a
+     non-ASF `organization` — there is nothing to reconcile against.
+2. **Detect config drift**: Compare these re-derived values against the committed values in `.apache-magpie-overrides/project.md`.
+3. **Surface and reconcile**: If any value has changed (e.g., branch renamed, or — for ASF projects — a mailing-list address updated in `.asf.yaml`), display the drift to the user. Offer to update `.apache-magpie-overrides/project.md` with the new values in place. If confirmed by the user, write the updated configuration to `.apache-magpie-overrides/project.md` and stage the file (`git add`).
+
 ## Step 7 — Update `<local-lock>`
 
 Write the new local lock with the values captured in Step
@@ -739,9 +761,9 @@ setup (bootstrap):
   ✓ in sync   OR   ↻ overwritten from snapshot (reloaded in-flight)
 
 Symlinks (main checkout):
-  Opt-in families:     <security>, <pr-management>, <issue>   (from lock)
-  Newly added opt-in:  <issue>   (introduced since lock was written; lock updated)
-  Always-on families:  setup-*, list-*       (per Golden rule 8)
+  Opt-in families:     <e.g. security, pr-management, release-management>   (from lock)
+  Newly added opt-in:  <e.g. repo-health>   (introduced since lock was written; lock updated)
+  Always-on families:  setup, utilities       (per Golden rule 8)
   ✓ <list of unchanged symlinks>
   + <list of newly-created symlinks (skill present in the
      effective family set but missing from an active target dir)>
