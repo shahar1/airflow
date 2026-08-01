@@ -234,7 +234,8 @@ def generate_mprocs_config() -> str:
         procs["airy_selfheal_mcp"] = {
             "shell": (
                 "while ! nc -z localhost 8080 2>/dev/null; do sleep 1; done && "
-                "{ python -c 'import fastmcp' 2>/dev/null || pip install --quiet fastmcp; } && "
+                "{ python -c 'import fastmcp.server' 2>/dev/null || "
+                "  pip install --quiet 'fastmcp-slim[server]'; } && "
                 "python /opt/airflow/dev/airy_mcp/server.py --port 8001"
             ),
             "restart": "always",
