@@ -322,7 +322,7 @@ jobs:
     with:
       runner-arch: ${{ inputs.runner-arch }}
       workflow-name: "Event driven e2e test"
-      runners: ${{ format('["airflow-runner-{0}-medium"]', inputs.runner-arch) }}
+      runners: ${{ format('["airflow-runner-{0}-xl"]', inputs.runner-arch) }}
       platform: ${{ inputs.platform }}
       default-python-version: "${{ inputs.default-python-version }}"
       use-uv: ${{ inputs.use-uv }}
