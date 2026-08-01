@@ -812,6 +812,7 @@ testing = ["dev", "providers.tests", "tests_common", "tests", "system", "unit", 
 # TRY002: Use `raise Exception`
 "dev/perf/*" = ["TID253"]
 "dev/check_files.py" = ["S101"]
+"dev/airy_mcp/test_server.py" = ["S101"]
 "dev/breeze/tests/*" = ["TID253", "S101", "TRY002"]
 "devel-common/tests/*" = ["S101"]
 "airflow-core/tests/*" = ["D", "TID253", "S101", "TRY002"]
