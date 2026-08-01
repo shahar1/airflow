@@ -215,8 +215,9 @@ in a given active target dir, classify it (a skill missing
 from `.agents/skills/` is as much a gap as one missing from
 `.claude/skills/`):
 
-- **Always-on family** (every `setup-*` *except*
-  `setup` itself, and every `list-*` — per
+- **Always-on family** (every `family: setup` skill *except*
+  `setup` itself, and every `family: utilities` skill — read the
+  `family:` frontmatter key, per
   [`SKILL.md` Golden rule 8](SKILL.md#golden-rules)) →
   surface as ✗. These families are not opt-in; missing
   symlinks here indicate a broken install or a skipped
@@ -543,7 +544,7 @@ hit these constantly; pre-allowing them removes the
 repetitive confirmation prompts without weakening the
 boundary. Tailor the recommendation to the families the
 adopter opted into via
-[`<committed-lock>` → `skill-families`](adopt.md#step-5--pick-the-skill-families):
+[`<committed-lock>` → `skill-families`](adopt.md#step-5--pick-the-skill-families-and-mcp-servers):
 
 - **`security` family** —
   - `mcp__claude_ai_Gmail__get_thread`
@@ -673,8 +674,21 @@ latest `main` of `apache/comdev` (tracked, not pinned). Confirm:
    of the freshness assertion; the authoritative live fetch belongs
    to [`/magpie-setup upgrade` Step 6e](upgrade.md#step-6e--refresh-comdev-mcp-checkouts-asf-projects)
    and [`setup-isolated-setup-update`](../setup-isolated-setup-update/SKILL.md).
-   ✗ off-`main` or non-`apache/comdev` remote; ⚠ behind
-   `origin/main`.
+    ✗ off-`main` or non-`apache/comdev` remote; ⚠ behind
+    `origin/main`.
+
+### 8f. Auto-sourced config fields drift check
+
+Verify that the auto-sourced stable configuration fields in
+`.apache-magpie-overrides/project.md` are in sync with the repository's live
+metadata:
+
+- Always (organization-agnostic): `upstream_repo`, `upstream_default_branch`,
+  `product_family_url`, `labels` — from `gh repo view`.
+- **Only when `organization: ASF`**: the mailing lists, against the current
+  `.asf.yaml`. Skip the `.asf.yaml` comparison for a non-ASF `organization`
+  (an `independent` project has no `.asf.yaml` to drift against — not a finding).
+- ⚠ if any value has changed or drifted (e.g. the default branch changed from `master` to `main`, or — for ASF projects — mailing-list routing in `.asf.yaml` was updated). Recommend running `/magpie-setup upgrade` to re-derive and align the committed configuration with the new metadata.
 
 ### 9. Project documentation mentions the framework
 
@@ -729,6 +743,26 @@ lists at least one source — otherwise skip this check silently
 - **No name collision.** No `magpie-<name>` provided by a source
   shadows a framework skill or another source's skill. Collision
   ⇒ ✗ (surface, do not auto-resolve).
+
+### 8g. Codex project profile (if present)
+
+When `<repo-root>/.codex/config.toml` exists, validate the committed
+Codex policy with:
+
+```bash
+uv run --project tools/sandbox-lint sandbox-lint --codex <repo-root>/.codex
+```
+
+- ✓ on a clean pass.
+- ✗ on any invariant violation (sandbox mode, workspace network
+  access, approval policy, or missing exec-policy coverage) — surface
+  the violations for review. A conflicting adopter value is never
+  silently weakened; the remediation is `/magpie-setup` (adopt or
+  upgrade), which shows the diff and asks.
+
+When `.codex/` is absent this check is skipped — the Codex profile is
+opt-in per runtime; see
+[the Codex adapter](../../docs/adapters/codex.md).
 
 ## After the report
 

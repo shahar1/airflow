@@ -432,6 +432,14 @@ async def _stream_agent(
         yield {"type": "error", "message": str(_root_cause(e))}
 
 
+def _bundle_version() -> int:
+    """Modification time of the built bundle, used to bust the browser cache."""
+    try:
+        return int((STATIC_DIR / "main.iife.js").stat().st_mtime)
+    except OSError:
+        return 0
+
+
 class ChatbotInjectionMiddleware(BaseHTTPMiddleware):
     """
     Middleware to inject the chatbot script into HTML responses.
@@ -493,11 +501,15 @@ class ChatbotInjectionMiddleware(BaseHTTPMiddleware):
     def _get_injection_script(self) -> str:
         """Generate the script tag to inject the chatbot."""
         # The IIFE bundle is self-contained (bundles React) and
-        # auto-initializes via the code in main.tsx.
+        # auto-initializes via the code in main.tsx.  StaticFiles sends no
+        # Cache-Control, so without a changing query the browser happily keeps
+        # serving a bundle from before the last rebuild — which looks like the
+        # backend and frontend disagreeing.  Stat per request, not at startup,
+        # so a rebuild takes effect on reload rather than on restart.
         return f"""
 <!-- Airflow Chatbot Plugin -->
 <div id="airflow-chatbot-root"></div>
-<script src="{self.bundle_url}"></script>
+<script src="{self.bundle_url}?v={_bundle_version()}"></script>
 """
 
 
