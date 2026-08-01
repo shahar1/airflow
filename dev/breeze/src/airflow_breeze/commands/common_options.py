@@ -197,7 +197,11 @@ option_dry_run = click.option(
     callback=_set_default_from_parent,
 )
 option_forward_credentials = click.option(
-    "-f", "--forward-credentials", help="Forward local credentials to container when running.", is_flag=True
+    "-f",
+    "--forward-credentials",
+    help="Forward local credentials to container when running.",
+    is_flag=True,
+    envvar="FORWARD_CREDENTIALS",
 )
 option_forward_ports = click.option(
     "--forward-ports",

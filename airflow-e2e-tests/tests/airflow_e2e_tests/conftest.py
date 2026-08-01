@@ -31,6 +31,7 @@ from testcontainers.compose import DockerCompose
 from airflow_e2e_tests.constants import (
     AIRFLOW_ROOT_PATH,
     AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT,
+    AIRFLOW_UID,
     AWS_INIT_PATH,
     DOCKER_COMPOSE_HOST_PORT,
     DOCKER_COMPOSE_PATH,
@@ -76,6 +77,26 @@ from tests_common.test_utils.fernet import generate_fernet_key_string
 console = Console(width=400, color_system="standard")
 
 
+def _is_ghcr_airflow_image(image: str) -> bool:
+    """Return True for ghcr.io/<owner>/airflow[/...] images.
+
+    Parses the image reference properly instead of using substring matching,
+    so that 'airflow' must be the second path component (not anywhere in the string).
+    Handles optional tag (:tag) and digest (@sha256:...) suffixes.
+    """
+    image_no_digest = image.split("@", 1)[0]
+    last_slash = image_no_digest.rfind("/")
+    last_colon = image_no_digest.rfind(":")
+    if last_colon > last_slash:
+        image_no_digest = image_no_digest[:last_colon]
+    parts = image_no_digest.split("/")
+    if len(parts) < 3:
+        return False
+    registry = parts[0]
+    repo_parts = parts[1:]
+    return registry == "ghcr.io" and len(repo_parts) >= 2 and repo_parts[1] == "airflow"
+
+
 class _E2ETestState:
     compose_instance: DockerCompose | None = None
     airflow_logs_path: Path | None = None
@@ -105,7 +126,7 @@ def _setup_s3_integration(dot_env_file, tmp_dir):
     _copy_localstack_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         "AWS_DEFAULT_REGION=us-east-1\n"
         "AWS_ENDPOINT_URL_S3=http://localstack:4566\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
@@ -121,7 +142,7 @@ def _setup_elasticsearch_integration(dot_env_file, tmp_dir):
     _copy_elasticsearch_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
         "AIRFLOW__ELASTICSEARCH__HOST=http://elasticsearch:9200\n"
         "AIRFLOW__ELASTICSEARCH__WRITE_STDOUT=false\n"
@@ -136,7 +157,7 @@ def _setup_opensearch_integration(dot_env_file, tmp_dir):
     _copy_opensearch_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
         "AIRFLOW__OPENSEARCH__HOST=http://opensearch:9200\n"
         "AIRFLOW__OPENSEARCH__PORT=9200\n"
@@ -150,6 +171,41 @@ def _setup_opensearch_integration(dot_env_file, tmp_dir):
         "AIRFLOW__OPENSEARCH__OFFSET_FIELD=offset\n"
     )
     os.environ["ENV_FILE_PATH"] = str(dot_env_file)
+
+
+def _write_codebuild_health_override(tmp_dir: Path) -> None:
+    """Write a compose override that relaxes health-check timing on CodeBuild runners.
+
+    CodeBuild's EBS-backed storage and shared CPUs make container startup much slower than
+    on GitHub-hosted runners, which exhausts the default health-check windows in two places:
+
+    * postgres runs a two-phase init cycle (a temporary server to run the init scripts, then
+      the permanent server). With the default ``start_period: 5s`` the first health check
+      passes against the temporary server, airflow-init starts migrating, and the migration
+      breaks when the temporary server shuts down ~30s in.
+    * the airflow services install ``_PIP_ADDITIONAL_REQUIREMENTS`` at startup for the
+      event_driven and xcom test modes (now that they run as non-root — see AIRFLOW_UID — the
+      install actually runs instead of crash-looping). Five services install concurrently,
+      which on CodeBuild can take longer than the apiserver's default 180s window
+      (``start_period 30s + 5 × interval 30s``), so the apiserver could be marked unhealthy
+      before the install finishes and the server starts.
+
+    ``start_period`` only suppresses *failing* probes during the window — a service that
+    becomes healthy earlier is still detected immediately — so enlarging it is free for the
+    fast test modes. Applied only when ``CODEBUILD_BUILD_ID`` is set.
+    """
+    # postgres needs less time than the airflow services (no startup pip install).
+    start_periods = {"postgres": 120}
+    start_periods.update({service: 300 for service in AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT})
+    lines = ["---", "services:"]
+    for service, start_period in start_periods.items():
+        lines += [
+            f"  {service}:",
+            "    healthcheck:",
+            f"      start_period: {start_period}s",
+            "      retries: 10",
+        ]
+    (tmp_dir / "codebuild-health-override.yml").write_text("\n".join(lines) + "\n")
 
 
 def _copy_kafka_files(tmp_dir):
@@ -212,7 +268,7 @@ def _setup_event_driven_integration(dot_env_file, tmp_dir):
     )
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         f"AIRFLOW_CONN_KAFKA_DEFAULT='{kafka_conn}'\n"
         f"_PIP_ADDITIONAL_REQUIREMENTS={' '.join(provider_paths)}\n"
     )
@@ -244,7 +300,7 @@ def _setup_xcom_object_storage_integration(dot_env_file, tmp_dir):
     _copy_localstack_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         # XComObjectStorageBackend requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as env vars
         # because `universal-path` uses boto3's native S3 client, which relies on environment variables
         # for authentication rather than parsing credentials from the connection URI
@@ -315,7 +371,12 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
       entry in the container's /etc/passwd; Docker would otherwise inherit the
       image's HOME (/root) which the non-root process cannot write to.
     * files/m2 is mounted directly as ~/.m2 so publishToMavenLocal writes
-      there without nesting, and its contents are visible on the host.
+      there without nesting, and its contents are visible on the host. The
+      -Dmaven.repo.local pin is required on top of HOME because a root (uid 0)
+      runner — as on the CodeBuild container — resolves the JVM user.home to
+      /root via /etc/passwd regardless of HOME, so mavenLocal() would otherwise
+      default to an ephemeral /root/.m2 and the published plugin would be lost
+      before the `bundle` step could find it.
     """
     if native:
         cwd = workdir
@@ -348,6 +409,7 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
             "eclipse-temurin:17-jdk",
             "/repo/java-sdk/gradlew",
             "--no-daemon",
+            "-Dmaven.repo.local=/workspace-home/.m2/repository",
             *gradle_argv,
         ]
     return subprocess.run(argv, cwd=cwd, check=True, capture_output=capture_output, text=True)
@@ -483,7 +545,7 @@ def _setup_java_sdk_integration(dot_env_file, tmp_dir):
     )
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={os.getuid()}\n"
+        f"AIRFLOW_UID={AIRFLOW_UID}\n"
         # Single-quote the JSON values so Docker Compose reads them literally.
         f"AIRFLOW__SDK__COORDINATORS='{coordinator_config}'\n"
         f"AIRFLOW__SDK__QUEUE_TO_COORDINATOR='{queue_to_coordinator}'\n"
@@ -747,7 +809,13 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
     console.print(f"[yellow]Creating subfolders:[/ {subfolders}")
 
     for subdir in subfolders:
-        (tmp_dir / subdir).mkdir()
+        path = tmp_dir / subdir
+        path.mkdir()
+        # When the host runs as root the containers run as the airflow user (AIRFLOW_UID=50000,
+        # not the host's uid), so make the bind-mounted dirs writable by it — otherwise airflow
+        # cannot write its logs into the root-owned mount.
+        if os.getuid() != AIRFLOW_UID:
+            path.chmod(0o777)
 
     _E2ETestState.airflow_logs_path = tmp_dir / "logs"
     _E2ETestState.airflow_dags_path = tmp_dir / "dags"
@@ -759,12 +827,16 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
         copytree(E2E_DAGS_FOLDER, tmp_dir / "dags", dirs_exist_ok=True)
 
     dot_env_file = tmp_dir / ".env"
-    dot_env_file.write_text(f"AIRFLOW_UID={os.getuid()}\n")
+    dot_env_file.write_text(f"AIRFLOW_UID={AIRFLOW_UID}\n")
 
     console.print(f"[yellow]Creating .env file :[/ {dot_env_file}")
 
     os.environ["AIRFLOW_IMAGE_NAME"] = DOCKER_IMAGE
     compose_file_names = ["docker-compose.yaml"]
+
+    if os.environ.get("CODEBUILD_BUILD_ID"):
+        _write_codebuild_health_override(tmp_dir)
+        compose_file_names.append("codebuild-health-override.yml")
 
     if E2E_TEST_MODE == "remote_log":
         compose_file_names.append("localstack.yml")
@@ -801,9 +873,11 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
     os.environ["FERNET_KEY"] = generate_fernet_key_string()
 
     # Skip pull for images that exist only locally and cannot be fetched from a registry:
-    # - ghcr.io/apache/airflow/: pre-pulled by the prepare_breeze_and_image CI step
+    # - ghcr.io/<owner>/airflow/: pre-pulled by the prepare_breeze_and_image CI step; fork
+    #   ghcr packages are private, so a `docker compose pull` there fails with an
+    #   authentication error even though the image is present locally.
     # - openlineage-e2e/: locally built by _build_openlineage_e2e_compat_image (never pushed)
-    pull = not DOCKER_IMAGE.startswith(("ghcr.io/apache/airflow/", "openlineage-e2e/"))
+    pull = not (_is_ghcr_airflow_image(DOCKER_IMAGE) or DOCKER_IMAGE.startswith("openlineage-e2e/"))
 
     try:
         console.print(f"[blue]Spinning up airflow environment using {DOCKER_IMAGE}")
@@ -831,12 +905,31 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
 
 
 def _print_logs(compose_instance: DockerCompose):
-    containers = compose_instance.get_containers()
+    # include_all=True so containers that already exited are shown too. The default
+    # (running-only) hides exactly the container that makes `docker compose up --wait` fail —
+    # e.g. an airflow service whose startup pip install was killed, or airflow-init exiting
+    # non-zero. The State/ExitCode summary distinguishes an OOM kill (137) from a real error.
+    try:
+        containers = compose_instance.get_containers(include_all=True)
+    except TypeError:
+        containers = compose_instance.get_containers()
+    console.print("::group:: Container states (incl. exited)")
+    for container in containers:
+        console.print(
+            f"{getattr(container, 'Name', '?')} service={getattr(container, 'Service', '?')} "
+            f"state={getattr(container, 'State', '?')} exit_code={getattr(container, 'ExitCode', '?')}",
+            style="yellow",
+            soft_wrap=True,
+            markup=False,
+        )
+    console.print("::endgroup::")
     for container in containers:
         service = container.Service
         if service:
             stdout, _ = compose_instance.get_logs(service)
-            console.print(f"::group:: {service} Logs")
+            state = getattr(container, "State", "?")
+            exit_code = getattr(container, "ExitCode", "?")
+            console.print(f"::group:: {service} Logs (state={state}, exit={exit_code})")
             console.print(stdout, style="red", soft_wrap=True, markup=False)
             console.print("::endgroup::")
 

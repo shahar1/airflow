@@ -303,8 +303,15 @@ if CI:
         print("No files to test. Quitting")
         sys.exit(0)
 
-    write_file_list(all_files_to_check)
-    file_argument_ci = "@/files/mypy_files.txt"
+    # Use a per-invocation filename (suffixed with the folders being checked) instead of a
+    # single shared ``mypy_files.txt``. prek runs the mypy-* hooks concurrently (its concurrency
+    # scales with the host CPU count — 36 on a large CodeBuild box), and every hook calls this
+    # script, so a shared filename gets clobbered mid-read by a parallel hook. That surfaced as
+    # ``mypy: error: Cannot read file '<two paths mangled together>'`` and a spurious exit 2.
+    # The local-venv path above already isolates per hook via ``suffix=``; mirror that here.
+    suffix = "_".join(mypy_folders).replace("/", "_").replace(".", "_")
+    mypy_file_list = write_file_list(all_files_to_check, suffix=suffix)
+    file_argument_ci = f"@/files/{mypy_file_list.name}"
 
     mypy_cmd = (
         f"TERM=ansi mypy --follow-imports=silent {shlex.quote(file_argument_ci)} {' '.join(mypy_extra_args)}"

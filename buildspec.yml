@@ -1,0 +1,176 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+---
+# FORK / CodeBuild-runner test only.
+#
+# For a CodeBuild-managed GitHub Actions runner project the build commands are
+# overridden to start the runner agent, EXCEPT the install/pre_build/post_build
+# phases when "Run buildspec commands in INSTALL, PRE_BUILD and POST_BUILD
+# phases" is enabled on the project. We use that to authenticate the runner's
+# Docker daemon to Docker Hub before any workflow step runs, so the very first
+# `docker run ...` (the "Cleanup repo" step) no longer hits Docker Hub's
+# anonymous pull rate limit on AWS's shared egress IPs.
+#
+# NOTE: a buildspec-override runner build does NOT check out the repository
+# (only this buildspec file is downloaded), so every command here must be
+# self-contained -- it cannot call a script committed under scripts/.
+#
+# Requires two project environment variables:
+#   DOCKERHUB_USERNAME - Plaintext
+#   DOCKERHUB_TOKEN    - Secrets Manager (a Docker Hub access token)
+version: 0.2
+
+env:
+  # Commands below use bash features (set -o pipefail); the CodeBuild default
+  # Linux shell is /bin/sh (dash), which does not support them.
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Docker Hub as ${DOCKERHUB_USERNAME}"
+      - echo "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+      # Widen Docker's bridge-network address pools. Parallel breeze chunks each
+      # create their own docker-compose network; Docker's default pools only give
+      # ~31 networks, so on this high-core instance the extra chunks fail with
+      # "all predefined address pools have been fully subnetted". We carve a /14
+      # into /24s (1024 networks). The base stays inside 172.16.0.0/12 (Docker's
+      # own default range, known to work here) and uses 172.16.0.0/14, which
+      # avoids the AWS default VPC range 172.31.0.0/16. If this runner is ever
+      # attached to a VPC inside 172.16.0.0/14, change the base below.
+      - |
+        set -euo pipefail
+        # cgroup v2 delegation for nested containers. KinD's node kubelet fails with
+        # "required cgroups disabled" because the controllers are not delegated down to
+        # the (doubly) nested node container -- docker:dind's entrypoint normally does
+        # this, but CodeBuild's standard image starts dockerd without it. Move processes
+        # out of the root cgroup (a cgroup with member procs cannot enable controllers in
+        # subtree_control) and enable every available controller for children. Heavily
+        # guarded: a failure here must never abort pre_build. Done before the dockerd
+        # restart below so the new daemon's containers inherit the delegated hierarchy.
+        if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+          sudo mkdir -p /sys/fs/cgroup/init 2>/dev/null || true
+          # move every process to the init sub-cgroup
+          for _pid in $(cat /sys/fs/cgroup/cgroup.procs 2>/dev/null); do
+            echo "${_pid}" | sudo tee /sys/fs/cgroup/init/cgroup.procs >/dev/null 2>&1 || true
+          done
+          # enable all controllers for the root's children (+cpu +cpuset +io +memory +pids ...)
+          _ctrls="$(sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers)"
+          echo "${_ctrls}" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
+          _now="$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo '?')"
+          echo "cgroup v2 delegation: subtree_control=${_now}"
+        fi
+        pools='[{"base":"172.16.0.0/14","size":24}]'
+        # Raise the per-container open-file limit. The PythonVirtualenv/ExternalPython
+        # operator tests (providers/standard) open many fds (venvs + subprocesses) and
+        # exhaust the CodeBuild container's low default nofile, failing the compat job with
+        # "OSError: [Errno 24] Too many open files" (then pytest cannot even write its junit
+        # XML). Set this at the daemon's default-ulimits so every test container inherits it.
+        #
+        # Keep the SOFT limit moderate (65536) and the HARD limit high (1048576): a high *soft*
+        # limit is a known performance trap -- code that closes every fd up to the soft limit
+        # before fork/exec (RPM, old pexpect/ptyprocess, pinned in lowest-dependency runs) then
+        # makes ~1M close() calls per spawn. Measured locally: ~515 ms/spawn at soft=1048576 vs
+        # ~32 ms at 65536. Under the all-providers parallel run that saturates the daemon and
+        # times out unrelated container creates (e.g. the mongo testcontainers tests). 65536 is
+        # ample for the venv tests (64x the ~1024 default) while staying fast; anything needing
+        # more raises its own soft limit up to the hard cap. (System-wide caps are raised in the
+        # kernel-limits block below so the daemon can grant the hard limit.)
+        ulimits='{"nofile":{"Name":"nofile","Hard":1048576,"Soft":65536}}'
+        # Route Docker Hub pulls through Google's public, unauthenticated mirror to dodge
+        # Docker Hub's anonymous pull-rate limit on AWS's shared egress IPs. Tools that pull
+        # from *inside* the test container (e.g. testcontainers' docker-py client for the mongo
+        # provider tests) cannot use the host's `docker login`, so their anonymous pulls/manifest
+        # checks otherwise stall and time out. The mirror only affects docker.io; other registries
+        # are untouched, and it falls back to Docker Hub if the mirror lacks an image.
+        mirrors='["https://mirror.gcr.io"]'
+        sudo mkdir -p /etc/docker
+        # Optional: move Docker's data-root onto a RAM-backed tmpfs to speed up the
+        # heavy in-container I/O (provider installs, image layers). Enable by
+        # setting the project env var DOCKER_DATA_ROOT_TMPFS_GB to a size in GB;
+        # leave it unset/0 to keep the data-root on disk. tmpfs is real RAM, so
+        # size it well below total RAM (leave headroom for the parallel build
+        # processes) -- an explicit cap makes overflow a recoverable ENOSPC rather
+        # than an OOM kill. overlay2-on-tmpfs is unsupported-but-works on modern
+        # kernels; this is an experiment, so validate before relying on it.
+        data_root=""
+        if [ "${DOCKER_DATA_ROOT_TMPFS_GB:-0}" -gt 0 ] 2>/dev/null; then
+          echo "Mounting ${DOCKER_DATA_ROOT_TMPFS_GB}G tmpfs for Docker data-root"
+          sudo mkdir -p /mnt/docker-ram
+          sudo mount -t tmpfs -o "size=${DOCKER_DATA_ROOT_TMPFS_GB}g,mode=0711" \
+            tmpfs /mnt/docker-ram
+          data_root=',"data-root":"/mnt/docker-ram"'
+        fi
+        merge="{\"default-address-pools\":${pools},\"default-ulimits\":${ulimits},\"registry-mirrors\":${mirrors}${data_root}}"
+        if [ -s /etc/docker/daemon.json ] && command -v jq >/dev/null 2>&1; then
+          tmp="$(mktemp)"
+          sudo jq --argjson m "${merge}" '. + $m' /etc/docker/daemon.json >"${tmp}"
+          sudo mv "${tmp}" /etc/docker/daemon.json
+        else
+          echo "${merge}" | sudo tee /etc/docker/daemon.json >/dev/null
+        fi
+        echo "Wrote /etc/docker/daemon.json:"
+        sudo cat /etc/docker/daemon.json
+        # CodeBuild images have no systemd, so restart dockerd directly,
+        # preserving the args the agent started it with. default-address-pools
+        # is only read at daemon startup, so a restart is required.
+        dockerd_args="$(ps -o args= -C dockerd 2>/dev/null | head -n1 | sed -E 's#^[^ ]*dockerd##' || true)"
+        echo "Stopping dockerd (args:${dockerd_args})"
+        sudo pkill -TERM -x dockerd || true
+        # Wait for the dockerd PROCESS to exit -- the API stops responding on the
+        # first SIGTERM, so polling `docker info` returns too early and the new
+        # dockerd then races a still-alive PID and a stale pidfile.
+        for _ in $(seq 1 60); do pgrep -x dockerd >/dev/null 2>&1 || break; sleep 1; done
+        if pgrep -x dockerd >/dev/null 2>&1; then
+          echo "dockerd still alive after SIGTERM; sending SIGKILL"
+          sudo pkill -KILL -x dockerd || true
+          sleep 3
+        fi
+        sudo rm -f /var/run/docker.pid
+        echo "Starting dockerd with widened address pools"
+        sudo bash -c "nohup dockerd ${dockerd_args} >/var/log/dockerd-codebuild.log 2>&1 &"
+        for _ in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+        if ! docker info >/dev/null 2>&1; then
+          echo "ERROR: dockerd did not restart" >&2
+          sudo tail -n 50 /var/log/dockerd-codebuild.log >&2 || true
+          exit 1
+        fi
+        docker info --format 'Configured address pools: {{json .DefaultAddressPools}}'
+      # Raise kernel limits needed to run multiple kind (Kubernetes-in-Docker)
+      # clusters. GitHub-hosted runners ship these; self-hosted ones don't.
+      # `sysctl -w` applies them now -- appending to /etc/sysctl.conf alone has
+      # no effect during an ephemeral build. Failures are tolerated (|| true) so
+      # a read-only/namespaced sysctl can never fail pre_build and hang the job.
+      - |
+        sudo modprobe nf_conntrack 2>/dev/null || true
+        sudo sysctl -w fs.inotify.max_user_watches=524288 || true
+        sudo sysctl -w fs.inotify.max_user_instances=512 || true
+        sudo sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 || true
+        # System-wide open-file caps must be >= the per-container nofile set in daemon.json
+        # above, or the daemon cannot grant it (fixes "Too many open files" in compat tests).
+        sudo sysctl -w fs.nr_open=2097152 || true
+        sudo sysctl -w fs.file-max=2097152 || true
+        echo "Applied kind-related kernel limits"
+      # Pre-pull images that provider tests launch via testcontainers. Inside the test
+      # container, testcontainers' docker-py client pulls anonymously (it has no
+      # logged-in Docker Hub creds) and hits the anonymous rate limit, failing the
+      # container create with "No such image". Pulling here on the authenticated host
+      # daemon puts the image in the shared local store so testcontainers finds it
+      # without pulling. Only the mongo provider tests use testcontainers (mongo:8.0).
+      - |
+        docker pull mongo:8.0 || true

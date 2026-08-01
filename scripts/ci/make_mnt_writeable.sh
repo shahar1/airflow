@@ -17,6 +17,14 @@
 # under the License.
 function make_mnt_writeable {
     set -x
+    # FORK / self-hosted-runner test: skip on AWS self-hosted runners (CodeBuild or
+    # the EKS/ARC pods) — there is no separate /mnt mount to prepare, and this is
+    # only needed for the GitHub-hosted docker-to-/mnt relocation, which is itself
+    # skipped there.
+    if [[ -n "${CODEBUILD_BUILD_ID:-}${AIRFLOW_SELF_HOSTED_RUNNER:-}" ]]; then
+        echo "Self-hosted runner detected — skipping /mnt preparation."
+        return 0
+    fi
     echo "Investigating node disks"
     lsblk
     sudo blkid

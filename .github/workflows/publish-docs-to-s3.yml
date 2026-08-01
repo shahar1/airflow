@@ -75,7 +75,9 @@ jobs:
   build-info:
     timeout-minutes: 10
     name: "Build Info"
-    runs-on: ["ubuntu-24.04"]
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       VERBOSE: true
       REF: ${{ inputs.ref }}
@@ -270,7 +272,9 @@ jobs:
     needs: [build-info, build-ci-image]
     timeout-minutes: 150
     name: "Build documentation"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     permissions:
       contents: read
       packages: read
@@ -340,7 +344,7 @@ jobs:
       - name: >
           Restore CI docker image built for ref ${{ inputs.ref }}
           linux/amd64:${{ needs.build-info.outputs.default-python-version }}
-        uses: apache/infrastructure-actions/stash/restore@0ff9972b5872e19c9f4555c9159c2fea4f794355
+        uses: ./.github/actions/stash-s3-restore
         with:
           key: "ci-image-save-v3-linux/amd64-\
             ${{ needs.build-info.outputs.default-python-version }}-${{ inputs.ref }}"
@@ -353,7 +357,7 @@ jobs:
         run: >
           breeze ci-image load --platform "linux/amd64" --python "${PYTHON}" --image-file-dir "/mnt"
       - name: "Restore docs inventory cache"
-        uses: apache/infrastructure-actions/stash/restore@0ff9972b5872e19c9f4555c9159c2fea4f794355
+        uses: ./.github/actions/stash-s3-restore
         with:
           path: ./generated/_inventory_cache/
           key: cache-docs-inventory-v1
@@ -383,7 +387,7 @@ jobs:
             breeze build-docs ${SPHINX_INCLUDE_DOCS} --docs-only ${FAIL_ON_INVENTORIES}
           fi
       - name: "Save docs inventory cache"
-        uses: apache/infrastructure-actions/stash/save@0ff9972b5872e19c9f4555c9159c2fea4f794355
+        uses: ./.github/actions/stash-s3-save
         if: >-
           steps.restore-docs-inventory-cache.outputs.stash-hit != 'true' &&
           steps.build-sphinx-docs.outputs.sphinx-build-skipped != 'true'
@@ -444,7 +448,9 @@ jobs:
     needs: [build-info]
     timeout-minutes: 30
     name: "Build Java SDK Javadoc"
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     permissions:
       contents: read
       packages: read
@@ -505,7 +511,9 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

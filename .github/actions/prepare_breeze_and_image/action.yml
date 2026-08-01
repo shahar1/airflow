@@ -65,7 +65,7 @@ runs:
     - name: >
         Restore ${{ inputs.image-type }} docker image ${{ inputs.platform }}:${{ inputs.python }}
         ${{ inputs.image-stash-ref != '' && format('built for ref {0}', inputs.image-stash-ref) || '' }}
-      uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+      uses: ./.github/actions/stash-s3-restore
       with:
         key: "${{ inputs.image-type }}-image-save-v3-${{ inputs.platform }}-${{ inputs.python }}\
           ${{ inputs.image-stash-ref != '' && format('-{0}', inputs.image-stash-ref) || '' }}"

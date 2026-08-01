@@ -36,6 +36,7 @@ from airflow_breeze.commands.common_options import (
     option_answer,
     option_debug_resources,
     option_dry_run,
+    option_github_repository,
     option_include_success_outputs,
     option_parallelism,
     option_python,
@@ -645,8 +646,9 @@ def _rebuild_k8s_image(
     copy_local_sources: bool,
     use_uv: bool,
     output: Output | None,
+    github_repository: str = "apache/airflow",
 ) -> tuple[int, str]:
-    params = BuildProdParams(python=python, use_uv=use_uv)
+    params = BuildProdParams(python=python, use_uv=use_uv, github_repository=github_repository)
     if rebuild_base_image:
         run_build_production_image(
             prod_image_params=params,
@@ -697,8 +699,16 @@ ENV GUNICORN_CMD_ARGS='--preload'
     return docker_build_result.returncode, f"K8S image for Python {python}"
 
 
-def _upload_k8s_image(python: str, kubernetes_version: str, output: Output | None) -> tuple[int, str]:
-    params = BuildProdParams(python=python)
+def _upload_k8s_image(
+    python: str,
+    kubernetes_version: str,
+    output: Output | None,
+    github_repository: str = "apache/airflow",
+) -> tuple[int, str]:
+    # github_repository must match the value used when the image was built (_rebuild_k8s_image),
+    # otherwise airflow_image_kubernetes resolves to the wrong namespace (e.g. ghcr.io/apache/airflow
+    # on a fork) and `kind load` fails with "image ... not present locally".
+    params = BuildProdParams(python=python, github_repository=github_repository)
     cluster_name = get_kind_cluster_name(python=python, kubernetes_version=kubernetes_version)
     get_console(output=output).print(
         f"[info]Uploading Airflow image {params.airflow_image_kubernetes} to cluster {cluster_name}"
@@ -738,6 +748,7 @@ K8S_TEST_IMAGES_TO_PRELOAD: tuple[str, ...] = (
     "bitnamilegacy/postgresql:16.1.0-debian-11-r15",  # chart/values.yaml postgresql subchart
     "busybox:1.38.0",  # busybox-based system tests in kubernetes-tests/
     "ubuntu:24.04",  # ubuntu-based system tests in kubernetes-tests/
+    "redis:7.2-bookworm",  # chart/values.yaml redis broker (CeleryExecutor) — avoids in-cluster DockerHub 429
 )
 
 
@@ -826,6 +837,7 @@ def _preload_test_images_to_kind(
 @option_copy_local_sources
 @option_debug_resources
 @option_dry_run
+@option_github_repository
 @option_include_success_outputs
 @option_parallelism
 @option_python
@@ -838,6 +850,7 @@ def _preload_test_images_to_kind(
 def build_k8s_image(
     copy_local_sources: bool,
     debug_resources: bool,
+    github_repository: str,
     include_success_outputs: bool,
     parallelism: int,
     python: str,
@@ -866,9 +879,10 @@ def build_k8s_image(
                         kwds={
                             "python": _python,
                             "rebuild_base_image": rebuild_base_image,
-                            "copy local sources": copy_local_sources,
+                            "copy_local_sources": copy_local_sources,
                             "use_uv": use_uv,
                             "output": outputs[index],
+                            "github_repository": github_repository,
                         },
                     )
                     for index, _python in enumerate(python_version_array)
@@ -887,6 +901,7 @@ def build_k8s_image(
             copy_local_sources=copy_local_sources,
             use_uv=use_uv,
             output=None,
+            github_repository=github_repository,
         )
         if return_code == 0:
             console_print("\n[warning]NEXT STEP:[/][info] You might now upload your k8s image by:\n")
@@ -907,6 +922,7 @@ def build_k8s_image(
 @option_include_success_outputs
 @option_python_versions
 @option_kubernetes_versions
+@option_github_repository
 @option_verbose
 @option_dry_run
 def upload_k8s_image(
@@ -919,6 +935,7 @@ def upload_k8s_image(
     include_success_outputs: bool,
     python_versions: str,
     kubernetes_versions: str,
+    github_repository: str,
 ):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
@@ -946,6 +963,7 @@ def upload_k8s_image(
                             "python": combo.python_version,
                             "kubernetes_version": combo.kubernetes_version,
                             "output": outputs[index],
+                            "github_repository": github_repository,
                         },
                     )
                     for index, combo in enumerate(combos)
@@ -962,6 +980,7 @@ def upload_k8s_image(
             python=python,
             kubernetes_version=kubernetes_version,
             output=None,
+            github_repository=github_repository,
         )
         if return_code == 0:
             console_print("\n[warning]NEXT STEP:[/][info] You might now deploy airflow by:\n")
@@ -989,10 +1008,11 @@ def _build_skaffold_config(
     dags_relative_path: str,
     dags_dest: str,
     log_level: str,
+    github_repository: str = "apache/airflow",
 ) -> dict[str, Any]:
     from packaging.version import Version
 
-    params = BuildProdParams(python=python)
+    params = BuildProdParams(python=python, github_repository=github_repository)
     use_flask_appbuilder = Version(python) < Version("3.13")
     auth_manager = (
         "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
@@ -1339,6 +1359,7 @@ def _deploy_helm_chart(
     use_standard_naming: bool,
     extra_options: tuple[str, ...] | None = None,
     multi_namespace_mode: bool = False,
+    github_repository: str = "apache/airflow",
 ) -> RunCommandResult:
     from packaging.version import Version
 
@@ -1351,7 +1372,9 @@ def _deploy_helm_chart(
         shutil.copytree(CHART_PATH, os.fspath(tmp_chart_path), ignore_dangling_symlinks=True)
         get_console(output=output).print(f"[info]Copied chart sources to {tmp_chart_path}")
         kubectl_context = get_kubectl_cluster_name(python=python, kubernetes_version=kubernetes_version)
-        params = BuildProdParams(python=python)
+        # Must match the namespace the image was built+loaded under (see _upload_k8s_image), so the
+        # Helm chart references the image that is actually present in the kind cluster.
+        params = BuildProdParams(python=python, github_repository=github_repository)
         # TODO (potiuk): we can also run on matrix of auth managers if we make SimpleAuthManager prod-ready ?
         use_flask_appbuilder = Version(python) < Version("3.13")
         if use_flask_appbuilder:
@@ -1447,6 +1470,7 @@ def _deploy_airflow(
     extra_options: tuple[str, ...] | None = None,
     multi_namespace_mode: bool = False,
     num_tries: int = 1,
+    github_repository: str = "apache/airflow",
 ) -> tuple[int, str]:
     action = "Deploying" if not upgrade else "Upgrading"
     cluster_name = get_kind_cluster_name(python=python, kubernetes_version=kubernetes_version)
@@ -1462,6 +1486,7 @@ def _deploy_airflow(
             use_standard_naming=use_standard_naming,
             extra_options=extra_options,
             multi_namespace_mode=multi_namespace_mode,
+            github_repository=github_repository,
         )
         if result.returncode == 0:
             break
@@ -1569,6 +1594,7 @@ def _deploy_airflow(
 @option_multi_namespace_mode
 @option_python_versions
 @option_kubernetes_versions
+@option_github_repository
 @option_verbose
 @option_dry_run
 @click.argument("extra_options", nargs=-1, type=click.UNPROCESSED)
@@ -1588,6 +1614,7 @@ def deploy_airflow(
     kubernetes_versions: str,
     extra_options: tuple[str, ...],
     multi_namespace_mode: bool = False,
+    github_repository: str = "apache/airflow",
 ):
     if run_in_parallel:
         python_version_array: list[str] = python_versions.split(" ")
@@ -1617,6 +1644,7 @@ def deploy_airflow(
                             "extra_options": extra_options,
                             "output": outputs[index],
                             "multi_namespace_mode": multi_namespace_mode,
+                            "github_repository": github_repository,
                         },
                     )
                     for index, combo in enumerate(combos)
@@ -1639,6 +1667,7 @@ def deploy_airflow(
             wait_time_in_seconds=wait_time_in_seconds,
             extra_options=extra_options,
             multi_namespace_mode=multi_namespace_mode,
+            github_repository=github_repository,
         )
         if return_code == 0:
             console_print(
@@ -1670,6 +1699,7 @@ def deploy_airflow(
 @option_dags_path
 @option_dags_dest
 @option_skaffold_deploy
+@option_github_repository
 @option_verbose
 @option_dry_run
 @click.argument("skaffold_args", nargs=-1, type=click.UNPROCESSED)
@@ -1684,6 +1714,7 @@ def dev(
     dags_dest: str,
     deploy: bool,
     skaffold_args: tuple[str, ...],
+    github_repository: str = "apache/airflow",
 ):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
@@ -1737,6 +1768,7 @@ def dev(
         dags_relative_path=dags_relative_path,
         dags_dest=dags_dest,
         log_level=log_level,
+        github_repository=github_repository,
     )
     if not deploy:
         console_print(
@@ -2127,6 +2159,7 @@ def _run_complete_tests(
     extra_options: tuple[str, ...] | None,
     test_args: list[str],
     output: Output | None,
+    github_repository: str = "apache/airflow",
 ) -> tuple[int, str]:
     get_console(output=output).print(f"\n[info]Rebuilding k8s image for Python {python}\n")
     returncode, message = _rebuild_k8s_image(
@@ -2135,6 +2168,7 @@ def _run_complete_tests(
         use_uv=use_uv,
         rebuild_base_image=rebuild_base_image,
         copy_local_sources=copy_local_sources,
+        github_repository=github_repository,
     )
     if returncode != 0:
         return returncode, message
@@ -2167,7 +2201,10 @@ def _run_complete_tests(
             f"\n[info]Uploading k8s images for Python {python}, Kubernetes {kubernetes_version}\n"
         )
         returncode, message = _upload_k8s_image(
-            python=python, kubernetes_version=kubernetes_version, output=output
+            python=python,
+            kubernetes_version=kubernetes_version,
+            output=output,
+            github_repository=github_repository,
         )
         if returncode != 0:
             _logs(python=python, kubernetes_version=kubernetes_version)
@@ -2196,6 +2233,7 @@ def _run_complete_tests(
             extra_options=extra_options,
             multi_namespace_mode=True,
             num_tries=3,
+            github_repository=github_repository,
         )
         if returncode != 0:
             _logs(python=python, kubernetes_version=kubernetes_version)
@@ -2205,7 +2243,12 @@ def _run_complete_tests(
                 f"\n[info]Provisioning lang-SDK test env for Python {python}, "
                 f"Kubernetes {kubernetes_version}\n"
             )
-            _setup_lang_sdk_test(python=python, kubernetes_version=kubernetes_version, output=output)
+            _setup_lang_sdk_test(
+                python=python,
+                kubernetes_version=kubernetes_version,
+                output=output,
+                github_repository=github_repository,
+            )
         get_console(output=output).print(
             f"\n[info]Running tests Python {python}, Kubernetes {kubernetes_version}\n"
         )
@@ -2236,6 +2279,7 @@ def _run_complete_tests(
                 extra_options=extra_options,
                 multi_namespace_mode=True,
                 num_tries=3,
+                github_repository=github_repository,
             )
             if returncode != 0 or include_success_outputs:
                 _logs(python=python, kubernetes_version=kubernetes_version)
@@ -2273,6 +2317,7 @@ def _run_complete_tests(
 @option_executor
 @option_force_recreate_cluster
 @option_force_venv_setup
+@option_github_repository
 @option_include_success_outputs
 @option_kubernetes_version
 @option_kubernetes_versions
@@ -2295,6 +2340,7 @@ def run_complete_tests(
     executor: str,
     force_recreate_cluster: bool,
     force_venv_setup: bool,
+    github_repository: str,
     include_success_outputs: bool,
     kubernetes_version: str,
     kubernetes_versions: str,
@@ -2362,6 +2408,7 @@ def run_complete_tests(
                             "extra_options": None,
                             "test_args": pytest_args,
                             "output": outputs[index],
+                            "github_repository": github_repository,
                         },
                     )
                     for index, combo in enumerate(combos)
@@ -2393,6 +2440,7 @@ def run_complete_tests(
             extra_options=None,
             test_args=pytest_args,
             output=None,
+            github_repository=github_repository,
         )
         if result != 0:
             sys.exit(result)
@@ -2413,6 +2461,7 @@ def run_complete_tests(
 @option_use_uv
 @option_skip_image_build
 @option_skip_compile_ui_assets
+@option_github_repository
 def deploy_cluster(
     force_venv_setup: bool,
     force_recreate_cluster: bool,
@@ -2422,6 +2471,7 @@ def deploy_cluster(
     use_uv: bool,
     skip_image_build: bool,
     skip_compile_ui_assets: bool,
+    github_repository: str,
 ):
     console_print("[info]Syncing Virtual Environment[/]")
     result = sync_virtualenv(force_venv_setup=force_venv_setup)
@@ -2469,6 +2519,7 @@ def deploy_cluster(
             copy_local_sources=True,
             use_uv=use_uv,
             output=None,
+            github_repository=github_repository,
         )
         if return_code != 0:
             sys.exit(return_code)
@@ -2477,6 +2528,7 @@ def deploy_cluster(
         python=python,
         kubernetes_version=kubernetes_version,
         output=None,
+        github_repository=github_repository,
     )
     if return_code != 0:
         sys.exit(return_code)
@@ -2956,8 +3008,10 @@ def _lang_sdk_build_java_worker_image(
     return LANG_SDK_JAVA_WORKER_IMAGE
 
 
-def _lang_sdk_deploy_airflow(python: str, kubernetes_version: str, output: Output | None) -> None:
-    params = BuildProdParams(python=python)
+def _lang_sdk_deploy_airflow(
+    python: str, kubernetes_version: str, output: Output | None, github_repository: str = "apache/airflow"
+) -> None:
+    params = BuildProdParams(python=python, github_repository=github_repository)
     image = params.airflow_image_kubernetes
     get_console(output=output).print("[info]Upgrading airflow Helm release with lang-SDK values")
     run_command_with_k8s_env(
@@ -3041,6 +3095,7 @@ def _setup_lang_sdk_test(
     go_image: str | None = None,
     java_image: str | None = None,
     output: Output | None = None,
+    github_repository: str = "apache/airflow",
 ) -> None:
     """Provision the lang-SDK coordinator env on an already-deployed KubernetesExecutor cluster.
 
@@ -3048,7 +3103,10 @@ def _setup_lang_sdk_test(
     image and deploys localstack in parallel, then serially uploads the artifacts, applies the
     config + secret, and helm-upgrades Airflow with the lang-SDK values.
     """
-    go_image = go_image or f"{BuildProdParams(python=python).airflow_image_kubernetes}:latest"
+    go_image = (
+        go_image
+        or f"{BuildProdParams(python=python, github_repository=github_repository).airflow_image_kubernetes}:latest"
+    )
     build_java_image = java_image is None
     if java_image is None:
         # The worker-image build below produces this fixed tag; resolve it up-front so the config
@@ -3081,7 +3139,7 @@ def _setup_lang_sdk_test(
         _run_lang_sdk_parallel(steps, output=output)
         _lang_sdk_upload_artifacts(staging, python, kubernetes_version, output)
     _lang_sdk_apply_configmaps_and_secret(python, kubernetes_version, go_image, java_image, output)
-    _lang_sdk_deploy_airflow(python, kubernetes_version, output)
+    _lang_sdk_deploy_airflow(python, kubernetes_version, output, github_repository=github_repository)
 
 
 @kubernetes_group.command(
@@ -3103,9 +3161,12 @@ def _setup_lang_sdk_test(
     help="Image for the Java (JavaCoordinator) worker pod. Must include a JRE. Defaults to building "
     "the prod image plus a headless JRE (Dockerfile.java) and loading it into the kind cluster.",
 )
+@option_github_repository
 @option_verbose
 @option_dry_run
-def setup_lang_sdk_test(python: str, kubernetes_version: str, go_image: str | None, java_image: str | None):
+def setup_lang_sdk_test(
+    python: str, kubernetes_version: str, go_image: str | None, java_image: str | None, github_repository: str
+):
     result = sync_virtualenv(force_venv_setup=False)
     if result.returncode != 0:
         sys.exit(result.returncode)
@@ -3116,6 +3177,7 @@ def setup_lang_sdk_test(python: str, kubernetes_version: str, go_image: str | No
         go_image=go_image,
         java_image=java_image,
         output=None,
+        github_repository=github_repository,
     )
     console_print(
         "\n[success]lang-SDK test environment is ready.[/]\n"

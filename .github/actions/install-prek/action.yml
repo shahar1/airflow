@@ -56,8 +56,13 @@ runs:
       env:
         UV_VERSION: ${{ steps.versions.outputs.uv-version }}
         PREK_VERSION: ${{ steps.versions.outputs.prek-version }}
-      run: |
+      run: |  # zizmor: ignore[github-env]
         uv tool install prek==${PREK_VERSION} --with uv==${UV_VERSION}
+        # FORK / CodeBuild-runner test: ensure the uv tool bin dir is on PATH for
+        # later steps and downstream jobs. GitHub-hosted runners already have
+        # ~/.local/bin on PATH; self-hosted CodeBuild runs as root and does not,
+        # so prek would be "command not found". $HOME resolves on both.
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
       working-directory: ${{ github.workspace }}
     # We need to use tar file with archive to restore all the permissions and symlinks
     - name: "Delete ~.cache"
@@ -70,7 +75,7 @@ runs:
         echo
       shell: bash
     - name: "Restore prek cache"
-      uses: apache/infrastructure-actions/stash/restore@49df447b39b18354895520e0a63731b7cad7cbec
+      uses: ./.github/actions/stash-s3-restore
       with:
         # yamllint disable rule:line-length
         key: cache-prek-v9-${{ inputs.platform }}-python${{ inputs.python-version }}-uv${{ steps.versions.outputs.uv-version }}-${{ hashFiles('**/.pre-commit-config.yaml') }}
@@ -119,7 +124,7 @@ runs:
       shell: bash
       if: inputs.save-cache == 'true'
     - name: "Save prek cache"
-      uses: apache/infrastructure-actions/stash/save@49df447b39b18354895520e0a63731b7cad7cbec
+      uses: ./.github/actions/stash-s3-save
       with:
         # yamllint disable rule:line-length
         key: cache-prek-v9-${{ inputs.platform }}-python${{ inputs.python-version }}-uv${{ steps.versions.outputs.uv-version }}-${{ hashFiles('**/.pre-commit-config.yaml') }}
