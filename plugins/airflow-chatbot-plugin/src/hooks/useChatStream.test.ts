@@ -115,7 +115,25 @@ describe("useChat streaming", () => {
         { content: "one", role: "assistant" },
       ],
       message: "second",
+      page_url: globalThis.location.pathname,
     });
+  });
+
+  it("sends the page path, never the full URL", async () => {
+    const fetchMock = mockFetch(
+      streamingResponse([frame({ delta: "hi", type: "text" }), frame({ type: "done" })]),
+    );
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("what is wrong here?");
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body));
+    // The query string and fragment are attacker-influenceable and this value
+    // reaches the system prompt, so only the path may be sent.
+    expect(body.page_url).toBe(globalThis.location.pathname);
+    expect(body.page_url).not.toContain("?");
   });
 
   it("never replays a failed turn back to the model as its own words", async () => {
