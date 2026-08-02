@@ -404,6 +404,102 @@ describe("useChat streaming", () => {
     expect(result.current.messages[1]?.isError).toBeUndefined();
   });
 
+  const confirmFrames = [
+    frame({ args: { dag_id: "sales_summary" }, id: "c9", name: "fix_dag_code", type: "tool" }),
+    frame({ delta: "I can fix that.", type: "text" }),
+    frame({ args: { dag_id: "sales_summary" }, call_id: "c9", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" }),
+    frame({ type: "done" }),
+  ];
+
+  it("parks a confirm_required frame on the message and stops the chip", async () => {
+    mockFetch(streamingResponse(confirmFrames));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("fix it");
+    });
+
+    const assistant = result.current.messages[1];
+    expect(assistant?.confirms).toEqual([
+      { args: { dag_id: "sales_summary" }, callId: "c9", nonce: "n1", tool: "fix_dag_code" },
+    ]);
+    // The suspended call must not spin while the user decides.
+    expect(assistant?.tools?.[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(assistant?.isError).toBeUndefined();
+  });
+
+  it.each([true, false])(
+    "resolveConfirm(%s) posts the verdict and streams the continuation into the same bubble",
+    async (approved) => {
+      const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("fix it");
+      });
+
+      fetchMock.mockReturnValue(
+        Promise.resolve(
+          streamingResponse([frame({ delta: " Applied.", type: "text" }), frame({ type: "done" })]),
+        ),
+      );
+      await act(async () => {
+        await result.current.resolveConfirm("n1", approved);
+      });
+
+      const [url, init] = fetchMock.mock.lastCall ?? [];
+      expect(String(url)).toContain("/chatbot/confirm");
+      expect(JSON.parse(String(init?.body))).toEqual({ approved, nonce: "n1" });
+      const assistant = result.current.messages[1];
+      expect(assistant?.content).toBe("I can fix that. Applied.");
+      expect(assistant?.confirms?.[0]?.resolution).toBe(approved ? "approved" : "rejected");
+      expect(result.current.messages).toHaveLength(2);
+    },
+  );
+
+  it("explains an expired confirmation", async () => {
+    const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("fix it");
+    });
+
+    fetchMock.mockResolvedValue({
+      json: () => Promise.resolve({ error: "Unknown or expired confirmation" }),
+      ok: false,
+      status: 404,
+    } as unknown as Response);
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+
+    expect(result.current.messages[1]?.content).toContain("no longer valid");
+    expect(result.current.messages[1]?.isError).toBe(true);
+  });
+
+  it("ignores a confirm that was already resolved", async () => {
+    const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("fix it");
+    });
+
+    fetchMock.mockReturnValue(
+      Promise.resolve(streamingResponse([frame({ type: "done" })])),
+    );
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+    const callsAfterFirst = fetchMock.mock.calls.length;
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+
+    expect(fetchMock.mock.calls).toHaveLength(callsAfterFirst);
+  });
+
   it("clears the conversation", async () => {
     mockFetch(streamingResponse([frame({ delta: "hi", type: "text" }), frame({ type: "done" })]));
 

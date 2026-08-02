@@ -43,9 +43,12 @@ import builtins
 import json
 import logging
 import os
+import secrets
 import socket
 import sys
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -78,6 +81,13 @@ class ChatRequest(BaseModel):
     page_url: str | None = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+
+class ConfirmRequest(BaseModel):
+    """Request body for the /confirm endpoint."""
+
+    nonce: str = Field(..., min_length=1)
+    approved: bool
 
 
 def _get_base_url_path(path: str) -> str:
@@ -177,30 +187,36 @@ def _create_chatbot_api() -> dict[str, Any]:
         Streams the agent's tool calls and text as they happen, so the drawer can
         show what Airy is doing instead of a spinner.  Frames are
         ``data: {json}`` with a ``type`` of ``tool``, ``tool_result``, ``text``,
-        ``error`` or ``done``.
+        ``confirm_required``, ``error`` or ``done``.
         """
         if not body.message.strip():
             return JSONResponse({"error": "Empty message", "status": "error"}, status_code=400)
 
-        can_write = _user_can_write(user)
-
-        async def frames() -> AsyncIterator[str]:
-            try:
-                async for payload in _stream_agent(
-                    body.message, body.history, body.page_url, can_write=can_write
-                ):
-                    yield f"data: {json.dumps(payload)}\n\n"
-            except Exception as e:
-                log.exception("Airy chat endpoint error")
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-            yield 'data: {"type": "done"}\n\n'
-
-        return StreamingResponse(
-            frames(),
-            media_type="text/event-stream",
-            # Proxies that buffer would defeat the point of streaming at all.
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        return _sse_response(
+            _stream_agent(
+                body.message,
+                body.history,
+                body.page_url,
+                can_write=_user_can_write(user),
+                user_id=str(user.get_id()),
+            )
         )
+
+    @app.post("/confirm")
+    async def confirm_endpoint(body: ConfirmRequest, user=Depends(security.get_user)):
+        """
+        Approve or reject a write tool call suspended by /chat.
+
+        Streams the rest of the agent run as the same SSE frames as /chat.
+        """
+        # Popped before the permission checks so a failed attempt burns the nonce.
+        pending = _pop_pending(body.nonce)
+        if pending is None:
+            return JSONResponse({"error": "Unknown or expired confirmation"}, status_code=404)
+        if pending.user_id != str(user.get_id()) or not _user_can_write(user):
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        return _sse_response(_resume_agent(pending, body.approved))
 
     return {
         "app": app,
@@ -238,16 +254,17 @@ and "here": `/dags/sales_summary/grid` means questions are about the
 _WRITE_PROMPT = """\
 
 **Self-healing.**  You can diagnose a broken Dag (`diagnose_dag`), patch its
-source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Work one step at
-a time and never chain them without the user asking:
+source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Every write
+tool suspends until the user approves it with in-UI Confirm/Reject buttons,
+so never ask for permission in prose — calling the tool *is* the proposal.
+Work one step at a time:
 
 1. After diagnosing, name the failing task, quote the offending line, and say
-   exactly what you would change — then stop.
-2. Only call `fix_dag_code` when the user asks you to apply the fix.  Pass the
-   smallest unique `old` snippet you can (it must occur exactly once in the file).
+   exactly what you would change.
+2. Call `fix_dag_code` with the smallest unique `old` snippet you can (it must
+   occur exactly once in the file).
 3. After a successful fix, offer to re-run — do not re-run on your own.
-4. Call `revert_dag_code` **only** when the user explicitly asks to undo a fix.
-   Never call it to recover from a failed step or because a run still fails.
+4. Call `revert_dag_code` only when the user wants a fix undone.
 """
 
 _READ_ONLY_PROMPT = """\
@@ -385,10 +402,55 @@ WRITE_TOOLS = frozenset({"fix_dag_code", "revert_dag_code", "rerun_dag", "run_ba
 
 
 def _gate_toolsets(toolsets: list[Any], can_write: bool) -> list[Any]:
-    """Viewers get Airy without the write tools; Dag editors get everything."""
+    """Viewers get Airy without the write tools; editors get them behind a confirm."""
     if can_write:
-        return toolsets
+        # The model can request a write, but the run suspends until the user
+        # approves it in the UI (see /confirm) — prompt prose is not a gate.
+        return [
+            ts.approval_required(lambda ctx, tool_def, args: tool_def.name in WRITE_TOOLS) for ts in toolsets
+        ]
     return [ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS) for ts in toolsets]
+
+
+_CONFIRM_TTL_S = 600.0
+_CONFIRM_MAX_PENDING = 50
+
+
+@dataclass
+class _PendingApproval:
+    """A suspended agent run waiting for the user's verdict on a write tool."""
+
+    user_id: str
+    call_ids: list[str]
+    messages: list[Any]
+    page_url: str | None
+    created_at: float
+
+
+# In-memory and per-process: enough for the demo's single api-server worker;
+# a multi-worker deployment needs a shared store.
+_pending_approvals: dict[str, _PendingApproval] = {}
+
+
+def _purge_expired_pending(now: float) -> None:
+    for nonce in [n for n, p in _pending_approvals.items() if now - p.created_at > _CONFIRM_TTL_S]:
+        del _pending_approvals[nonce]
+
+
+def _store_pending(*, user_id: str, call_ids: list[str], messages: list[Any], page_url: str | None) -> str:
+    now = time.monotonic()
+    _purge_expired_pending(now)
+    while len(_pending_approvals) >= _CONFIRM_MAX_PENDING:
+        del _pending_approvals[next(iter(_pending_approvals))]
+    nonce = secrets.token_urlsafe(16)
+    _pending_approvals[nonce] = _PendingApproval(user_id, call_ids, messages, page_url, now)
+    return nonce
+
+
+def _pop_pending(nonce: str) -> _PendingApproval | None:
+    """Single-use by construction: a nonce can only ever be popped once."""
+    _purge_expired_pending(time.monotonic())
+    return _pending_approvals.pop(nonce, None)
 
 
 def _build_agent(page_url: str | None = None, can_write: bool = False) -> tuple[Any, str | None]:
@@ -475,12 +537,67 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
     return None
 
 
+async def _run_and_stream(
+    agent: Any,
+    *,
+    user_id: str,
+    page_url: str | None,
+    user_prompt: str | None = None,
+    message_history: list[Any] | None = None,
+    deferred_tool_results: Any = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Stream one agent run; a write tool suspends it behind a confirm nonce.
+
+    Write tools are approval-required (see ``_gate_toolsets``), so instead of
+    executing them the run ends with deferred requests.  Those are parked in
+    ``_pending_approvals`` and surfaced as ``confirm_required`` frames;
+    /confirm resumes the run with the user's verdict.
+    """
+    from pydantic_ai import DeferredToolRequests
+
+    requests = result = None
+    async with agent.run_stream_events(
+        user_prompt,
+        message_history=message_history,
+        deferred_tool_results=deferred_tool_results,
+        output_type=[str, DeferredToolRequests],
+    ) as stream:
+        async for event in stream:
+            kind = getattr(event, "event_kind", None)
+            if kind == "deferred_tool_requests":
+                requests = event.requests
+            elif kind == "agent_run_result":
+                result = event.result
+            else:
+                payload = _event_payload(event)
+                if payload:
+                    yield payload
+
+    if requests is not None and requests.approvals and result is not None:
+        nonce = _store_pending(
+            user_id=user_id,
+            call_ids=[part.tool_call_id for part in requests.approvals],
+            messages=result.all_messages(),
+            page_url=page_url,
+        )
+        for part in requests.approvals:
+            yield {
+                "type": "confirm_required",
+                "nonce": nonce,
+                "call_id": part.tool_call_id,
+                "tool": part.tool_name,
+                "args": part.args,
+            }
+
+
 async def _stream_agent(
     message: str,
     history: list[dict[str, str]] | None = None,
     page_url: str | None = None,
     *,
     can_write: bool = False,
+    user_id: str = "",
 ) -> AsyncIterator[dict[str, Any]]:
     """Run the agent, yielding tool calls and text as they happen."""
     agent, problem = _build_agent(page_url, can_write=can_write)
@@ -489,16 +606,64 @@ async def _stream_agent(
         return
 
     try:
-        async with agent.run_stream_events(
-            message, message_history=_to_message_history(history) or None
-        ) as stream:
-            async for event in stream:
-                payload = _event_payload(event)
-                if payload:
-                    yield payload
+        async for payload in _run_and_stream(
+            agent,
+            user_id=user_id,
+            page_url=page_url,
+            user_prompt=message,
+            message_history=_to_message_history(history) or None,
+        ):
+            yield payload
     except Exception as e:
         log.exception("Agent execution failed")
         yield {"type": "error", "message": str(_root_cause(e))}
+
+
+async def _resume_agent(pending: _PendingApproval, approved: bool) -> AsyncIterator[dict[str, Any]]:
+    """Resume a suspended run with the user's verdict on the write tool."""
+    agent, problem = _build_agent(pending.page_url, can_write=True)
+    if problem:
+        yield {"type": "text", "delta": problem}
+        return
+
+    try:
+        from pydantic_ai import DeferredToolResults, ToolDenied
+
+        # One verdict for the whole suspension batch — in practice one call.
+        verdict = True if approved else ToolDenied("The user rejected this action.")
+        async for payload in _run_and_stream(
+            agent,
+            user_id=pending.user_id,
+            page_url=pending.page_url,
+            message_history=pending.messages,
+            deferred_tool_results=DeferredToolResults(
+                approvals={call_id: verdict for call_id in pending.call_ids}
+            ),
+        ):
+            yield payload
+    except Exception as e:
+        log.exception("Agent resume failed")
+        yield {"type": "error", "message": str(_root_cause(e))}
+
+
+def _sse_response(payloads: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
+    """Wrap a payload stream as server-sent events, always terminated by done."""
+
+    async def frames() -> AsyncIterator[str]:
+        try:
+            async for payload in payloads:
+                yield f"data: {json.dumps(payload)}\n\n"
+        except Exception as e:
+            log.exception("Airy stream error")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        yield 'data: {"type": "done"}\n\n'
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        # Proxies that buffer would defeat the point of streaming at all.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _bundle_version() -> int:

@@ -45,6 +45,7 @@ interface ChatDrawerProps {
   readonly onClear: () => void;
   readonly messages: Message[];
   readonly onSendMessage: (content: string) => void;
+  readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
   readonly isLoading?: boolean;
   readonly health: HealthStatus;
 }
@@ -55,13 +56,14 @@ interface ChatDrawerProps {
  * (only toward the content, never past the right viewport edge).
  */
 export const ChatDrawer: FC<ChatDrawerProps> = ({
+  health,
   isLoading = false,
   isOpen,
   messages,
   onClear,
   onClose,
+  onConfirmClick,
   onSendMessage,
-  health,
 }) => {
   const { colorMode } = useColorMode();
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -345,6 +347,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
             messages={messages}
             isLoading={isLoading}
             onSuggestionClick={handleSuggestionClick}
+            onConfirmClick={onConfirmClick}
           />
         </Box>
 

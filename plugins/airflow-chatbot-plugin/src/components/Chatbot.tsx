@@ -29,7 +29,7 @@ import { useChat, useHealth } from "../hooks/useChat";
  */
 export const Chatbot: FC = () => {
   const [isOpen, setIsOpen] = useState(false);
-  const { clearMessages, isLoading, messages, sendMessage } = useChat();
+  const { clearMessages, isLoading, messages, resolveConfirm, sendMessage } = useChat();
   const { health } = useHealth();
 
   const handleToggle = () => {
@@ -48,6 +48,7 @@ export const Chatbot: FC = () => {
         onClear={clearMessages}
         messages={messages}
         onSendMessage={sendMessage}
+        onConfirmClick={resolveConfirm}
         isLoading={isLoading}
         health={health}
       />
