@@ -476,6 +476,10 @@ class ChatbotInjectionMiddleware(BaseHTTPMiddleware):
         if "text/html" not in content_type:
             return response
 
+        # Splicing text into a compressed body can never work.
+        if response.headers.get("content-encoding"):
+            return response
+
         # Skip API, static file, and auth/login paths
         path = request.url.path
         if any(path.startswith(p) for p in ["/api/", "/static/", "/chatbot/", "/login", "/auth/"]):
@@ -495,23 +499,28 @@ class ChatbotInjectionMiddleware(BaseHTTPMiddleware):
             if "</body>" in html_content:
                 html_content = html_content.replace("</body>", f"{injection_script}</body>")
 
-            # Create new response with modified content
             from starlette.responses import Response as StarletteResponse
 
+            # The body just grew: drop content-length so Starlette recomputes it
+            # (it keeps a pre-set value as-is), and etag which no longer matches.
+            headers = {
+                k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "etag")
+            }
             return StarletteResponse(
                 content=html_content,
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=headers,
                 media_type="text/html",
             )
         except Exception:
             # If anything fails, return the original response
             from starlette.responses import Response as StarletteResponse
 
+            headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
             return StarletteResponse(
                 content=body,
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=headers,
             )
 
     def _get_injection_script(self) -> str:
