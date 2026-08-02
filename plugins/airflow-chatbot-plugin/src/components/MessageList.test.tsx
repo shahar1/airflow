@@ -24,7 +24,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ColorModeProvider } from "src/context/colorMode";
 
 import { localSystem } from "../theme";
-import { MessageList, splitActions } from "./MessageList";
+import { buildPrompts, canRetry, MessageList, splitActions } from "./MessageList";
 import { Message } from "./types";
 
 const show = (ui: ReactElement) =>
@@ -806,6 +806,108 @@ describe("MessageList", () => {
       const copy = screen.getByText("Copy");
       expect(getComputedStyle(copy).minHeight).toBe("24px");
       expect(getComputedStyle(copy).minWidth).toBe("24px");
+    });
+  });
+
+  describe("empty-state prompts", () => {
+    it.each([
+      ["/dags/sales_summary/grid", "sales_summary"],
+      ["/prod/airflow/dags/sales_summary", "sales_summary"],
+      ["/dags/sales%20summary/runs", "sales summary"],
+    ])("offers %s the Dag's own prompts", (pathname, dagId) => {
+      expect(buildPrompts(pathname)).toEqual([
+        `Why did ${dagId} fail?`,
+        `Check ${dagId} for warnings`,
+        `Summarise recent runs of ${dagId}`,
+      ]);
+    });
+
+    it.each([["/dags"], ["/dags/"], ["/home"], ["/dags/%E0%A4%A"], ["/dags/%20"]])(
+      "falls back to the generic prompts for %s",
+      (pathname) => {
+        expect(buildPrompts(pathname)).toEqual([
+          "How do I create a Dag?",
+          "Explain task dependencies",
+          "Debug a failed task",
+        ]);
+      },
+    );
+
+    it("renders the contextual prompts as ordinary chips", () => {
+      const onSuggestionClick = vi.fn();
+      globalThis.history.pushState({}, "", "/dags/sales_summary/grid");
+      show(<MessageList messages={[]} onSuggestionClick={onSuggestionClick} />);
+
+      fireEvent.click(screen.getByText("Why did sales_summary fail?"));
+
+      expect(onSuggestionClick).toHaveBeenCalledWith("Why did sales_summary fail?");
+      globalThis.history.pushState({}, "", "/");
+    });
+  });
+
+  describe("retrying a failed turn", () => {
+    const failed = (partial: Partial<Message> = {}): Message[] => [
+      user("why?"),
+      assistant({ content: "**Error:** boom", id: "a1", isError: true, ...partial }),
+    ];
+
+    it("offers Retry beside a failed read-only answer", () => {
+      const onRetry = vi.fn();
+      show(<MessageList messages={failed()} onRetry={onRetry} />);
+
+      fireEvent.click(screen.getByText("Retry"));
+
+      // Identified by the failed message, not by "the last question asked".
+      expect(onRetry).toHaveBeenCalledWith("a1");
+    });
+
+    it.each([
+      [
+        "an approved write",
+        {
+          confirms: [
+            {
+              args: {},
+              callId: "c1",
+              nonce: "n1",
+              resolution: "approved" as const,
+              tool: "fix_dag_code",
+            },
+          ],
+        },
+      ],
+      [
+        "a write that got past the proposal",
+        { tools: [{ durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 }] },
+      ],
+    ])("suppresses Retry after %s", (_label, partial) => {
+      show(<MessageList messages={failed(partial)} onRetry={vi.fn()} />);
+
+      expect(screen.queryByText("Retry")).toBeNull();
+    });
+
+    it("still offers Retry for a write that never left the proposal", () => {
+      show(
+        <MessageList
+          messages={failed({ tools: [{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }] })}
+          onRetry={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText("Retry")).not.toBeNull();
+    });
+
+    it.each([
+      ["a stream is active", { isLoading: true }],
+      ["there is no question to re-ask", { messages: [assistant({ content: "**Error:** boom", isError: true })] }],
+    ])("suppresses Retry while %s", (_label, over) => {
+      show(<MessageList messages={failed()} onRetry={vi.fn()} {...over} />);
+
+      expect(screen.queryByText("Retry")).toBeNull();
+    });
+
+    it("offers nothing to retry on a successful answer", () => {
+      expect(canRetry([user("why?"), assistant({ content: "fine" })], 1)).toBe(false);
     });
   });
 

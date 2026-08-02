@@ -42,6 +42,7 @@ interface ChatDrawerProps {
   readonly health: HealthStatus;
   readonly canStop?: boolean;
   readonly onStop?: () => void;
+  readonly onRetry?: (errorMessageId: string) => void;
   readonly isApplyingChange?: boolean;
 }
 
@@ -60,6 +61,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   onClear,
   onClose,
   onConfirmClick,
+  onRetry,
   onSendMessage,
   onStop,
   streamingId,
@@ -332,6 +334,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
             streamingId={streamingId}
             onSuggestionClick={handleSuggestionClick}
             onConfirmClick={onConfirmClick}
+            onRetry={onRetry}
           />
         </Box>
 
