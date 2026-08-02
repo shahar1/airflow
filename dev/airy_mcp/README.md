@@ -37,13 +37,13 @@ A second MCP sidecar with the three **write-capable** tools that
 |---|---|
 | `diagnose_dag(dag_id)` | latest failed run → failing task + log tail + full Dag source |
 | `fix_dag_code(dag_id, old, new)` | patches the source file (`old` must be unique), forces a reparse, returns a unified diff |
-| `revert_dag_code(dag_id)` | restores the pre-fix backup (rehearse the demo from the chat) |
-| `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas, conf changes, and the source diff between the runs' Dag versions |
-| `find_failure_clusters(hours)` | recent failed task instances across every Dag, grouped by normalised error signature |
-| `plan_backfill(dag_id, from, to)` | dry-run preview of a backfill — read-only |
-| `run_backfill(dag_id, from, to)` | creates the backfill previewed by `plan_backfill` |
+| `revert_dag_code(dag_id)` | restores the **original** file, discarding every fix (rehearse the demo from the chat) |
+| `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas and conf changes; names the differing Dag versions but does **not** diff them, since an older version may hold a co-located Dag the caller was never authorized against |
+| `find_failure_clusters(hours, dag_ids)` | recent failed task instances grouped by normalised error signature; `dag_ids` is set by the caller's permissions, not by the model |
+| `plan_backfill(dag_id, from, to)` | dry-run preview — read-only; returns every planned run and the `plan_token` that authorizes creating them |
+| `run_backfill(dag_id, from, to, plan_token, planned_runs)` | creates the backfill, only for a plan the user reviewed and that still produces the same runs, capped at `AIRY_MCP_MAX_BACKFILL_RUNS` (50) |
 | `get_blast_radius(dag_id)` | assets this Dag produces/consumes and the Dags up- and downstream of them |
-| `rerun_dag(dag_id)` | unpauses if needed and triggers a **new** run |
+| `rerun_dag(dag_id, unpause=False, unpause_token="")` | triggers a **new** run; a paused Dag first returns a warning and a token, and only a second call carrying it may unpause |
 
 This goes past AIP-91 phase 1 (read-only) on purpose — it is the "what if the
 assistant could close the loop" end state, not a proposal for phase 1.
@@ -128,20 +128,121 @@ Declared up front, all of them cheap to replace:
    send the text as the next user message. *Real answer:* structured UI parts
    streamed over SSE, so the button carries a typed tool call instead of a
    round-trip through the model.
-2. **Service-account execution.** Every `/chatbot` route now requires a
-   logged-in Airflow user, and the write tools are only reachable for users the
-   auth manager grants Dag-edit rights — but the sidecar still *executes* as one
-   admin service account (loopback-only), so in-Airflow audit trails attribute
-   actions to that account, not the human. *Real answer:* AIP-91's identity
-   propagation — pass the user's JWT through and let RBAC decide per call.
+2. **Service-account execution.** Every `/chatbot` route requires a logged-in
+   Airflow user, and every tool call is authorized against the *specific* Dag in
+   its arguments before it reaches a sidecar — and again when `/confirm` resumes
+   an approved call, so approving a write against one Dag cannot execute against
+   another. `TOOL_POLICY` is an **allowlist**, and a tool absent from it is refused
+   rather than guessed at — a denylist of writer names fails open the moment a
+   sidecar gains a mutating tool, which would then be treated as a read, needing
+   neither write permission nor a confirmation. `WRITE_TOOLS` is derived from the
+   policy, so a tool cannot be added without classifying it. The practical cost:
+   the read-only `astro-airflow-mcp` sidecar's tools are not reachable until
+   someone enumerates them there.
+
+   A tool is a bundle of REST calls, so it is authorized as one:
+   `_tool_access_requirements` maps each tool to the `(method, DagAccessEntity)`
+   pairs Airflow's own routes demand, and every one has to pass. `diagnose_dag`
+   therefore needs `RUN`, `TASK_INSTANCE`, `TASK_LOGS` and `CODE`, not just
+   Dag-level read; triggering a run is `POST` on `RUN`, not edit on the Dag. The
+   Dag's `team_name` is passed in `DagDetails`, because a team-scoped auth
+   manager answers a different question without it.
+
+   Three cases reach past the named Dag and are authorized accordingly. A source
+   file can define several Dags, so **patching** one requires edit on all of them
+   (the reparse re-reads the file — the same reason Airflow's `/parseDagFile`
+   authorizes by file), and **reading** source requires every co-located Dag to
+   be readable (the rule `/dagSources` enforces by returning `REDACTED_SOURCE`).
+   `get_blast_radius` derives its answer from the asset table, so it also needs
+   `is_authorized_asset`. Tools absent from the policy are refused, so the read-only
+   sidecar's tools are unreachable until someone classifies them there.
+
+   A tool that names no `dag_id` would speak for the whole fleet, and it is
+   **narrowed, never gated**: the plugin computes the Dags that clear the tool's
+   requirements and writes them into the call's `dag_ids` argument, overwriting
+   whatever the model asked for (arguments that are not a dict are refused, since
+   the rewrite would otherwise be silently dropped). A preflight "may you read
+   everything?" would only be a snapshot, and the sidecar's admin-backed scan
+   runs after it, so a Dag created in between would come back unauthorized.
+   Narrowing has no such window. `find_failure_clusters` then queries the
+   **batch** `POST .../taskInstances/list`, the only variant that filters by
+   `dag_ids` — the wildcard `GET` ignores it, so its 50-row page would fill up
+   with failures from Dags the caller cannot see and hide the ones they can —
+   and re-filters the rows before fetching a single log. A fleet-wide tool that
+   takes no allowlist is refused outright, even for a full reader: there is no
+   version of that call that is not a snapshot.
+
+   Underneath, the sidecar still *executes* as one admin service account
+   (loopback-only), so in-Airflow audit trails attribute actions to that account,
+   not the human. *Real answer:* AIP-91's identity propagation — pass the user's
+   JWT through and let RBAC decide per call.
 3. ~~No confirmation on the write itself.~~ Now server-enforced: write tools are
    approval-required in pydantic-ai, so the run suspends and the UI shows
-   Confirm/Reject buttons backed by a single-use, TTL'd, user-bound nonce on
-   `POST /chatbot/confirm`. Remaining shortcuts: the pending-approval store is
-   in-memory and per-process, one verdict covers a whole suspension batch, and
-   there is still no audit-log entry per applied patch.
+   Confirm/Reject buttons backed by a TTL'd, user-bound nonce on
+   `POST /chatbot/confirm`. The record is *not* discarded when the stream starts:
+   it moves `pending → executing → done` and keeps the frames it emitted, so a
+   browser that disconnects after the write landed can ask again with the same
+   nonce and be told what happened instead of silently repeating it — and the
+   card exposes that as a **Check outcome** button, because a guarantee the UI
+   cannot reach is not a guarantee. A cancelled stream lands in `interrupted`,
+   not `done`: the tool may have run, and a partial transcript is not an outcome.
+   Replays of anything unfinished carry an `unsettled` frame, since every SSE
+   stream ends with `done` and the drawer would otherwise read that as
+   settlement. Remaining
+   shortcuts: that store is in-memory and per-process (a restart loses the
+   outcome, and a second api-server worker never had it), one verdict covers a
+   whole suspension batch, and there is still no audit-log entry per applied
+   patch.
 4. **Full-file string replace instead of a real patch.** Requires `old` to be
    unique. Fine for a one-line fix, not for multi-hunk edits.
+
+   Source access is bound to the snapshot it was authorized against. Permission
+   is granted over the Dags Airflow has *parsed* out of one file **version**, so
+   the plugin pins that version's **content hash** into the tool's arguments and
+   the sidecar refuses anything else — "latest" could have grown a Dag nobody was
+   checked against between the two reads, and a version *number* would not catch
+   it either, because `DagCode.update_source_code` rewrites the latest version's
+   source in place. `diagnose_dag` therefore returns `/dagSources`
+   content, never the bytes on disk, and a write refuses outright when the two
+   differ. The whole read-check-write runs under an `flock` on the Dag file and
+   re-compares immediately before replacing it, so an edit landing mid-patch is
+   refused rather than overwritten by a buffer computed from bytes that have
+   moved. A writer that does not take the lock — a human in an editor — is
+   outside what a file-backed bundle can defend.
+5. **Consent that outlives the click, proved with tokens.** Two actions change
+   Airflow beyond the thing the user thinks they approved, so neither is
+   reachable from a first tool call:
+   - `plan_backfill` returns **every** planned run with both halves of its
+     identity, and issues no token at all above the cap — a token must not
+     authorize runs the preview was too abbreviated to have shown, and a
+     partitioned Dag has no logical date to show in the first place.
+   - `run_backfill` must repeat the plan back in `planned_runs` — the runs are in
+     the *arguments* so the confirmation card spells out every run it will create,
+     and the token is what proves the list was not invented. Mismatched, and it
+     refuses.
+   - `run_backfill` needs the single-use `plan_token` from `plan_backfill`, its
+     arguments must match that plan exactly, and the dry run is repeated at the
+     moment of execution — schedule or state drift since the preview aborts it.
+     `AIRY_MCP_MAX_BACKFILL_RUNS` (50) still caps the size. Preview and create
+     are two REST calls and so cannot be atomic from outside Airflow; what
+     actually got created is therefore read back and compared by run *identity*
+     — `(logical_date, partition_key)`, since the same count can be different
+     runs; the date is canonicalised by parsing, the partition key compared
+     exactly, and slots Airflow could not fill (no `dag_run_id`, or an
+     `exception_reason`) do not count as created. A backfill that does not match
+     is cancelled. Cancelling is a
+     compensating action, not a rollback: it pauses the backfill and fails its
+     *queued* runs, so anything the scheduler already picked up is reported in
+     `surviving_runs` rather than quietly implied to be gone. *Real answer:* an
+     expected-plan precondition on `POST /backfills` itself.
+   - `rerun_dag` on a paused Dag returns a warning plus an `unpause_token`
+     instead of unpausing. Only a second call carrying that token may unpause,
+     and the confirmation card retitles itself to "Re-run and resume this Dag's
+     schedule" so the lasting effect is in the line people actually read.
+
+   Both token stores are in-memory and per-process, like the pending-approval
+   store. A token proves the warning was issued and the plan was shown, not that
+   a human read either — the confirmation card is what covers that.
 
 ## Tests
 

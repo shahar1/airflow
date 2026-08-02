@@ -22,6 +22,7 @@
     "dev": "vite --port 5173 --strictPort",
     "build": "vite build",
     "build:types": "tsc --p tsconfig.lib.json",
+    "deploy:breeze": "vite build && cp dist/* www/dist/ && mkdir -p ../../files/plugins && cp airflow_chatbot_plugin.py ../../files/plugins/ && cp -r www ../../files/plugins/",
     "build:lib": "vite build",
     "lint": "eslint --quiet && tsc --p tsconfig.app.json",
     "lint:fix": "eslint --fix && tsc --p tsconfig.app.json",

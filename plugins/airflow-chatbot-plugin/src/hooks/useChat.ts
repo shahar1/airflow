@@ -16,14 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ConfirmRequest, Message, ToolCall } from "../components/types";
 
 /** Generate a unique ID for messages. */
-const generateId = (): string =>
-  `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+const generateId = (): string => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
 const CHATBOT_BASE = () => `${globalThis.location.origin}/chatbot`;
 
@@ -43,9 +41,7 @@ export const loadStoredMessages = (): Message[] => {
         ...m,
         timestamp: new Date(m.timestamp),
         // A chip still in flight when the page reloaded must not spin forever.
-        tools: m.tools?.map((tool) =>
-          tool.durationMs === undefined ? { ...tool, durationMs: 0 } : tool,
-        ),
+        tools: m.tools?.map((tool) => (tool.durationMs === undefined ? { ...tool, durationMs: 0 } : tool)),
       }));
   } catch {
     return [];
@@ -61,9 +57,7 @@ const persistMessages = (messages: Message[]) => {
 };
 
 /** The backend takes prior turns as history; the new turn is sent separately. */
-export const toHistory = (
-  msgs: Message[],
-): Array<{ content: string; role: string }> =>
+export const toHistory = (msgs: Message[]): Array<{ content: string; role: string }> =>
   msgs
     .filter((m) => m.content !== "" && m.isError !== true)
     .slice(-HISTORY_TURNS)
@@ -73,17 +67,13 @@ export const toHistory = (
  * Split a server-sent-events buffer into parsed frames plus whatever partial
  * frame is left over for the next chunk.
  */
-export const parseFrames = (
-  buffer: string,
-): { events: Array<Record<string, unknown>>; rest: string } => {
+export const parseFrames = (buffer: string): { events: Array<Record<string, unknown>>; rest: string } => {
   const chunks = buffer.split(/\r?\n\r?\n/u);
   const rest = chunks.pop() ?? "";
   const events: Array<Record<string, unknown>> = [];
 
   for (const chunk of chunks) {
-    const line = chunk
-      .split(/\r?\n/u)
-      .find((l) => l.startsWith("data:"));
+    const line = chunk.split(/\r?\n/u).find((l) => l.startsWith("data:"));
     if (!line) continue;
     try {
       events.push(JSON.parse(line.slice(5).trim()));
@@ -98,9 +88,7 @@ export const parseFrames = (
 export const finalizeTools = (message: Message, now: number): Message => ({
   ...message,
   tools: message.tools?.map((tool) =>
-    tool.durationMs === undefined
-      ? { ...tool, durationMs: now - tool.startedAt }
-      : tool,
+    tool.durationMs === undefined ? { ...tool, durationMs: now - tool.startedAt } : tool,
   ),
 });
 
@@ -111,7 +99,28 @@ export const applyEvent = (
   now: number = Date.now(),
 ): Message => {
   switch (event.type) {
-    case "tool":
+    case "tool": {
+      // An approved write tool streams again under its original call id when
+      // the run resumes; that is the same call going back to work, not a new
+      // row (and duplicate ids would collide as React keys).
+      if ((message.tools ?? []).some((tool) => tool.id === event.id)) {
+        return {
+          ...message,
+          tools: (message.tools ?? []).map((tool) =>
+            tool.id === event.id
+              ? {
+                  ...tool,
+                  awaitingConfirm: undefined,
+                  denied: undefined,
+                  durationMs: undefined,
+                  failed: undefined,
+                  result: undefined,
+                  startedAt: now,
+                }
+              : tool,
+          ),
+        };
+      }
       return {
         ...message,
         tools: [
@@ -124,12 +133,20 @@ export const applyEvent = (
           } satisfies ToolCall,
         ],
       };
+    }
     case "tool_result":
       return {
         ...message,
         tools: (message.tools ?? []).map((tool) =>
-          tool.id === event.id && tool.durationMs === undefined
-            ? { ...tool, durationMs: now - tool.startedAt }
+          tool.id === event.id && (tool.durationMs === undefined || tool.awaitingConfirm === true)
+            ? {
+                ...tool,
+                awaitingConfirm: undefined,
+                denied: event.denied === true,
+                durationMs: tool.durationMs ?? now - tool.startedAt,
+                failed: event.failed === true,
+                result: typeof event.result === "string" ? event.result : undefined,
+              }
             : tool,
         ),
       };
@@ -145,10 +162,11 @@ export const applyEvent = (
             tool: String(event.tool ?? "tool"),
           } satisfies ConfirmRequest,
         ],
-        // The suspended call's chip must not spin while the user decides.
+        // The suspended call must neither spin nor read as done while the
+        // user decides — freeze the clock and flag it as awaiting.
         tools: (message.tools ?? []).map((tool) =>
           tool.id === event.call_id && tool.durationMs === undefined
-            ? { ...tool, durationMs: now - tool.startedAt }
+            ? { ...tool, awaitingConfirm: true, durationMs: now - tool.startedAt }
             : tool,
         ),
       };
@@ -157,8 +175,7 @@ export const applyEvent = (
     case "error":
       return {
         ...finalizeTools(message, now),
-        content:
-          `${message.content}\n\n**Error:** ${String(event.message ?? "unknown error")}`.trimStart(),
+        content: `${message.content}\n\n**Error:** ${String(event.message ?? "unknown error")}`.trimStart(),
         isError: true,
       };
     default:
@@ -169,9 +186,7 @@ export const applyEvent = (
 /** Map an HTTP failure to a message the user can act on. */
 const errorForResponse = async (response: Response): Promise<Error> => {
   if (response.status === 401) {
-    return new Error(
-      "Your Airflow session has expired — sign in again to keep chatting.",
-    );
+    return new Error("Your Airflow session has expired — sign in again to keep chatting.");
   }
   if (response.status === 403) {
     return new Error("You don't have permission to use Airy.");
@@ -181,9 +196,7 @@ const errorForResponse = async (response: Response): Promise<Error> => {
   }
   const errBody = await response.json().catch(() => null);
   // FastAPI errors arrive as {detail}, our own as {error}.
-  return new Error(
-    errBody?.error ?? errBody?.detail ?? `Server error (${response.status})`,
-  );
+  return new Error(errBody?.error ?? errBody?.detail ?? `Server error (${response.status})`);
 };
 
 // ── Health status ──────────────────────────────────────────────────────
@@ -204,11 +217,11 @@ export interface HealthStatus {
  */
 export const useHealth = () => {
   const [health, setHealth] = useState<HealthStatus>({
-    ok: false,
-    llm: false,
-    mcp: false,
     degraded: false,
+    llm: false,
     loading: true,
+    mcp: false,
+    ok: false,
   });
 
   const fetchHealth = useCallback(async () => {
@@ -219,16 +232,14 @@ export const useHealth = () => {
       if (!res.ok) throw new Error(`status ${res.status}`);
       const data = await res.json();
       setHealth({
-        ok: data.llm?.configured ?? false,
+        degraded: (data.mcp?.unreachable?.length ?? 0) > 0 || data.mcp?.toolset_importable === false,
         llm: data.llm?.configured ?? false,
-        mcp: data.mcp?.reachable ?? false,
-        degraded:
-          (data.mcp?.unreachable?.length ?? 0) > 0 ||
-          data.mcp?.toolset_importable === false,
         loading: false,
+        mcp: data.mcp?.reachable ?? false,
+        ok: data.llm?.configured ?? false,
       });
     } catch {
-      setHealth({ ok: false, llm: false, mcp: false, degraded: false, loading: false });
+      setHealth({ degraded: false, llm: false, loading: false, mcp: false, ok: false });
     }
   }, []);
 
@@ -253,6 +264,9 @@ export const useHealth = () => {
 export const useChat = () => {
   const [messages, setMessages] = useState<Message[]>(loadStoredMessages);
   const [isLoading, setIsLoading] = useState(false);
+  // The message currently receiving the SSE stream — not always the last one:
+  // a confirmation can be resolved after later turns were added.
+  const [streamingId, setStreamingId] = useState<string | null>(null);
   const messagesRef = useRef<Message[]>(messages);
 
   const commit = useCallback((next: Message[]) => {
@@ -265,9 +279,7 @@ export const useChat = () => {
   const streamInto = useCallback(
     async (assistantId: string, response: Response) => {
       const update = (fn: (message: Message) => Message) =>
-        commit(
-          messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)),
-        );
+        commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
 
       const body = response.body;
       if (!body) return;
@@ -276,6 +288,7 @@ export const useChat = () => {
       const decoder = new TextDecoder();
       let buffer = "";
       let complete = false;
+      let unsettled = false;
 
       const consume = (chunk: string) => {
         buffer += chunk;
@@ -283,6 +296,9 @@ export const useChat = () => {
         buffer = rest;
         for (const event of events) {
           complete ||= event.type === "done";
+          // The server saying "I still don't know" outranks the stream ending
+          // tidily — every stream ends with `done`, including that one.
+          unsettled ||= event.type === "unsettled";
           update((message) => applyEvent(message, event));
         }
       };
@@ -303,6 +319,7 @@ export const useChat = () => {
           isError: true,
         }));
       }
+      return complete && !unsettled;
     },
     [commit],
   );
@@ -323,22 +340,21 @@ export const useChat = () => {
         },
       ]);
       setIsLoading(true);
+      setStreamingId(assistantId);
 
       const update = (fn: (message: Message) => Message) =>
-        commit(
-          messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)),
-        );
+        commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
 
       try {
         const response = await fetch(`${CHATBOT_BASE()}/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
           body: JSON.stringify({
             history,
             message: content,
             page_url: globalThis.location.pathname,
           }),
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
         });
 
         if (!response.ok || !response.body) {
@@ -357,6 +373,7 @@ export const useChat = () => {
         }));
       } finally {
         setIsLoading(false);
+        setStreamingId(null);
         // A bubble with nothing in it is hidden, so without this the drawer
         // would show the question and no answer at all.
         update((message) =>
@@ -376,26 +393,34 @@ export const useChat = () => {
   /** Answer a confirm_required frame; the reply streams into the same bubble. */
   const resolveConfirm = useCallback(
     async (nonce: string, approved: boolean) => {
+      // A confirm whose outcome is unknown is still answerable: the server kept
+      // the record, so posting the same nonce replays what happened.
       const owner = messagesRef.current.find((m) =>
-        m.confirms?.some((c) => c.nonce === nonce && c.resolution === undefined),
+        m.confirms?.some(
+          (c) => c.nonce === nonce && (c.resolution === undefined || c.outcomeUnknown === true),
+        ),
       );
       if (!owner) return;
       const assistantId = owner.id;
 
       const update = (fn: (message: Message) => Message) =>
-        commit(
-          messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)),
-        );
+        commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
 
-      update((message) => ({
-        ...message,
-        confirms: message.confirms?.map((c) =>
-          c.nonce === nonce
-            ? { ...c, resolution: approved ? "approved" : "rejected" }
-            : c,
-        ),
-      }));
+      const settle = (outcomeUnknown: boolean) =>
+        update((message) => ({
+          ...message,
+          confirms: message.confirms?.map((c) =>
+            c.nonce === nonce
+              ? { ...c, outcomeUnknown, resolution: approved ? "approved" : "rejected" }
+              : c,
+          ),
+        }));
+
+      // Submitted, not settled: the write may land even if the reply never
+      // arrives, so the outcome stays unknown until the stream says otherwise.
+      settle(true);
       setIsLoading(true);
+      setStreamingId(assistantId);
 
       try {
         const response = await fetch(`${CHATBOT_BASE()}/confirm`, {
@@ -409,19 +434,17 @@ export const useChat = () => {
           throw await errorForResponse(response);
         }
 
-        await streamInto(assistantId, response);
+        settle(!(await streamInto(assistantId, response)));
       } catch (err) {
         update((message) =>
           applyEvent(message, {
-            message:
-              err instanceof Error
-                ? err.message
-                : "Failed to get a response from Airy.",
+            message: err instanceof Error ? err.message : "Failed to get a response from Airy.",
             type: "error",
           }),
         );
       } finally {
         setIsLoading(false);
+        setStreamingId(null);
         const ended = Date.now();
         update((message) => finalizeTools(message, ended));
       }
@@ -445,5 +468,6 @@ export const useChat = () => {
     messages,
     resolveConfirm,
     sendMessage,
+    streamingId,
   };
 };

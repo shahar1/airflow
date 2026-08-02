@@ -30,6 +30,14 @@ export interface ToolCall {
   startedAt: number;
   /** Set when the result arrives; until then the call is still running. */
   durationMs?: number;
+  /** Clipped tool output (or error text when failed), for the expandable row. */
+  result?: string;
+  /** True when the call errored instead of returning. */
+  failed?: boolean;
+  /** True while the server holds the call waiting for the user's verdict. */
+  awaitingConfirm?: boolean;
+  /** True when the user rejected the call instead of approving it. */
+  denied?: boolean;
 }
 
 /** A write tool call the server suspended, waiting for the user's verdict. */
@@ -40,6 +48,12 @@ export interface ConfirmRequest {
   args?: unknown;
   /** Set once the user has clicked; the buttons then freeze. */
   resolution?: "approved" | "rejected";
+  /**
+   * Set when the reply never finished, so the write may or may not have landed.
+   * The nonce is still good: asking again replays the outcome rather than
+   * repeating the action.
+   */
+  outcomeUnknown?: boolean;
 }
 
 export interface Message {

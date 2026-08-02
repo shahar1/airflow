@@ -16,7 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 import { createSystem, defaultConfig } from "@chakra-ui/react";
 
-export const localSystem = createSystem(defaultConfig);
+// Airflow logo blue. Without this token every `brand.500` usage (buttons,
+// spinners, focus rings) resolves to an empty CSS var and renders transparent.
+export const localSystem = createSystem(defaultConfig, {
+  theme: {
+    tokens: {
+      colors: {
+        brand: { 500: { value: "#017cee" } },
+      },
+    },
+  },
+});

@@ -35,11 +35,16 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fcntl
 import json
 import os
 import re
+import secrets
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from hashlib import md5
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -56,6 +61,7 @@ REPARSE_TIMEOUT_S = 45.0
 FAILURE_SCAN_LIMIT = 50
 LOG_TAIL_LINES = 40
 LOG_TAIL_CHARS = 4000
+MAX_BACKFILL_RUNS = int(os.environ.get("AIRY_MCP_MAX_BACKFILL_RUNS", "50"))
 
 mcp: FastMCP = FastMCP("airy-selfheal")
 
@@ -108,6 +114,69 @@ def _dag_path(dag_id: str, dag: dict[str, Any] | None = None) -> Path:
     return path
 
 
+def _parsed_source(dag_id: str, source_digest: str | None = None) -> str:
+    """The parsed source, proved to be the bytes this call was authorized against.
+
+    Matched by content hash rather than version number: Airflow rewrites the
+    latest version's source in place when it changes, so the number alone does
+    not name a fixed set of bytes.
+    """
+    content = _api("GET", f"/dagSources/{quote(dag_id, safe='')}")["content"]
+    if source_digest is not None and md5(content.encode("utf-8")).hexdigest() != source_digest:
+        raise DagFileDriftError(
+            f"the parsed source of {dag_id} is no longer the version this request was authorized "
+            f"against; it may now define a Dag that was never checked — try again"
+        )
+    return content
+
+
+class DagFileDriftError(DagFileError):
+    """Raised when the file on disk is not the version Airflow parsed."""
+
+
+@contextmanager
+def _exclusive(path: Path) -> Iterator[None]:
+    """Hold the Dag file for a whole read-check-write.
+
+    Validating and then writing as two separate steps loses an edit that lands in
+    between — the buffer written back was computed from bytes that are no longer
+    there. This closes the window against every writer that takes the same lock;
+    a human with an editor does not, which is inherent to a file-backed bundle.
+    """
+    with path.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _write_if_unchanged(path: Path, expected: str, content: str) -> None:
+    """Replace the file, but only if it still holds what was checked."""
+    if path.read_text() != expected:
+        raise DagFileDriftError(
+            f"{path.name} changed while the patch was being prepared, so applying it would "
+            f"overwrite an edit nobody reviewed; try again"
+        )
+    path.write_text(content)
+
+
+def _read_reviewed_file(dag_id: str, path: Path, source_digest: str | None = None) -> str:
+    """Read a Dag's file, refusing if Airflow has not parsed what is in it.
+
+    Access to this file was authorized against the Dags Airflow parsed out of it.
+    If the bytes on disk have moved on — an edit mid-flight, a Dag added and not
+    yet processed — then those are not the bytes anyone approved touching.
+    """
+    on_disk = path.read_text()
+    if on_disk != _parsed_source(dag_id, source_digest):
+        raise DagFileDriftError(
+            f"{path.name} on disk is not the version Airflow has parsed, so what it now "
+            f"contains has not been reviewed; wait for the Dag processor and try again"
+        )
+    return on_disk
+
+
 def _latest_version(dag_id: str) -> int | None:
     versions = _api(
         "GET", _dag_url(dag_id, "/dagVersions"), params={"order_by": "-version_number", "limit": 1}
@@ -150,12 +219,14 @@ def _tail(content: Any) -> str:
     return text[-LOG_TAIL_CHARS:]
 
 
-def diagnose_dag(dag_id: str) -> dict[str, Any]:
+def diagnose_dag(dag_id: str, source_digest: str | None = None) -> dict[str, Any]:
     """
     Find out why the latest run of a Dag failed.
 
     Returns the failed task, the tail of its log (including the traceback) and
     the full Dag source, which together are enough to work out the fix.
+
+    ``source_digest`` is set by the caller's permissions, not by you.
     """
     runs = _api("GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": 5})[
         "dag_runs"
@@ -174,14 +245,15 @@ def diagnose_dag(dag_id: str) -> dict[str, Any]:
         "dag_run_id": run["dag_run_id"],
         "run_state": run["state"],
     }
-    # Diagnosis is read-only, so a Dag outside the writable bundle is still worth
-    # reporting on — just without its source.
+    # The *parsed* source, not the file on disk. Permission to read this file was
+    # granted against the Dags Airflow has parsed out of it; the live file may
+    # already define one more, and handing that back would disclose a Dag nobody
+    # authorized. A Dag outside the writable bundle is still worth reporting on.
     try:
-        path = _dag_path(dag_id)
-        result["source_file"] = str(path)
-        result["source"] = path.read_text(errors="replace")
-    except (DagFileError, OSError) as e:
-        result["source"] = f"unavailable: {e}"
+        result["source"] = _parsed_source(dag_id, source_digest)
+        result["source_file"] = str(_dag_path(dag_id))
+    except (DagFileError, OSError, httpx.HTTPStatusError, KeyError) as e:
+        result.setdefault("source", f"unavailable: {e}")
 
     if not tis:
         result["diagnosis"] = f"latest run is {run['state']}; no failed task instances"
@@ -200,37 +272,45 @@ def diagnose_dag(dag_id: str) -> dict[str, Any]:
     return result
 
 
-def fix_dag_code(dag_id: str, old: str, new: str) -> dict[str, Any]:
+def fix_dag_code(dag_id: str, old: str, new: str, source_digest: str | None = None) -> dict[str, Any]:
     """
     Patch a Dag's source file by replacing ``old`` with ``new``, then make
     Airflow pick the change up immediately.
 
     ``old`` must appear exactly once in the file. Returns a unified diff.
+    ``source_digest`` is set by the caller's permissions, not by you.
     """
     dag = _api("GET", _dag_url(dag_id))
     path = _dag_path(dag_id, dag)
-    source = path.read_text()
     version_before_write = _latest_version(dag_id)
+    with _exclusive(path):
+        try:
+            source = _read_reviewed_file(dag_id, path, source_digest)
+        except DagFileDriftError as e:
+            return {"applied": False, "error": str(e)}
 
-    occurrences = source.count(old)
-    if occurrences != 1:
-        return {
-            "applied": False,
-            "error": f"{old!r} appears {occurrences} times in {path.name}; it must appear exactly once",
-        }
+        occurrences = source.count(old)
+        if occurrences != 1:
+            return {
+                "applied": False,
+                "error": f"{old!r} appears {occurrences} times in {path.name}; it must appear exactly once",
+            }
 
-    patched = source.replace(old, new)
-    if patched == source:
-        return {"applied": False, "error": "the replacement is identical to the original"}
-    try:
-        compile(patched, str(path), "exec")
-    except SyntaxError as e:
-        return {"applied": False, "error": f"the patched file would not compile: {e}"}
+        patched = source.replace(old, new)
+        if patched == source:
+            return {"applied": False, "error": "the replacement is identical to the original"}
+        try:
+            compile(patched, str(path), "exec")
+        except SyntaxError as e:
+            return {"applied": False, "error": f"the patched file would not compile: {e}"}
 
-    backup = path.with_suffix(".py.airy-bak")
-    if not backup.exists():
-        backup.write_text(source)
-    path.write_text(patched)
+        backup = path.with_suffix(".py.airy-bak")
+        if not backup.exists():
+            backup.write_text(source)
+        try:
+            _write_if_unchanged(path, source, patched)
+        except DagFileDriftError as e:
+            return {"applied": False, "error": str(e)}
 
     diff = "".join(
         difflib.unified_diff(
@@ -249,29 +329,95 @@ def fix_dag_code(dag_id: str, old: str, new: str) -> dict[str, Any]:
     return {"applied": True, "file": str(path), "diff": diff, "reparse": reparse}
 
 
-def revert_dag_code(dag_id: str) -> dict[str, Any]:
-    """Restore a Dag's source from the backup taken before the first fix."""
+def revert_dag_code(dag_id: str, source_digest: str | None = None) -> dict[str, Any]:
+    """
+    Restore a Dag's source to the original, discarding **every** fix_dag_code
+    change — not just the most recent one. Returns the diff of what was undone.
+    """
     dag = _api("GET", _dag_url(dag_id))
     path = _dag_path(dag_id, dag)
     backup = path.with_suffix(".py.airy-bak")
     if not backup.exists():
         return {"reverted": False, "error": f"no backup for {path.name}"}
     version_before_write = _latest_version(dag_id)
-    path.write_text(backup.read_text())
-    backup.unlink()
+    with _exclusive(path):
+        try:
+            current = _read_reviewed_file(dag_id, path, source_digest)
+            original = backup.read_text()
+            _write_if_unchanged(path, current, original)
+        except DagFileDriftError as e:
+            return {"reverted": False, "error": str(e)}
+        backup.unlink()
+    diff = "".join(
+        difflib.unified_diff(
+            current.splitlines(keepends=True),
+            original.splitlines(keepends=True),
+            f"a/{path.name}",
+            f"b/{path.name}",
+        )
+    )
     try:
         reparse = _force_reparse(dag_id, dag["file_token"], version_before_write)
     except Exception as e:  # the restore already landed; never raise past it
         reparse = f"file restored, but the reparse request failed: {e}"
-    return {"reverted": True, "file": str(path), "reparse": reparse}
+    return {"reverted": True, "file": str(path), "diff": diff, "reparse": reparse}
 
 
-def rerun_dag(dag_id: str) -> dict[str, Any]:
-    """Unpause the Dag if needed and trigger a fresh run on the latest code."""
+def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> dict[str, Any]:
+    """
+    Trigger a fresh run of a Dag on the latest code.
+
+    A paused Dag will not run until it is unpaused, and unpausing also resumes
+    its *scheduled* runs — a lasting change beyond this one run. So it cannot be
+    part of a first proposal: calling this on a paused Dag returns a warning and
+    an ``unpause_token``. Put the warning to the user in your own words, and only
+    if they agree call again with ``unpause=True`` and that token.
+    """
     if _api("GET", _dag_url(dag_id))["is_paused"]:
+        if not unpause:
+            return {
+                "triggered": False,
+                "unpause_token": _issue_token("unpause", {"dag_id": dag_id}),
+                "error": (
+                    f"{dag_id} is paused, so a new run would not start. Tell the user that re-running "
+                    f"means unpausing, which also resumes its scheduled runs from now on, and ask them. "
+                    f"If they agree, call again with unpause=True and this unpause_token."
+                ),
+            }
+        warned = _redeem_token("unpause", unpause_token)
+        if warned is None or warned["dag_id"] != dag_id:
+            return {
+                "triggered": False,
+                "error": (
+                    f"unpausing {dag_id} needs the unpause_token from its paused-Dag warning; "
+                    f"call rerun_dag without unpause first and put that warning to the user"
+                ),
+            }
         _api("PATCH", _dag_url(dag_id), json={"is_paused": False})
-    run = _api("POST", _dag_url(dag_id, "/dagRuns"), json={"logical_date": None, "conf": {}})
-    return {"dag_id": dag_id, "dag_run_id": run["dag_run_id"], "state": run["state"]}
+        unpaused = True
+    else:
+        unpaused = False
+    try:
+        run = _api("POST", _dag_url(dag_id, "/dagRuns"), json={"logical_date": None, "conf": {}})
+    except Exception as e:
+        # The unpause already committed. Reporting only the failure would leave
+        # the user thinking nothing happened, with the Dag now scheduling again.
+        return {
+            "triggered": False,
+            "dag_id": dag_id,
+            "unpaused": unpaused,
+            "error": (
+                f"triggering the run failed: {e}"
+                + (f". {dag_id} was unpaused first and is still unpaused." if unpaused else "")
+            ),
+        }
+    return {
+        "triggered": True,
+        "dag_id": dag_id,
+        "dag_run_id": run["dag_run_id"],
+        "state": run["state"],
+        "unpaused": unpaused,
+    }
 
 
 def _run_version(run: dict[str, Any]) -> int | None:
@@ -280,13 +426,21 @@ def _run_version(run: dict[str, Any]) -> int | None:
     return versions[-1].get("version_number") if versions else None
 
 
-def compare_dag_runs(dag_id: str, run_a: str, run_b: str) -> dict[str, Any]:
+def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | None = None) -> dict[str, Any]:
     """
-    Compare two runs of a Dag: per-task duration changes, conf differences,
-    and — when the runs executed different Dag versions — the source diff.
+    Compare two runs of a Dag: per-task duration changes and conf differences.
 
     Answers "was it my change?" after a run that used to work starts failing.
+    Names the Dag versions each run used, but does not diff them — an older
+    version can contain a co-located Dag this caller was never authorized for.
+    ``source_digest`` is set by the caller's permissions, not by you.
     """
+    # Fail closed before any of it: the caller was authorized against one exact
+    # source, and this is where we find out it is still that source.
+    try:
+        _parsed_source(dag_id, source_digest)
+    except DagFileDriftError as e:
+        return {"dag_id": dag_id, "error": str(e)}
     summaries: dict[str, dict[str, Any]] = {}
     durations: dict[str, dict[str, float | None]] = {}
     for label, run_id in (("run_a", run_a), ("run_b", run_b)):
@@ -324,19 +478,13 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str) -> dict[str, Any]:
     ver_a, ver_b = summaries["run_a"]["version"], summaries["run_b"]["version"]
     source_diff = None
     if ver_a is not None and ver_b is not None and ver_a != ver_b:
-        sources = {
-            ver: _api("GET", f"/dagSources/{quote(dag_id, safe='')}", params={"version_number": ver})[
-                "content"
-            ]
-            for ver in (ver_a, ver_b)
-        }
-        source_diff = "".join(
-            difflib.unified_diff(
-                sources[ver_a].splitlines(keepends=True),
-                sources[ver_b].splitlines(keepends=True),
-                f"{dag_id} v{ver_a}",
-                f"{dag_id} v{ver_b}",
-            )
+        # No diff of historical versions. Permission was decided over the Dags in
+        # the file *now*; an older version can hold a co-located Dag since
+        # removed, which nobody was ever checked against. The version numbers are
+        # enough to say a change happened.
+        source_diff = (
+            f"not shown: comparing v{ver_a} with v{ver_b} would mean reading source this request "
+            f"was not authorized for. Ask about the current source instead."
         )
 
     return {
@@ -362,19 +510,33 @@ def _error_signature(log_tail: str) -> str:
     return line[:200]
 
 
-def find_failure_clusters(hours: float = 24) -> dict[str, Any]:
+def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -> dict[str, Any]:
     """
-    Group recent task failures across every Dag by error signature.
+    Group recent task failures by error signature.
 
     Answers "what is breaking, fleet-wide?" — biggest clusters first, each
     with example task instances to drill into.
+
+    ``dag_ids`` is set by the caller's permissions, not by you: whatever you pass
+    is replaced with the Dags the signed-in user may actually read.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    tis = _api(
-        "GET",
-        "/dags/~/dagRuns/~/taskInstances",
-        params={"state": "failed", "start_date_gte": since, "limit": FAILURE_SCAN_LIMIT},
-    )["task_instances"]
+    # The batch endpoint, not the wildcard GET: only this one filters by dag_ids,
+    # and filtering locally after a fleet-wide page would let failures from Dags
+    # the caller cannot see push the ones they can out of the limit.
+    body: dict[str, Any] = {
+        "state": ["failed"],
+        "start_date_gte": since,
+        "page_limit": FAILURE_SCAN_LIMIT,
+    }
+    if dag_ids is not None:
+        body["dag_ids"] = list(dag_ids)
+    tis = _api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)["task_instances"]
+    # Belt and braces: never fetch a log for a Dag outside the allowlist, whatever
+    # the API returned.
+    if dag_ids is not None:
+        allowed = set(dag_ids)
+        tis = [ti for ti in tis if ti["dag_id"] in allowed]
 
     clusters: dict[str, dict[str, Any]] = {}
     for ti in tis:
@@ -401,37 +563,238 @@ def find_failure_clusters(hours: float = 24) -> dict[str, Any]:
     }
 
 
-def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
-    """
-    Preview the runs a backfill would create, without creating anything.
+def _run_identity(entry: dict[str, Any]) -> tuple[str, str | None]:
+    """What makes a planned run *that* run — a matching count is not a matching plan.
 
-    Read-only. Always show this plan to the user and get their confirmation
-    before calling run_backfill.
+    Only the date is canonicalised, and by parsing rather than by text: the two
+    endpoints being compared serialise the same instant differently (``Z`` versus
+    ``+00:00``).  ``partition_key`` is an opaque string and is left exactly as it
+    came, so two keys that merely look similar stay distinct.
     """
+    raw = entry.get("logical_date")
+    if raw is None:
+        return "", entry.get("partition_key")
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return str(raw), entry.get("partition_key")
+    # To the instant, not the offset: the dry run can answer in the Dag's
+    # timezone while the created run is read back as UTC, and 00:00+00:00 is
+    # 02:00+02:00. Comparing the text would cancel a perfectly good backfill.
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(), entry.get("partition_key")
+
+
+def _same_runs(left: list[tuple[str, Any]], right: list[tuple[str, Any]]) -> bool:
+    """Compare as multisets: neither endpoint promises an order."""
+    return sorted(left, key=repr) == sorted(right, key=repr)
+
+
+def _dry_run_backfill(dag_id: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
     resp = _api(
         "POST",
         "/backfills/dry_run",
         json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date},
     )
-    dates = [b.get("logical_date") for b in resp.get("backfills", [])]
-    return {
+    return resp.get("backfills", [])
+
+
+# What the user was shown before consenting, keyed by token: the reviewed
+# backfill plan, and the paused-Dag warning that has to precede an unpause.
+# In-memory and per-process, like the plugin's pending approvals.
+_issued_tokens: dict[str, dict[str, Any]] = {}
+_TOKEN_TTL_S = 900.0
+_TOKEN_MAX = 20
+
+
+def _issue_token(kind: str, payload: dict[str, Any]) -> str:
+    now = time.monotonic()
+    for token in [t for t, p in _issued_tokens.items() if now - p["created_at"] > _TOKEN_TTL_S]:
+        del _issued_tokens[token]
+    while len(_issued_tokens) >= _TOKEN_MAX:
+        del _issued_tokens[next(iter(_issued_tokens))]
+    token = secrets.token_urlsafe(12)
+    _issued_tokens[token] = {**payload, "kind": kind, "created_at": now}
+    return token
+
+
+def _redeem_token(kind: str, token: str) -> dict[str, Any] | None:
+    """Single-use by construction: a token can only ever be redeemed once."""
+    payload = _issued_tokens.pop(token, None)
+    if payload is None or payload["kind"] != kind:
+        return None
+    if time.monotonic() - payload["created_at"] > _TOKEN_TTL_S:
+        return None
+    return payload
+
+
+def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
+    """
+    Preview the runs a backfill would create, without creating anything.
+
+    Read-only. Show the user every run listed in ``planned_runs``, then pass the
+    ``plan_token`` back to run_backfill — that is what proves the backfill you
+    create is the one they reviewed.
+    """
+    entries = _dry_run_backfill(dag_id, from_date, to_date)
+    preview = {
         "dag_id": dag_id,
         "from_date": from_date,
         "to_date": to_date,
-        "planned_run_count": resp.get("total_entries", len(dates)),
-        "planned_logical_dates": dates[:20],
+        "planned_run_count": len(entries),
+        # Every run, and both halves of its identity: a partitioned Dag has no
+        # logical_date, so a dates-only list would show the user nothing at all.
+        "planned_runs": [
+            {"logical_date": entry.get("logical_date"), "partition_key": entry.get("partition_key")}
+            for entry in entries
+        ],
     }
+    if len(entries) > MAX_BACKFILL_RUNS:
+        # No token: the plan is beyond what may be created anyway, and issuing one
+        # would authorize runs this preview is too long to have really shown.
+        return {
+            **preview,
+            "error": (
+                f"{len(entries)} runs exceeds the {MAX_BACKFILL_RUNS}-run limit for one backfill; "
+                f"narrow the date range before proposing it"
+            ),
+        }
+    plan = {
+        "dag_id": dag_id,
+        "from_date": from_date,
+        "to_date": to_date,
+        "planned_runs": [_run_identity(entry) for entry in entries],
+    }
+    return {**preview, "plan_token": _issue_token("backfill", plan)}
 
 
-def run_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
-    """Create the backfill previewed by plan_backfill. Only call after the user confirmed the plan."""
+def run_backfill(
+    dag_id: str,
+    from_date: str,
+    to_date: str,
+    plan_token: str = "",
+    planned_runs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Create the backfill previewed by plan_backfill.
+
+    Pass back both the ``plan_token`` *and* the exact ``planned_runs`` list that
+    plan_backfill returned. The runs go in the arguments so the confirmation the
+    user clicks spells out every run it creates; the token is what proves the
+    list was not invented. Refuses if either is missing or they disagree.
+    """
+    plan = _redeem_token("backfill", plan_token)
+    if plan is None:
+        return {
+            "created": False,
+            "error": "no reviewed plan for this backfill; call plan_backfill and show the user the result",
+        }
+    if (plan["dag_id"], plan["from_date"], plan["to_date"]) != (dag_id, from_date, to_date):
+        return {
+            "created": False,
+            "error": (
+                f"these arguments are not the ones planned "
+                f"({plan['dag_id']} {plan['from_date']}..{plan['to_date']}); re-plan and show the user"
+            ),
+        }
+    quoted = [_run_identity(entry) for entry in planned_runs or []]
+    if not _same_runs(quoted, plan["planned_runs"]):
+        return {
+            "created": False,
+            "error": (
+                f"planned_runs must repeat the {len(plan['planned_runs'])} runs plan_backfill returned, "
+                f"so the confirmation shows the user what they are approving; re-plan and pass them back"
+            ),
+        }
+    # Re-run the dry run at the moment of execution: schedule or state drift
+    # between the preview and now would silently change what gets created.
+    planned = [_run_identity(entry) for entry in _dry_run_backfill(dag_id, from_date, to_date)]
+    reviewed = plan["planned_runs"]
+    count = len(planned)
+    if not _same_runs(planned, reviewed):
+        return {
+            "created": False,
+            "planned_run_count": count,
+            "error": (
+                f"the backfill changed since the user reviewed it "
+                f"({len(reviewed)} runs then, {count} now); re-plan and show the user"
+            ),
+        }
+    if count > MAX_BACKFILL_RUNS:
+        return {
+            "created": False,
+            "planned_run_count": count,
+            "error": (
+                f"{count} runs exceeds the {MAX_BACKFILL_RUNS}-run limit for one backfill; "
+                f"narrow the date range"
+            ),
+        }
     resp = _api("POST", "/backfills", json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date})
+    # The preview and the create are two REST calls, so they cannot be atomic from
+    # out here: state can move between them. Check what actually got created and
+    # cancel it if it is not what the user approved.
+    created = _backfill_runs(resp["id"])
+    # A slot Airflow could not fill still comes back with the planned identity, and
+    # carries no dag_run_id plus a reason. Matching on identity alone would call
+    # that a success, so the run has to have actually been created.
+    landed = [entry for entry in created if entry.get("dag_run_id") and not entry.get("exception_reason")]
+    # Identity, not arity: the same number of runs can still be different runs.
+    if not _same_runs([_run_identity(entry) for entry in landed], planned):
+        return _abandon_backfill(resp["id"], planned=planned, created=created)
     return {
+        "created": True,
         "backfill_id": resp["id"],
         "dag_id": resp["dag_id"],
         "from_date": resp["from_date"],
         "to_date": resp["to_date"],
+        "planned_run_count": count,
         "is_paused": resp.get("is_paused", False),
+    }
+
+
+def _backfill_runs(backfill_id: int) -> list[dict[str, Any]]:
+    resp = _api("GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": MAX_BACKFILL_RUNS + 1})
+    return resp.get("backfill_dag_runs", [])
+
+
+def _abandon_backfill(
+    backfill_id: int, *, planned: list[tuple[Any, Any]], created: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Undo as much of a backfill as cancelling can, and be explicit about the rest.
+
+    Cancelling pauses the backfill and fails its *queued* runs. It does not
+    delete rows, and a run the scheduler already picked up keeps going — so the
+    surviving states are reported rather than implied.
+    """
+    try:
+        _api("PUT", f"/backfills/{backfill_id}/cancel")
+        cancelled = True
+    except Exception:
+        cancelled = False
+    survivors = []
+    try:
+        survivors = [
+            {"dag_run_id": entry.get("dag_run_id"), "state": entry.get("dag_run_state")}
+            for entry in _backfill_runs(backfill_id)
+            if entry.get("dag_run_state") not in (None, "failed")
+        ]
+    except Exception:
+        survivors = [{"dag_run_id": None, "state": "unknown — could not re-read the backfill"}]
+    aftermath = "cancelled" if cancelled else "CANCELLING IT FAILED"
+    if survivors:
+        aftermath += f", but {len(survivors)} run(s) were already past queued and are still going"
+    return {
+        "created": False,
+        "backfill_id": backfill_id,
+        "planned_run_count": len(planned),
+        "created_run_count": len(created),
+        "cancelled": cancelled,
+        "surviving_runs": survivors,
+        "error": (
+            f"the backfill did not match the {len(planned)} runs the user approved; {aftermath}. "
+            f"Tell the user to check backfill {backfill_id}."
+        ),
     }
 
 

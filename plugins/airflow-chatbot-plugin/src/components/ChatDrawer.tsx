@@ -16,24 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-import {
-  Box,
-  Flex,
-  Heading,
-  IconButton,
-  Portal,
-  Text,
-  VStack,
-} from "@chakra-ui/react";
+import { Box, Flex, Heading, IconButton, Portal, Text, VStack } from "@chakra-ui/react";
 import { FC, useCallback, useEffect, useRef, useState } from "react";
 
 import { useColorMode } from "src/context/colorMode";
 
+import { HealthStatus } from "../hooks/useChat";
 import { ChatInput } from "./ChatInput";
 import { MessageList } from "./MessageList";
 import { Message } from "./types";
-import { HealthStatus } from "../hooks/useChat";
 
 const DEFAULT_WIDTH = 420;
 const MIN_WIDTH = 320;
@@ -47,6 +38,7 @@ interface ChatDrawerProps {
   readonly onSendMessage: (content: string) => void;
   readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
   readonly isLoading?: boolean;
+  readonly streamingId?: string | null;
   readonly health: HealthStatus;
 }
 
@@ -64,6 +56,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   onClose,
   onConfirmClick,
   onSendMessage,
+  streamingId,
 }) => {
   const { colorMode } = useColorMode();
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -92,9 +85,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   useEffect(() => {
     if (isOpen) {
       document.body.style.marginRight = `${width}px`;
-      document.body.style.transition = isDragging.current
-        ? "none"
-        : "margin-right 0.3s ease-in-out";
+      document.body.style.transition = isDragging.current ? "none" : "margin-right 0.3s ease-in-out";
     } else {
       document.body.style.marginRight = "";
       document.body.style.transition = "margin-right 0.3s ease-in-out";
@@ -150,11 +141,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   // Handle click outside to close on mobile
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (
-        drawerRef.current &&
-        !drawerRef.current.contains(e.target as Node) &&
-        isOpen
-      ) {
+      if (drawerRef.current && !drawerRef.current.contains(e.target as Node) && isOpen) {
         const target = e.target as HTMLElement;
         if (target.getAttribute("data-backdrop") === "true") {
           onClose();
@@ -238,12 +225,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
           flexShrink={0}
         >
           <Flex align="center" gap={2}>
-            <Box
-              bg="brand.500"
-              color="white"
-              p={1.5}
-              borderRadius="md"
-            >
+            <Box bg="brand.500" color="white" p={1.5} borderRadius="md">
               <svg
                 fill="currentColor"
                 height="16"
@@ -272,7 +254,9 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
                 }
               >
                 {health.loading ? (
-                  <Text fontSize="xs" color="gray.500">Connecting…</Text>
+                  <Text fontSize="xs" color="gray.500">
+                    Connecting…
+                  </Text>
                 ) : health.llm && health.mcp ? (
                   <>
                     <Box
@@ -288,7 +272,9 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
                 ) : (
                   <>
                     <Box boxSize="7px" borderRadius="full" bg="red.400" flexShrink={0} />
-                    <Text fontSize="xs" color="red.400">Disconnected</Text>
+                    <Text fontSize="xs" color="red.400">
+                      Disconnected
+                    </Text>
                   </>
                 )}
               </Flex>
@@ -317,12 +303,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
               />
             </svg>
           </IconButton>
-          <IconButton
-            aria-label="Close chat"
-            onClick={onClose}
-            variant="ghost"
-            size="sm"
-          >
+          <IconButton aria-label="Close chat" onClick={onClose} variant="ghost" size="sm">
             <svg
               fill="none"
               height="20"
@@ -332,11 +313,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
               width="20"
               xmlns="http://www.w3.org/2000/svg"
             >
-              <path
-                d="M6 18L18 6M6 6l12 12"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
+              <path d="M6 18L18 6M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </IconButton>
         </Flex>
@@ -346,19 +323,14 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
           <MessageList
             messages={messages}
             isLoading={isLoading}
+            streamingId={streamingId}
             onSuggestionClick={handleSuggestionClick}
             onConfirmClick={onConfirmClick}
           />
         </Box>
 
         {/* Input Area */}
-        <Box
-          borderTopWidth="1px"
-          borderColor={borderColor}
-          p={4}
-          bg={headerBg}
-          flexShrink={0}
-        >
+        <Box borderTopWidth="1px" borderColor={borderColor} p={4} bg={headerBg} flexShrink={0}>
           <ChatInput
             onSend={(msg) => {
               onSendMessage(msg);
