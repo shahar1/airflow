@@ -87,10 +87,6 @@ describe("MessageList", () => {
     show(<MessageList messages={[user("why?"), assistant()]} isLoading />);
 
     expect(screen.getByText("Thinking...")).not.toBeNull();
-    // The empty placeholder must not render as a bare bubble with a timestamp;
-    // only the user's message should carry one. (Matched loosely: the exact
-    // format depends on the machine's locale and timezone.)
-    expect(screen.queryAllByText(/^\d{1,2}:\d{2}/u)).toHaveLength(1);
   });
 
   it.each([
@@ -105,7 +101,7 @@ describe("MessageList", () => {
   it("renders nothing for a finished whitespace-only assistant message", () => {
     const { container } = show(<MessageList messages={[assistant({ content: " \n" })]} />);
 
-    expect(container.querySelector(".airy-timestamp")).toBeNull();
+    expect(container.textContent).toBe("");
   });
 
   it("drops the indicator once the first tool call arrives", () => {
@@ -349,9 +345,12 @@ describe("MessageList", () => {
     );
 
     expect(screen.getByText("Approve 2 actions")).not.toBeNull();
-    // Both calls are visible before any single click authorizes them.
-    expect(screen.getByText(/fix_dag_code/u)).not.toBeNull();
-    expect(screen.getByText(/rerun_dag/u)).not.toBeNull();
+    // Every lasting effect is spelled out before the one click authorizes them all.
+    expect(screen.getByText("Proposed Dag source change")).not.toBeNull();
+    expect(screen.getByText("Trigger a new Dag run")).not.toBeNull();
+    expect(screen.getAllByText("Writes the Dag file · reparses immediately")).toHaveLength(1);
+    expect(screen.getByText("Creates a Dag run")).not.toBeNull();
+    expect(screen.getByText(/Creates one manual run of/u)).not.toBeNull();
 
     fireEvent.click(screen.getByText("Approve all"));
 
@@ -393,15 +392,19 @@ describe("MessageList", () => {
       />,
     );
 
-    expect(screen.getByText("Apply a code fix")).not.toBeNull();
-    expect(screen.getByText("Modifies your Airflow")).not.toBeNull();
+    expect(screen.getByText("Proposed Dag source change")).not.toBeNull();
+    expect(screen.getByText("Writes the Dag file · reparses immediately")).not.toBeNull();
+    expect(screen.getByText(/there is no review step after this/u)).not.toBeNull();
 
-    // The exact change stays one click away instead of flooding the card.
+    // The diff is the thing being approved, so it is already on screen; the raw
+    // arguments stay one click away.
+    expect(screen.getByText("-a")).not.toBeNull();
+    expect(screen.getByText("+b")).not.toBeNull();
     expect(screen.queryByText(/"old": "a"/u)).toBeNull();
-    fireEvent.click(screen.getByText("Review change"));
+    fireEvent.click(screen.getByText("Technical details"));
     expect(screen.getByText(/"old": "a"/u)).not.toBeNull();
 
-    fireEvent.click(screen.getByText("Apply fix"));
+    fireEvent.click(screen.getByText("Apply to Dag source file"));
     expect(onConfirmClick).toHaveBeenCalledWith("n1", true);
   });
 
@@ -460,12 +463,12 @@ describe("MessageList", () => {
     expect(screen.getByText("Re-run sales_summary")).not.toBeNull();
   });
 
-  it("keeps timestamps out of the way until the bubble is hovered", () => {
-    const { container } = show(<MessageList messages={[assistant({ content: "done" })]} />);
+  it("shows no timestamp, so nothing shifts on hover", () => {
+    const { container } = show(
+      <MessageList messages={[user("why?"), assistant({ content: "done" })]} />,
+    );
 
-    const timestamp = container.querySelector(".airy-timestamp");
-    expect(timestamp).not.toBeNull();
-    expect(timestamp?.textContent).toMatch(/\d{1,2}:\d{2}/u);
+    expect(container.textContent).not.toMatch(/\d{1,2}:\d{2}/u);
   });
 
   it("colours added and removed lines in a diff block", () => {
@@ -494,6 +497,159 @@ describe("MessageList", () => {
     );
 
     expect(container.querySelector("[data-diff]")).toBeNull();
+  });
+
+  it("shows a proposed write as awaiting a decision, never as work in progress", () => {
+    const { container } = show(
+      <MessageList
+        messages={[
+          assistant({
+            tools: [{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }],
+          }),
+        ]}
+        isLoading
+      />,
+    );
+
+    expect(screen.getByText("Proposed code change")).not.toBeNull();
+    expect(screen.getByText("· approval required")).not.toBeNull();
+    expect(screen.queryByText("Editing Dag code")).toBeNull();
+    expect(screen.queryByText("Edited Dag code")).toBeNull();
+    expect(screen.queryByText(/\ds$/u)).toBeNull();
+    expect(container.querySelector(".chakra-spinner")).toBeNull();
+  });
+
+  it("does not repeat the approval suffix once the call is suspended", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [{ args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "fix_dag_code" }],
+            tools: [
+              {
+                awaitingConfirm: true,
+                durationMs: 500,
+                id: "c1",
+                name: "fix_dag_code",
+                proposed: true,
+                startedAt: 0,
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Editing Dag code")).not.toBeNull();
+    expect(screen.getByText("· awaiting approval")).not.toBeNull();
+    expect(screen.queryByText("· approval required")).toBeNull();
+    expect(screen.queryByText("Proposed code change")).toBeNull();
+  });
+
+  it("keeps the group icon still while a proposed write waits, but the rows visible", () => {
+    const tools = [
+      { durationMs: 100, id: "c0", name: "diagnose_dag", startedAt: 0 },
+      { durationMs: 100, id: "c1", name: "get_blast_radius", startedAt: 0 },
+      { id: "c2", name: "fix_dag_code", proposed: true, startedAt: 0 },
+    ];
+    const { container } = show(<MessageList messages={[assistant({ tools })]} isLoading />);
+
+    expect(screen.queryByText("Using 3 tools…")).toBeNull();
+    expect(screen.getByText("3 tools · approval required")).not.toBeNull();
+    expect(container.querySelector(".chakra-spinner")).toBeNull();
+    // The waiting row cannot be collapsed out of sight.
+    expect(screen.getByText("Proposed code change")).not.toBeNull();
+  });
+
+  it("shows a cancelled call as cancelled rather than as a success", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            content: "_Stopped._",
+            tools: [{ cancelled: true, durationMs: 300, id: "c1", name: "diagnose_dag", startedAt: 0 }],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Diagnose Dag cancelled")).not.toBeNull();
+    expect(screen.queryByText("Diagnosed Dag")).toBeNull();
+  });
+
+  it("never derives a file name from the Dag id", () => {
+    const { container } = show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: { dag_id: "sales_summary", new: "x = 2", old: "x = 1" },
+                callId: "c1",
+                nonce: "n1",
+                tool: "fix_dag_code",
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(container.textContent).not.toContain("sales_summary.py");
+    // The old truncated-argument line is gone from the card entirely.
+    expect(container.textContent).not.toContain("old=");
+  });
+
+  it("says so instead of inventing a diff when the arguments are not a change", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              { args: "not json at all", callId: "c1", nonce: "n1", tool: "fix_dag_code" },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(/Diff unavailable/u)).not.toBeNull();
+    // The technical details are already open, since nothing else describes the call.
+    expect(screen.getByText(/not json at all/u)).not.toBeNull();
+  });
+
+  it.each([
+    ["revert_dag_code", {}, "Restore original Dag source", "Restore original source"],
+    ["run_backfill", { from_date: "2026-01-01", to_date: "2026-01-05" }, "Run the reviewed backfill", "Run backfill"],
+  ])("states what %s does before it is approved", (tool, extra, title, approve) => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [{ args: { dag_id: "sales_summary", ...extra }, callId: "c1", nonce: "n1", tool }],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(title)).not.toBeNull();
+    expect(screen.getByText(approve)).not.toBeNull();
+  });
+
+  it("warns rather than guessing when the write tool is unknown to this build", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [{ args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "delete_everything" }],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Makes a lasting change")).not.toBeNull();
+    expect(screen.getByText(/cannot describe its effect/u)).not.toBeNull();
+    expect(screen.getByText("Approve")).not.toBeNull();
   });
 
   it("sends the action's own label when its chip is clicked", () => {

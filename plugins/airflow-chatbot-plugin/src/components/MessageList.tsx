@@ -154,6 +154,32 @@ const DIFF_LANG_RE = /\blanguage-diff\b/u;
 const diffLineKind = (line: string): "add" | "del" | undefined =>
   line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined;
 
+const diffPalette = (isDark: boolean) => ({
+  add: isDark ? "var(--chakra-colors-green-300)" : "var(--chakra-colors-green-600)",
+  del: isDark ? "var(--chakra-colors-red-300)" : "var(--chakra-colors-red-600)",
+});
+
+/** One `-`/`+` prefixed line, coloured by kind; the unit both diff views share. */
+const DiffLines: FC<{ readonly isDark: boolean; readonly lines: string[] }> = ({ isDark, lines }) => {
+  const palette = diffPalette(isDark);
+  return (
+    <>
+      {lines.map((line, index) => {
+        const kind = diffLineKind(line);
+        return (
+          <span
+            data-diff={kind}
+            key={`${index}-${line}`}
+            style={{ color: kind ? palette[kind] : undefined, display: "block" }}
+          >
+            {line || " "}
+          </span>
+        );
+      })}
+    </>
+  );
+};
+
 /**
  * The fix diff is the money shot of the self-healing flow; flat grey text
  * undersells it. Colour +/- lines inside ```diff fences, leave every other
@@ -168,27 +194,9 @@ const buildMarkdownComponents = (isDark: boolean): Components => ({
         </code>
       );
     }
-    const palette = {
-      add: isDark ? "var(--chakra-colors-green-300)" : "var(--chakra-colors-green-600)",
-      del: isDark ? "var(--chakra-colors-red-300)" : "var(--chakra-colors-red-600)",
-    };
     return (
       <code className={className}>
-        {String(children)
-          .replace(/\n$/u, "")
-          .split("\n")
-          .map((line, index) => {
-            const kind = diffLineKind(line);
-            return (
-              <span
-                data-diff={kind}
-                key={`${index}-${line}`}
-                style={{ color: kind ? palette[kind] : undefined, display: "block" }}
-              >
-                {line || " "}
-              </span>
-            );
-          })}
+        <DiffLines isDark={isDark} lines={String(children).replace(/\n$/u, "").split("\n")} />
       </code>
     );
   },
@@ -213,12 +221,6 @@ const isBlank = (message?: Message, streaming = false): boolean => {
   return text === "" && actions.length === 0;
 };
 
-// Timestamps are projector noise; keep them one hover away.
-const timestampCss = {
-  "& .airy-timestamp": { opacity: 0, transition: "opacity 0.15s" },
-  "&:hover .airy-timestamp": { opacity: 1 },
-};
-
 const MessageBubble: FC<MessageBubbleProps> = memo(
   ({ isStreaming = false, message, onActionClick, onConfirmClick }) => {
     const { colorMode } = useColorMode();
@@ -241,20 +243,11 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
             wordBreak="break-word"
             fontSize="md"
             lineHeight="tall"
-            css={{ ...markdownCss(isDark), ...timestampCss }}
+            css={markdownCss(isDark)}
           >
             <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
               {text}
             </Markdown>
-            <Text
-              className="airy-timestamp"
-              fontSize="xs"
-              color={isDark ? "gray.300" : "gray.600"}
-              mt={1}
-              textAlign="right"
-            >
-              {formatTime(message.timestamp)}
-            </Text>
           </Box>
         </Flex>
       );
@@ -262,7 +255,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
 
     // Assistant: prose sits directly on the panel; only tool calls and errors keep a card.
     return (
-      <Flex align="flex-start" css={timestampCss}>
+      <Flex align="flex-start">
         <Flex
           align="center"
           justify="center"
@@ -300,9 +293,6 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
           {groupConfirmsByNonce(confirms).map((group) => (
             <ConfirmPanel key={group[0]?.nonce} confirms={group} onDecide={onConfirmClick} />
           ))}
-          <Text className="airy-timestamp" fontSize="xs" color={isDark ? "gray.400" : "gray.600"}>
-            {formatTime(message.timestamp)}
-          </Text>
           {onActionClick !== undefined &&
             actions.map((action, index) => (
               <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
@@ -332,45 +322,121 @@ interface ConfirmPanelProps {
   readonly onDecide?: (nonce: string, approved: boolean) => void;
 }
 
-/** Human titles and approve-button labels for the write tools behind a confirm. */
-const CONFIRM_LABELS: Record<string, { title: string; approve: string }> = {
-  fix_dag_code: { approve: "Apply fix", title: "Apply a code fix" },
-  rerun_dag: { approve: "Re-run Dag", title: "Trigger a new Dag run" },
-  revert_dag_code: { approve: "Restore original", title: "Discard every Airy fix to this Dag" },
-  run_backfill: { approve: "Run backfill", title: "Run a backfill" },
+interface WriteEffect {
+  /** Label of the primary button that authorizes it. */
+  approve: string;
+  /** The lasting change, in four or five words. */
+  badge: string;
+  /** Row label while the model has only asked for the call. */
+  proposed: string;
+  /** One sentence saying what happens on approval. */
+  summary: (args: Record<string, unknown>) => string;
+  title: string;
+}
+
+/**
+ * What each write tool actually does, in the user's terms.
+ *
+ * `fix_dag_code` and `revert_dag_code` rewrite the Dag's source file on the
+ * Airflow host and force a reparse — no pull request, no staging, no review
+ * step after the Approve button.  The card has to say so.
+ *
+ * The confirmation carries a `dag_id`, never a path: a Dag id is not a file
+ * name and one file can define several Dags, so nothing here may derive one.
+ */
+const WRITE_EFFECTS: Record<string, WriteEffect> = {
+  fix_dag_code: {
+    approve: "Apply to Dag source file",
+    badge: "Writes the Dag file · reparses immediately",
+    proposed: "Proposed code change",
+    summary: (args) =>
+      `Rewrites the source file containing ${describeDag(args)} on the Airflow host and reparses it straight away — there is no review step after this.`,
+    title: "Proposed Dag source change",
+  },
+  rerun_dag: {
+    approve: "Re-run Dag",
+    badge: "Creates a Dag run",
+    proposed: "Proposed Dag run",
+    summary: (args) => `Creates one manual run of ${describeDag(args)} using the latest parsed code.`,
+    title: "Trigger a new Dag run",
+  },
+  revert_dag_code: {
+    approve: "Restore original source",
+    badge: "Writes the Dag file · reparses immediately",
+    proposed: "Proposed source restore",
+    summary: (args) =>
+      `Restores the one-time Airy backup for the source file containing ${describeDag(args)}, discards every Airy fix since that backup, and reparses immediately.`,
+    title: "Restore original Dag source",
+  },
+  run_backfill: {
+    approve: "Run backfill",
+    badge: "Creates Dag runs",
+    proposed: "Proposed backfill",
+    // No count: the number of runs is not in the confirmation arguments.
+    summary: (args) =>
+      `Creates the reviewed backfill runs for ${describeDag(args)} from ${describeArg(args.from_date)} through ${describeArg(args.to_date)}.`,
+    title: "Run the reviewed backfill",
+  },
+};
+
+/** `rerun_dag --unpause` resumes the schedule for good; that is a different card. */
+const UNPAUSE_EFFECT: WriteEffect = {
+  approve: "Unpause and re-run",
+  badge: "Unpauses Dag · resumes scheduled runs",
+  proposed: "Proposed Dag run",
+  summary: (args) =>
+    `Unpauses ${describeDag(args)}, resumes its future scheduled runs, and creates one manual run now.`,
+  title: "Re-run and resume this Dag's schedule",
+};
+
+/** A write tool this build has never heard of: warn, do not guess the effect. */
+const buildUnknownEffect = (tool: string): WriteEffect => ({
+  approve: "Approve",
+  badge: "Makes a lasting change",
+  proposed: "Proposed change",
+  summary: () =>
+    `Runs ${tool} against your Airflow. This build cannot describe its effect, so read the technical details before approving — the change will last.`,
+  title: humanizeToolName(tool),
+});
+
+const describeDag = (args: Record<string, unknown>): string =>
+  typeof args.dag_id === "string" && args.dag_id ? `\`${args.dag_id}\`` : "the named Dag";
+
+const describeArg = (value: unknown): string =>
+  typeof value === "string" && value ? `\`${value}\`` : "the requested date";
+
+export const parseArgs = (args: unknown): Record<string, unknown> => {
+  const parsed = typeof args === "string" ? tryParse(args) : args;
+  return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
 };
 
 /**
- * The card's title, which is the only line most people read.  Arguments that
- * change what the action *lastingly* does have to reach it: `rerun_dag` with
- * `unpause` resumes the Dag's schedule for good, which "Trigger a new Dag run"
- * does not say.
+ * What approving this one call would do.  Arguments that change the *lasting*
+ * effect have to reach the card: `rerun_dag` with `unpause` resumes the Dag's
+ * schedule, which "Trigger a new Dag run" does not say.
  */
-export const buildConfirmTitle = (confirm: ConfirmRequest): string => {
-  const args = typeof confirm.args === "string" ? tryParse(confirm.args) : confirm.args;
-  if (confirm.tool === "rerun_dag" && (args as { unpause?: unknown } | undefined)?.unpause === true) {
-    return "Re-run and resume this Dag's schedule";
+export const buildWriteEffect = (confirm: ConfirmRequest): WriteEffect => {
+  if (confirm.tool === "rerun_dag" && parseArgs(confirm.args).unpause === true) {
+    return UNPAUSE_EFFECT;
   }
-  return CONFIRM_LABELS[confirm.tool]?.title ?? humanizeToolName(confirm.tool);
+  return WRITE_EFFECTS[confirm.tool] ?? buildUnknownEffect(confirm.tool);
 };
 
 /**
  * Write tools the server refuses to run without an explicit go-ahead.  Reads
- * as an action card, not prose: what will change, a badge saying it mutates
- * state, and a "Review change" expander with the exact arguments.  One nonce
- * covers the whole batch, so a multi-tool suspension is one card with every
- * tool listed — approving must never silently authorize an unseen call.
+ * as an action card, not prose: what lastingly changes, a badge naming the
+ * mutation, and — for a source patch — the diff itself, because that is the
+ * thing being approved.  One nonce covers the whole batch, so a multi-tool
+ * suspension is one card carrying every action's own effect: approving must
+ * never silently authorize an unseen call.
  */
 const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, onDecide }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
-  const [reviewOpen, setReviewOpen] = useState(false);
   const [first] = confirms;
   if (first === undefined) return undefined;
-  const single = confirms.length === 1 ? (CONFIRM_LABELS[first.tool] ?? undefined) : undefined;
-  const title =
-    confirms.length === 1 ? buildConfirmTitle(first) : `Approve ${confirms.length} actions`;
-  const approveLabel = confirms.length === 1 ? (single?.approve ?? "Approve") : "Approve all";
+  const batch = confirms.length > 1;
+  const effect = buildWriteEffect(first);
 
   return (
     <Box
@@ -382,64 +448,23 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, onDecide }) => {
       px={3}
       py={2.5}
     >
-      <Flex align="center" gap={2} wrap="wrap">
-        <Text fontSize="sm" fontWeight="medium" color={isDark ? "gray.100" : "gray.900"}>
-          {title}
-        </Text>
-        <Text
-          fontSize="xs"
-          px={1.5}
-          py={0.5}
-          borderRadius="sm"
-          bg={isDark ? "orange.900" : "orange.100"}
-          color={isDark ? "orange.200" : "orange.800"}
-        >
-          Modifies your Airflow
-        </Text>
-      </Flex>
+      {batch ? (
+        <ConfirmHeading
+          badge="Modifies your Airflow"
+          isDark={isDark}
+          title={`Approve ${confirms.length} actions`}
+        />
+      ) : undefined}
       {confirms.map((confirm) => (
-        <Text
-          key={confirm.callId}
-          fontSize="xs"
-          fontFamily="mono"
-          color={isDark ? "gray.400" : "gray.600"}
-          mt={1}
-          truncate
-        >
-          {confirm.tool} {formatArgs(confirm.args)}
-        </Text>
+        <ConfirmDetail key={confirm.callId} confirm={confirm} isDark={isDark} nested={batch} />
       ))}
-      {reviewOpen && (
-        <Box
-          as="pre"
-          fontSize="xs"
-          fontFamily="mono"
-          whiteSpace="pre-wrap"
-          wordBreak="break-word"
-          bg={isDark ? "blackAlpha.400" : "blackAlpha.50"}
-          color={isDark ? "gray.300" : "gray.700"}
-          borderRadius="md"
-          px={2.5}
-          py={2}
-          mt={2}
-          maxHeight="240px"
-          overflowY="auto"
-        >
-          {confirms
-            .map((confirm) => `${confirm.tool}: ${formatArgsFull(confirm.args) || "(no arguments)"}`)
-            .join("\n\n")}
-        </Box>
-      )}
       {first.resolution === undefined ? (
         <Flex gap={2} mt={2} wrap="wrap">
-          <ConfirmButton onClick={() => setReviewOpen((o) => !o)} aria-expanded={reviewOpen}>
-            {reviewOpen ? "Hide change" : "Review change"}
-          </ConfirmButton>
           <ConfirmButton onClick={() => onDecide?.(first.nonce, true)} disabled={!onDecide} primary>
-            {approveLabel}
+            {batch ? "Approve all" : effect.approve}
           </ConfirmButton>
           <ConfirmButton onClick={() => onDecide?.(first.nonce, false)} disabled={!onDecide}>
-            {confirms.length === 1 ? "Reject" : "Reject all"}
+            {batch ? "Reject all" : "Reject"}
           </ConfirmButton>
         </Flex>
       ) : first.outcomeUnknown === true ? (
@@ -462,6 +487,129 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, onDecide }) => {
           {first.resolution === "approved" ? "Approved ✓" : "Rejected ✕"}
         </Text>
       )}
+    </Box>
+  );
+};
+
+interface ConfirmHeadingProps {
+  readonly badge: string;
+  readonly isDark: boolean;
+  readonly title: string;
+}
+
+const ConfirmHeading: FC<ConfirmHeadingProps> = ({ badge, isDark, title }) => (
+  <Flex align="center" gap={2} wrap="wrap">
+    <Text fontSize="sm" fontWeight="medium" color={isDark ? "gray.100" : "gray.900"}>
+      {title}
+    </Text>
+    <Text
+      fontSize="xs"
+      px={1.5}
+      py={0.5}
+      borderRadius="sm"
+      bg={isDark ? "orange.900" : "orange.100"}
+      color={isDark ? "orange.200" : "orange.800"}
+    >
+      {badge}
+    </Text>
+  </Flex>
+);
+
+/**
+ * `old` and `new` *are* the change, so show them as a diff rather than as
+ * truncated arguments.  Built as elements, never as a Markdown fence: a
+ * snippet containing backticks would break out of one.
+ */
+export const buildDiffLines = (args: Record<string, unknown>): string[] | undefined => {
+  const { new: added, old: removed } = args;
+  if (typeof removed !== "string" || typeof added !== "string") return undefined;
+  return [
+    ...removed.split("\n").map((line) => `-${line}`),
+    ...added.split("\n").map((line) => `+${line}`),
+  ];
+};
+
+interface ConfirmDetailProps {
+  readonly confirm: ConfirmRequest;
+  readonly isDark: boolean;
+  /** One of several actions under a shared "Approve N actions" heading. */
+  readonly nested: boolean;
+}
+
+/** One action's own effect: title, badge, sentence, and the diff being approved. */
+const ConfirmDetail: FC<ConfirmDetailProps> = ({ confirm, isDark, nested }) => {
+  const effect = buildWriteEffect(confirm);
+  const args = parseArgs(confirm.args);
+  const diff = confirm.tool === "fix_dag_code" ? buildDiffLines(args) : undefined;
+  const diffUnavailable = confirm.tool === "fix_dag_code" && diff === undefined;
+  const [diffOpen, setDiffOpen] = useState(true);
+  // Nothing else says what this call would do when the diff cannot be built.
+  const [detailsOpen, setDetailsOpen] = useState(diffUnavailable);
+
+  return (
+    <Box
+      mt={nested ? 3 : 0}
+      pl={nested ? 2 : 0}
+      borderLeftWidth={nested ? "2px" : undefined}
+      borderColor={isDark ? "whiteAlpha.300" : "blackAlpha.200"}
+    >
+      <ConfirmHeading badge={effect.badge} isDark={isDark} title={effect.title} />
+      <Box fontSize="sm" color={isDark ? "gray.300" : "gray.700"} mt={1} css={markdownCss(isDark)}>
+        <Markdown>{effect.summary(args)}</Markdown>
+      </Box>
+      {diffUnavailable && (
+        <Text fontSize="xs" color={isDark ? "orange.300" : "orange.700"} mt={2}>
+          Diff unavailable — read the technical details below before approving.
+        </Text>
+      )}
+      {diff !== undefined && diffOpen && (
+        <Box
+          as="pre"
+          fontSize="xs"
+          fontFamily="mono"
+          whiteSpace="pre-wrap"
+          wordBreak="break-word"
+          bg={isDark ? "blackAlpha.400" : "blackAlpha.50"}
+          color={isDark ? "gray.300" : "gray.700"}
+          borderRadius="md"
+          px={2.5}
+          py={2}
+          mt={2}
+          maxHeight="260px"
+          overflowY="auto"
+        >
+          <DiffLines isDark={isDark} lines={diff} />
+        </Box>
+      )}
+      {detailsOpen && (
+        <Box
+          as="pre"
+          fontSize="xs"
+          fontFamily="mono"
+          whiteSpace="pre-wrap"
+          wordBreak="break-word"
+          bg={isDark ? "blackAlpha.400" : "blackAlpha.50"}
+          color={isDark ? "gray.300" : "gray.700"}
+          borderRadius="md"
+          px={2.5}
+          py={2}
+          mt={2}
+          maxHeight="240px"
+          overflowY="auto"
+        >
+          {`${confirm.tool}: ${formatArgsFull(confirm.args) || "(no arguments)"}`}
+        </Box>
+      )}
+      <Flex gap={2} mt={2} wrap="wrap">
+        {diff !== undefined && (
+          <ConfirmButton onClick={() => setDiffOpen((open) => !open)} aria-expanded={diffOpen}>
+            {diffOpen ? "Hide diff" : "Show diff"}
+          </ConfirmButton>
+        )}
+        <ConfirmButton onClick={() => setDetailsOpen((open) => !open)} aria-expanded={detailsOpen}>
+          Technical details
+        </ConfirmButton>
+      </Flex>
     </Box>
   );
 };
@@ -623,17 +771,24 @@ const humanizeToolName = (name: string): string => {
 };
 
 export const buildToolLabel = (tool: ToolCall): string => {
-  if (tool.failed === true) {
+  const status = buildToolStatus(tool);
+  if (status === "proposed") {
+    return WRITE_EFFECTS[tool.name]?.proposed ?? "Proposed change";
+  }
+  if (status === "cancelled") {
+    return `${humanizeToolName(tool.name)} cancelled`;
+  }
+  if (status === "failed") {
     return `${humanizeToolName(tool.name)} failed`;
   }
-  if (tool.denied === true) {
+  if (status === "denied") {
     return `${humanizeToolName(tool.name)} rejected`;
   }
   const known = TOOL_LABELS[tool.name];
   if (known) {
     // Awaiting approval means the work has not happened yet — keep it in the
     // running form so the row never claims "Edited" before the user says yes.
-    return tool.durationMs === undefined || tool.awaitingConfirm === true ? known.running : known.done;
+    return status === "done" ? known.done : known.running;
   }
   return humanizeToolName(tool.name);
 };
@@ -675,11 +830,19 @@ const CrossIcon: FC = () => (
   </svg>
 );
 
-type ToolStatus = "awaiting" | "denied" | "done" | "failed" | "running";
+type ToolStatus = "awaiting" | "cancelled" | "denied" | "done" | "failed" | "proposed" | "running";
+
+/** Statuses in which the tool has certainly not run. */
+const UNSTARTED: ReadonlySet<ToolStatus> = new Set<ToolStatus>(["awaiting", "cancelled", "proposed"]);
+
+/** Statuses still waiting on the user, so the row has to stay on screen. */
+const PENDING_APPROVAL: ReadonlySet<ToolStatus> = new Set<ToolStatus>(["awaiting", "proposed"]);
 
 export const buildToolStatus = (tool: ToolCall): ToolStatus => {
-  if (tool.durationMs === undefined) return "running";
+  // Suspended outranks proposed: the server is now holding this exact call.
   if (tool.awaitingConfirm === true) return "awaiting";
+  if (tool.cancelled === true) return "cancelled";
+  if (tool.durationMs === undefined) return tool.proposed === true ? "proposed" : "running";
   if (tool.failed === true) return "failed";
   if (tool.denied === true) return "denied";
   return "done";
@@ -694,9 +857,11 @@ const ToolStatusIcon: FC<{ readonly status: ToolStatus }> = ({ status }) => {
   }
   const palette: Record<Exclude<ToolStatus, "running">, { color: string; icon: ReactNode }> = {
     awaiting: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
+    cancelled: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
     denied: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
     done: { color: isDark ? "green.300" : "green.600", icon: <CheckIcon /> },
     failed: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
+    proposed: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
   };
   return (
     <Box color={palette[status].color} flexShrink={0}>
@@ -732,9 +897,11 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
   const isDark = colorMode === "dark";
   const [open, setOpen] = useState(false);
   const status = buildToolStatus(tool);
-  const running = status === "running";
   const failed = status === "failed";
-  const expandable = !running && status !== "awaiting" && (tool.result !== undefined || failed);
+  // Nothing has run yet in the unstarted states, so there is nothing to expand
+  // and no duration to report.
+  const unstarted = status === "running" || UNSTARTED.has(status);
+  const expandable = !unstarted && (tool.result !== undefined || failed);
   const muted = isDark ? "gray.400" : "gray.600";
 
   return (
@@ -762,12 +929,12 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
             <Text fontSize="sm" color={isDark ? "gray.200" : "gray.800"}>
               {buildToolLabel(tool)}
             </Text>
-            {status === "awaiting" ? (
+            {status === "awaiting" || status === "proposed" ? (
               <Text as="span" fontSize="xs" color={muted} flexShrink={0}>
-                · awaiting approval
+                {status === "awaiting" ? "· awaiting approval" : "· approval required"}
               </Text>
             ) : (
-              !running && (
+              !unstarted && (
                 <Text as="span" fontSize="xs" color={muted} flexShrink={0}>
                   · {((tool.durationMs ?? 0) / 1000).toFixed(1)}s
                 </Text>
@@ -827,11 +994,15 @@ const ToolActivity: FC<ToolActivityProps> = ({ tools }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
   const [userOpen, setUserOpen] = useState<boolean>();
-  const anyRunning = tools.some((tool) => tool.durationMs === undefined);
+  const statuses = tools.map(buildToolStatus);
+  const anyRunning = statuses.includes("running");
+  // A write the user has not approved is not work in progress: it keeps its row
+  // on screen and blocks collapsing, but must not make the group spin.
+  const anyPending = anyRunning || statuses.some((status) => PENDING_APPROVAL.has(status));
   const anyFailed = tools.some((tool) => tool.failed === true);
   const grouped = tools.length >= 3;
   // Live rows must stay visible: while anything runs the group cannot collapse.
-  const open = anyRunning || (userOpen ?? !grouped);
+  const open = anyPending || (userOpen ?? !grouped);
 
   return (
     <Box
@@ -845,9 +1016,9 @@ const ToolActivity: FC<ToolActivityProps> = ({ tools }) => {
     >
       {grouped && (
         <Flex
-          as={anyRunning ? undefined : "button"}
-          onClick={anyRunning ? undefined : () => setUserOpen(!open)}
-          aria-expanded={anyRunning ? undefined : open}
+          as={anyPending ? undefined : "button"}
+          onClick={anyPending ? undefined : () => setUserOpen(!open)}
+          aria-expanded={anyPending ? undefined : open}
           align="center"
           gap={2}
           width="100%"
@@ -855,15 +1026,21 @@ const ToolActivity: FC<ToolActivityProps> = ({ tools }) => {
           px={1.5}
           py={1}
           borderRadius="md"
-          cursor={anyRunning ? undefined : "pointer"}
-          _hover={anyRunning ? undefined : { bg: isDark ? "whiteAlpha.100" : "blackAlpha.100" }}
+          cursor={anyPending ? undefined : "pointer"}
+          _hover={anyPending ? undefined : { bg: isDark ? "whiteAlpha.100" : "blackAlpha.100" }}
           _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "-2px" }}
         >
-          <ToolStatusIcon status={anyRunning ? "running" : anyFailed ? "failed" : "done"} />
+          <ToolStatusIcon
+            status={anyRunning ? "running" : anyPending ? "awaiting" : anyFailed ? "failed" : "done"}
+          />
           <Text fontSize="sm" color={isDark ? "gray.200" : "gray.800"} flex="1" minWidth={0}>
-            {anyRunning ? `Using ${tools.length} tools…` : `Used ${tools.length} tools`}
+            {anyRunning
+              ? `Using ${tools.length} tools…`
+              : anyPending
+                ? `${tools.length} tools · approval required`
+                : `Used ${tools.length} tools`}
           </Text>
-          {!anyRunning && (
+          {!anyPending && (
             <Box color={isDark ? "gray.400" : "gray.600"}>
               <Chevron open={open} />
             </Box>
@@ -994,14 +1171,4 @@ const SuggestionChip: FC<SuggestionChipProps> = ({ children, onClick }) => {
       {children}
     </Box>
   );
-};
-
-/**
- * Format timestamp to a human-readable time string.
- */
-const formatTime = (date: Date): string => {
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 };
