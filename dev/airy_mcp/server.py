@@ -401,12 +401,48 @@ def find_failure_clusters(hours: float = 24) -> dict[str, Any]:
     }
 
 
+def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
+    """
+    Preview the runs a backfill would create, without creating anything.
+
+    Read-only. Always show this plan to the user and get their confirmation
+    before calling run_backfill.
+    """
+    resp = _api(
+        "POST",
+        "/backfills/dry_run",
+        json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date},
+    )
+    dates = [b.get("logical_date") for b in resp.get("backfills", [])]
+    return {
+        "dag_id": dag_id,
+        "from_date": from_date,
+        "to_date": to_date,
+        "planned_run_count": resp.get("total_entries", len(dates)),
+        "planned_logical_dates": dates[:20],
+    }
+
+
+def run_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
+    """Create the backfill previewed by plan_backfill. Only call after the user confirmed the plan."""
+    resp = _api("POST", "/backfills", json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date})
+    return {
+        "backfill_id": resp["id"],
+        "dag_id": resp["dag_id"],
+        "from_date": resp["from_date"],
+        "to_date": resp["to_date"],
+        "is_paused": resp.get("is_paused", False),
+    }
+
+
 # Registered here rather than with @mcp.tool so the module keeps exporting plain
 # functions — directly callable from tests.
 for _tool in (
     diagnose_dag,
     compare_dag_runs,
     find_failure_clusters,
+    plan_backfill,
+    run_backfill,
     fix_dag_code,
     revert_dag_code,
     rerun_dag,
