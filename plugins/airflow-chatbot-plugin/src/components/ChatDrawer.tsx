@@ -42,6 +42,7 @@ const MAX_WIDTH_RATIO = 0.6; // max 60% of viewport
 interface ChatDrawerProps {
   readonly isOpen: boolean;
   readonly onClose: () => void;
+  readonly onClear: () => void;
   readonly messages: Message[];
   readonly onSendMessage: (content: string) => void;
   readonly isLoading?: boolean;
@@ -57,6 +58,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   isLoading = false,
   isOpen,
   messages,
+  onClear,
   onClose,
   onSendMessage,
   health,
@@ -290,6 +292,29 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
               </Flex>
             </VStack>
           </Flex>
+          <IconButton
+            aria-label="Clear conversation"
+            onClick={onClear}
+            disabled={messages.length === 0 || isLoading}
+            variant="ghost"
+            size="sm"
+          >
+            <svg
+              fill="none"
+              height="18"
+              stroke="currentColor"
+              strokeWidth={2}
+              viewBox="0 0 24 24"
+              width="18"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M3 6h18M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14zM10 11v6M14 11v6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </IconButton>
           <IconButton
             aria-label="Close chat"
             onClick={onClose}
