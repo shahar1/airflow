@@ -230,9 +230,14 @@ const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, messa
           borderBottomLeftRadius={isUser ? "xl" : "sm"}
           width="100%"
           wordBreak="break-word"
-          fontSize="sm"
+          fontSize="md"
           lineHeight="tall"
-          css={markdownCss(isDark)}
+          css={{
+            ...markdownCss(isDark),
+            // Timestamps are projector noise; keep them one hover away.
+            "& .airy-timestamp": { opacity: 0, transition: "opacity 0.15s" },
+            "&:hover .airy-timestamp": { opacity: 1 },
+          }}
         >
           {(message.tools ?? []).map((tool) => (
             <ToolChip key={tool.id} tool={tool} />
@@ -241,6 +246,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, messa
             {text}
           </Markdown>
           <Text
+            className="airy-timestamp"
             fontSize="xs"
             color={isUser ? "whiteAlpha.700" : "gray.500"}
             mt={1}
