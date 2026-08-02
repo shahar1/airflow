@@ -35,14 +35,15 @@ export const loadStoredMessages = (): Message[] => {
     if (raw === null || raw === undefined) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
+    const reloadedAt = Date.now();
     return (parsed as Message[])
       .filter((m) => m.content !== "" || (m.tools?.length ?? 0) > 0)
-      .map((m) => ({
-        ...m,
-        timestamp: new Date(m.timestamp),
-        // A chip still in flight when the page reloaded must not spin forever.
-        tools: m.tools?.map((tool) => (tool.durationMs === undefined ? { ...tool, durationMs: 0 } : tool)),
-      }));
+      .map((m) =>
+        // A call in flight when the page reloaded lost its stream. It must not
+        // spin forever — and it must not be dressed up as a finished one
+        // either: a write proposed but never approved never ran at all.
+        cancelTools({ ...m, timestamp: new Date(m.timestamp) }, reloadedAt),
+      );
   } catch {
     return [];
   }
@@ -115,6 +116,12 @@ export const applyEvent = (
 ): Message => {
   switch (event.type) {
     case "tool": {
+      // A *rejected* call is streamed again under its id as well — the runner
+      // replays every deferred call, approved or not. Nothing runs for this
+      // one, so it must not flip to the running state on its way to rejected.
+      if ((message.confirms ?? []).some((c) => c.callId === event.id && c.resolution === "rejected")) {
+        return message;
+      }
       // An approved write tool streams again under its original call id when
       // the run resumes; that is the same call going back to work, not a new
       // row (and duplicate ids would collide as React keys).

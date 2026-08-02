@@ -51,15 +51,35 @@ describe("loadStoredMessages", () => {
     expect(messages[1]?.timestamp).toBeInstanceOf(Date);
   });
 
-  it("stops the clock on a chip that was mid-flight at reload", () => {
+  it("cancels a chip that was mid-flight at reload rather than calling it done", () => {
+    // A write proposed but never approved never ran; restoring it as a finished
+    // call would claim the Dag was edited.
     sessionStorage.setItem(
       KEY,
-      JSON.stringify(stored({ tools: [{ id: "c1", name: "fix_dag_code", startedAt: 5 }] })),
+      JSON.stringify(
+        stored({ tools: [{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 5 }] }),
+      ),
     );
 
     const [, assistant] = loadStoredMessages();
 
-    expect(assistant?.tools?.[0]?.durationMs).toBe(0);
+    expect(assistant?.tools?.[0]?.cancelled).toBe(true);
+    expect(assistant?.tools?.[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(assistant?.tools?.[0]?.proposed).toBeUndefined();
+  });
+
+  it("leaves a call that had already finished alone", () => {
+    sessionStorage.setItem(
+      KEY,
+      JSON.stringify(
+        stored({ tools: [{ durationMs: 1_400, id: "c1", name: "diagnose_dag", startedAt: 5 }] }),
+      ),
+    );
+
+    const [, assistant] = loadStoredMessages();
+
+    expect(assistant?.tools?.[0]?.cancelled).toBeUndefined();
+    expect(assistant?.tools?.[0]?.durationMs).toBe(1_400);
   });
 
   it("drops the blank streaming bubble a reload interrupted", () => {
