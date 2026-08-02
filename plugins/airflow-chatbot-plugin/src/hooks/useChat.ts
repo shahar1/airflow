@@ -56,6 +56,41 @@ const persistMessages = (messages: Message[]) => {
   }
 };
 
+/**
+ * The event the host Airflow UI listens for to refetch what a write changed.
+ *
+ * The chatbot is its own React root, mounted outside Airflow's
+ * `QueryClientProvider`, so it cannot reach the host's query cache directly.
+ * Versioned because the host listener and this bundle are deployed separately.
+ */
+export const RESOURCE_CHANGED_EVENT = "airflow:resource-changed:v1";
+
+const UPDATE_KINDS = new Set(["dag_definition", "dag_run", "task_instances"]);
+
+/**
+ * Tell the host UI that a mutation landed — nothing more.
+ *
+ * The detail carries no data and no authority: it asks queries the user is
+ * already allowed to run to run again. Frames that name nothing recognisable
+ * dispatch nothing, so a future server can add kinds without this build
+ * inventing a meaning for them.
+ */
+export const dispatchResourceChanged = (event: Record<string, unknown>): boolean => {
+  const updates = Array.isArray(event.updates)
+    ? event.updates.filter(
+        (update): update is Record<string, unknown> =>
+          typeof update === "object" &&
+          update !== null &&
+          UPDATE_KINDS.has(String((update as Record<string, unknown>).kind)) &&
+          typeof (update as Record<string, unknown>).dag_id === "string" &&
+          (update as Record<string, unknown>).dag_id !== "",
+      )
+    : [];
+  if (updates.length === 0) return false;
+  globalThis.dispatchEvent(new CustomEvent(RESOURCE_CHANGED_EVENT, { detail: { updates } }));
+  return true;
+};
+
 /** The backend takes prior turns as history; the new turn is sent separately. */
 export const toHistory = (msgs: Message[]): Array<{ content: string; role: string }> =>
   msgs
@@ -354,6 +389,9 @@ export const useChat = () => {
           // The server saying "I still don't know" outranks the stream ending
           // tidily — every stream ends with `done`, including that one.
           unsettled ||= event.type === "unsettled";
+          // Not folded into the message: this frame is not part of the reply,
+          // it is the reply's side effect on the page around it.
+          if (event.type === "resource_changed") dispatchResourceChanged(event);
           update((message) => applyEvent(message, event));
         }
       };
@@ -432,9 +470,7 @@ export const useChat = () => {
             excludeFromHistory: true,
             stopped: true,
           }));
-          commit(
-            messagesRef.current.map((m) => (m.id === userId ? { ...m, excludeFromHistory: true } : m)),
-          );
+          commit(messagesRef.current.map((m) => (m.id === userId ? { ...m, excludeFromHistory: true } : m)));
         } else {
           update((message) => ({
             ...message,
@@ -516,9 +552,7 @@ export const useChat = () => {
         update((message) => ({
           ...message,
           confirms: message.confirms?.map((c) =>
-            c.nonce === nonce
-              ? { ...c, outcomeUnknown, resolution: approved ? "approved" : "rejected" }
-              : c,
+            c.nonce === nonce ? { ...c, outcomeUnknown, resolution: approved ? "approved" : "rejected" } : c,
           ),
         }));
 

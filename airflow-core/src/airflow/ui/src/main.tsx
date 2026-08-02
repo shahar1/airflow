@@ -34,6 +34,7 @@ import { ChakraCustomProvider } from "src/context/ChakraCustomProvider";
 import { ColorModeProvider } from "src/context/colorMode";
 import { ShortcutRegistryProvider } from "src/context/keyboardShortcuts";
 import { TimezoneProvider } from "src/context/timezone";
+import { listenForResourceChanges } from "src/queries/useResourceChanged";
 import { router } from "src/router";
 import { getNextHref, getRedirectPath } from "src/utils/links.ts";
 
@@ -97,6 +98,10 @@ axios.interceptors.response.use(
 );
 
 pruneLegacyDependencyKeys();
+
+// Plugins render in their own React roots, outside the provider below, so this
+// is how a mutation they made reaches the cache the page is actually reading.
+listenForResourceChanges(client);
 
 createRoot(document.querySelector("#root") as HTMLDivElement).render(
   <StrictMode>

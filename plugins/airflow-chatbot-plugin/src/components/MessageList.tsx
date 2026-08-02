@@ -475,13 +475,27 @@ interface WriteEffect {
  * name and one file can define several Dags, so nothing here may derive one.
  */
 const WRITE_EFFECTS: Record<string, WriteEffect> = {
-  fix_dag_code: {
+  apply_dag_code_changes: {
     approve: "Apply to Dag source file",
     badge: "Writes the Dag file · reparses immediately",
     proposed: "Proposed code change",
     summary: (args) =>
-      `Rewrites the source file containing ${describeDag(args)} on the Airflow host and reparses it straight away — there is no review step after this.`,
+      `Applies ${describeChangeCount(args)} to the source file containing ${describeDag(args)} on the Airflow host, all together, and reparses it straight away — there is no review step after this.`,
     title: "Proposed Dag source change",
+  },
+  apply_task_instance_clear: {
+    approve: "Clear task instance",
+    badge: "Re-runs an existing task · creates no Dag run",
+    proposed: "Proposed task clear",
+    summary: (args) =>
+      `Clears ${describeTaskIds(args)}${
+        args.include_downstream === false ? " (that task only)" : " and everything downstream of it"
+      } in run ${describeArg(args.dag_run_id)} of ${describeDag(args)} so ${
+        args.run_on_latest_version === false
+          ? "it runs again on the version that run used"
+          : "it runs again on the latest parsed code"
+      }. The existing task instances are re-queued — no new Dag run is created.`,
+    title: "Clear a task instance in an existing run",
   },
   rerun_dag: {
     approve: "Re-run Dag",
@@ -531,6 +545,23 @@ const buildUnknownEffect = (tool: string): WriteEffect => ({
 
 const describeDag = (args: Record<string, unknown>): string =>
   typeof args.dag_id === "string" && args.dag_id ? `\`${args.dag_id}\`` : "the named Dag";
+
+const describeChangeCount = (args: Record<string, unknown>): string => {
+  const count = Array.isArray(args.changes) ? args.changes.length : 0;
+  return count === 1 ? "1 change" : `${count} changes`;
+};
+
+/** `["report"]`, or `[["report", 3]]` for one map index of a mapped task. */
+const describeTaskIds = (args: Record<string, unknown>): string => {
+  if (!Array.isArray(args.task_ids) || args.task_ids.length === 0) return "the named task";
+  return args.task_ids
+    .map((marker) =>
+      Array.isArray(marker)
+        ? `\`${String(marker[0])}\` (map index ${String(marker[1])})`
+        : `\`${String(marker)}\``,
+    )
+    .join(", ");
+};
 
 const describeArg = (value: unknown): string =>
   typeof value === "string" && value ? `\`${value}\`` : "the requested date";
@@ -847,9 +878,17 @@ const ConfirmHeading: FC<ConfirmHeadingProps> = ({ effect, isDark, title }) => (
  * snippet containing backticks would break out of one.
  */
 export const buildDiffLines = (args: Record<string, unknown>): string[] | undefined => {
-  const { new: added, old: removed } = args;
-  if (typeof removed !== "string" || typeof added !== "string") return undefined;
-  return [...removed.split("\n").map((line) => `-${line}`), ...added.split("\n").map((line) => `+${line}`)];
+  const changes = args.changes;
+  if (!Array.isArray(changes) || changes.length === 0) return undefined;
+  const hunks = changes.map((change) => {
+    const { new: added, old: removed } = parseArgs(change);
+    if (typeof removed !== "string" || typeof added !== "string") return undefined;
+    return [...removed.split("\n").map((line) => `-${line}`), ...added.split("\n").map((line) => `+${line}`)];
+  });
+  // One bad hunk means the card cannot show everything being approved, and a
+  // partial diff is worse than none: it reads as the whole change.
+  if (hunks.some((hunk) => hunk === undefined)) return undefined;
+  return hunks.flatMap((hunk, index) => (index === 0 ? hunk! : ["", ...hunk!]));
 };
 
 interface ConfirmDetailProps {
@@ -863,8 +902,8 @@ interface ConfirmDetailProps {
 const ConfirmDetail: FC<ConfirmDetailProps> = ({ confirm, isDark, nested }) => {
   const effect = buildWriteEffect(confirm);
   const args = parseArgs(confirm.args);
-  const diff = confirm.tool === "fix_dag_code" ? buildDiffLines(args) : undefined;
-  const diffUnavailable = confirm.tool === "fix_dag_code" && diff === undefined;
+  const diff = confirm.tool === "apply_dag_code_changes" ? buildDiffLines(args) : undefined;
+  const diffUnavailable = confirm.tool === "apply_dag_code_changes" && diff === undefined;
   const [diffOpen, setDiffOpen] = useState(true);
   // Nothing else says what this call would do when the diff cannot be built.
   const [detailsOpen, setDetailsOpen] = useState(diffUnavailable);
@@ -1084,12 +1123,15 @@ const CodeControl: FC<CodeControlProps> = ({ children, isDark, onClick, pressed 
 
 /** Human labels for the tools Airy ships with; anything else gets humanized. */
 const TOOL_LABELS: Record<string, { running: string; done: string }> = {
+  apply_dag_code_changes: { done: "Edited Dag code", running: "Editing Dag code" },
+  apply_task_instance_clear: { done: "Cleared task instance", running: "Clearing task instance" },
   compare_dag_runs: { done: "Compared Dag runs", running: "Comparing Dag runs" },
   diagnose_dag: { done: "Diagnosed Dag", running: "Diagnosing Dag" },
   find_failure_clusters: { done: "Scanned for failure clusters", running: "Scanning for failure clusters" },
-  fix_dag_code: { done: "Edited Dag code", running: "Editing Dag code" },
   get_blast_radius: { done: "Checked downstream impact", running: "Checking downstream impact" },
   plan_backfill: { done: "Planned backfill", running: "Planning backfill" },
+  plan_dag_code_changes: { done: "Planned Dag code change", running: "Planning Dag code change" },
+  plan_task_instance_clear: { done: "Planned task clear", running: "Planning task clear" },
   rerun_dag: { done: "Re-ran Dag", running: "Re-running Dag" },
   revert_dag_code: { done: "Reverted Dag code", running: "Reverting Dag code" },
   run_backfill: { done: "Ran backfill", running: "Running backfill" },

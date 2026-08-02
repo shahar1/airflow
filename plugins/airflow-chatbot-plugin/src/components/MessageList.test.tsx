@@ -96,13 +96,13 @@ describe("buildConfirmState", () => {
   const confirm = (partial: Partial<ConfirmRequest> = {}): ConfirmRequest => ({
     callId: "c1",
     nonce: "n1",
-    tool: "fix_dag_code",
+    tool: "apply_dag_code_changes",
     ...partial,
   });
   const tool = (partial: Partial<ToolCall> = {}): ToolCall => ({
     durationMs: 500,
     id: "c1",
-    name: "fix_dag_code",
+    name: "apply_dag_code_changes",
     startedAt: 0,
     ...partial,
   });
@@ -167,9 +167,9 @@ describe("buildGroupState", () => {
   it("counts what actually landed when a batch ends mixed", () => {
     const states: ConfirmState[] = ["applied", "failed", "unknown"];
 
-    expect(buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "fix_dag_code" })).toBe(
-      "1 of 3 applied · 2 need attention",
-    );
+    expect(
+      buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }),
+    ).toBe("1 of 3 applied · 2 need attention");
   });
 });
 
@@ -353,9 +353,17 @@ describe("MessageList", () => {
       <MessageList
         messages={[
           assistant({
-            confirms: [{ args: {}, callId: "c1", nonce: "n1", tool: "fix_dag_code" }],
+            confirms: [{ args: {}, callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }],
             content: "",
-            tools: [{ awaitingConfirm: true, durationMs: 500, id: "c1", name: "fix_dag_code", startedAt: 0 }],
+            tools: [
+              {
+                awaitingConfirm: true,
+                durationMs: 500,
+                id: "c1",
+                name: "apply_dag_code_changes",
+                startedAt: 0,
+              },
+            ],
           }),
         ]}
       />,
@@ -421,14 +429,21 @@ describe("MessageList", () => {
           assistant({
             content: "ok",
             tools: [
-              { denied: true, durationMs: 500, id: "c1", name: "fix_dag_code", result: "no", startedAt: 0 },
+              {
+                denied: true,
+                durationMs: 500,
+                id: "c1",
+                name: "apply_dag_code_changes",
+                result: "no",
+                startedAt: 0,
+              },
             ],
           }),
         ]}
       />,
     );
 
-    expect(screen.getByText("Fix Dag code rejected")).not.toBeNull();
+    expect(screen.getByText("Apply Dag code changes rejected")).not.toBeNull();
     expect(screen.queryByText("Edited Dag code")).toBeNull();
   });
 
@@ -439,7 +454,7 @@ describe("MessageList", () => {
         messages={[
           assistant({
             confirms: [
-              { args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "fix_dag_code" },
+              { args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" },
               { args: { dag_id: "a" }, callId: "c2", nonce: "n1", tool: "rerun_dag" },
             ],
             content: "Two steps.",
@@ -484,10 +499,10 @@ describe("MessageList", () => {
           assistant({
             confirms: [
               {
-                args: { dag_id: "sales_summary", new: "b", old: "a" },
+                args: { changes: [{ new: "b", old: "a" }], dag_id: "sales_summary" },
                 callId: "c1",
                 nonce: "n1",
-                tool: "fix_dag_code",
+                tool: "apply_dag_code_changes",
               },
             ],
             content: "I can fix that.",
@@ -511,6 +526,100 @@ describe("MessageList", () => {
 
     fireEvent.click(screen.getByText("Apply to Dag source file"));
     expect(onConfirmClick).toHaveBeenCalledWith("n1", true);
+  });
+
+  it("shows every hunk of an atomic multi-edit repair under one decision", () => {
+    const onConfirmClick = vi.fn();
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: {
+                  changes: [
+                    { new: '"column": "amount"', old: '"column": "gross"' },
+                    { new: "task_ids='summarize'", old: "task_ids='summarise'" },
+                  ],
+                  dag_id: "sales_summary",
+                },
+                callId: "c1",
+                nonce: "n1",
+                tool: "apply_dag_code_changes",
+              },
+            ],
+          }),
+        ]}
+        onConfirmClick={onConfirmClick}
+      />,
+    );
+
+    expect(screen.getByText(/Applies 2 changes/u)).not.toBeNull();
+    expect(screen.getByText('-"column": "gross"')).not.toBeNull();
+    expect(screen.getByText('+"column": "amount"')).not.toBeNull();
+    expect(screen.getByText("-task_ids='summarise'")).not.toBeNull();
+    expect(screen.getByText("+task_ids='summarize'")).not.toBeNull();
+
+    // One decision covers both edits — they land together or not at all.
+    fireEvent.click(screen.getByText("Apply to Dag source file"));
+    expect(onConfirmClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows nothing rather than a partial diff when one hunk is unreadable", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: { changes: [{ new: "b", old: "a" }, { old: "c" }], dag_id: "sales_summary" },
+                callId: "c1",
+                nonce: "n1",
+                tool: "apply_dag_code_changes",
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(/Diff unavailable/u)).not.toBeNull();
+    expect(screen.queryByText("-a")).toBeNull();
+  });
+
+  it("says exactly what a task clear does, and what it does not", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: {
+                  dag_id: "sales_summary",
+                  dag_run_id: "manual__2026-08-02",
+                  run_on_latest_version: true,
+                  task_ids: ["report"],
+                },
+                callId: "c1",
+                nonce: "n1",
+                tool: "apply_task_instance_clear",
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Clear a task instance in an existing run")).not.toBeNull();
+    expect(screen.getByText("Re-runs an existing task · creates no Dag run")).not.toBeNull();
+    const summary = screen.getByText(/Clears/u).textContent ?? "";
+
+    expect(summary).toContain("report");
+    expect(summary).toContain("manual__2026-08-02");
+    expect(summary).toContain("latest parsed code");
+    expect(summary).toContain("no new Dag run is created");
+    // The clear takes the downstream with it — the card has to say which way.
+    expect(summary).toContain("everything downstream of it");
   });
 
   it("offers a copy control on fenced code blocks", async () => {
@@ -607,7 +716,7 @@ describe("MessageList", () => {
       <MessageList
         messages={[
           assistant({
-            tools: [{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }],
+            tools: [{ id: "c1", name: "apply_dag_code_changes", proposed: true, startedAt: 0 }],
           }),
         ]}
         isLoading
@@ -627,13 +736,13 @@ describe("MessageList", () => {
       <MessageList
         messages={[
           assistant({
-            confirms: [{ args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "fix_dag_code" }],
+            confirms: [{ args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }],
             tools: [
               {
                 awaitingConfirm: true,
                 durationMs: 500,
                 id: "c1",
-                name: "fix_dag_code",
+                name: "apply_dag_code_changes",
                 proposed: true,
                 startedAt: 0,
               },
@@ -653,7 +762,7 @@ describe("MessageList", () => {
     const tools = [
       { durationMs: 100, id: "c0", name: "diagnose_dag", startedAt: 0 },
       { durationMs: 100, id: "c1", name: "get_blast_radius", startedAt: 0 },
-      { id: "c2", name: "fix_dag_code", proposed: true, startedAt: 0 },
+      { id: "c2", name: "apply_dag_code_changes", proposed: true, startedAt: 0 },
     ];
     const { container } = show(<MessageList messages={[assistant({ tools })]} isLoading />);
 
@@ -687,13 +796,15 @@ describe("MessageList", () => {
           assistant({
             content: "**Error:** the sidecar went away",
             isError: true,
-            tools: [{ durationMs: 400, id: "c1", name: "fix_dag_code", startedAt: 0, unsettled: true }],
+            tools: [
+              { durationMs: 400, id: "c1", name: "apply_dag_code_changes", startedAt: 0, unsettled: true },
+            ],
           }),
         ]}
       />,
     );
 
-    expect(screen.getByText("Fix Dag code — outcome unknown")).not.toBeNull();
+    expect(screen.getByText("Apply Dag code changes — outcome unknown")).not.toBeNull();
     expect(screen.queryByText("Edited Dag code")).toBeNull();
     // A duration would imply the call ran to completion.
     expect(screen.queryByText(/^· \d/u)).toBeNull();
@@ -706,10 +817,10 @@ describe("MessageList", () => {
           assistant({
             confirms: [
               {
-                args: { dag_id: "sales_summary", new: "x = 2", old: "x = 1" },
+                args: { changes: [{ new: "x = 2", old: "x = 1" }], dag_id: "sales_summary" },
                 callId: "c1",
                 nonce: "n1",
-                tool: "fix_dag_code",
+                tool: "apply_dag_code_changes",
               },
             ],
           }),
@@ -727,7 +838,9 @@ describe("MessageList", () => {
       <MessageList
         messages={[
           assistant({
-            confirms: [{ args: "not json at all", callId: "c1", nonce: "n1", tool: "fix_dag_code" }],
+            confirms: [
+              { args: "not json at all", callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" },
+            ],
           }),
         ]}
       />,
@@ -996,14 +1109,14 @@ describe("MessageList", () => {
               callId: "c1",
               nonce: "n1",
               resolution: "approved" as const,
-              tool: "fix_dag_code",
+              tool: "apply_dag_code_changes",
             },
           ],
         },
       ],
       [
         "a write that got past the proposal",
-        { tools: [{ durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 }] },
+        { tools: [{ durationMs: 10, id: "c1", name: "apply_dag_code_changes", startedAt: 0 }] },
       ],
     ])("suppresses Retry after %s", (_label, partial) => {
       show(<MessageList messages={failed(partial)} onRetry={vi.fn()} />);
@@ -1014,7 +1127,9 @@ describe("MessageList", () => {
     it("still offers Retry for a write that never left the proposal", () => {
       show(
         <MessageList
-          messages={failed({ tools: [{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }] })}
+          messages={failed({
+            tools: [{ id: "c1", name: "apply_dag_code_changes", proposed: true, startedAt: 0 }],
+          })}
           onRetry={vi.fn()}
         />,
       );
@@ -1049,10 +1164,10 @@ describe("MessageList", () => {
       assistant({
         confirms: [
           {
-            args: { dag_id: "a", new: "x = 2", old: "x = 1" },
+            args: { changes: [{ new: "x = 2", old: "x = 1" }], dag_id: "a" },
             callId: "c1",
             nonce: "n1",
-            tool: "fix_dag_code",
+            tool: "apply_dag_code_changes",
             ...confirm,
           },
         ],
@@ -1064,7 +1179,7 @@ describe("MessageList", () => {
     const done = (over: Partial<ToolCall> = {}): ToolCall => ({
       durationMs: 500,
       id: "c1",
-      name: "fix_dag_code",
+      name: "apply_dag_code_changes",
       startedAt: 0,
       ...over,
     });
@@ -1112,7 +1227,7 @@ describe("MessageList", () => {
       show(
         <MessageList
           messages={decided({ outcomeUnknown: true, resolution: "approved" }, [
-            { awaitingConfirm: true, durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 },
+            { awaitingConfirm: true, durationMs: 10, id: "c1", name: "apply_dag_code_changes", startedAt: 0 },
           ])}
           streamingId="a1"
           isLoading
@@ -1145,7 +1260,13 @@ describe("MessageList", () => {
           messages={[
             assistant({
               confirms: [
-                { args: {}, callId: "c1", nonce: "n1", resolution: "approved", tool: "fix_dag_code" },
+                {
+                  args: {},
+                  callId: "c1",
+                  nonce: "n1",
+                  resolution: "approved",
+                  tool: "apply_dag_code_changes",
+                },
                 { args: {}, callId: "c2", nonce: "n1", resolution: "approved", tool: "rerun_dag" },
               ],
               tools: [done(), { durationMs: 5, failed: true, id: "c2", name: "rerun_dag", startedAt: 0 }],
@@ -1159,7 +1280,7 @@ describe("MessageList", () => {
 
     it("hands focus to the receipt that replaces the button the user pressed", () => {
       const messages = decided({}, [
-        { awaitingConfirm: true, durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 },
+        { awaitingConfirm: true, durationMs: 10, id: "c1", name: "apply_dag_code_changes", startedAt: 0 },
       ]);
       const { rerender } = show(<MessageList messages={messages} onConfirmClick={vi.fn()} />);
 

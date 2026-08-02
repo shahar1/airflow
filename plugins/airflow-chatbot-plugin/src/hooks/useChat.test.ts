@@ -19,7 +19,7 @@
 import { describe, expect, it } from "vitest";
 
 import { Message } from "../components/types";
-import { applyEvent, finalizeTools, parseFrames } from "./useChat";
+import { applyEvent, dispatchResourceChanged, finalizeTools, parseFrames } from "./useChat";
 
 const blank = (): Message => ({
   content: "",
@@ -107,10 +107,10 @@ describe("applyEvent", () => {
   });
 
   it("marks a suspended call as awaiting instead of done", () => {
-    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    let message = applyEvent(blank(), { id: "c1", name: "apply_dag_code_changes", type: "tool" }, 0);
     message = applyEvent(
       message,
-      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      { call_id: "c1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" },
       500,
     );
 
@@ -119,10 +119,10 @@ describe("applyEvent", () => {
   });
 
   it("resolves an awaiting call when its result finally arrives", () => {
-    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    let message = applyEvent(blank(), { id: "c1", name: "apply_dag_code_changes", type: "tool" }, 0);
     message = applyEvent(
       message,
-      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      { call_id: "c1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" },
       500,
     );
     message = applyEvent(message, { denied: true, id: "c1", result: "no", type: "tool_result" }, 900);
@@ -132,13 +132,13 @@ describe("applyEvent", () => {
   });
 
   it("reuses the existing row when a resumed call streams under the same id", () => {
-    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    let message = applyEvent(blank(), { id: "c1", name: "apply_dag_code_changes", type: "tool" }, 0);
     message = applyEvent(
       message,
-      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      { call_id: "c1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" },
       500,
     );
-    message = applyEvent(message, { id: "c1", name: "fix_dag_code", type: "tool" }, 1_000);
+    message = applyEvent(message, { id: "c1", name: "apply_dag_code_changes", type: "tool" }, 1_000);
 
     expect(message.tools).toHaveLength(1);
     expect(message.tools?.[0]?.durationMs).toBeUndefined();
@@ -148,7 +148,7 @@ describe("applyEvent", () => {
   it("carries the proposed flag onto a write call that has not run", () => {
     const message = applyEvent(
       blank(),
-      { args: {}, id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      { args: {}, id: "c1", name: "apply_dag_code_changes", proposed: true, type: "tool" },
       0,
     );
 
@@ -166,17 +166,17 @@ describe("applyEvent", () => {
     // the repeated id proves this call is the approved one going back to work.
     let message = applyEvent(
       blank(),
-      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      { id: "c1", name: "apply_dag_code_changes", proposed: true, type: "tool" },
       0,
     );
     message = applyEvent(
       message,
-      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      { call_id: "c1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" },
       500,
     );
     message = applyEvent(
       message,
-      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      { id: "c1", name: "apply_dag_code_changes", proposed: true, type: "tool" },
       1_000,
     );
 
@@ -191,12 +191,12 @@ describe("applyEvent", () => {
     // too, so the resumed frame is not proof that anything ran.
     let message = applyEvent(
       blank(),
-      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      { id: "c1", name: "apply_dag_code_changes", proposed: true, type: "tool" },
       0,
     );
     message = applyEvent(
       message,
-      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      { call_id: "c1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" },
       500,
     );
     message = {
@@ -206,7 +206,7 @@ describe("applyEvent", () => {
 
     const resumed = applyEvent(
       message,
-      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      { id: "c1", name: "apply_dag_code_changes", proposed: true, type: "tool" },
       900,
     );
 
@@ -271,7 +271,7 @@ describe("finalizeTools", () => {
     // The run can die before `confirm_required` ever arrives; the approval gate
     // guarantees nothing was written.
     const message = finalizeTools(
-      withTools([{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }]),
+      withTools([{ id: "c1", name: "apply_dag_code_changes", proposed: true, startedAt: 0 }]),
       500,
     );
 
@@ -284,8 +284,8 @@ describe("finalizeTools", () => {
     // a green check.
     const message = finalizeTools(
       withTools(
-        [{ id: "c1", name: "fix_dag_code", startedAt: 0 }],
-        [{ args: {}, callId: "c1", nonce: "n1", resolution: "approved", tool: "fix_dag_code" }],
+        [{ id: "c1", name: "apply_dag_code_changes", startedAt: 0 }],
+        [{ args: {}, callId: "c1", nonce: "n1", resolution: "approved", tool: "apply_dag_code_changes" }],
       ),
       700,
     );
@@ -302,5 +302,35 @@ describe("finalizeTools", () => {
 
     expect(message.tools?.[0]?.durationMs).toBe(1_400);
     expect(message.tools?.[0]?.cancelled).toBeUndefined();
+  });
+});
+
+describe("dispatchResourceChanged", () => {
+  const RESOURCE_CHANGED_EVENT = "airflow:resource-changed:v1";
+
+  const captured = (frame: Record<string, unknown>): Array<unknown> => {
+    const seen: Array<unknown> = [];
+    const listener = (event: Event) => seen.push((event as CustomEvent<unknown>).detail);
+
+    globalThis.addEventListener(RESOURCE_CHANGED_EVENT, listener);
+    dispatchResourceChanged(frame);
+    globalThis.removeEventListener(RESOURCE_CHANGED_EVENT, listener);
+
+    return seen;
+  };
+
+  it("tells the host UI which Dag to refetch", () => {
+    const updates = [{ dag_id: "sales_summary", kind: "dag_definition", version_number: 2 }];
+
+    expect(captured({ type: "resource_changed", updates })).toEqual([{ updates }]);
+  });
+
+  it.each([
+    ["no updates", {}],
+    ["an empty list", { updates: [] }],
+    ["a kind this build cannot act on", { updates: [{ dag_id: "d", kind: "everything" }] }],
+    ["an update naming no Dag", { updates: [{ kind: "dag_definition" }] }],
+  ])("dispatches nothing for %s", (_label, frame) => {
+    expect(captured(frame)).toEqual([]);
   });
 });
