@@ -566,6 +566,189 @@ describe("useChat streaming", () => {
     expect(fetchMock.mock.calls).toHaveLength(callsAfterFirst);
   });
 
+  /** A body whose reader rejects like an aborted fetch does. */
+  const abortingResponse = (): Response =>
+    ({
+      body: {
+        getReader: () => ({
+          read: () =>
+            Promise.reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" })),
+        }),
+      },
+      ok: true,
+      status: 200,
+    }) as unknown as Response;
+
+  describe("stopping a response", () => {
+    it("passes an abort signal and exposes a stop control while streaming", async () => {
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fetchMock = vi.fn().mockReturnValue(
+        gate.then(() => streamingResponse([frame({ delta: "hi", type: "text" }), frame({ type: "done" })])),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { result } = renderHook(() => useChat());
+      let pending: Promise<void> | undefined;
+      act(() => {
+        pending = result.current.sendMessage("first");
+      });
+
+      expect(result.current.canStop).toBe(true);
+      expect(result.current.isApplyingChange).toBe(false);
+      expect(fetchMock.mock.lastCall?.[1]?.signal).toBeInstanceOf(AbortSignal);
+
+      await act(async () => {
+        release?.();
+        await pending;
+      });
+      expect(result.current.canStop).toBe(false);
+    });
+
+    it("reads a stop as a stop, not as an error", async () => {
+      mockFetch(abortingResponse());
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("hi");
+      });
+
+      const assistant = result.current.messages[1];
+      expect(assistant?.content).toContain("_Stopped._");
+      expect(assistant?.stopped).toBe(true);
+      expect(assistant?.isError).toBeUndefined();
+      expect(assistant?.content).not.toContain("connection ended before Airy finished");
+      expect(result.current.isLoading).toBe(false);
+      expect(result.current.canStop).toBe(false);
+    });
+
+    it("keeps the stopped turn on screen but out of the model's history", async () => {
+      const fetchMock = mockFetch(abortingResponse());
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("the stopped question");
+      });
+      expect(result.current.messages).toHaveLength(2);
+
+      fetchMock.mockReturnValue(
+        Promise.resolve(streamingResponse([frame({ delta: "ok", type: "text" }), frame({ type: "done" })])),
+      );
+      await act(async () => {
+        await result.current.sendMessage("next");
+      });
+
+      expect(JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).history).toEqual([]);
+    });
+
+    it("cancels the tools that were still in flight instead of ticking them green", async () => {
+      const encoder = new TextEncoder();
+      // A tool call arrives, then the reader is aborted mid-answer.
+      mockFetch({
+        body: {
+          getReader: () => {
+            let sent = false;
+            return {
+              read: () => {
+                if (sent) {
+                  return Promise.reject(
+                    Object.assign(new Error("aborted"), { name: "AbortError" }),
+                  );
+                }
+                sent = true;
+                return Promise.resolve({
+                  done: false,
+                  value: encoder.encode(
+                    frame({ args: {}, id: "c1", name: "diagnose_dag", type: "tool" }) +
+                      frame({ args: {}, id: "c2", name: "fix_dag_code", proposed: true, type: "tool" }),
+                  ),
+                });
+              },
+            };
+          },
+        },
+        ok: true,
+        status: 200,
+      } as unknown as Response);
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("fix it");
+      });
+
+      const tools = result.current.messages[1]?.tools ?? [];
+      expect(tools).toHaveLength(2);
+      expect(tools.every((tool) => tool.cancelled === true)).toBe(true);
+      // A write stopped before it was ever confirmed must not read as applied.
+      expect(tools[1]?.proposed).toBeUndefined();
+      expect(tools.every((tool) => tool.failed !== true)).toBe(true);
+    });
+
+    it("offers no stop while an approved write may already be running", async () => {
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("fix it");
+      });
+
+      fetchMock.mockReturnValue(
+        gate.then(() =>
+          streamingResponse([frame({ delta: " Applied.", type: "text" }), frame({ type: "done" })]),
+        ),
+      );
+      let pending: Promise<void> | undefined;
+      act(() => {
+        pending = result.current.resolveConfirm("n1", true);
+      });
+
+      expect(result.current.isApplyingChange).toBe(true);
+      expect(result.current.canStop).toBe(false);
+
+      await act(async () => {
+        release?.();
+        await pending;
+      });
+      expect(result.current.isApplyingChange).toBe(false);
+    });
+
+    it("still offers stop for the prose that follows a rejection", async () => {
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("fix it");
+      });
+
+      fetchMock.mockReturnValue(
+        gate.then(() =>
+          streamingResponse([frame({ delta: " Left alone.", type: "text" }), frame({ type: "done" })]),
+        ),
+      );
+      let pending: Promise<void> | undefined;
+      act(() => {
+        pending = result.current.resolveConfirm("n1", false);
+      });
+
+      expect(result.current.canStop).toBe(true);
+
+      await act(async () => {
+        release?.();
+        await pending;
+      });
+    });
+  });
+
   it("clears the conversation", async () => {
     mockFetch(streamingResponse([frame({ delta: "hi", type: "text" }), frame({ type: "done" })]));
 

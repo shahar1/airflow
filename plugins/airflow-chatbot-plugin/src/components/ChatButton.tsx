@@ -20,8 +20,6 @@
 import { Box, IconButton } from "@chakra-ui/react";
 import { FC } from "react";
 
-import { useColorMode } from "src/context/colorMode";
-
 import { ChatIcon } from "./icons/ChatIcon";
 
 interface ChatButtonProps {
@@ -35,9 +33,6 @@ interface ChatButtonProps {
  * Hidden when the chat drawer is open.
  */
 export const ChatButton: FC<ChatButtonProps> = ({ isOpen, onClick }) => {
-  const { colorMode } = useColorMode();
-  const isDark = colorMode === "dark";
-
   // Hide the button when drawer is open
   if (isOpen) {
     return null;

@@ -40,6 +40,9 @@ interface ChatDrawerProps {
   readonly isLoading?: boolean;
   readonly streamingId?: string | null;
   readonly health: HealthStatus;
+  readonly canStop?: boolean;
+  readonly onStop?: () => void;
+  readonly isApplyingChange?: boolean;
 }
 
 /**
@@ -48,7 +51,9 @@ interface ChatDrawerProps {
  * (only toward the content, never past the right viewport edge).
  */
 export const ChatDrawer: FC<ChatDrawerProps> = ({
+  canStop = false,
   health,
+  isApplyingChange = false,
   isLoading = false,
   isOpen,
   messages,
@@ -56,6 +61,7 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
   onClose,
   onConfirmClick,
   onSendMessage,
+  onStop,
   streamingId,
 }) => {
   const { colorMode } = useColorMode();
@@ -338,6 +344,9 @@ export const ChatDrawer: FC<ChatDrawerProps> = ({
             }}
             disabled={isLoading}
             buttonDisabled={!health.llm || !health.mcp}
+            canStop={canStop}
+            isApplyingChange={isApplyingChange}
+            onStop={onStop}
             value={inputValue}
             onValueChange={setInputValue}
           />

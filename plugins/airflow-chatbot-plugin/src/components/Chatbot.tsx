@@ -28,7 +28,17 @@ import { ChatDrawer } from "./ChatDrawer";
  */
 export const Chatbot: FC = () => {
   const [isOpen, setIsOpen] = useState(false);
-  const { clearMessages, isLoading, messages, resolveConfirm, sendMessage, streamingId } = useChat();
+  const {
+    canStop,
+    clearMessages,
+    isApplyingChange,
+    isLoading,
+    messages,
+    resolveConfirm,
+    sendMessage,
+    stopResponse,
+    streamingId,
+  } = useChat();
   const { health } = useHealth();
 
   const handleToggle = () => {
@@ -49,6 +59,9 @@ export const Chatbot: FC = () => {
         onSendMessage={sendMessage}
         onConfirmClick={resolveConfirm}
         isLoading={isLoading}
+        canStop={canStop}
+        isApplyingChange={isApplyingChange}
+        onStop={stopResponse}
         streamingId={streamingId}
         health={health}
       />

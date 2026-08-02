@@ -79,3 +79,37 @@ describe("ChatDrawer reset button", () => {
     expect(screen.getByLabelText("Clear conversation")).toHaveProperty("disabled", true);
   });
 });
+
+describe("ChatDrawer send control", () => {
+  it("sends by default", () => {
+    drawer();
+
+    expect(screen.getByLabelText("Send message")).not.toBeNull();
+    expect(screen.queryByLabelText("Stop response")).toBeNull();
+  });
+
+  it("becomes an enabled Stop while a stoppable stream is in flight", () => {
+    const onStop = vi.fn();
+    drawer({ canStop: true, isLoading: true, onStop });
+
+    const stop = screen.getByLabelText("Stop response");
+    expect(stop).toHaveProperty("disabled", false);
+    fireEvent.click(stop);
+    expect(onStop).toHaveBeenCalledOnce();
+
+    // The textarea stays disabled: the turn is still Airy's.
+    expect(screen.getByPlaceholderText(/Ask anything/u)).toHaveProperty("disabled", true);
+  });
+
+  it("offers no stop while an approved change may be executing", () => {
+    const onStop = vi.fn();
+    drawer({ isApplyingChange: true, isLoading: true, onStop });
+
+    expect(screen.queryByLabelText("Stop response")).toBeNull();
+    const applying = screen.getByLabelText("Applying approved change…");
+    expect(applying).toHaveProperty("disabled", true);
+
+    fireEvent.click(applying);
+    expect(onStop).not.toHaveBeenCalled();
+  });
+});

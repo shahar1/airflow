@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Box, chakra, Flex, Spinner, Text, VStack } from "@chakra-ui/react";
+import { Box, chakra, Flex, Spinner, Text, VisuallyHidden, VStack } from "@chakra-ui/react";
 import { FC, memo, ReactNode, useEffect, useRef, useState } from "react";
 import Markdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -51,9 +51,14 @@ interface MessageListProps {
   readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
 }
 
+/** Distance from the bottom still counted as "following the stream". */
+const AT_BOTTOM_SLACK_PX = 80;
+
 /**
  * Message list component displaying chat history.
- * Automatically scrolls to bottom on new messages.
+ *
+ * Follows the stream only while the user is already at the bottom; reading
+ * earlier output mid-answer is otherwise impossible.
  */
 export const MessageList: FC<MessageListProps> = ({
   isLoading = false,
@@ -65,14 +70,34 @@ export const MessageList: FC<MessageListProps> = ({
   const { colorMode } = useColorMode();
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // A ref, not state: a render caused by a new token would otherwise measure
+  // the freshly-grown scrollHeight and mistake it for the user's position.
+  const atBottomRef = useRef(true);
+  const [hasNewer, setHasNewer] = useState(false);
 
   const isDark = colorMode === "dark";
 
-  // Auto-scroll to bottom when new messages arrive
+  const scrollToBottom = (behavior: ScrollBehavior) => {
+    atBottomRef.current = true;
+    setHasNewer(false);
+    bottomRef.current?.scrollIntoView({ behavior });
+  };
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - AT_BOTTOM_SLACK_PX;
+    atBottomRef.current = atBottom;
+    if (atBottom) setHasNewer(false);
+  };
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({
-      behavior: isLoading ? "auto" : "smooth",
-    });
+    if (atBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
+      setHasNewer(false);
+    } else {
+      setHasNewer(true);
+    }
   }, [messages, isLoading]);
 
   if (messages.length === 0 && !isLoading) {
@@ -101,45 +126,88 @@ export const MessageList: FC<MessageListProps> = ({
   }
 
   return (
-    <Box
-      ref={containerRef}
-      height="100%"
-      overflowY="auto"
-      px={4}
-      py={4}
-      css={{
-        "&::-webkit-scrollbar": {
-          width: "6px",
-        },
-        "&::-webkit-scrollbar-thumb": {
-          background: isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)",
-          borderRadius: "3px",
-        },
-        "&::-webkit-scrollbar-track": {
-          background: "transparent",
-        },
-      }}
-    >
-      <VStack gap={5} align="stretch">
-        {messages.map((message, index) => {
-          const streaming =
-            isLoading && (streamingId == null ? index === messages.length - 1 : message.id === streamingId);
-          return isBlank(message, streaming) ? undefined : (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              isStreaming={streaming}
-              // Chips do nothing while a stream is in flight, so don't offer them.
-              onActionClick={isLoading ? undefined : onSuggestionClick}
-              onConfirmClick={isLoading ? undefined : onConfirmClick}
-            />
-          );
-        })}
-        {isLoading && isBlank(messages[messages.length - 1], true) && <LoadingIndicator />}
-        <div ref={bottomRef} />
-      </VStack>
+    <Box position="relative" height="100%">
+      <Box
+        ref={containerRef}
+        onScroll={handleScroll}
+        height="100%"
+        overflowY="auto"
+        px={4}
+        py={4}
+        css={{
+          "&::-webkit-scrollbar": {
+            width: "6px",
+          },
+          "&::-webkit-scrollbar-thumb": {
+            background: isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)",
+            borderRadius: "3px",
+          },
+          "&::-webkit-scrollbar-track": {
+            background: "transparent",
+          },
+        }}
+      >
+        <VStack gap={5} align="stretch">
+          {messages.map((message, index) => {
+            const streaming =
+              isLoading &&
+              (streamingId == null ? index === messages.length - 1 : message.id === streamingId);
+            return isBlank(message, streaming) ? undefined : (
+              <MessageBubble
+                key={message.id}
+                message={message}
+                isStreaming={streaming}
+                // Chips do nothing while a stream is in flight, so don't offer them.
+                onActionClick={isLoading ? undefined : onSuggestionClick}
+                onConfirmClick={isLoading ? undefined : onConfirmClick}
+              />
+            );
+          })}
+          {isLoading && isBlank(messages[messages.length - 1], true) && <LoadingIndicator />}
+          <div ref={bottomRef} />
+        </VStack>
+      </Box>
+      {/* Mounted before its text ever changes: a region that appears together
+          with its message is announced far less reliably. */}
+      <VisuallyHidden role="status" aria-live="polite" aria-atomic="true">
+        {buildToolAnnouncement(messages)}
+      </VisuallyHidden>
+      {hasNewer && (
+        <Box
+          as="button"
+          onClick={() => scrollToBottom("smooth")}
+          position="absolute"
+          bottom={3}
+          left="50%"
+          transform="translateX(-50%)"
+          px={3}
+          py={1.5}
+          borderRadius="full"
+          borderWidth="1px"
+          borderColor={isDark ? "gray.600" : "gray.300"}
+          bg={isDark ? "gray.800" : "white"}
+          color={isDark ? "gray.200" : "gray.700"}
+          fontSize="sm"
+          boxShadow="md"
+          cursor="pointer"
+          _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "2px" }}
+        >
+          Jump to latest
+        </Box>
+      )}
     </Box>
   );
+};
+
+/**
+ * The newest tool's own label — "Diagnosing Dag" or "Diagnosed Dag" is already
+ * the start/finish state.  Prefixed so the announcement identifies itself as
+ * Airy's status rather than repeating the visible row verbatim.
+ */
+export const buildToolAnnouncement = (messages: Message[]): string => {
+  const tools = messages.flatMap((message) => message.tools ?? []);
+  const latest = tools[tools.length - 1];
+  return latest ? `Airy: ${buildToolLabel(latest)}` : "";
 };
 
 interface MessageBubbleProps {
@@ -272,6 +340,8 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
           {tools.length > 0 && <ToolActivity tools={tools} />}
           {text ? (
             <Box
+              role={message.isError ? "alert" : undefined}
+              aria-live={message.isError ? "assertive" : undefined}
               width="100%"
               bg={message.isError ? (isDark ? "red.900" : "red.50") : undefined}
               color={message.isError ? (isDark ? "red.200" : "red.700") : isDark ? "gray.100" : "gray.800"}
@@ -738,6 +808,9 @@ const CodeControl: FC<CodeControlProps> = ({ children, isDark, onClick, pressed 
     as="button"
     onClick={onClick}
     aria-pressed={pressed}
+    // Every other target already clears the 24px minimum; this one did not.
+    minHeight="24px"
+    minWidth="24px"
     px={1.5}
     py={0.5}
     fontSize="xs"
