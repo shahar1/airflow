@@ -37,7 +37,9 @@ import argparse
 import difflib
 import json
 import os
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -51,6 +53,7 @@ PASSWORD = os.environ.get("AIRFLOW_PASSWORD", "admin")
 DAGS_DIR = Path(os.environ.get("AIRY_MCP_DAGS_DIR", "/files/dags"))
 
 REPARSE_TIMEOUT_S = 45.0
+FAILURE_SCAN_LIMIT = 50
 LOG_TAIL_LINES = 40
 LOG_TAIL_CHARS = 4000
 
@@ -346,9 +349,68 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str) -> dict[str, Any]:
     }
 
 
+def _error_signature(log_tail: str) -> str:
+    """Collapse an error message so equivalent failures land in one cluster."""
+    lines = [line.strip() for line in log_tail.splitlines() if line.strip()]
+    if not lines:
+        return "unknown failure"
+    hits = [line for line in lines if re.search(r"(?i)\b(error|exception|failed|traceback)\b", line)]
+    line = (hits or lines)[-1]
+    line = re.sub(r"'[^']*'", "'…'", line)
+    line = re.sub(r'"[^"]*"', '"…"', line)
+    line = re.sub(r"\d+", "N", line)
+    return line[:200]
+
+
+def find_failure_clusters(hours: float = 24) -> dict[str, Any]:
+    """
+    Group recent task failures across every Dag by error signature.
+
+    Answers "what is breaking, fleet-wide?" — biggest clusters first, each
+    with example task instances to drill into.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    tis = _api(
+        "GET",
+        "/dags/~/dagRuns/~/taskInstances",
+        params={"state": "failed", "start_date_gte": since, "limit": FAILURE_SCAN_LIMIT},
+    )["task_instances"]
+
+    clusters: dict[str, dict[str, Any]] = {}
+    for ti in tis:
+        log = _api(
+            "GET",
+            _dag_url(
+                ti["dag_id"],
+                f"/dagRuns/{quote(ti['dag_run_id'], safe='')}/taskInstances/"
+                f"{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
+            ),
+        )
+        signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log))
+        cluster = clusters.setdefault(signature, {"error": signature, "count": 0, "examples": []})
+        cluster["count"] += 1
+        if len(cluster["examples"]) < 5:
+            cluster["examples"].append(
+                {"dag_id": ti["dag_id"], "task_id": ti["task_id"], "dag_run_id": ti["dag_run_id"]}
+            )
+
+    return {
+        "window_hours": hours,
+        "failures_scanned": len(tis),
+        "clusters": sorted(clusters.values(), key=lambda c: c["count"], reverse=True),
+    }
+
+
 # Registered here rather than with @mcp.tool so the module keeps exporting plain
 # functions — directly callable from tests.
-for _tool in (diagnose_dag, compare_dag_runs, fix_dag_code, revert_dag_code, rerun_dag):
+for _tool in (
+    diagnose_dag,
+    compare_dag_runs,
+    find_failure_clusters,
+    fix_dag_code,
+    revert_dag_code,
+    rerun_dag,
+):
     mcp.tool(_tool)
 
 

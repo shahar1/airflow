@@ -52,6 +52,7 @@ class FakeAirflow:
         self.runs_by_id: dict[str, dict] = {}
         self.tis_by_run: dict[str, list] = {}
         self.sources_by_version: dict[int, str] = {}
+        self.logs_by_task: dict[tuple[str, str], str] = {}
         self.bump_version_on_reparse = True
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
@@ -101,6 +102,9 @@ class FakeAirflow:
         if path.endswith("/taskInstances"):
             return {"task_instances": self.task_instances}
         if "/logs/" in path:
+            for (dag_id, task_id), content in self.logs_by_task.items():
+                if f"/dags/{dag_id}/" in path and f"/taskInstances/{task_id}/" in path:
+                    return {"content": content}
             return {"content": self.log}
         raise AssertionError(f"unexpected API call {method} {path}")
 
@@ -374,6 +378,55 @@ def test_compare_dag_runs_skips_the_diff_when_versions_match(airflow):
 
     assert result["source_diff"] is None
     assert not any("/dagSources/" in path for _, path in airflow.calls)
+
+
+@pytest.mark.parametrize(
+    ("log_tail", "expected"),
+    [
+        ("KeyError: 'ammount'", "KeyError: '…'"),
+        ("KeyError: 'region'", "KeyError: '…'"),
+        (
+            "ValueError: invalid literal for int() with base 10: 'None'",
+            "ValueError: invalid literal for int() with base N: '…'",
+        ),
+        (
+            "some INFO line\nTraceback (most recent call last):\n  boring frame",
+            "Traceback (most recent call last):",
+        ),
+        ("", "unknown failure"),
+    ],
+    ids=["quoted-key", "same-shape-other-key", "digits", "prefers-error-line", "empty"],
+)
+def test_error_signature_normalises_equivalent_failures(log_tail, expected):
+    assert server._error_signature(log_tail) == expected
+
+
+def test_find_failure_clusters_groups_by_signature_biggest_first(airflow):
+    airflow.task_instances = [
+        {"dag_id": "etl", "task_id": "load", "dag_run_id": "r1", "try_number": 1},
+        {"dag_id": "ml", "task_id": "train", "dag_run_id": "r2", "try_number": 1},
+        {"dag_id": "etl", "task_id": "load", "dag_run_id": "r3", "try_number": 2},
+    ]
+    airflow.logs_by_task = {
+        ("etl", "load"): "KeyError: 'ammount'",
+        ("ml", "train"): "TimeoutError: deadline exceeded after 30 seconds",
+    }
+
+    result = server.find_failure_clusters(hours=6)
+
+    assert result["failures_scanned"] == 3
+    assert [c["count"] for c in result["clusters"]] == [2, 1]
+    assert result["clusters"][0]["error"] == "KeyError: '…'"
+    assert {e["dag_run_id"] for e in result["clusters"][0]["examples"]} == {"r1", "r3"}
+
+
+def test_find_failure_clusters_scans_only_recent_failed_tis(airflow):
+    server.find_failure_clusters(hours=6)
+
+    listing = next(p for p in airflow.params if p and "state" in p)
+    assert listing["state"] == "failed"
+    assert listing["limit"] == server.FAILURE_SCAN_LIMIT
+    assert "start_date_gte" in listing
 
 
 def test_rerun_dag_unpauses_first(airflow):
