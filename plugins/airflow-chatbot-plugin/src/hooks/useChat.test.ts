@@ -186,6 +186,40 @@ describe("applyEvent", () => {
     expect(message.tools?.[0]?.startedAt).toBe(1_000);
   });
 
+  it("never lets a rejected call claim it is executing on its way to rejected", () => {
+    // pydantic-ai replays a FunctionToolCallEvent for denied deferred calls
+    // too, so the resumed frame is not proof that anything ran.
+    let message = applyEvent(
+      blank(),
+      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      0,
+    );
+    message = applyEvent(
+      message,
+      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      500,
+    );
+    message = {
+      ...message,
+      confirms: message.confirms?.map((c) => ({ ...c, resolution: "rejected" as const })),
+    };
+
+    const resumed = applyEvent(
+      message,
+      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      900,
+    );
+
+    expect(resumed.tools?.[0]?.durationMs).toBe(500);
+    expect(resumed.tools?.[0]?.startedAt).toBe(0);
+
+    const settled = applyEvent(resumed, { denied: true, id: "c1", result: "no", type: "tool_result" }, 1_000);
+
+    expect(settled.tools?.[0]?.denied).toBe(true);
+    expect(settled.tools?.[0]?.result).toBe("no");
+    expect(settled.tools?.[0]?.awaitingConfirm).toBeUndefined();
+  });
+
   it("times each call separately when several are in flight", () => {
     let message = applyEvent(blank(), { id: "a", name: "one", type: "tool" }, 0);
     message = applyEvent(message, { id: "b", name: "two", type: "tool" }, 500);
