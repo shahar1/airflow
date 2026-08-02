@@ -29,6 +29,7 @@ import {
   buildGroupState,
   buildPrompts,
   buildReceiptLabel,
+  buildSelectionCss,
   canRetry,
   ConfirmState,
   MessageList,
@@ -169,6 +170,20 @@ describe("buildGroupState", () => {
     expect(buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "fix_dag_code" })).toBe(
       "1 of 3 applied · 2 need attention",
     );
+  });
+});
+
+describe("buildSelectionCss", () => {
+  // White on the #017cee brand blue is 4.10:1; these pairs are 6.31:1 and 12.32:1.
+  it.each([
+    [true, "#005FB8", "#FFFFFF"],
+    [false, "#B7DBFF", "#111827"],
+  ])("gives dark=%s selections their own readable pair", (isDark, background, color) => {
+    expect(buildSelectionCss(isDark)["&::selection, & *::selection"]).toEqual({
+      background,
+      color,
+      textShadow: "none",
+    });
   });
 });
 

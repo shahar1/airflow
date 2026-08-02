@@ -359,7 +359,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
             wordBreak="break-word"
             fontSize="md"
             lineHeight="tall"
-            css={markdownCss(isDark)}
+            css={{ ...markdownCss(isDark), ...buildSelectionCss(isDark) }}
           >
             <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
               {text}
@@ -1424,6 +1424,20 @@ const tryParse = (raw: string): unknown => {
 };
 
 const truncate = (value: string): string => (value.length > 40 ? `${value.slice(0, 39)}…` : value);
+
+/**
+ * Selection colours for the user bubble, which the host's default palette can
+ * otherwise land on invisibly against its own grey.
+ *
+ * Explicit hues rather than `brand.500`: white on Airflow's `#017cee` is
+ * 4.10:1, under the 4.5:1 floor for normal text.  No `forced-color-adjust` —
+ * high-contrast mode must stay free to substitute its own.
+ */
+export const buildSelectionCss = (isDark: boolean) => ({
+  "&::selection, & *::selection": isDark
+    ? { background: "#005FB8", color: "#FFFFFF", textShadow: "none" }
+    : { background: "#B7DBFF", color: "#111827", textShadow: "none" },
+});
 
 /** Just enough spacing so rendered Markdown doesn't collapse inside the bubble. */
 const markdownCss = (isDark: boolean) => ({
