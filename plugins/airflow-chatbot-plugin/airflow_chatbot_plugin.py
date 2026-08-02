@@ -268,18 +268,37 @@ and "here": `/dags/sales_summary/grid` means questions are about the
 
 _WRITE_PROMPT = """\
 
-**Self-healing.**  You can diagnose a broken Dag (`diagnose_dag`), patch its
-source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Every write
-tool suspends until the user approves it with in-UI Confirm/Reject buttons,
-so never ask for permission in prose — calling the tool *is* the proposal.
-Work one step at a time:
+**Self-healing.**  Every change is planned first and written second.  The
+planning tools are read-only and hand back a `plan_token`; the write tools
+refuse without it.  A write tool suspends until the user approves it with in-UI
+Confirm/Reject buttons, so **calling the write tool *is* the proposal**: never
+ask for permission in prose, never say you are "about to", "will now" or are
+"proceeding with" a change, and never report a change as made without the tool
+result that says so.
 
-1. After diagnosing, name the failing task, quote the offending line, and say
-   exactly what you would change.
-2. Call `fix_dag_code` with the smallest unique `old` snippet you can (it must
-   occur exactly once in the file).
-3. After a successful fix, offer to re-run — do not re-run on your own.
-4. `revert_dag_code` restores the *original* file and discards every fix you
+1. **Diagnose everything, not just what failed first.**  `diagnose_dag` returns
+   every task instance, every failed task's log, the task graph, the source and
+   deterministic `checks`.  Report every high-confidence problem in one answer,
+   and separate them: a **confirmed failure** is backed by a log, a **latent
+   blocker** is backed by the source or graph and has not run yet.
+2. **Repair as one change.**  Put *every* fix in a single
+   `plan_dag_code_changes` call — a second plan made after the first one lands
+   was computed against source that no longer exists.  Show the diff and any
+   `blocking` entry, then call `apply_dag_code_changes` with the same changes
+   and the token.  A plan with blockers has no token: explain what it would
+   break instead of applying it.  If the plan reports `asset_review_needed`,
+   call `get_blast_radius` and say what else the change moves before proposing
+   the write.
+3. **Clearing is not re-running.**  To re-run a task inside a run that already
+   exists — "clear", "retry this task", "same run" — use
+   `plan_task_instance_clear` and then `apply_task_instance_clear`.  `rerun_dag`
+   creates a *new* Dag run and is never an implementation of clearing.  The
+   clear takes everything downstream of the task with it, which is what makes
+   the re-run mean anything — tell the user which instances `affected` lists.
+   If the plan refuses (an ambiguous position, nothing to clear, a task set that
+   would move), report that and clear nothing.
+4. After a successful fix, offer to re-run — do not re-run on your own.
+5. `revert_dag_code` restores the *original* file and discards every change you
    applied, not just the last one. Say that before proposing it.
 """
 
@@ -292,11 +311,15 @@ permission the user does not have.  If asked to change anything, say so.
 
 _FOLLOWUP_PROMPT = """\
 
-**Follow-up buttons.**  When the obvious next step is a single action, end your
-reply with one or more lines of the form `[ACTION: <what the user should say>]`.
-They are rendered as clickable buttons, so write them as the user's own words,
-e.g. `[ACTION: Apply the fix to sales_summary]` or `[ACTION: Re-run sales_summary]`.
-Put nothing after them.
+**Follow-up buttons.**  When the obvious next step is a *question you would
+answer*, end your reply with one or more lines of the form
+`[ACTION: <what the user should say>]`.  They are rendered as clickable buttons,
+so write them as the user's own words, e.g. `[ACTION: Show me the log for
+summarize]`.  Put nothing after them.
+
+Never use one to stand in for a change you could propose yourself: a write is
+proposed by calling its write tool, which the user then approves or rejects.  A
+button that only asks the user to ask you again is the slow way to do nothing.
 """
 
 
@@ -427,9 +450,29 @@ def _is_authorized_dag(
     )
 
 
+def _writable_tools(user: Any) -> frozenset[str]:
+    """
+    Return the write tools this user could run against *some* Dag.
+
+    Per tool, not one "may you edit a Dag?": clearing a task instance and
+    rewriting a Dag file are different permissions on the real API, and a user
+    who holds one and not the other should be offered exactly what they hold.
+    (Under the simple auth manager both answers come from the role, so this
+    changes nothing there; under FAB they are genuinely separate.)
+    """
+    return frozenset(
+        name
+        for name in WRITE_TOOLS
+        if all(
+            _is_authorized_dag(user, method=method, dag_id=None, access_entity=entity)
+            for method, entity in _tool_access_requirements(name, {})
+        )
+    )
+
+
 def _user_can_write(user: Any) -> bool:
-    """Whether the user may edit *some* Dag — the gate on offering write tools at all."""
-    return _is_authorized_dag(user, method="PUT", dag_id=None)
+    """Whether any write tool is available at all — the gate on offering them."""
+    return bool(_writable_tools(user))
 
 
 # The only tools Airy will run. A name-based *denylist* of writers fails open:
@@ -447,13 +490,36 @@ TOOL_POLICY: dict[str, dict[str, bool]] = {
     "find_failure_clusters": {"fleet": True},
     "get_blast_radius": {"reads_assets": True},
     "plan_backfill": {},
-    "fix_dag_code": {"writes": True, "reads_source": True},
+    # Read-only, but it reads the whole source file to plan against it, so it is
+    # held to the same co-located-Dag rule as the write it precedes.
+    "plan_dag_code_changes": {"reads_source": True},
+    "plan_task_instance_clear": {},
+    "apply_dag_code_changes": {"writes": True, "reads_source": True},
+    "apply_task_instance_clear": {"writes": True},
     "revert_dag_code": {"writes": True, "reads_source": True},
     "rerun_dag": {"writes": True},
     "run_backfill": {"writes": True},
 }
 
 WRITE_TOOLS = frozenset(name for name, policy in TOOL_POLICY.items() if policy.get("writes"))
+
+# Read-only tools that hand back a single-use token. A run that gets one and
+# then proposes nothing has narrated a change instead of offering it.
+PLAN_TOOLS = frozenset({"plan_dag_code_changes", "plan_task_instance_clear", "plan_backfill"})
+
+_UNPROPOSED_PLAN_CORRECTION = (
+    "You planned a change and then did not propose it — or proposed it without the plan_token, which "
+    "the write tool will refuse. Call the matching write tool now, with the exact arguments you "
+    "planned and the plan_token it returned, so the user gets an approval card that can actually be "
+    "applied. If you are not going to propose it, say so in one sentence and say why. Do not describe "
+    "the change again."
+)
+
+
+# Every denial from the authorization wrapper opens with this. A write refused
+# here never ran, and the drawer has to be able to tell that from a write that
+# did — the tool returns it as an ordinary result, not as an error.
+_ACCESS_DENIED = "Access denied: "
 
 
 def _authorized_dag_ids(user: Any) -> set[str]:
@@ -482,22 +548,51 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
 
     runs = (("GET", Entity.RUN), ("GET", Entity.TASK_INSTANCE))
+    # Every one of these tools reads ``GET /dags/{dag_id}`` — for the file
+    # location, the paused flag, or the run's Dag — and that route wants plain
+    # GET on the Dag, which no entity-scoped permission implies.
+    read_dag = ("GET", None)
     # Patching a Dag's source edits the Dag, reads its code, and reads its
     # versions to tell whether the reparse landed; there is no write-the-code
     # permission in Airflow to mirror.
-    patch_source = (("PUT", None), ("GET", Entity.CODE), ("GET", Entity.VERSION))
+    patch_source = (("PUT", None), read_dag, ("GET", Entity.CODE), ("GET", Entity.VERSION))
+    # Airflow's clearTaskInstances route carries one PUT-on-TASK_INSTANCE
+    # dependency that covers its dry run as well, so the planner is held to the
+    # same permission as the clear it previews. Both also list the run's
+    # instances to see whether re-queuing it would change the task set.
+    clear = (
+        ("PUT", Entity.TASK_INSTANCE),
+        ("GET", Entity.TASK_INSTANCE),
+        ("GET", Entity.RUN),
+        ("GET", Entity.TASK),
+    )
     requirements: dict[str, tuple[tuple[str, Any], ...]] = {
-        "diagnose_dag": (*runs, ("GET", Entity.TASK_LOGS), ("GET", Entity.CODE)),
+        # Reads the Dag itself (for its file location), its runs, instances,
+        # logs, source and task graph.
+        "diagnose_dag": (
+            read_dag,
+            *runs,
+            ("GET", Entity.TASK_LOGS),
+            ("GET", Entity.CODE),
+            ("GET", Entity.TASK),
+        ),
+        # Planning reads the source and the graph it would disturb; applying
+        # rewrites the file, so it needs everything a patch needs.
+        "plan_dag_code_changes": (read_dag, ("GET", Entity.CODE), ("GET", Entity.TASK)),
+        "apply_dag_code_changes": patch_source,
+        "plan_task_instance_clear": clear,
+        "apply_task_instance_clear": clear,
         # Scans task instances fleet-wide, then reads each failure's log.
         "find_failure_clusters": (("GET", Entity.TASK_INSTANCE), ("GET", Entity.TASK_LOGS)),
         "compare_dag_runs": (*runs, ("GET", Entity.CODE)),
         # Cross-Dag neighbours are what DEPENDENCIES exists to expose; the asset
         # rows the answer is derived from are checked separately.
         "get_blast_radius": (("GET", Entity.DEPENDENCIES),),
-        "fix_dag_code": patch_source,
         "revert_dag_code": patch_source,
+        # Reads the Dag to see whether it is paused, then creates a run.
         # Unpausing is a separate, lasting edit — only demanded when actually asked for.
-        "rerun_dag": (("POST", Entity.RUN),) + ((("PUT", None),) if tool_args.get("unpause") else ()),
+        "rerun_dag": (read_dag, ("POST", Entity.RUN))
+        + ((("PUT", None),) if tool_args.get("unpause") else ()),
         # Airflow gates even the backfill dry run on POST; mirror that.
         "plan_backfill": (("POST", Entity.RUN),),
         # Creating it is POST, but it then reads back what landed and may cancel
@@ -566,7 +661,7 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
         # write permission nor a confirmation.
         log.warning("Airy refused %s: not in TOOL_POLICY", tool_name)
         return (
-            f"Access denied: {tool_name} is not a tool Airy is allowed to run. "
+            f"{_ACCESS_DENIED}{tool_name} is not a tool Airy is allowed to run. "
             f"Tell the user this; do not retry."
         )
 
@@ -574,18 +669,22 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
     # only reaches the sidecar if these *are* the arguments. Anything else and
     # the narrowing would be silently dropped.
     if not isinstance(tool_args, dict):
-        return f"Access denied: {tool_name} was called with arguments Airy cannot check. Do not retry."
+        return f"{_ACCESS_DENIED}{tool_name} was called with arguments Airy cannot check. Do not retry."
 
     args = tool_args
     dag_id = args.get("dag_id")
     if not isinstance(dag_id, str) or not dag_id:
         return _authorize_fleet_wide_call(user, tool_name, args)
 
-    if _policy(tool_name, "reads_assets") and not get_auth_manager().is_authorized_asset(
-        method="GET", user=user
+    if _policy(tool_name, "reads_assets") and not (
+        # Both, because ``GET /assets`` itself demands both: an alias is another
+        # name for an asset, so reading the graph without alias access would
+        # hand back edges the route would have refused.
+        get_auth_manager().is_authorized_asset(method="GET", user=user)
+        and get_auth_manager().is_authorized_asset_alias(method="GET", user=user)
     ):
         return (
-            f"Access denied: {tool_name} reads the asset graph, which the signed-in user cannot. "
+            f"{_ACCESS_DENIED}{tool_name} reads the asset graph, which the signed-in user cannot. "
             f"Tell the user this; do not retry."
         )
 
@@ -597,7 +696,7 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
         digest = _parsed_source_digest(dag_id)
         if digest is None:
             return (
-                f"Access denied: Airflow has not parsed a version of Dag {dag_id!r} yet, so there is "
+                f"{_ACCESS_DENIED}Airflow has not parsed a version of Dag {dag_id!r} yet, so there is "
                 f"nothing {tool_name} can safely read. Tell the user this; do not retry."
             )
         args["source_digest"] = digest
@@ -623,11 +722,11 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
                 # withholding the file exists to protect. /dagSources is generic
                 # for the same reason.
                 return (
-                    f"Access denied: {dag_id!r} shares a source file with another Dag the signed-in "
+                    f"{_ACCESS_DENIED}{dag_id!r} shares a source file with another Dag the signed-in "
                     f"user may not read. Tell the user this; do not retry."
                 )
             return (
-                f"Access denied: {tool_name} needs {needed} for Dag {target!r}, which the "
+                f"{_ACCESS_DENIED}{tool_name} needs {needed} for Dag {target!r}, which the "
                 f"signed-in user does not have. Tell the user this; do not retry."
             )
     return None
@@ -684,7 +783,7 @@ def _authorize_fleet_wide_call(user: Any, tool_name: str, tool_args: dict[str, A
     for, and the sidecar filters to them.  Anything outside is never fetched.
     """
     if tool_name in WRITE_TOOLS:
-        return f"Access denied: {tool_name} must name the Dag it changes. Tell the user this; do not retry."
+        return f"{_ACCESS_DENIED}{tool_name} must name the Dag it changes. Tell the user this; do not retry."
 
     if not _policy(tool_name, "fleet"):
         # No allowlist to narrow with — the read-only sidecar's listings, whose
@@ -692,13 +791,13 @@ def _authorize_fleet_wide_call(user: Any, tool_name: str, tool_args: dict[str, A
         # a snapshot, and the admin-backed call runs after it, so a Dag created in
         # between comes back unauthorized. There is no safe version of this call.
         return (
-            f"Access denied: {tool_name} names no Dag and cannot be scoped to the ones the signed-in "
+            f"{_ACCESS_DENIED}{tool_name} names no Dag and cannot be scoped to the ones the signed-in "
             f"user may read. Ask them for a specific dag_id instead."
         )
     cleared = _readable_dag_ids_for(user, tool_name)
     if not cleared:
         return (
-            f"Access denied: the signed-in user may not read any Dag that {tool_name} would report on. "
+            f"{_ACCESS_DENIED}the signed-in user may not read any Dag that {tool_name} would report on. "
             f"Ask them for a specific dag_id instead."
         )
     tool_args["dag_ids"] = cleared
@@ -744,12 +843,27 @@ def _gate_toolsets(toolsets: list[Any], can_write: bool, user: Any = None) -> li
     """
     # Unknown tools are not offered at all — the authorization wrapper would
     # refuse them anyway, and a tool the model can see is a tool it will try.
+    #
+    # The policy is keyed on bare names, and names are only unique *within* a
+    # sidecar: a second sidecar that happens to ship a ``rerun_dag`` of its own
+    # would pass this filter on our entry's authority and be called in its
+    # place. pydantic-ai refuses to attach two toolsets sharing a name, which
+    # turns that confusion into a startup error rather than a silent swap — so
+    # the fix for a collision is to rename ours, never to prefix past it.
     known = [ts.filtered(lambda ctx, tool_def: tool_def.name in TOOL_POLICY) for ts in toolsets]
+    # Each write tool on its own merits: holding "clear a task instance" is not
+    # holding "rewrite this Dag's file", and offering both for either is how a
+    # user ends up approving a card the API then refuses.
+    allowed = _writable_tools(user) if can_write and user is not None else WRITE_TOOLS
+    offered = [
+        ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS or tool_def.name in allowed)
+        for ts in known
+    ]
     if can_write:
         # The model can request a write, but the run suspends until the user
         # approves it in the UI (see /confirm) — prompt prose is not a gate.
         gated = [
-            ts.approval_required(lambda ctx, tool_def, args: tool_def.name in WRITE_TOOLS) for ts in known
+            ts.approval_required(lambda ctx, tool_def, args: tool_def.name in WRITE_TOOLS) for ts in offered
         ]
     else:
         gated = [ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS) for ts in known]
@@ -901,21 +1015,63 @@ _RESULT_CLIP_CHARS = 4000
 _DENIAL_MESSAGE = "The user rejected this action."
 
 # The self-healing tools report a refused write as an ordinary return, not as an
-# error: ``{"applied": false, "error": …}`` when the snippet is not unique, the
-# file drifted under them, or the patch would not compile — and the same for
-# ``reverted``. Left alone, the drawer paints those green and tells the user
-# their Dag was edited when the file was never written.
-_WRITE_OUTCOME_KEYS = ("applied", "reverted")
+# error: ``{"applied": false, "error": …}`` when the file drifted under them or
+# the plan expired, ``{"triggered": false}`` for a paused Dag, ``{"cleared":
+# false}`` when the target moved. Left alone, the drawer paints those green and
+# tells the user their Dag was changed when nothing was written.
+#
+# ``mutation_applied`` is the field every write tool now reports; the rest stay
+# because reading them costs nothing and a tool that forgets the new field must
+# not thereby become un-checkable.
+_WRITE_OUTCOME_KEYS = ("mutation_applied", "applied", "reverted", "triggered", "created", "cleared")
 
 
 def _write_refused(content: Any) -> bool:
-    """Whether a write tool's own result says it changed nothing."""
+    """Whether a write tool's result says it changed nothing."""
     if isinstance(content, str):
+        # The per-Dag authorization wrapper answers with this instead of calling
+        # the tool at all — the user may edit *some* Dag, so the tool was
+        # offered, and this one was refused. Nothing ran, and a green
+        # "Edited Dag code" over a refusal is the worst lie the drawer can tell.
+        if content.startswith(_ACCESS_DENIED):
+            return True
         try:
             content = json.loads(content)
         except ValueError:
             return False
     return isinstance(content, dict) and any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS)
+
+
+_UI_UPDATE_KINDS = ("dag_definition", "dag_run", "task_instances")
+
+
+def _resource_changed_frame(tool_name: str, content: Any) -> dict[str, Any] | None:
+    """
+    Build the refresh a landed write earns, read from the tool's own result.
+
+    Never inferred from prose or from the tool's name: the frame's only job is
+    to tell already-authorized UI queries to refetch, and a frame sent for a
+    write that did not happen would refresh a view into saying it did. So it
+    takes the tool at its word only when that word is ``mutation_applied``.
+    """
+    if tool_name not in WRITE_TOOLS:
+        return None
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return None
+    if not isinstance(content, dict) or content.get("mutation_applied") is not True:
+        return None
+    updates = [
+        update
+        for update in content.get("ui_updates") or []
+        if isinstance(update, dict)
+        and update.get("kind") in _UI_UPDATE_KINDS
+        and isinstance(update.get("dag_id"), str)
+        and update["dag_id"]
+    ]
+    return {"type": "resource_changed", "updates": updates} if updates else None
 
 
 def _clip_result(content: Any) -> str:
@@ -991,6 +1147,47 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
     return None
 
 
+def _issued_a_plan(tool_name: str, content: Any) -> bool:
+    """Whether a planning tool just handed the model a token to act on."""
+    if tool_name not in PLAN_TOOLS:
+        return False
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return False
+    return isinstance(content, dict) and bool(content.get("plan_token"))
+
+
+def _carries_a_plan(part: Any) -> bool:
+    """
+    Whether a proposed write actually carries the token it was planned with.
+
+    A write proposed without one is a card that can only ever be refused: the
+    tool rejects it, and the user has spent a decision on nothing. That is the
+    same failure as narrating the change, so it is corrected the same way.
+    """
+    args = part.args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return False
+    return isinstance(args, dict) and bool(args.get("plan_token"))
+
+
+def _needs_correcting(outcome: dict[str, Any]) -> bool:
+    """
+    Report a plan the model then only *described* — the "Proceeding with the fix…" failure.
+
+    A token was issued, nothing was proposed, and the user is left with prose and
+    no button. Prompt wording cannot guarantee otherwise, so such a run is
+    corrected once: the model either proposes the write or says plainly that it
+    will not.
+    """
+    return bool(outcome.get("planned") and not outcome.get("proposed") and outcome.get("messages"))
+
+
 async def _run_and_stream(
     agent: Any,
     *,
@@ -999,6 +1196,7 @@ async def _run_and_stream(
     user_prompt: str | None = None,
     message_history: list[Any] | None = None,
     deferred_tool_results: Any = None,
+    outcome: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     Stream one agent run; a write tool suspends it behind a confirm nonce.
@@ -1007,6 +1205,10 @@ async def _run_and_stream(
     executing them the run ends with deferred requests.  Those are parked in
     ``_pending_approvals`` and surfaced as ``confirm_required`` frames;
     /confirm resumes the run with the user's verdict.
+
+    ``outcome`` collects what the caller needs to judge the run afterwards: the
+    messages, whether a plan was issued, and whether a write was actually
+    proposed.
     """
     from pydantic_ai import DeferredToolRequests
 
@@ -1027,8 +1229,23 @@ async def _run_and_stream(
                 payload = _event_payload(event)
                 if payload:
                     yield payload
+                    # Only after the tool result itself has gone out clean: a
+                    # refused, denied or failed write refreshes nothing.
+                    if kind == "function_tool_result" and not (
+                        payload.get("failed") or payload.get("denied")
+                    ):
+                        if outcome is not None and _issued_a_plan(event.part.tool_name, event.part.content):
+                            outcome["planned"] = True
+                        changed = _resource_changed_frame(event.part.tool_name, event.part.content)
+                        if changed:
+                            yield changed
+
+    if outcome is not None and result is not None:
+        outcome["messages"] = result.all_messages()
 
     if requests is not None and requests.approvals and result is not None:
+        if outcome is not None:
+            outcome["proposed"] = any(_carries_a_plan(part) for part in requests.approvals)
         nonce = _store_pending(
             user_id=user_id,
             call_ids=[part.tool_call_id for part in requests.approvals],
@@ -1060,6 +1277,7 @@ async def _stream_agent(
         yield {"type": "text", "delta": problem}
         return
 
+    outcome: dict[str, Any] = {}
     try:
         async for payload in _run_and_stream(
             agent,
@@ -1067,8 +1285,18 @@ async def _stream_agent(
             page_url=page_url,
             user_prompt=message,
             message_history=_to_message_history(history) or None,
+            outcome=outcome,
         ):
             yield payload
+        if _needs_correcting(outcome):
+            async for payload in _run_and_stream(
+                agent,
+                user_id=user_id,
+                page_url=page_url,
+                user_prompt=_UNPROPOSED_PLAN_CORRECTION,
+                message_history=outcome["messages"],
+            ):
+                yield payload
     except Exception as e:
         log.exception("Agent execution failed")
         yield {"type": "error", "message": str(_root_cause(e))}
@@ -1097,6 +1325,7 @@ async def _resume_agent(
         # One verdict for the whole suspension batch — in practice one call.
         verdict = True if approved else ToolDenied(_DENIAL_MESSAGE)
         settled = set()
+        outcome: dict[str, Any] = {}
         async for payload in _run_and_stream(
             agent,
             user_id=pending.user_id,
@@ -1105,6 +1334,7 @@ async def _resume_agent(
             deferred_tool_results=DeferredToolResults(
                 approvals={call_id: verdict for call_id in pending.call_ids}
             ),
+            outcome=outcome,
         ):
             # A clean return is the only proof the write reached a known end.
             # A failed one is not: rerun_dag unpauses before it triggers, and a
@@ -1113,6 +1343,19 @@ async def _resume_agent(
                 settled.add(payload.get("id"))
             pending.frames.append(payload)
             yield payload
+        # The run that resumes an approved write can go on to plan the *next*
+        # change — "fix it, then re-run" — and narrate that one instead of
+        # proposing it. The same correction applies here as on a fresh turn.
+        if _needs_correcting(outcome):
+            async for payload in _run_and_stream(
+                agent,
+                user_id=pending.user_id,
+                page_url=pending.page_url,
+                user_prompt=_UNPROPOSED_PLAN_CORRECTION,
+                message_history=outcome["messages"],
+            ):
+                pending.frames.append(payload)
+                yield payload
     except Exception as e:
         log.exception("Agent resume failed")
         failure = {"type": "error", "message": str(_root_cause(e))}

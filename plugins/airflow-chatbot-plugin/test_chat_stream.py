@@ -72,7 +72,7 @@ def test_event_payload_reports_a_tool_call():
 def test_event_payload_flags_a_write_tool_call_as_only_proposed():
     # approval_required means nothing has run; without this the drawer spins
     # under "Editing Dag code" from the moment the model asks.
-    payload = plugin._event_payload(tool_call_event(name="fix_dag_code"))
+    payload = plugin._event_payload(tool_call_event(name="apply_dag_code_changes"))
 
     assert payload["proposed"] is True
 
@@ -80,8 +80,8 @@ def test_event_payload_flags_a_write_tool_call_as_only_proposed():
 def test_event_payload_flags_the_resumed_frame_too():
     # The flag describes the tool class, not the phase. The browser tells the
     # resumed call apart by its repeated id, so the server need not guess.
-    first = plugin._event_payload(tool_call_event(name="fix_dag_code", call_id="c1"))
-    resumed = plugin._event_payload(tool_call_event(name="fix_dag_code", call_id="c1"))
+    first = plugin._event_payload(tool_call_event(name="apply_dag_code_changes", call_id="c1"))
+    resumed = plugin._event_payload(tool_call_event(name="apply_dag_code_changes", call_id="c1"))
 
     assert first["proposed"] is True
     assert resumed["proposed"] is True
@@ -112,7 +112,9 @@ def test_event_payload_marks_a_denied_tool_call():
     # A rejected write comes back as a plain tool return carrying the denial
     # message — it must not be presented to the browser as a success.
     event = FunctionToolResultEvent(
-        part=ToolReturnPart(tool_name="fix_dag_code", content=plugin._DENIAL_MESSAGE, tool_call_id="c1")
+        part=ToolReturnPart(
+            tool_name="apply_dag_code_changes", content=plugin._DENIAL_MESSAGE, tool_call_id="c1"
+        )
     )
 
     payload = plugin._event_payload(event)
@@ -134,7 +136,7 @@ def test_event_payload_refuses_to_call_a_no_op_write_a_success(content):
     # The tool reports a refused patch as an ordinary return, so without this
     # the drawer paints "Edited Dag code" green over a file it never wrote.
     event = FunctionToolResultEvent(
-        part=ToolReturnPart(tool_name="fix_dag_code", content=content, tool_call_id="c1")
+        part=ToolReturnPart(tool_name="apply_dag_code_changes", content=content, tool_call_id="c1")
     )
 
     payload = plugin._event_payload(event)
@@ -143,10 +145,47 @@ def test_event_payload_refuses_to_call_a_no_op_write_a_success(content):
     assert payload["denied"] is False
 
 
+def test_event_payload_refuses_to_call_a_denied_write_a_success():
+    """Edit rights on *some* Dag offers the tool; this Dag can still refuse it."""
+    denial = (
+        f"{plugin._ACCESS_DENIED}apply_dag_code_changes needs PUT on the Dag for Dag 'other', "
+        f"which the signed-in user does not have. Tell the user this; do not retry."
+    )
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="apply_dag_code_changes", content=denial, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is True
+    assert plugin._resource_changed_frame("apply_dag_code_changes", denial) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # A paused Dag refuses the trigger and says so in its own field; before
+        # this key was read, the drawer reported "Re-ran Dag · approved by you".
+        {"triggered": False, "unpause_token": "t0k3n"},
+        {"created": False, "error": "the backfill did not match"},
+        {"cleared": False, "error": "no reviewed plan for this clear"},
+        {"mutation_applied": False, "error": "the source changed since it was planned"},
+    ],
+    ids=["not_triggered", "not_created", "not_cleared", "no_mutation"],
+)
+def test_event_payload_refuses_to_call_any_no_op_write_a_success(content):
+    tool = {"triggered": "rerun_dag", "created": "run_backfill", "cleared": "apply_task_instance_clear"}.get(
+        next(iter(content)), "apply_dag_code_changes"
+    )
+    event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
+
+    assert plugin._event_payload(event)["failed"] is True
+
+
 @pytest.mark.parametrize(
     ("tool", "content"),
     [
-        ("fix_dag_code", {"applied": True, "diff": "--- a/dag.py"}),
+        ("apply_dag_code_changes", {"applied": True, "diff": "--- a/dag.py"}),
         ("rerun_dag", {"dag_run_id": "manual__1"}),
         # A read tool that happens to carry the key is not a write outcome.
         ("diagnose_dag", {"applied": False}),
@@ -284,9 +323,14 @@ def test_render_system_prompt_advertises_writes_only_to_editors():
     writable = plugin._render_system_prompt(None, can_write=True)
     read_only = plugin._render_system_prompt(None, can_write=False)
 
-    assert "fix_dag_code" in writable
+    assert "apply_dag_code_changes" in writable
     assert "Read-only access" not in writable
-    assert "fix_dag_code" not in read_only
+    assert "apply_dag_code_changes" not in read_only
+    # The whole point of the write contract: propose by calling the tool, and
+    # never let a re-run stand in for clearing an instance that already exists.
+    assert "calling the write tool *is* the proposal" in writable
+    assert '"proceeding with"' in writable
+    assert "never an implementation of clearing" in writable
     assert "Read-only access" in read_only
     # Both modes keep the follow-up button protocol.
     assert "[ACTION:" in writable
@@ -483,6 +527,7 @@ class FakeAuthManager:
         self.allowed: set[tuple] = set()
         self.authorized_dag_ids: set[str] = set()
         self.assets_readable = True
+        self.asset_aliases_readable = True
         self.asked: list[tuple] = []
 
     def is_authorized_dag(self, *, method, user, access_entity=None, details=None):
@@ -500,6 +545,9 @@ class FakeAuthManager:
 
     def is_authorized_asset(self, *, method, user, details=None):
         return self.assets_readable
+
+    def is_authorized_asset_alias(self, *, method, user, details=None):
+        return self.asset_aliases_readable
 
     def batch_is_authorized_dag(self, requests, *, user):
         return all(
@@ -536,8 +584,15 @@ def _grant(manager, pairs, dag_id="sales_summary", team="data_platform"):
 
 
 # What Airflow's own routes demand of each tool's underlying REST calls.
-DIAGNOSE_ACCESS = [("GET", "RUN"), ("GET", "TASK_INSTANCE"), ("GET", "TASK_LOGS"), ("GET", "CODE")]
-FIX_ACCESS = [("PUT", None), ("GET", "CODE"), ("GET", "VERSION")]
+DIAGNOSE_ACCESS = [
+    ("GET", None),
+    ("GET", "RUN"),
+    ("GET", "TASK_INSTANCE"),
+    ("GET", "TASK_LOGS"),
+    ("GET", "CODE"),
+    ("GET", "TASK"),
+]
+FIX_ACCESS = [("PUT", None), ("GET", None), ("GET", "CODE"), ("GET", "VERSION")]
 
 
 @pytest.mark.parametrize(
@@ -547,9 +602,9 @@ FIX_ACCESS = [("PUT", None), ("GET", "CODE"), ("GET", "VERSION")]
         ("diagnose_dag", [p for p in DIAGNOSE_ACCESS if p != ("GET", "TASK_LOGS")], "GET on TASK_LOGS"),
         ("diagnose_dag", [p for p in DIAGNOSE_ACCESS if p != ("GET", "CODE")], "GET on CODE"),
         # Editing the Dag object is not permission to read its source.
-        ("fix_dag_code", [("PUT", None)], "GET on CODE"),
+        ("apply_dag_code_changes", [("PUT", None), ("GET", None)], "GET on CODE"),
         # Triggering a run is POST on RUN, not edit on the Dag.
-        ("rerun_dag", [("PUT", None)], "POST on RUN"),
+        ("rerun_dag", [("PUT", None), ("GET", None)], "POST on RUN"),
         # Airflow gates even the backfill preview on POST.
         ("plan_backfill", [("GET", "RUN")], "POST on RUN"),
     ],
@@ -567,8 +622,8 @@ def test_authorize_tool_call_demands_each_underlying_permission(auth_manager, to
     ("tool", "access"),
     [
         ("diagnose_dag", DIAGNOSE_ACCESS),
-        ("fix_dag_code", FIX_ACCESS),
-        ("rerun_dag", [("POST", "RUN")]),
+        ("apply_dag_code_changes", FIX_ACCESS),
+        ("rerun_dag", [("GET", None), ("POST", "RUN")]),
     ],
     ids=["cross-dag-read", "cross-dag-write", "cross-dag-rerun"],
 )
@@ -600,14 +655,20 @@ def test_authorize_tool_call_refuses_source_of_a_dag_with_no_parsed_version(monk
 def test_authorize_tool_call_denies_a_write_that_names_no_dag(auth_manager):
     _grant(auth_manager, FIX_ACCESS)
 
-    denial = plugin._authorize_tool_call(FakeUser(), "fix_dag_code", {"old": "a", "new": "b"})
+    denial = plugin._authorize_tool_call(
+        FakeUser(), "apply_dag_code_changes", {"changes": [{"old": "a", "new": "b"}]}
+    )
 
     assert "must name the Dag it changes" in denial
 
 
 @pytest.mark.parametrize(
     ("tool", "access"),
-    [("diagnose_dag", DIAGNOSE_ACCESS), ("fix_dag_code", FIX_ACCESS), ("rerun_dag", [("POST", "RUN")])],
+    [
+        ("diagnose_dag", DIAGNOSE_ACCESS),
+        ("apply_dag_code_changes", FIX_ACCESS),
+        ("rerun_dag", [("GET", None), ("POST", "RUN")]),
+    ],
 )
 def test_authorize_tool_call_allows_the_users_own_dag(auth_manager, tool, access):
     _grant(auth_manager, access)
@@ -619,7 +680,7 @@ def test_authorize_tool_call_scopes_the_question_to_the_dags_team(auth_manager):
     """A team-scoped manager answers differently without the team, so it must be supplied."""
     _grant(auth_manager, FIX_ACCESS, team=None)
 
-    denial = plugin._authorize_tool_call(FakeUser(), "fix_dag_code", {"dag_id": "sales_summary"})
+    denial = plugin._authorize_tool_call(FakeUser(), "apply_dag_code_changes", {"dag_id": "sales_summary"})
 
     assert denial is not None
     assert {question[3] for question in auth_manager.asked} == {"data_platform"}
@@ -627,7 +688,7 @@ def test_authorize_tool_call_scopes_the_question_to_the_dags_team(auth_manager):
 
 def test_authorize_tool_call_demands_edit_only_when_unpausing(auth_manager):
     """Unpausing is a lasting edit, so it costs a permission a plain re-run does not."""
-    _grant(auth_manager, [("POST", "RUN")])
+    _grant(auth_manager, [("GET", None), ("POST", "RUN")])
 
     assert plugin._authorize_tool_call(FakeUser(), "rerun_dag", {"dag_id": "sales_summary"}) is None
     unpausing = {"dag_id": "sales_summary", "unpause": True}
@@ -639,7 +700,7 @@ def test_authorize_tool_call_covers_every_dag_in_a_patched_file(monkeypatch, aut
     _grant(auth_manager, FIX_ACCESS)
     monkeypatch.setattr(plugin, "_dag_ids_sharing_file", lambda dag_id: ["sales_summary", "sales_audit"])
 
-    denial = plugin._authorize_tool_call(FakeUser(), "fix_dag_code", {"dag_id": "sales_summary"})
+    denial = plugin._authorize_tool_call(FakeUser(), "apply_dag_code_changes", {"dag_id": "sales_summary"})
 
     assert "shares a source file" in denial
     # Naming the sibling would leak the very Dag id the refusal protects.
@@ -667,15 +728,18 @@ def test_authorize_tool_call_reads_source_when_the_whole_file_is_readable(monkey
 
 def test_authorize_tool_call_does_not_widen_a_tool_that_reads_no_source(monkeypatch, auth_manager):
     """rerun_dag touches no file, so a co-located Dag is none of its business."""
-    _grant(auth_manager, [("POST", "RUN")])
+    _grant(auth_manager, [("GET", None), ("POST", "RUN")])
     monkeypatch.setattr(plugin, "_dag_ids_sharing_file", lambda dag_id: ["sales_summary", "sales_audit"])
 
     assert plugin._authorize_tool_call(FakeUser(), "rerun_dag", {"dag_id": "sales_summary"}) is None
 
 
-def test_authorize_tool_call_demands_asset_access_for_the_asset_graph(auth_manager):
+@pytest.mark.parametrize("denied", ["assets_readable", "asset_aliases_readable"])
+def test_authorize_tool_call_demands_asset_access_for_the_asset_graph(auth_manager, denied):
+    # GET /assets demands asset *and* asset-alias read; an alias is just another
+    # name for an asset, so half the permission is not permission.
     _grant(auth_manager, [("GET", "DEPENDENCIES")])
-    auth_manager.assets_readable = False
+    setattr(auth_manager, denied, False)
 
     denial = plugin._authorize_tool_call(FakeUser(), "get_blast_radius", {"dag_id": "sales_summary"})
 
@@ -697,9 +761,29 @@ def test_a_tool_outside_the_policy_is_refused(auth_manager, args):
     assert "not a tool Airy is allowed to run" in denial
 
 
+def test_every_policy_tool_states_the_permissions_it_needs():
+    """A tool in the policy but not in the requirements is a KeyError, not a denial."""
+    for name in plugin.TOOL_POLICY:
+        assert plugin._tool_access_requirements(name, {})
+
+
+def test_clearing_demands_the_permission_airflow_asks_of_its_dry_run(auth_manager):
+    """Airflow's clearTaskInstances route gates the preview on PUT too, so both tools do."""
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    for name in ("plan_task_instance_clear", "apply_task_instance_clear"):
+        assert ("PUT", Entity.TASK_INSTANCE) in plugin._tool_access_requirements(name, {})
+
+
 def test_the_policy_is_the_only_source_of_write_tools():
     """WRITE_TOOLS is derived, so a new tool cannot be added without classifying it."""
-    assert {"fix_dag_code", "revert_dag_code", "rerun_dag", "run_backfill"} == plugin.WRITE_TOOLS
+    assert {
+        "apply_dag_code_changes",
+        "apply_task_instance_clear",
+        "revert_dag_code",
+        "rerun_dag",
+        "run_backfill",
+    } == plugin.WRITE_TOOLS
     assert all(plugin.TOOL_POLICY[name]["writes"] for name in plugin.WRITE_TOOLS)
 
 
@@ -799,7 +883,7 @@ async def test_dag_auth_toolset_runs_an_authorized_call(auth_manager):
 
 
 @pytest.mark.parametrize("can_write", [True, False])
-def test_gate_toolsets_authorizes_outside_the_approval_gate(can_write):
+def test_gate_toolsets_authorizes_outside_the_approval_gate(auth_manager, can_write):
     """Approval is asked for *inside* the auth wrapper, so /confirm re-checks it."""
     from pydantic_ai.toolsets import FunctionToolset
 
@@ -807,6 +891,24 @@ def test_gate_toolsets_authorizes_outside_the_approval_gate(can_write):
 
     assert type(gated).__name__ == "DagAuthToolset"
     assert gated.user.get_id() == "alice"
+
+
+@pytest.mark.parametrize(
+    ("granted", "expected"),
+    [
+        (
+            [("PUT", "TASK_INSTANCE"), ("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK")],
+            {"apply_task_instance_clear"},
+        ),
+        (FIX_ACCESS, {"apply_dag_code_changes", "revert_dag_code"}),
+    ],
+    ids=["clear-only", "source-only"],
+)
+def test_writable_tools_offers_each_write_on_its_own_permission(auth_manager, granted, expected):
+    """Clearing a task instance and rewriting a Dag file are not the same right."""
+    auth_manager.allowed = {(method, entity, None, None) for method, entity in granted}
+
+    assert plugin._writable_tools(FakeUser()) == expected
 
 
 def test_confirm_endpoint_resumes_with_the_requesting_user(client, monkeypatch, pending_store):
@@ -983,7 +1085,7 @@ async def test_a_write_that_never_reported_back_is_streamed_as_unsettled(monkeyp
     """The stream ended tidily, but the write never returned a clean result."""
 
     async def no_result(*args, **kwargs):
-        yield {"type": "tool", "id": "c1", "name": "fix_dag_code"}
+        yield {"type": "tool", "id": "c1", "name": "apply_dag_code_changes"}
         yield {"type": "text", "delta": "hmm"}
 
     monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (object(), None))
@@ -999,7 +1101,7 @@ async def test_a_write_that_never_reported_back_is_streamed_as_unsettled(monkeyp
 @pytest.mark.asyncio
 async def test_a_settled_write_is_not_streamed_as_unsettled(monkeypatch, pending_store):
     async def clean(*args, **kwargs):
-        yield {"type": "tool", "id": "c1", "name": "fix_dag_code"}
+        yield {"type": "tool", "id": "c1", "name": "apply_dag_code_changes"}
         yield {"type": "tool_result", "id": "c1", "failed": False}
 
     monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (object(), None))
@@ -1067,9 +1169,11 @@ class FakeDeferredStream:
     """An agent stream that requests approval for a write tool, then ends."""
 
     def __init__(self):
-        approvals = [ToolCallPart(tool_name="fix_dag_code", args={"dag_id": "d"}, tool_call_id="c9")]
+        approvals = [
+            ToolCallPart(tool_name="apply_dag_code_changes", args={"dag_id": "d"}, tool_call_id="c9")
+        ]
         self._events = [
-            tool_call_event(name="fix_dag_code", call_id="c9"),
+            tool_call_event(name="apply_dag_code_changes", call_id="c9"),
             SimpleNamespace(
                 event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=approvals)
             ),
@@ -1101,13 +1205,247 @@ async def test_run_and_stream_suspends_a_write_tool_behind_a_confirm_nonce(pendi
     assert payloads[0]["type"] == "tool"
     confirm = payloads[-1]
     assert confirm["type"] == "confirm_required"
-    assert confirm["tool"] == "fix_dag_code"
+    assert confirm["tool"] == "apply_dag_code_changes"
     assert confirm["call_id"] == "c9"
     pending = plugin._get_pending(confirm["nonce"])
     assert pending.user_id == "alice"
     assert pending.call_ids == ["c9"]
     # The resumed run needs the suspended run's full message history.
     assert pending.messages == ["m1", "m2"]
+
+
+class FakeRunStream:
+    """An agent stream replaying a fixed list of events."""
+
+    def __init__(self, events):
+        self._events = events
+
+    async def __aenter__(self):
+        async def gen():
+            for event in self._events:
+                yield event
+
+        return gen()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class ScriptedAgent:
+    """Answers each run from a queue of event lists, recording the prompts."""
+
+    def __init__(self, runs):
+        self.runs = list(runs)
+        self.prompts = []
+
+    def run_stream_events(self, user_prompt=None, **kwargs):
+        self.prompts.append(user_prompt)
+        return FakeRunStream(self.runs.pop(0) if self.runs else [])
+
+
+def plan_result_event(tool="plan_dag_code_changes", content=None):
+    return FunctionToolResultEvent(
+        part=ToolReturnPart(
+            tool_name=tool,
+            content=content if content is not None else {"planned": True, "plan_token": "t0k3n"},
+            tool_call_id="p1",
+        )
+    )
+
+
+def run_result_event(messages=("m1",)):
+    return SimpleNamespace(
+        event_kind="agent_run_result", result=SimpleNamespace(all_messages=lambda: list(messages))
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_plan_the_model_only_narrated_is_corrected_once(monkeypatch):
+    """A plan followed by prose and no card is the failure this closes."""
+    agent = ScriptedAgent(
+        [
+            [plan_result_event(), text_delta_event("Proceeding with the fix..."), run_result_event()],
+            [text_delta_event("Sorry — proposing it now.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    payloads = [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert agent.prompts[0] == "fix it"
+    assert "did not propose it" in agent.prompts[1]
+    assert payloads[-1] == {"type": "text", "delta": "Sorry — proposing it now."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("events", "label"),
+    [
+        ([plan_result_event(content={"planned": False, "error": "blocked"}), run_result_event()], "no token"),
+        ([text_delta_event("here is why it failed"), run_result_event()], "no plan"),
+    ],
+)
+async def test_no_correction_when_there_was_nothing_to_propose(monkeypatch, events, label):
+    agent = ScriptedAgent([events])
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("why?", user_id="alice")]
+
+    assert agent.prompts == ["why?"]
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_run_that_narrates_its_next_plan_is_corrected_too(monkeypatch):
+    """A fix-then-re-run turn plans the second change after the first is approved."""
+    approved_write = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="apply_dag_code_changes", content={"applied": True}, tool_call_id="c1")
+    )
+    agent = ScriptedAgent(
+        [
+            [
+                approved_write,
+                plan_result_event(tool="plan_backfill"),
+                text_delta_event("Now backfilling..."),
+                run_result_event(),
+            ],
+            [text_delta_event("Proposing the backfill.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+    pending = plugin._PendingApproval("alice", ["c1"], ["m1"], None, 0.0)
+
+    payloads = [p async for p in plugin._resume_agent(pending, approved=True)]
+
+    assert "did not propose it" in agent.prompts[1]
+    assert payloads[-1] == {"type": "text", "delta": "Proposing the backfill."}
+    # The replay of this nonce has to show the correction as well.
+    assert pending.frames[-1] == payloads[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_write_proposed_without_its_token_is_corrected(monkeypatch, pending_store):
+    """A card the tool can only refuse spends the user's decision on nothing."""
+    tokenless = [ToolCallPart(tool_name="apply_dag_code_changes", args={"dag_id": "d"}, tool_call_id="c9")]
+    agent = ScriptedAgent(
+        [
+            [
+                plan_result_event(),
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=tokenless)
+                ),
+                run_result_event(),
+            ],
+            [text_delta_event("Re-proposing with the token.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert "without the plan_token" in agent.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_no_correction_when_the_write_was_actually_proposed(monkeypatch, pending_store):
+    approvals = [
+        ToolCallPart(
+            tool_name="apply_dag_code_changes",
+            args={"dag_id": "d", "plan_token": "t0k3n"},
+            tool_call_id="c9",
+        )
+    ]
+    agent = ScriptedAgent(
+        [
+            [
+                plan_result_event(),
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=approvals)
+                ),
+                run_result_event(),
+            ]
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    payloads = [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert agent.prompts == ["fix it"]
+    assert payloads[-1]["type"] == "confirm_required"
+
+
+CLEARED = {
+    "cleared": True,
+    "mutation_applied": True,
+    "ui_updates": [
+        {"kind": "task_instances", "dag_id": "sales_summary", "dag_run_id": "manual__1"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("tool", "content"),
+    [
+        ("apply_task_instance_clear", CLEARED),
+        ("apply_task_instance_clear", json.dumps(CLEARED)),
+    ],
+    ids=["dict", "json_string"],
+)
+def test_resource_changed_frame_carries_a_landed_write(tool, content):
+    assert plugin._resource_changed_frame(tool, content) == {
+        "type": "resource_changed",
+        "updates": CLEARED["ui_updates"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool", "content"),
+    [
+        # Never for a read tool, whatever it claims.
+        ("diagnose_dag", CLEARED),
+        # Never for a write that did not land...
+        ("apply_task_instance_clear", {"mutation_applied": False, "ui_updates": CLEARED["ui_updates"]}),
+        ("rerun_dag", {"triggered": False, "ui_updates": CLEARED["ui_updates"]}),
+        # ...nor for one that landed but names nothing to refresh.
+        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": []}),
+        # Nor for updates the browser has no handler for, or that name no Dag.
+        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": [{"kind": "everything"}]}),
+        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": [{"kind": "dag_run"}]}),
+        ("apply_task_instance_clear", "not json at all"),
+    ],
+    ids=["read_tool", "not_applied", "not_triggered", "no_updates", "unknown_kind", "no_dag", "not_json"],
+)
+def test_resource_changed_frame_stays_silent_when_nothing_landed(tool, content):
+    assert plugin._resource_changed_frame(tool, content) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denied", [False, True], ids=["settled", "denied"])
+async def test_run_and_stream_emits_the_refresh_only_after_a_clean_write(denied):
+    """The frame is what tells the open Dag view to refetch; a denial changed nothing."""
+    content = plugin._DENIAL_MESSAGE if denied else CLEARED
+
+    class FakeStream:
+        async def __aenter__(self):
+            async def gen():
+                yield FunctionToolResultEvent(
+                    part=ToolReturnPart(
+                        tool_name="apply_task_instance_clear", content=content, tool_call_id="c1"
+                    )
+                )
+
+            return gen()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeAgent:
+        def run_stream_events(self, *args, **kwargs):
+            return FakeStream()
+
+    payloads = [p async for p in plugin._run_and_stream(FakeAgent(), user_id="alice", page_url="/x")]
+
+    expected = ["tool_result"] if denied else ["tool_result", "resource_changed"]
+    assert [p["type"] for p in payloads] == expected
 
 
 def _injected_client(response_headers=None, content="<html><body>hi</body></html>"):
