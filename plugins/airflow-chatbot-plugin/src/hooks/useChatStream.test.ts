@@ -749,6 +749,83 @@ describe("useChat streaming", () => {
     });
   });
 
+  describe("retrying a failed turn", () => {
+    it("re-asks exactly that question, with the failed pair out of history", async () => {
+      const fetchMock = mockFetch(
+        streamingResponse([frame({ delta: "one", type: "text" }), frame({ type: "done" })]),
+      );
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("first");
+      });
+
+      fetchMock.mockRejectedValueOnce(new Error("Failed to fetch"));
+      await act(async () => {
+        await result.current.sendMessage("the failed question");
+      });
+      const failedId = result.current.messages[3]?.id ?? "";
+      expect(result.current.messages[3]?.isError).toBe(true);
+
+      fetchMock.mockReturnValue(
+        Promise.resolve(streamingResponse([frame({ delta: "ok", type: "text" }), frame({ type: "done" })])),
+      );
+      await act(async () => {
+        await result.current.retryMessage(failedId);
+      });
+
+      const body = JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body));
+      expect(body.message).toBe("the failed question");
+      // Neither the question that failed nor the synthetic error goes back.
+      expect(body.history).toEqual([
+        { content: "first", role: "user" },
+        { content: "one", role: "assistant" },
+      ]);
+      expect(result.current.messages).toHaveLength(6);
+      expect(result.current.messages[5]?.content).toBe("ok");
+    });
+
+    it("re-asks the question that failed, not the newest one on screen", async () => {
+      // A confirmation resumes into an older bubble, so "the last user message"
+      // is the wrong anchor.
+      const fetchMock = mockFetch(
+        streamingResponse([frame({ delta: "one", type: "text" }), frame({ type: "done" })]),
+      );
+
+      const { result } = renderHook(() => useChat());
+      fetchMock.mockRejectedValueOnce(new Error("Failed to fetch"));
+      await act(async () => {
+        await result.current.sendMessage("the old broken question");
+      });
+      const failedId = result.current.messages[1]?.id ?? "";
+
+      fetchMock.mockReturnValue(
+        Promise.resolve(streamingResponse([frame({ delta: "two", type: "text" }), frame({ type: "done" })])),
+      );
+      await act(async () => {
+        await result.current.sendMessage("a newer, unrelated question");
+      });
+      await act(async () => {
+        await result.current.retryMessage(failedId);
+      });
+
+      expect(JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).message).toBe(
+        "the old broken question",
+      );
+    });
+
+    it("does nothing for a message that is not there", async () => {
+      const fetchMock = mockFetch(streamingResponse([frame({ type: "done" })]));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.retryMessage("nope");
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("clears the conversation", async () => {
     mockFetch(streamingResponse([frame({ delta: "hi", type: "text" }), frame({ type: "done" })]));
 

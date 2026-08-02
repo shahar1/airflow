@@ -49,10 +49,37 @@ interface MessageListProps {
   readonly streamingId?: string | null;
   readonly onSuggestionClick?: (text: string) => void;
   readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
+  readonly onRetry?: (errorMessageId: string) => void;
 }
 
 /** Distance from the bottom still counted as "following the stream". */
 const AT_BOTTOM_SLACK_PX = 80;
+
+// Not anchored at the start: Airflow is often served below a URL prefix, so
+// `/prod/dags/sales_summary/grid` has to match as readily as `/dags/…`.
+const DAG_PATH_RE = /\/dags\/([^/?#]+)/u;
+
+const GENERIC_PROMPTS = ["How do I create a Dag?", "Explain task dependencies", "Debug a failed task"];
+
+/** The Dag the user is looking at, or nothing if the path does not name one. */
+export const dagIdFromPath = (pathname: string): string | undefined => {
+  const raw = DAG_PATH_RE.exec(pathname)?.[1];
+  if (raw === undefined) return undefined;
+  try {
+    // A percent sign that is not an escape throws rather than yielding a lie.
+    const decoded = decodeURIComponent(raw).trim();
+    return decoded === "" ? undefined : decoded;
+  } catch {
+    return undefined;
+  }
+};
+
+export const buildPrompts = (pathname: string): string[] => {
+  const dagId = dagIdFromPath(pathname);
+  return dagId === undefined
+    ? GENERIC_PROMPTS
+    : [`Why did ${dagId} fail?`, `Check ${dagId} for warnings`, `Summarise recent runs of ${dagId}`];
+};
 
 /**
  * Message list component displaying chat history.
@@ -64,6 +91,7 @@ export const MessageList: FC<MessageListProps> = ({
   isLoading = false,
   messages,
   onConfirmClick,
+  onRetry,
   onSuggestionClick,
   streamingId,
 }) => {
@@ -116,9 +144,11 @@ export const MessageList: FC<MessageListProps> = ({
             </Text>
           </VStack>
           <VStack gap={2} mt={4} width="100%">
-            <SuggestionChip onClick={onSuggestionClick}>How do I create a Dag?</SuggestionChip>
-            <SuggestionChip onClick={onSuggestionClick}>Explain task dependencies</SuggestionChip>
-            <SuggestionChip onClick={onSuggestionClick}>Debug a failed task</SuggestionChip>
+            {buildPrompts(globalThis.location.pathname).map((prompt) => (
+              <SuggestionChip key={prompt} onClick={onSuggestionClick}>
+                {prompt}
+              </SuggestionChip>
+            ))}
           </VStack>
         </VStack>
       </Flex>
@@ -160,6 +190,7 @@ export const MessageList: FC<MessageListProps> = ({
                 // Chips do nothing while a stream is in flight, so don't offer them.
                 onActionClick={isLoading ? undefined : onSuggestionClick}
                 onConfirmClick={isLoading ? undefined : onConfirmClick}
+                onRetry={isLoading || !canRetry(messages, index) ? undefined : onRetry}
               />
             );
           })}
@@ -215,7 +246,25 @@ interface MessageBubbleProps {
   readonly isStreaming?: boolean;
   readonly onActionClick?: (text: string) => void;
   readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
+  readonly onRetry?: (errorMessageId: string) => void;
 }
+
+/**
+ * Whether re-asking this failed turn is safe and possible.
+ *
+ * Not after a mutation: an approved write, or a write that got past the
+ * proposal, may have changed the Dag already.  Recovery from that starts as a
+ * fresh request and passes through a new approval, not a silent replay.
+ */
+export const canRetry = (messages: Message[], index: number): boolean => {
+  const message = messages[index];
+  if (message?.isError !== true || message.role !== "assistant") return false;
+  if (message.confirms?.some((confirm) => confirm.resolution === "approved")) return false;
+  if (message.tools?.some((tool) => WRITE_EFFECTS[tool.name] && !UNSTARTED.has(buildToolStatus(tool)))) {
+    return false;
+  }
+  return messages.slice(0, index).some((earlier) => earlier.role === "user");
+};
 
 const DIFF_LANG_RE = /\blanguage-diff\b/u;
 
@@ -290,7 +339,7 @@ const isBlank = (message?: Message, streaming = false): boolean => {
 };
 
 const MessageBubble: FC<MessageBubbleProps> = memo(
-  ({ isStreaming = false, message, onActionClick, onConfirmClick }) => {
+  ({ isStreaming = false, message, onActionClick, onConfirmClick, onRetry }) => {
     const { colorMode } = useColorMode();
     const isDark = colorMode === "dark";
     const { actions, text } = splitActions(message.content, isStreaming);
@@ -363,6 +412,9 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
           {groupConfirmsByNonce(confirms).map((group) => (
             <ConfirmPanel key={group[0]?.nonce} confirms={group} onDecide={onConfirmClick} />
           ))}
+          {onRetry !== undefined && (
+            <SuggestionChip onClick={() => onRetry(message.id)}>Retry</SuggestionChip>
+          )}
           {onActionClick !== undefined &&
             actions.map((action, index) => (
               <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
@@ -1165,6 +1217,7 @@ const markdownCss = (isDark: boolean) => ({
     padding: "0.1em 0.3em",
   },
   "& li": { listStyle: "revert" },
+  "& li > ul, & li > ol": { paddingLeft: "0.9em" },
   "& p, & ul, & ol, & pre, & table": { marginBottom: "0.5em" },
   "& pre": {
     background: isDark ? "rgba(0,0,0,0.35)" : "rgba(0,0,0,0.06)",

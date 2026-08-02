@@ -35,6 +35,7 @@ export const Chatbot: FC = () => {
     isLoading,
     messages,
     resolveConfirm,
+    retryMessage,
     sendMessage,
     stopResponse,
     streamingId,
@@ -58,6 +59,7 @@ export const Chatbot: FC = () => {
         messages={messages}
         onSendMessage={sendMessage}
         onConfirmClick={resolveConfirm}
+        onRetry={retryMessage}
         isLoading={isLoading}
         canStop={canStop}
         isApplyingChange={isApplyingChange}

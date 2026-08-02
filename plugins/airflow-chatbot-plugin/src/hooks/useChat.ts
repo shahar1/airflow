@@ -204,6 +204,16 @@ export const applyEvent = (
   }
 };
 
+/** Index of the user turn an errored assistant message was answering. */
+export const findAskedIndex = (messages: Message[], errorMessageId: string): number | undefined => {
+  const failedIndex = messages.findIndex((m) => m.id === errorMessageId);
+  if (failedIndex < 0) return undefined;
+  for (let index = failedIndex - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user") return index;
+  }
+  return undefined;
+};
+
 /** Map an HTTP failure to a message the user can act on. */
 const errorForResponse = async (response: Response): Promise<Error> => {
   if (response.status === 401) {
@@ -449,6 +459,27 @@ export const useChat = () => {
     [runTurn],
   );
 
+  /**
+   * Re-ask the question behind one failed answer.
+   *
+   * Located by the errored message's own id, never by "the last user message":
+   * a confirmation stream resumes into an older bubble, so the newest question
+   * may belong to an entirely different turn.
+   */
+  const retryMessage = useCallback(
+    async (errorMessageId: string) => {
+      const messages = messagesRef.current;
+      const askedIndex = findAskedIndex(messages, errorMessageId);
+      if (askedIndex === undefined) return;
+      const asked = messages[askedIndex];
+      if (!asked) return;
+      // History stops before the failed pair: the question is being asked again
+      // as this turn, and the synthetic error was never Airy's answer.
+      return runTurn(asked.content, toHistory(messages.slice(0, askedIndex)));
+    },
+    [runTurn],
+  );
+
   /** Hang up on a stoppable stream; an approved mutation is never stoppable. */
   const stopResponse = useCallback(() => {
     abortRef.current?.abort();
@@ -550,6 +581,7 @@ export const useChat = () => {
     isLoading,
     messages,
     resolveConfirm,
+    retryMessage,
     sendMessage,
     stopResponse,
     streamingId,
