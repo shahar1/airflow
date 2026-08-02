@@ -75,6 +75,7 @@ class ChatRequest(BaseModel):
 
     message: str = Field(..., min_length=1)
     history: list[dict[str, str]] = Field(default_factory=list)
+    page_url: str | None = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -175,7 +176,7 @@ def _create_chatbot_api() -> dict[str, Any]:
 
         async def frames() -> AsyncIterator[str]:
             try:
-                async for payload in _stream_agent(body.message, body.history):
+                async for payload in _stream_agent(body.message, body.history, body.page_url):
                     yield f"data: {json.dumps(payload)}\n\n"
             except Exception as e:
                 log.exception("Airy chat endpoint error")
@@ -215,6 +216,11 @@ up real data instead of giving generic advice.  For example, if a user asks
 before answering.
 
 Keep answers concise and actionable.  Use Markdown formatting.
+
+**Page context.**  The system prompt may end with a `Current page:` line — the
+path the user is looking at right now.  Use it to resolve words like "this"
+and "here": `/dags/sales_summary/grid` means questions are about the
+`sales_summary` Dag unless the user says otherwise.
 
 **Self-healing.**  You can diagnose a broken Dag (`diagnose_dag`), patch its
 source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Work one step at
@@ -330,7 +336,17 @@ def _root_cause(exc: BaseException) -> BaseException:
     return exc
 
 
-def _build_agent() -> tuple[Any, str | None]:
+def _render_system_prompt(page_url: str | None) -> str:
+    """Tell Airy which page the user is on, so "this" and "here" resolve."""
+    if not page_url:
+        return _SYSTEM_PROMPT
+    # The value comes from the browser: keep it one line and bounded before it
+    # joins the highest-trust part of the conversation.
+    page = page_url.replace("\n", " ").replace("\r", " ")[:500]
+    return f"{_SYSTEM_PROMPT}\nCurrent page: {page}\n"
+
+
+def _build_agent(page_url: str | None = None) -> tuple[Any, str | None]:
     """Return ``(agent, None)``, or ``(None, markdown)`` explaining what is missing."""
     api_key = _get_llm_api_key()
     if not api_key:
@@ -361,7 +377,7 @@ def _build_agent() -> tuple[Any, str | None]:
         except ImportError:
             log.exception("pydantic-ai MCP extra missing — Airy is running without any tools")
 
-    return Agent(model=model, system_prompt=_SYSTEM_PROMPT, toolsets=toolsets), None
+    return Agent(model=model, system_prompt=_render_system_prompt(page_url), toolsets=toolsets), None
 
 
 def _to_message_history(history: list[dict[str, str]] | None) -> list[Any]:
@@ -411,10 +427,10 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
 
 
 async def _stream_agent(
-    message: str, history: list[dict[str, str]] | None = None
+    message: str, history: list[dict[str, str]] | None = None, page_url: str | None = None
 ) -> AsyncIterator[dict[str, Any]]:
     """Run the agent, yielding tool calls and text as they happen."""
-    agent, problem = _build_agent()
+    agent, problem = _build_agent(page_url)
     if problem:
         yield {"type": "text", "delta": problem}
         return

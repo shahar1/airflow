@@ -217,7 +217,11 @@ export const useChat = () => {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ message: content, history }),
+          body: JSON.stringify({
+            history,
+            message: content,
+            page_url: globalThis.location.pathname,
+          }),
         });
 
         if (!response.ok || !response.body) {
