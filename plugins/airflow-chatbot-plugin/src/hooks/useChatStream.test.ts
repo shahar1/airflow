@@ -229,6 +229,46 @@ describe("useChat streaming", () => {
     expect(result.current.isLoading).toBe(false);
   });
 
+  it.each([
+    [401, "session has expired"],
+    [403, "permission to use Airy"],
+  ])("explains a %i in the user's terms", async (status, text) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        json: () => Promise.resolve({ detail: "Forbidden" }),
+        ok: false,
+        status,
+      } as unknown as Response),
+    );
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("hi");
+    });
+
+    expect(result.current.messages[1]?.content).toContain(text);
+    expect(result.current.messages[1]?.isError).toBe(true);
+  });
+
+  it("surfaces a FastAPI detail body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        json: () => Promise.resolve({ detail: "boom" }),
+        ok: false,
+        status: 422,
+      } as unknown as Response),
+    );
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("hi");
+    });
+
+    expect(result.current.messages[1]?.content).toBe("**Error:** boom");
+  });
+
   it("says something rather than nothing when the reply is empty", async () => {
     mockFetch(streamingResponse([frame({ type: "done" })]));
 

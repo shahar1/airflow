@@ -152,7 +152,9 @@ async def test_stream_agent_surfaces_the_root_cause_of_a_failure(monkeypatch):
         def run_stream_events(self, *args, **kwargs):
             raise _EXC_GROUP("tg", [ConnectionError("mcp sidecar is gone")])
 
-    monkeypatch.setattr(plugin, "_build_agent", lambda page_url=None: (ExplodingAgent(), None))
+    monkeypatch.setattr(
+        plugin, "_build_agent", lambda page_url=None, can_write=False: (ExplodingAgent(), None)
+    )
 
     payloads = [p async for p in plugin._stream_agent("hi")]
 
@@ -165,8 +167,17 @@ def test_render_system_prompt_appends_the_page_line():
     assert rendered.startswith(plugin._SYSTEM_PROMPT)
 
 
-def test_render_system_prompt_without_a_page_is_unchanged():
-    assert plugin._render_system_prompt(None) == plugin._SYSTEM_PROMPT
+def test_render_system_prompt_advertises_writes_only_to_editors():
+    writable = plugin._render_system_prompt(None, can_write=True)
+    read_only = plugin._render_system_prompt(None, can_write=False)
+
+    assert "fix_dag_code" in writable
+    assert "Read-only access" not in writable
+    assert "fix_dag_code" not in read_only
+    assert "Read-only access" in read_only
+    # Both modes keep the follow-up button protocol.
+    assert "[ACTION:" in writable
+    assert "[ACTION:" in read_only
 
 
 def test_render_system_prompt_bounds_hostile_input():
@@ -176,13 +187,27 @@ def test_render_system_prompt_bounds_hostile_input():
     assert len(page_line) <= 501
 
 
+class FakeUser:
+    """Stands in for a BaseUser resolved by security.get_user."""
+
+    def get_id(self):
+        return "alice"
+
+
 @pytest.fixture
-def client():
-    return TestClient(plugin._create_chatbot_api()["app"])
+def client(monkeypatch):
+    from airflow.api_fastapi.core_api import security
+
+    app = plugin._create_chatbot_api()["app"]
+    # requires_authenticated() and Depends(get_user) both resolve through
+    # get_user, so one override authenticates every route.
+    app.dependency_overrides[security.get_user] = FakeUser
+    monkeypatch.setattr(plugin, "_user_can_write", lambda user: True)
+    return TestClient(app)
 
 
 def test_chat_endpoint_streams_sse_frames_and_always_terminates(client, monkeypatch):
-    async def fake_stream(message, history=None, page_url=None):
+    async def fake_stream(message, history=None, page_url=None, *, can_write=False):
         yield {"type": "tool", "id": "c1", "name": "diagnose_dag", "args": {}}
         yield {"type": "tool_result", "id": "c1", "name": "diagnose_dag"}
         yield {"type": "text", "delta": "Task summarize failed."}
@@ -204,7 +229,7 @@ def test_chat_endpoint_streams_sse_frames_and_always_terminates(client, monkeypa
 def test_chat_endpoint_disables_proxy_buffering(client, monkeypatch):
     # Without these a buffering proxy holds every frame until the end, which
     # silently undoes the whole point of streaming.
-    async def fake_stream(message, history=None, page_url=None):
+    async def fake_stream(message, history=None, page_url=None, *, can_write=False):
         yield {"type": "text", "delta": "hi"}
 
     monkeypatch.setattr(plugin, "_stream_agent", fake_stream)
@@ -216,7 +241,7 @@ def test_chat_endpoint_disables_proxy_buffering(client, monkeypatch):
 
 
 def test_chat_endpoint_reports_a_mid_stream_failure_then_terminates(client, monkeypatch):
-    async def exploding_stream(message, history=None, page_url=None):
+    async def exploding_stream(message, history=None, page_url=None, *, can_write=False):
         yield {"type": "text", "delta": "starting"}
         raise RuntimeError("stream died")
 
@@ -260,7 +285,7 @@ def test_injected_script_survives_a_missing_bundle(monkeypatch, tmp_path):
 def test_chat_endpoint_forwards_the_page_url(client, monkeypatch):
     seen = {}
 
-    async def capturing_stream(message, history=None, page_url=None):
+    async def capturing_stream(message, history=None, page_url=None, *, can_write=False):
         seen["page_url"] = page_url
         yield {"type": "text", "delta": "ok"}
 
@@ -276,6 +301,54 @@ def test_chat_endpoint_forwards_the_page_url(client, monkeypatch):
 
 def test_chat_endpoint_rejects_an_empty_message(client):
     assert client.post("/chat", json={"message": "   "}).status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("post", "/chat"), ("get", "/health"), ("get", "/bundle"), ("get", "/")],
+)
+def test_routes_reject_unauthenticated_requests(method, path):
+    client = TestClient(plugin._create_chatbot_api()["app"])
+    kwargs = {"json": {"message": "hi"}} if method == "post" else {}
+
+    assert getattr(client, method)(path, **kwargs).status_code == 401
+
+
+@pytest.mark.parametrize("can_write", [True, False])
+def test_chat_endpoint_passes_the_user_write_permission_to_the_agent(client, monkeypatch, can_write):
+    seen = {}
+
+    async def capturing_stream(message, history=None, page_url=None, *, can_write=False):
+        seen["can_write"] = can_write
+        yield {"type": "text", "delta": "ok"}
+
+    monkeypatch.setattr(plugin, "_stream_agent", capturing_stream)
+    monkeypatch.setattr(plugin, "_user_can_write", lambda user: can_write)
+
+    with client.stream("POST", "/chat", json={"message": "hi"}) as response:
+        response.read()
+
+    assert seen["can_write"] is can_write
+
+
+def test_gate_toolsets_filters_write_tools_for_viewers():
+    from pydantic_ai.toolsets import FilteredToolset, FunctionToolset
+
+    toolset = FunctionToolset()
+    (gated,) = plugin._gate_toolsets([toolset], can_write=False)
+
+    assert isinstance(gated, FilteredToolset)
+    for name in plugin.WRITE_TOOLS:
+        assert gated.filter_func(None, SimpleNamespace(name=name)) is False
+    assert gated.filter_func(None, SimpleNamespace(name="diagnose_dag")) is True
+
+
+def test_gate_toolsets_leaves_editors_unrestricted():
+    from pydantic_ai.toolsets import FunctionToolset
+
+    toolset = FunctionToolset()
+
+    assert plugin._gate_toolsets([toolset], can_write=True) == [toolset]
 
 
 def _injected_client(response_headers=None, content="<html><body>hi</body></html>"):

@@ -257,8 +257,19 @@ export const useChat = () => {
         });
 
         if (!response.ok || !response.body) {
+          if (response.status === 401) {
+            throw new Error(
+              "Your Airflow session has expired — sign in again to keep chatting.",
+            );
+          }
+          if (response.status === 403) {
+            throw new Error("You don't have permission to use Airy.");
+          }
           const errBody = await response.json().catch(() => null);
-          throw new Error(errBody?.error ?? `Server error (${response.status})`);
+          // FastAPI errors arrive as {detail}, our own as {error}.
+          throw new Error(
+            errBody?.error ?? errBody?.detail ?? `Server error (${response.status})`,
+          );
         }
 
         const reader = response.body.getReader();
