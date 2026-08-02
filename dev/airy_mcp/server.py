@@ -271,9 +271,84 @@ def rerun_dag(dag_id: str) -> dict[str, Any]:
     return {"dag_id": dag_id, "dag_run_id": run["dag_run_id"], "state": run["state"]}
 
 
+def _run_version(run: dict[str, Any]) -> int | None:
+    """The Dag version a run executed with — the last entry is the one in effect."""
+    versions = run.get("dag_versions") or []
+    return versions[-1].get("version_number") if versions else None
+
+
+def compare_dag_runs(dag_id: str, run_a: str, run_b: str) -> dict[str, Any]:
+    """
+    Compare two runs of a Dag: per-task duration changes, conf differences,
+    and — when the runs executed different Dag versions — the source diff.
+
+    Answers "was it my change?" after a run that used to work starts failing.
+    """
+    summaries: dict[str, dict[str, Any]] = {}
+    durations: dict[str, dict[str, float | None]] = {}
+    for label, run_id in (("run_a", run_a), ("run_b", run_b)):
+        run_path = f"/dagRuns/{quote(run_id, safe='')}"
+        run = _api("GET", _dag_url(dag_id, run_path))
+        tis = _api("GET", _dag_url(dag_id, f"{run_path}/taskInstances"))["task_instances"]
+        summaries[label] = {
+            "dag_run_id": run_id,
+            "state": run.get("state"),
+            "duration": run.get("duration"),
+            "version": _run_version(run),
+            "conf": run.get("conf") or {},
+        }
+        durations[label] = {ti["task_id"]: ti.get("duration") for ti in tis}
+
+    task_durations = []
+    for task_id in sorted(set(durations["run_a"]) | set(durations["run_b"])):
+        a, b = durations["run_a"].get(task_id), durations["run_b"].get(task_id)
+        task_durations.append(
+            {
+                "task_id": task_id,
+                "run_a": a,
+                "run_b": b,
+                "delta": round(b - a, 3) if a is not None and b is not None else None,
+            }
+        )
+
+    conf_a, conf_b = summaries["run_a"].pop("conf"), summaries["run_b"].pop("conf")
+    conf_changes = {
+        key: {"run_a": conf_a.get(key), "run_b": conf_b.get(key)}
+        for key in sorted(set(conf_a) | set(conf_b))
+        if conf_a.get(key) != conf_b.get(key)
+    }
+
+    ver_a, ver_b = summaries["run_a"]["version"], summaries["run_b"]["version"]
+    source_diff = None
+    if ver_a is not None and ver_b is not None and ver_a != ver_b:
+        sources = {
+            ver: _api("GET", f"/dagSources/{quote(dag_id, safe='')}", params={"version_number": ver})[
+                "content"
+            ]
+            for ver in (ver_a, ver_b)
+        }
+        source_diff = "".join(
+            difflib.unified_diff(
+                sources[ver_a].splitlines(keepends=True),
+                sources[ver_b].splitlines(keepends=True),
+                f"{dag_id} v{ver_a}",
+                f"{dag_id} v{ver_b}",
+            )
+        )
+
+    return {
+        "dag_id": dag_id,
+        "run_a": summaries["run_a"],
+        "run_b": summaries["run_b"],
+        "task_durations": task_durations,
+        "conf_changes": conf_changes,
+        "source_diff": source_diff,
+    }
+
+
 # Registered here rather than with @mcp.tool so the module keeps exporting plain
 # functions — directly callable from tests.
-for _tool in (diagnose_dag, fix_dag_code, revert_dag_code, rerun_dag):
+for _tool in (diagnose_dag, compare_dag_runs, fix_dag_code, revert_dag_code, rerun_dag):
     mcp.tool(_tool)
 
 

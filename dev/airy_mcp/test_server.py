@@ -48,6 +48,10 @@ class FakeAirflow:
         self.log: object = ""
         self.calls: list[tuple[str, str]] = []
         self.payloads: list[object] = []
+        self.params: list[object] = []
+        self.runs_by_id: dict[str, dict] = {}
+        self.tis_by_run: dict[str, list] = {}
+        self.sources_by_version: dict[int, str] = {}
         self.bump_version_on_reparse = True
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
@@ -55,8 +59,18 @@ class FakeAirflow:
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path))
         self.payloads.append(kwargs.get("json"))
+        self.params.append(kwargs.get("params"))
         if "headers" in kwargs:
             raise TypeError("_api() got multiple values for keyword argument 'headers'")
+        for run_id, run in self.runs_by_id.items():
+            quoted = f"/dagRuns/{run_id}"
+            if path == f"/dags/{DAG_ID}{quoted}":
+                return run
+            if path == f"/dags/{DAG_ID}{quoted}/taskInstances":
+                return {"task_instances": self.tis_by_run.get(run_id, [])}
+        if path == f"/dagSources/{DAG_ID}":
+            version = kwargs["params"]["version_number"]
+            return {"content": self.sources_by_version[version], "version_number": version}
         if path == f"/dags/{DAG_ID}":
             if method == "PATCH":
                 self.is_paused = kwargs["json"]["is_paused"]
@@ -286,6 +300,80 @@ def test_revert_dag_code_without_a_backup(airflow):
 
     assert result["reverted"] is False
     assert "no backup" in result["error"]
+
+
+def seed_two_runs(airflow):
+    airflow.runs_by_id = {
+        "old": {
+            "state": "success",
+            "duration": 30.0,
+            "conf": {"column": "amount"},
+            "dag_versions": [{"version_number": 1}],
+        },
+        "new": {
+            "state": "failed",
+            "duration": 45.0,
+            "conf": {"column": "ammount", "retries": 2},
+            "dag_versions": [{"version_number": 1}, {"version_number": 2}],
+        },
+    }
+    airflow.tis_by_run = {
+        "old": [
+            {"task_id": "extract", "duration": 1.0},
+            {"task_id": "summarize", "duration": 4.0},
+        ],
+        "new": [
+            {"task_id": "extract", "duration": 1.5},
+            {"task_id": "summarize", "duration": None},
+        ],
+    }
+    airflow.sources_by_version = {
+        1: 'op_kwargs={"column": "amount"}\n',
+        2: 'op_kwargs={"column": "ammount"}\n',
+    }
+
+
+def test_compare_dag_runs_reports_duration_deltas(airflow):
+    seed_two_runs(airflow)
+
+    result = server.compare_dag_runs(DAG_ID, "old", "new")
+
+    assert result["task_durations"] == [
+        {"task_id": "extract", "run_a": 1.0, "run_b": 1.5, "delta": 0.5},
+        {"task_id": "summarize", "run_a": 4.0, "run_b": None, "delta": None},
+    ]
+    assert result["run_a"]["state"] == "success"
+    assert result["run_b"]["state"] == "failed"
+
+
+def test_compare_dag_runs_reports_conf_changes_only(airflow):
+    seed_two_runs(airflow)
+
+    changes = server.compare_dag_runs(DAG_ID, "old", "new")["conf_changes"]
+
+    assert changes == {
+        "column": {"run_a": "amount", "run_b": "ammount"},
+        "retries": {"run_a": None, "run_b": 2},
+    }
+
+
+def test_compare_dag_runs_diffs_the_source_between_versions(airflow):
+    seed_two_runs(airflow)
+
+    diff = server.compare_dag_runs(DAG_ID, "old", "new")["source_diff"]
+
+    assert '-op_kwargs={"column": "amount"}' in diff
+    assert '+op_kwargs={"column": "ammount"}' in diff
+
+
+def test_compare_dag_runs_skips_the_diff_when_versions_match(airflow):
+    seed_two_runs(airflow)
+    airflow.runs_by_id["new"]["dag_versions"] = [{"version_number": 1}]
+
+    result = server.compare_dag_runs(DAG_ID, "old", "new")
+
+    assert result["source_diff"] is None
+    assert not any("/dagSources/" in path for _, path in airflow.calls)
 
 
 def test_rerun_dag_unpauses_first(airflow):
