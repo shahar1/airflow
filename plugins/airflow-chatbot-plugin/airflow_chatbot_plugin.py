@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -94,12 +94,20 @@ def _get_base_url_path(path: str) -> str:
 
 def _create_chatbot_api() -> dict[str, Any]:
     """Create the FastAPI app for serving chatbot static files and API."""
+    # Function-local so processes that import the plugin module without serving
+    # the API (workers, dag processor) don't pull in the API stack.
+    from airflow.api_fastapi.core_api import security
+
     app = FastAPI(
         title="Airflow Chatbot",
         description="LLM-powered chatbot assistant for Apache Airflow",
+        # Every route needs a logged-in Airflow user: /health leaks MCP topology
+        # and /chat drives the MCP tools.
+        dependencies=[Depends(security.requires_authenticated())],
     )
 
-    # Mount static files if the dist directory exists
+    # Mount static files if the dist directory exists.  Mounts bypass FastAPI
+    # dependencies, which is fine here: the bundle is public JS with no secrets.
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="chatbot_static")
 
@@ -162,7 +170,7 @@ def _create_chatbot_api() -> dict[str, Any]:
         return JSONResponse({"error": "Bundle not found"}, status_code=404)
 
     @app.post("/chat")
-    async def chat_endpoint(body: ChatRequest):
+    async def chat_endpoint(body: ChatRequest, user=Depends(security.get_user)):
         """
         Chat endpoint — server-sent events.
 
@@ -174,9 +182,13 @@ def _create_chatbot_api() -> dict[str, Any]:
         if not body.message.strip():
             return JSONResponse({"error": "Empty message", "status": "error"}, status_code=400)
 
+        can_write = _user_can_write(user)
+
         async def frames() -> AsyncIterator[str]:
             try:
-                async for payload in _stream_agent(body.message, body.history, body.page_url):
+                async for payload in _stream_agent(
+                    body.message, body.history, body.page_url, can_write=can_write
+                ):
                     yield f"data: {json.dumps(payload)}\n\n"
             except Exception as e:
                 log.exception("Airy chat endpoint error")
@@ -221,6 +233,9 @@ Keep answers concise and actionable.  Use Markdown formatting.
 path the user is looking at right now.  Use it to resolve words like "this"
 and "here": `/dags/sales_summary/grid` means questions are about the
 `sales_summary` Dag unless the user says otherwise.
+"""
+
+_WRITE_PROMPT = """\
 
 **Self-healing.**  You can diagnose a broken Dag (`diagnose_dag`), patch its
 source (`fix_dag_code`) and trigger a fresh run (`rerun_dag`).  Work one step at
@@ -233,6 +248,16 @@ a time and never chain them without the user asking:
 3. After a successful fix, offer to re-run — do not re-run on your own.
 4. Call `revert_dag_code` **only** when the user explicitly asks to undo a fix.
    Never call it to recover from a failed step or because a run still fails.
+"""
+
+_READ_ONLY_PROMPT = """\
+
+**Read-only access.**  This session has no write tools: you can diagnose and
+explain, but applying fixes, re-running or backfilling requires Dag-edit
+permission the user does not have.  If asked to change anything, say so.
+"""
+
+_FOLLOWUP_PROMPT = """\
 
 **Follow-up buttons.**  When the obvious next step is a single action, end your
 reply with one or more lines of the form `[ACTION: <what the user should say>]`.
@@ -336,17 +361,37 @@ def _root_cause(exc: BaseException) -> BaseException:
     return exc
 
 
-def _render_system_prompt(page_url: str | None) -> str:
+def _render_system_prompt(page_url: str | None, can_write: bool = False) -> str:
     """Tell Airy which page the user is on, so "this" and "here" resolve."""
+    prompt = _SYSTEM_PROMPT + (_WRITE_PROMPT if can_write else _READ_ONLY_PROMPT) + _FOLLOWUP_PROMPT
     if not page_url:
-        return _SYSTEM_PROMPT
+        return prompt
     # The value comes from the browser: keep it one line and bounded before it
     # joins the highest-trust part of the conversation.
     page = page_url.replace("\n", " ").replace("\r", " ")[:500]
-    return f"{_SYSTEM_PROMPT}\nCurrent page: {page}\n"
+    return f"{prompt}\nCurrent page: {page}\n"
 
 
-def _build_agent(page_url: str | None = None) -> tuple[Any, str | None]:
+def _user_can_write(user: Any) -> bool:
+    """Whether the auth manager grants the user Dag-edit rights (over any Dag)."""
+    # Module singleton, not request.app.state: inside a mounted sub-app,
+    # request.app is the sub-app and carries no auth manager.
+    from airflow.api_fastapi.app import get_auth_manager
+
+    return get_auth_manager().is_authorized_dag(method="PUT", user=user)
+
+
+WRITE_TOOLS = frozenset({"fix_dag_code", "revert_dag_code", "rerun_dag", "run_backfill"})
+
+
+def _gate_toolsets(toolsets: list[Any], can_write: bool) -> list[Any]:
+    """Viewers get Airy without the write tools; Dag editors get everything."""
+    if can_write:
+        return toolsets
+    return [ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS) for ts in toolsets]
+
+
+def _build_agent(page_url: str | None = None, can_write: bool = False) -> tuple[Any, str | None]:
     """Return ``(agent, None)``, or ``(None, markdown)`` explaining what is missing."""
     api_key = _get_llm_api_key()
     if not api_key:
@@ -377,7 +422,11 @@ def _build_agent(page_url: str | None = None) -> tuple[Any, str | None]:
         except ImportError:
             log.exception("pydantic-ai MCP extra missing — Airy is running without any tools")
 
-    return Agent(model=model, system_prompt=_render_system_prompt(page_url), toolsets=toolsets), None
+    return Agent(
+        model=model,
+        system_prompt=_render_system_prompt(page_url, can_write),
+        toolsets=_gate_toolsets(toolsets, can_write),
+    ), None
 
 
 def _to_message_history(history: list[dict[str, str]] | None) -> list[Any]:
@@ -427,10 +476,14 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
 
 
 async def _stream_agent(
-    message: str, history: list[dict[str, str]] | None = None, page_url: str | None = None
+    message: str,
+    history: list[dict[str, str]] | None = None,
+    page_url: str | None = None,
+    *,
+    can_write: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run the agent, yielding tool calls and text as they happen."""
-    agent, problem = _build_agent(page_url)
+    agent, problem = _build_agent(page_url, can_write=can_write)
     if problem:
         yield {"type": "text", "delta": problem}
         return
