@@ -19,7 +19,7 @@
 import { describe, expect, it } from "vitest";
 
 import { Message } from "../components/types";
-import { applyEvent, parseFrames } from "./useChat";
+import { applyEvent, finalizeTools, parseFrames } from "./useChat";
 
 const blank = (): Message => ({
   content: "",
@@ -250,5 +250,57 @@ describe("applyEvent", () => {
   it("leaves the message untouched for unknown event types", () => {
     const before = blank();
     expect(applyEvent(before, { type: "done" })).toEqual(before);
+  });
+});
+
+describe("finalizeTools", () => {
+  const withTools = (tools: Message["tools"], confirms?: Message["confirms"]): Message => ({
+    ...blank(),
+    ...(confirms ? { confirms } : {}),
+    tools,
+  });
+
+  it("does not green-check a call that never reported back", () => {
+    const message = finalizeTools(withTools([{ id: "c1", name: "diagnose_dag", startedAt: 0 }]), 900);
+
+    expect(message.tools?.[0]?.cancelled).toBe(true);
+    expect(message.tools?.[0]?.durationMs).toBe(900);
+  });
+
+  it("does not turn an unapproved proposal into an edit", () => {
+    // The run can die before `confirm_required` ever arrives; the approval gate
+    // guarantees nothing was written.
+    const message = finalizeTools(
+      withTools([{ id: "c1", name: "fix_dag_code", proposed: true, startedAt: 0 }]),
+      500,
+    );
+
+    expect(message.tools?.[0]?.cancelled).toBe(true);
+    expect(message.tools?.[0]?.proposed).toBeUndefined();
+  });
+
+  it("says the outcome is unknown for an approved write that never reported back", () => {
+    // The file may well have been rewritten — "cancelled" would be as wrong as
+    // a green check.
+    const message = finalizeTools(
+      withTools(
+        [{ id: "c1", name: "fix_dag_code", startedAt: 0 }],
+        [{ args: {}, callId: "c1", nonce: "n1", resolution: "approved", tool: "fix_dag_code" }],
+      ),
+      700,
+    );
+
+    expect(message.tools?.[0]?.unsettled).toBe(true);
+    expect(message.tools?.[0]?.cancelled).toBeUndefined();
+  });
+
+  it("leaves a call that already reported back alone", () => {
+    const message = finalizeTools(
+      withTools([{ durationMs: 1_400, id: "c1", name: "diagnose_dag", result: "ok", startedAt: 0 }]),
+      9_000,
+    );
+
+    expect(message.tools?.[0]?.durationMs).toBe(1_400);
+    expect(message.tools?.[0]?.cancelled).toBeUndefined();
   });
 });

@@ -903,6 +903,9 @@ export const buildToolLabel = (tool: ToolCall): string => {
   if (status === "cancelled") {
     return `${humanizeToolName(tool.name)} cancelled`;
   }
+  if (status === "unsettled") {
+    return `${humanizeToolName(tool.name)} — outcome unknown`;
+  }
   if (status === "failed") {
     return `${humanizeToolName(tool.name)} failed`;
   }
@@ -955,7 +958,15 @@ const CrossIcon: FC = () => (
   </svg>
 );
 
-type ToolStatus = "awaiting" | "cancelled" | "denied" | "done" | "failed" | "proposed" | "running";
+type ToolStatus =
+  | "awaiting"
+  | "cancelled"
+  | "denied"
+  | "done"
+  | "failed"
+  | "proposed"
+  | "running"
+  | "unsettled";
 
 /** Statuses in which the tool has certainly not run. */
 const UNSTARTED: ReadonlySet<ToolStatus> = new Set<ToolStatus>(["awaiting", "cancelled", "proposed"]);
@@ -967,6 +978,7 @@ export const buildToolStatus = (tool: ToolCall): ToolStatus => {
   // Suspended outranks proposed: the server is now holding this exact call.
   if (tool.awaitingConfirm === true) return "awaiting";
   if (tool.cancelled === true) return "cancelled";
+  if (tool.unsettled === true) return "unsettled";
   if (tool.durationMs === undefined) return tool.proposed === true ? "proposed" : "running";
   if (tool.failed === true) return "failed";
   if (tool.denied === true) return "denied";
@@ -987,6 +999,7 @@ const ToolStatusIcon: FC<{ readonly status: ToolStatus }> = ({ status }) => {
     done: { color: isDark ? "green.300" : "green.600", icon: <CheckIcon /> },
     failed: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
     proposed: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
+    unsettled: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
   };
   return (
     <Box color={palette[status].color} flexShrink={0}>
@@ -1023,10 +1036,10 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
   const [open, setOpen] = useState(false);
   const status = buildToolStatus(tool);
   const failed = status === "failed";
-  // Nothing has run yet in the unstarted states, so there is nothing to expand
-  // and no duration to report.
-  const unstarted = status === "running" || UNSTARTED.has(status);
-  const expandable = !unstarted && (tool.result !== undefined || failed);
+  // Only a call that reported back has a duration worth quoting, or anything
+  // to expand.
+  const reported = status === "denied" || status === "done" || failed;
+  const expandable = reported && (tool.result !== undefined || failed);
   const muted = isDark ? "gray.400" : "gray.600";
 
   return (
@@ -1059,7 +1072,7 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
                 {status === "awaiting" ? "· awaiting approval" : "· approval required"}
               </Text>
             ) : (
-              !unstarted && (
+              reported && (
                 <Text as="span" fontSize="xs" color={muted} flexShrink={0}>
                   · {((tool.durationMs ?? 0) / 1000).toFixed(1)}s
                 </Text>
