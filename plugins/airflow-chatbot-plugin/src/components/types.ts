@@ -38,6 +38,10 @@ export interface ToolCall {
   awaitingConfirm?: boolean;
   /** True when the user rejected the call instead of approving it. */
   denied?: boolean;
+  /** A write the model has only asked for; nothing has run yet. */
+  proposed?: boolean;
+  /** True when the user stopped the response before this call finished. */
+  cancelled?: boolean;
 }
 
 /** A write tool call the server suspended, waiting for the user's verdict. */
@@ -67,6 +71,10 @@ export interface Message {
   confirms?: ConfirmRequest[];
   /** When true the message represents an error response. */
   isError?: boolean;
+  /** Set when the user stopped this response; visible, but not an error. */
+  stopped?: boolean;
+  /** Kept on screen, kept out of the history the model is given. */
+  excludeFromHistory?: boolean;
 }
 
 export interface ChatState {

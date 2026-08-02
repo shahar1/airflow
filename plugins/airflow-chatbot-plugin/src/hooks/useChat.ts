@@ -111,9 +111,14 @@ export const applyEvent = (
               ? {
                   ...tool,
                   awaitingConfirm: undefined,
+                  cancelled: undefined,
                   denied: undefined,
                   durationMs: undefined,
                   failed: undefined,
+                  // The frame still says `proposed` — it describes the tool
+                  // class. The repeated id is what proves this is the approved
+                  // call going back to work, so the proposal state ends here.
+                  proposed: undefined,
                   result: undefined,
                   startedAt: now,
                 }
@@ -129,6 +134,7 @@ export const applyEvent = (
             args: event.args,
             id: String(event.id ?? ""),
             name: String(event.name ?? "tool"),
+            proposed: event.proposed === true ? true : undefined,
             startedAt: now,
           } satisfies ToolCall,
         ],

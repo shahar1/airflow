@@ -69,6 +69,34 @@ def test_event_payload_reports_a_tool_call():
     }
 
 
+def test_event_payload_flags_a_write_tool_call_as_only_proposed():
+    # approval_required means nothing has run; without this the drawer spins
+    # under "Editing Dag code" from the moment the model asks.
+    payload = plugin._event_payload(tool_call_event(name="fix_dag_code"))
+
+    assert payload["proposed"] is True
+
+
+def test_event_payload_flags_the_resumed_frame_too():
+    # The flag describes the tool class, not the phase. The browser tells the
+    # resumed call apart by its repeated id, so the server need not guess.
+    first = plugin._event_payload(tool_call_event(name="fix_dag_code", call_id="c1"))
+    resumed = plugin._event_payload(tool_call_event(name="fix_dag_code", call_id="c1"))
+
+    assert first["proposed"] is True
+    assert resumed["proposed"] is True
+
+
+def test_event_payload_leaves_read_tool_calls_unflagged():
+    assert "proposed" not in plugin._event_payload(tool_call_event(name="diagnose_dag"))
+
+
+def test_every_write_tool_is_flagged_as_proposed():
+    # A write tool added later must not slip through unflagged.
+    for name in plugin.WRITE_TOOLS:
+        assert plugin._event_payload(tool_call_event(name=name))["proposed"] is True
+
+
 def test_event_payload_reports_a_tool_result():
     assert plugin._event_payload(tool_result_event()) == {
         "type": "tool_result",

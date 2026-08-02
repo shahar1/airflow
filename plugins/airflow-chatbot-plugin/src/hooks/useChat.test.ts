@@ -145,6 +145,47 @@ describe("applyEvent", () => {
     expect(message.tools?.[0]?.awaitingConfirm).toBeUndefined();
   });
 
+  it("carries the proposed flag onto a write call that has not run", () => {
+    const message = applyEvent(
+      blank(),
+      { args: {}, id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      0,
+    );
+
+    expect(message.tools?.[0]?.proposed).toBe(true);
+  });
+
+  it("leaves a read call unproposed", () => {
+    const message = applyEvent(blank(), { id: "c1", name: "diagnose_dag", type: "tool" }, 0);
+
+    expect(message.tools?.[0]?.proposed).toBeUndefined();
+  });
+
+  it("clears the proposal when the approved call resumes under the same id", () => {
+    // The resumed frame still says `proposed` — that describes the tool, while
+    // the repeated id proves this call is the approved one going back to work.
+    let message = applyEvent(
+      blank(),
+      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      0,
+    );
+    message = applyEvent(
+      message,
+      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      500,
+    );
+    message = applyEvent(
+      message,
+      { id: "c1", name: "fix_dag_code", proposed: true, type: "tool" },
+      1_000,
+    );
+
+    expect(message.tools?.[0]?.proposed).toBeUndefined();
+    expect(message.tools?.[0]?.awaitingConfirm).toBeUndefined();
+    expect(message.tools?.[0]?.durationMs).toBeUndefined();
+    expect(message.tools?.[0]?.startedAt).toBe(1_000);
+  });
+
   it("times each call separately when several are in flight", () => {
     let message = applyEvent(blank(), { id: "a", name: "one", type: "tool" }, 0);
     message = applyEvent(message, { id: "b", name: "two", type: "tool" }, 500);

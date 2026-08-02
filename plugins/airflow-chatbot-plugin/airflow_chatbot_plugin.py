@@ -930,12 +930,20 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
             return {"type": "text", "delta": part.content}
         return None
     if kind == "function_tool_call":
-        return {
+        payload = {
             "type": "tool",
             "id": event.part.tool_call_id,
             "name": event.part.tool_name,
             "args": event.part.args,
         }
+        if event.part.tool_name in WRITE_TOOLS:
+            # The model has only *asked* for this write; approval_required means
+            # nothing has run yet. Without the flag the drawer spins under
+            # "Editing Dag code" from the proposal onwards, which is a lie.
+            # Sent on the resumed frame too: it describes the tool, not the
+            # phase — the drawer tells the phases apart by the repeated call id.
+            payload["proposed"] = True
+        return payload
     if kind == "function_tool_result":
         part = event.part
         # A RetryPromptPart here means the tool call itself failed (bad args,
