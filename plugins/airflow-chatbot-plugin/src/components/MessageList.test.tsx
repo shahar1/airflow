@@ -19,7 +19,7 @@
 import { ChakraProvider } from "@chakra-ui/react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { ReactElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ColorModeProvider } from "src/context/colorMode";
 
@@ -650,6 +650,163 @@ describe("MessageList", () => {
     expect(screen.getByText("Makes a lasting change")).not.toBeNull();
     expect(screen.getByText(/cannot describe its effect/u)).not.toBeNull();
     expect(screen.getByText("Approve")).not.toBeNull();
+  });
+
+  describe("following the stream", () => {
+    let scrollIntoView: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+    });
+
+    /** Pretend the container is taller than its viewport and scrolled up. */
+    const scrollUp = (container: HTMLElement) => {
+      const scroller = container.firstElementChild?.firstElementChild as HTMLElement;
+      Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 2_000 });
+      scroller.scrollTop = 0;
+      fireEvent.scroll(scroller);
+      return scroller;
+    };
+
+    it("stays put when the user has scrolled up, and offers a way back", () => {
+      const { container, rerender } = show(
+        <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
+      );
+      const scroller = scrollUp(container);
+      scrollIntoView.mockClear();
+
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList
+              messages={[user("why?"), assistant({ content: "one and then some more" })]}
+              isLoading
+            />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      const pill = screen.getByText("Jump to latest");
+
+      fireEvent.click(pill);
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(screen.queryByText("Jump to latest")).toBeNull();
+      expect(scroller).not.toBeNull();
+    });
+
+    it("keeps following while the user is already at the bottom", () => {
+      const { rerender } = show(
+        <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
+      );
+      scrollIntoView.mockClear();
+
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList messages={[user("why?"), assistant({ content: "one two" })]} isLoading />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(screen.queryByText("Jump to latest")).toBeNull();
+    });
+
+    it("clears the pill when the user scrolls back down by hand", () => {
+      const { container, rerender } = show(
+        <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
+      );
+      const scroller = scrollUp(container);
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList messages={[user("why?"), assistant({ content: "one two" })]} isLoading />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+      expect(screen.getByText("Jump to latest")).not.toBeNull();
+
+      scroller.scrollTop = 1_800;
+      fireEvent.scroll(scroller);
+
+      expect(screen.queryByText("Jump to latest")).toBeNull();
+    });
+
+    it("does not scroll when a tool row is expanded", () => {
+      show(
+        <MessageList
+          messages={[
+            assistant({
+              content: "done",
+              tools: [{ durationMs: 200, id: "c1", name: "diagnose_dag", result: "42 rows", startedAt: 0 }],
+            }),
+          ]}
+        />,
+      );
+      scrollIntoView.mockClear();
+
+      fireEvent.click(screen.getByRole("button", { expanded: false }));
+
+      expect(screen.getByText(/42 rows/u)).not.toBeNull();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("assistive announcements", () => {
+    it("keeps one live region that reports the latest tool state", () => {
+      const { container, rerender } = show(
+        <MessageList
+          messages={[assistant({ tools: [{ id: "c1", name: "diagnose_dag", startedAt: 0 }] })]}
+          isLoading
+        />,
+      );
+
+      const region = container.querySelector('[role="status"]');
+      expect(region?.getAttribute("aria-live")).toBe("polite");
+      expect(region?.getAttribute("aria-atomic")).toBe("true");
+      expect(region?.textContent).toBe("Airy: Diagnosing Dag");
+
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList
+              messages={[
+                assistant({
+                  content: "done",
+                  tools: [{ durationMs: 200, id: "c1", name: "diagnose_dag", startedAt: 0 }],
+                }),
+              ]}
+            />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+
+      // The same node, updated — not a newly mounted one.
+      expect(container.querySelector('[role="status"]')).toBe(region);
+      expect(region?.textContent).toBe("Airy: Diagnosed Dag");
+      expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
+    });
+
+    it("raises an error response as an assertive alert", () => {
+      const { container } = show(
+        <MessageList messages={[assistant({ content: "**Error:** boom", isError: true })]} />,
+      );
+
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert?.getAttribute("aria-live")).toBe("assertive");
+      expect(alert?.textContent).toContain("boom");
+    });
+
+    it("gives the code-block controls a 24px target", () => {
+      show(<MessageList messages={[assistant({ content: "```python\nx = 1\n```" })]} />);
+
+      const copy = screen.getByText("Copy");
+      expect(getComputedStyle(copy).minHeight).toBe("24px");
+      expect(getComputedStyle(copy).minWidth).toBe("24px");
+    });
   });
 
   it("sends the action's own label when its chip is clicked", () => {

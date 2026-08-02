@@ -59,7 +59,7 @@ const persistMessages = (messages: Message[]) => {
 /** The backend takes prior turns as history; the new turn is sent separately. */
 export const toHistory = (msgs: Message[]): Array<{ content: string; role: string }> =>
   msgs
-    .filter((m) => m.content !== "" && m.isError !== true)
+    .filter((m) => m.content !== "" && m.isError !== true && m.excludeFromHistory !== true)
     .slice(-HISTORY_TURNS)
     .map((m) => ({ content: m.content, role: m.role }));
 
@@ -89,6 +89,21 @@ export const finalizeTools = (message: Message, now: number): Message => ({
   ...message,
   tools: message.tools?.map((tool) =>
     tool.durationMs === undefined ? { ...tool, durationMs: now - tool.startedAt } : tool,
+  ),
+});
+
+/**
+ * Mark whatever was still in flight as cancelled.
+ *
+ * Must run before `finalizeTools`, which would otherwise stop the clock on an
+ * abandoned call and let it render as a successful green check.
+ */
+export const cancelTools = (message: Message, now: number): Message => ({
+  ...message,
+  tools: message.tools?.map((tool) =>
+    tool.durationMs === undefined
+      ? { ...tool, cancelled: true, durationMs: now - tool.startedAt, proposed: undefined }
+      : tool,
   ),
 });
 
@@ -261,6 +276,17 @@ export const useHealth = () => {
 // ── Chat hook ──────────────────────────────────────────────────────────
 
 /**
+ * What the drawer is doing, which is not the same question as "is it busy".
+ *
+ * `applying` is a /confirm the user approved: the lasting mutation may already
+ * be executing on the host, and hanging up the HTTP reader would not undo it.
+ * Only `streaming` may be stopped.
+ */
+export type ChatPhase = "applying" | "idle" | "streaming";
+
+const isAbort = (err: unknown): boolean => (err as { name?: string } | null)?.name === "AbortError";
+
+/**
  * Hook for managing chat state and interactions.
  *
  * `POST /chatbot/chat` answers with server-sent events, so the assistant
@@ -269,11 +295,13 @@ export const useHealth = () => {
  */
 export const useChat = () => {
   const [messages, setMessages] = useState<Message[]>(loadStoredMessages);
-  const [isLoading, setIsLoading] = useState(false);
+  const [phase, setPhase] = useState<ChatPhase>("idle");
   // The message currently receiving the SSE stream — not always the last one:
   // a confirmation can be resolved after later turns were added.
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const messagesRef = useRef<Message[]>(messages);
+  const abortRef = useRef<AbortController | null>(null);
+  const isLoading = phase !== "idle";
 
   const commit = useCallback((next: Message[]) => {
     messagesRef.current = next;
@@ -330,14 +358,15 @@ export const useChat = () => {
     [commit],
   );
 
-  const sendMessage = useCallback(
-    async (content: string) => {
-      const history = toHistory(messagesRef.current);
+  /** Post one user turn and stream the answer into a fresh assistant bubble. */
+  const runTurn = useCallback(
+    async (content: string, history: Array<{ content: string; role: string }>) => {
+      const userId = generateId();
       const assistantId = generateId();
 
       commit([
         ...messagesRef.current,
-        { content, id: generateId(), role: "user", timestamp: new Date() },
+        { content, id: userId, role: "user", timestamp: new Date() },
         {
           content: "",
           id: assistantId,
@@ -345,8 +374,10 @@ export const useChat = () => {
           timestamp: new Date(),
         },
       ]);
-      setIsLoading(true);
+      setPhase("streaming");
       setStreamingId(assistantId);
+      const controller = new AbortController();
+      abortRef.current = controller;
 
       const update = (fn: (message: Message) => Message) =>
         commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
@@ -361,6 +392,7 @@ export const useChat = () => {
           credentials: "include",
           headers: { "Content-Type": "application/json" },
           method: "POST",
+          signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
@@ -369,16 +401,32 @@ export const useChat = () => {
 
         await streamInto(assistantId, response);
       } catch (err) {
-        update((message) => ({
-          ...message,
-          content:
-            err instanceof Error
-              ? `**Error:** ${err.message}`
-              : "**Error:** Failed to get a response from Airy.",
-          isError: true,
-        }));
+        if (isAbort(err)) {
+          // The user's own stop is not a failure: keep the partial answer on
+          // screen, but keep the half-turn out of what the model is told next.
+          const stoppedAt = Date.now();
+          update((message) => ({
+            ...cancelTools(message, stoppedAt),
+            content: `${message.content}\n\n_Stopped._`.trimStart(),
+            excludeFromHistory: true,
+            stopped: true,
+          }));
+          commit(
+            messagesRef.current.map((m) => (m.id === userId ? { ...m, excludeFromHistory: true } : m)),
+          );
+        } else {
+          update((message) => ({
+            ...message,
+            content:
+              err instanceof Error
+                ? `**Error:** ${err.message}`
+                : "**Error:** Failed to get a response from Airy.",
+            isError: true,
+          }));
+        }
       } finally {
-        setIsLoading(false);
+        abortRef.current = null;
+        setPhase("idle");
         setStreamingId(null);
         // A bubble with nothing in it is hidden, so without this the drawer
         // would show the question and no answer at all.
@@ -395,6 +443,16 @@ export const useChat = () => {
     },
     [commit, streamInto],
   );
+
+  const sendMessage = useCallback(
+    async (content: string) => runTurn(content, toHistory(messagesRef.current)),
+    [runTurn],
+  );
+
+  /** Hang up on a stoppable stream; an approved mutation is never stoppable. */
+  const stopResponse = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
 
   /** Answer a confirm_required frame; the reply streams into the same bubble. */
   const resolveConfirm = useCallback(
@@ -425,8 +483,12 @@ export const useChat = () => {
       // Submitted, not settled: the write may land even if the reply never
       // arrives, so the outcome stays unknown until the stream says otherwise.
       settle(true);
-      setIsLoading(true);
+      // An approved write may already be running on the host; hanging up the
+      // reader would not undo it, so that phase offers no Stop.
+      setPhase(approved ? "applying" : "streaming");
       setStreamingId(assistantId);
+      const controller = new AbortController();
+      abortRef.current = approved ? null : controller;
 
       try {
         const response = await fetch(`${CHATBOT_BASE()}/confirm`, {
@@ -434,6 +496,7 @@ export const useChat = () => {
           credentials: "include",
           headers: { "Content-Type": "application/json" },
           method: "POST",
+          signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
@@ -442,14 +505,26 @@ export const useChat = () => {
 
         settle(!(await streamInto(assistantId, response)));
       } catch (err) {
-        update((message) =>
-          applyEvent(message, {
-            message: err instanceof Error ? err.message : "Failed to get a response from Airy.",
-            type: "error",
-          }),
-        );
+        if (isAbort(err)) {
+          const stoppedAt = Date.now();
+          update((message) => ({
+            ...cancelTools(message, stoppedAt),
+            content: `${message.content}\n\n_Stopped._`.trimStart(),
+            // The marker is ours, not Airy's; it must never come back as history.
+            excludeFromHistory: true,
+            stopped: true,
+          }));
+        } else {
+          update((message) =>
+            applyEvent(message, {
+              message: err instanceof Error ? err.message : "Failed to get a response from Airy.",
+              type: "error",
+            }),
+          );
+        }
       } finally {
-        setIsLoading(false);
+        abortRef.current = null;
+        setPhase("idle");
         setStreamingId(null);
         const ended = Date.now();
         update((message) => finalizeTools(message, ended));
@@ -469,11 +544,14 @@ export const useChat = () => {
   }, []);
 
   return {
+    canStop: phase === "streaming",
     clearMessages,
+    isApplyingChange: phase === "applying",
     isLoading,
     messages,
     resolveConfirm,
     sendMessage,
+    stopResponse,
     streamingId,
   };
 };

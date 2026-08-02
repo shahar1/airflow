@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import { Box, Flex, IconButton, Textarea } from "@chakra-ui/react";
+import { Flex, IconButton, Spinner, Textarea } from "@chakra-ui/react";
 import { FC, KeyboardEvent, useRef, useState } from "react";
 
 import { useColorMode } from "src/context/colorMode";
@@ -32,7 +32,18 @@ interface ChatInputProps {
   readonly placeholder?: string;
   readonly value?: string;
   readonly onValueChange?: (value: string) => void;
+  /** A stoppable stream is in flight: Send becomes Stop. */
+  readonly canStop?: boolean;
+  readonly onStop?: () => void;
+  /** An approved write may already be running; nothing here can call it back. */
+  readonly isApplyingChange?: boolean;
 }
+
+const StopIcon: FC = () => (
+  <svg fill="currentColor" height="14" viewBox="0 0 24 24" width="14">
+    <rect height="16" rx="2" width="16" x="4" y="4" />
+  </svg>
+);
 
 /**
  * Chat input component with auto-resizing textarea.
@@ -40,12 +51,15 @@ interface ChatInputProps {
  * Can be controlled via value/onValueChange props.
  */
 export const ChatInput: FC<ChatInputProps> = ({
-  disabled = false,
   buttonDisabled = false,
+  canStop = false,
+  disabled = false,
+  isApplyingChange = false,
   onSend,
+  onStop,
+  onValueChange,
   placeholder = "Ask anything about Airflow...",
   value: controlledValue,
-  onValueChange,
 }) => {
   const [internalValue, setInternalValue] = useState("");
   const value = controlledValue ?? internalValue;
@@ -124,17 +138,20 @@ export const ChatInput: FC<ChatInputProps> = ({
         rows={1}
       />
       <IconButton
-        aria-label="Send message"
-        onClick={handleSend}
-        disabled={!canSend}
+        aria-label={
+          canStop ? "Stop response" : isApplyingChange ? "Applying approved change…" : "Send message"
+        }
+        title={isApplyingChange ? "Applying approved change…" : undefined}
+        onClick={canStop ? onStop : handleSend}
+        disabled={canStop ? false : isApplyingChange || !canSend}
         borderRadius="full"
         width="44px"
         height="44px"
         minWidth="44px"
-        bg={canSend ? buttonBg : buttonDisabledBg}
+        bg={canStop || canSend ? buttonBg : buttonDisabledBg}
         color="white"
         _hover={{
-          bg: canSend ? buttonHoverBg : buttonDisabledBg,
+          bg: canStop || canSend ? buttonHoverBg : buttonDisabledBg,
         }}
         _disabled={{
           bg: buttonDisabledBg,
@@ -143,7 +160,7 @@ export const ChatInput: FC<ChatInputProps> = ({
         }}
         transition="all 0.2s"
       >
-        <SendIcon />
+        {canStop ? <StopIcon /> : isApplyingChange ? <Spinner size="sm" /> : <SendIcon />}
       </IconButton>
     </Flex>
   );
