@@ -718,6 +718,27 @@ describe("useChat streaming", () => {
       expect(result.current.isApplyingChange).toBe(false);
     });
 
+    it("reads a stopped rejection continuation as stopped, not as an error", async () => {
+      const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("fix it");
+      });
+
+      fetchMock.mockReturnValue(Promise.resolve(abortingResponse()));
+      await act(async () => {
+        await result.current.resolveConfirm("n1", false);
+      });
+
+      const assistant = result.current.messages[1];
+      expect(assistant?.stopped).toBe(true);
+      expect(assistant?.isError).toBeUndefined();
+      expect(assistant?.content).toContain("_Stopped._");
+      // The marker is ours, so this bubble never goes back as Airy's words.
+      expect(assistant?.excludeFromHistory).toBe(true);
+    });
+
     it("still offers stop for the prose that follows a rejection", async () => {
       let release: (() => void) | undefined;
       const gate = new Promise<void>((resolve) => {
