@@ -24,8 +24,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ColorModeProvider } from "src/context/colorMode";
 
 import { localSystem } from "../theme";
-import { buildPrompts, canRetry, MessageList, splitActions } from "./MessageList";
-import { Message } from "./types";
+import {
+  buildConfirmState,
+  buildGroupState,
+  buildPrompts,
+  buildReceiptLabel,
+  canRetry,
+  ConfirmState,
+  MessageList,
+  splitActions,
+} from "./MessageList";
+import { ConfirmRequest, Message, ToolCall } from "./types";
 
 const show = (ui: ReactElement) =>
   render(
@@ -78,6 +87,87 @@ describe("splitActions", () => {
   it("leaves ordinary brackets in the text alone", () => {
     expect(splitActions("see [the grid](http://x) for details").text).toBe(
       "see [the grid](http://x) for details",
+    );
+  });
+});
+
+describe("buildConfirmState", () => {
+  const confirm = (partial: Partial<ConfirmRequest> = {}): ConfirmRequest => ({
+    callId: "c1",
+    nonce: "n1",
+    tool: "fix_dag_code",
+    ...partial,
+  });
+  const tool = (partial: Partial<ToolCall> = {}): ToolCall => ({
+    durationMs: 500,
+    id: "c1",
+    name: "fix_dag_code",
+    startedAt: 0,
+    ...partial,
+  });
+
+  it.each([
+    ["undecided", confirm(), tool({ awaitingConfirm: true }), false, "pending"],
+    ["undecided mid-stream", confirm(), tool({ awaitingConfirm: true }), true, "pending"],
+    // `resolution` is set the moment /confirm is posted, together with an
+    // optimistic `outcomeUnknown`; neither may preempt the running write.
+    ["submitted", confirm({ outcomeUnknown: true, resolution: "approved" }), tool(), true, "applying"],
+    ["completed", confirm({ resolution: "approved" }), tool(), false, "applied"],
+    ["unverified", confirm({ outcomeUnknown: true, resolution: "approved" }), tool(), false, "unknown"],
+    ["unsettled", confirm({ resolution: "approved" }), tool({ unsettled: true }), false, "unknown"],
+    ["untraceable", confirm({ resolution: "approved" }), undefined, false, "unknown"],
+    ["errored", confirm({ resolution: "approved" }), tool({ failed: true }), false, "failed"],
+    // A reported error is an answer; the ambiguous flag does not outrank it.
+    [
+      "errored unverifiably",
+      confirm({ outcomeUnknown: true, resolution: "approved" }),
+      tool({ failed: true }),
+      false,
+      "failed",
+    ],
+    ["refused", confirm({ resolution: "rejected" }), tool({ denied: true }), false, "rejected"],
+    [
+      "refused unanswered",
+      confirm({ outcomeUnknown: true, resolution: "rejected" }),
+      undefined,
+      false,
+      "unknown",
+    ],
+    [
+      "refused mid-stream",
+      confirm({ outcomeUnknown: true, resolution: "rejected" }),
+      undefined,
+      true,
+      "rejected",
+    ],
+  ])("reads a %s write as %s", (_label, request, call, streaming, expected) => {
+    expect(buildConfirmState(request, call, streaming)).toBe(expected);
+  });
+
+  it("never claims a write landed on the decision alone", () => {
+    // The tool is still awaiting: approving is not applying.
+    expect(
+      buildConfirmState(confirm({ resolution: "approved" }), tool({ awaitingConfirm: true }), false),
+    ).toBe("unknown");
+  });
+});
+
+describe("buildGroupState", () => {
+  it.each([
+    [["applied", "applied"], "applied"],
+    [["applied", "applying"], "applying"],
+    [["applied", "unknown"], "unknown"],
+    [["applied", "unknown", "failed"], "failed"],
+    [["applying", "unknown"], "unknown"],
+  ])("settles %s as %s", (states, expected) => {
+    expect(buildGroupState(states as ConfirmState[])).toBe(expected);
+  });
+
+  it("counts what actually landed when a batch ends mixed", () => {
+    const states: ConfirmState[] = ["applied", "failed", "unknown"];
+
+    expect(buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "fix_dag_code" })).toBe(
+      "1 of 3 applied · 2 need attention",
     );
   });
 });
@@ -464,9 +554,7 @@ describe("MessageList", () => {
   });
 
   it("shows no timestamp, so nothing shifts on hover", () => {
-    const { container } = show(
-      <MessageList messages={[user("why?"), assistant({ content: "done" })]} />,
-    );
+    const { container } = show(<MessageList messages={[user("why?"), assistant({ content: "done" })]} />);
 
     expect(container.textContent).not.toMatch(/\d{1,2}:\d{2}/u);
   });
@@ -624,9 +712,7 @@ describe("MessageList", () => {
       <MessageList
         messages={[
           assistant({
-            confirms: [
-              { args: "not json at all", callId: "c1", nonce: "n1", tool: "fix_dag_code" },
-            ],
+            confirms: [{ args: "not json at all", callId: "c1", nonce: "n1", tool: "fix_dag_code" }],
           }),
         ]}
       />,
@@ -639,7 +725,12 @@ describe("MessageList", () => {
 
   it.each([
     ["revert_dag_code", {}, "Restore original Dag source", "Restore original source"],
-    ["run_backfill", { from_date: "2026-01-01", to_date: "2026-01-05" }, "Run the reviewed backfill", "Run backfill"],
+    [
+      "run_backfill",
+      { from_date: "2026-01-01", to_date: "2026-01-05" },
+      "Run the reviewed backfill",
+      "Run backfill",
+    ],
   ])("states what %s does before it is approved", (tool, extra, title, approve) => {
     show(
       <MessageList
@@ -918,7 +1009,10 @@ describe("MessageList", () => {
 
     it.each([
       ["a stream is active", { isLoading: true }],
-      ["there is no question to re-ask", { messages: [assistant({ content: "**Error:** boom", isError: true })] }],
+      [
+        "there is no question to re-ask",
+        { messages: [assistant({ content: "**Error:** boom", isError: true })] },
+      ],
     ])("suppresses Retry while %s", (_label, over) => {
       show(<MessageList messages={failed()} onRetry={vi.fn()} {...over} />);
 
@@ -927,6 +1021,143 @@ describe("MessageList", () => {
 
     it("offers nothing to retry on a successful answer", () => {
       expect(canRetry([user("why?"), assistant({ content: "fine" })], 1)).toBe(false);
+    });
+  });
+
+  describe("decided approvals", () => {
+    const decided = (
+      confirm: Partial<ConfirmRequest>,
+      tools: ToolCall[] = [],
+      over: Partial<Message> = {},
+    ) => [
+      user("fix it"),
+      assistant({
+        confirms: [
+          {
+            args: { dag_id: "a", new: "x = 2", old: "x = 1" },
+            callId: "c1",
+            nonce: "n1",
+            tool: "fix_dag_code",
+            ...confirm,
+          },
+        ],
+        tools,
+        ...over,
+      }),
+    ];
+
+    const done = (over: Partial<ToolCall> = {}): ToolCall => ({
+      durationMs: 500,
+      id: "c1",
+      name: "fix_dag_code",
+      startedAt: 0,
+      ...over,
+    });
+
+    it("replaces the evidence card with a one-line receipt once the write lands", () => {
+      show(<MessageList messages={decided({ resolution: "approved" }, [done()])} />);
+
+      expect(screen.getByText("Edited Dag code · approved by you")).not.toBeNull();
+      // The summary, the diff and the technical controls are all gone.
+      expect(screen.queryByText("Proposed Dag source change")).toBeNull();
+      expect(screen.queryByText("-x = 1")).toBeNull();
+      expect(screen.queryByText("Technical details")).toBeNull();
+      expect(screen.queryByText("Apply to Dag source file")).toBeNull();
+    });
+
+    it("gives back the exact reviewed diff on request, but never the decision", () => {
+      show(<MessageList messages={decided({ resolution: "approved" }, [done()])} />);
+
+      fireEvent.click(screen.getByText("View change"));
+
+      expect(screen.getByText("-x = 1")).not.toBeNull();
+      expect(screen.getByText("+x = 2")).not.toBeNull();
+      expect(screen.queryByText("Apply to Dag source file")).toBeNull();
+      expect(screen.queryByText("Reject")).toBeNull();
+    });
+
+    it.each([
+      ["rejected", { resolution: "rejected" as const }, [done({ denied: true })], "Rejected by you"],
+      ["failed", { resolution: "approved" as const }, [done({ failed: true })], "Approved change failed"],
+      [
+        "unsettled",
+        { resolution: "approved" as const },
+        [done({ unsettled: true })],
+        "Approved — outcome unknown",
+      ],
+    ])("records a %s decision without claiming success", (_label, confirm, tools, expected) => {
+      show(<MessageList messages={decided(confirm, tools)} />);
+
+      expect(screen.getByText(expected)).not.toBeNull();
+      expect(screen.queryByText("Edited Dag code · approved by you")).toBeNull();
+      expect(screen.getByText("View proposal")).not.toBeNull();
+    });
+
+    it("reports progress rather than doubt while the approved write is still running", () => {
+      show(
+        <MessageList
+          messages={decided({ outcomeUnknown: true, resolution: "approved" }, [
+            { awaitingConfirm: true, durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 },
+          ])}
+          streamingId="a1"
+          isLoading
+        />,
+      );
+
+      expect(screen.getByText("Approved · Editing Dag code…")).not.toBeNull();
+      expect(screen.queryByText("Approved — outcome unknown")).toBeNull();
+      expect(screen.queryByText("Check outcome")).toBeNull();
+    });
+
+    it("keeps a way to find out what happened when a rejection went unanswered", () => {
+      const onConfirmClick = vi.fn();
+      show(
+        <MessageList
+          messages={decided({ outcomeUnknown: true, resolution: "rejected" })}
+          onConfirmClick={onConfirmClick}
+        />,
+      );
+
+      expect(screen.getByText("Rejected — outcome unknown")).not.toBeNull();
+      fireEvent.click(screen.getByText("Check outcome"));
+
+      expect(onConfirmClick).toHaveBeenCalledWith("n1", false);
+    });
+
+    it("says how much of a batch landed when the actions disagree", () => {
+      show(
+        <MessageList
+          messages={[
+            assistant({
+              confirms: [
+                { args: {}, callId: "c1", nonce: "n1", resolution: "approved", tool: "fix_dag_code" },
+                { args: {}, callId: "c2", nonce: "n1", resolution: "approved", tool: "rerun_dag" },
+              ],
+              tools: [done(), { durationMs: 5, failed: true, id: "c2", name: "rerun_dag", startedAt: 0 }],
+            }),
+          ]}
+        />,
+      );
+
+      expect(screen.getByText("1 of 2 applied · 1 needs attention")).not.toBeNull();
+    });
+
+    it("hands focus to the receipt that replaces the button the user pressed", () => {
+      const messages = decided({}, [
+        { awaitingConfirm: true, durationMs: 10, id: "c1", name: "fix_dag_code", startedAt: 0 },
+      ]);
+      const { rerender } = show(<MessageList messages={messages} onConfirmClick={vi.fn()} />);
+
+      fireEvent.click(screen.getByText("Apply to Dag source file"));
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList messages={decided({ resolution: "approved" }, [done()])} />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+
+      expect(document.activeElement?.textContent).toContain("Edited Dag code · approved by you");
     });
   });
 
