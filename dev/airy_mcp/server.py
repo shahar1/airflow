@@ -435,6 +435,45 @@ def run_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
     }
 
 
+def get_blast_radius(dag_id: str) -> dict[str, Any]:
+    """
+    Show what a failure in this Dag knocks over: the assets it produces and
+    the Dags scheduled on or reading those assets — plus the upstream side,
+    the assets this Dag depends on and who produces them.
+    """
+    assets = _api("GET", "/assets", params={"limit": 100})["assets"]
+
+    produces: list[str] = []
+    consumes: list[str] = []
+    downstream: set[str] = set()
+    upstream: set[str] = set()
+    for asset in assets:
+        producers = {task.get("dag_id") for task in asset.get("producing_tasks") or []}
+        consumers = {dag.get("dag_id") for dag in asset.get("scheduled_dags") or []} | {
+            task.get("dag_id") for task in asset.get("consuming_tasks") or []
+        }
+        if dag_id in producers:
+            produces.append(asset["name"])
+            downstream |= consumers
+        # An asset this Dag produces is an output, even when a self-loop also
+        # lists the Dag as a consumer of it.
+        elif dag_id in consumers:
+            consumes.append(asset["name"])
+            upstream |= producers
+
+    for bucket in (downstream, upstream):
+        bucket.discard(dag_id)
+        bucket.discard(None)
+
+    return {
+        "dag_id": dag_id,
+        "produces_assets": sorted(produces),
+        "downstream_dags": sorted(downstream),
+        "consumes_assets": sorted(consumes),
+        "upstream_dags": sorted(upstream),
+    }
+
+
 # Registered here rather than with @mcp.tool so the module keeps exporting plain
 # functions — directly callable from tests.
 for _tool in (
@@ -443,6 +482,7 @@ for _tool in (
     find_failure_clusters,
     plan_backfill,
     run_backfill,
+    get_blast_radius,
     fix_dag_code,
     revert_dag_code,
     rerun_dag,

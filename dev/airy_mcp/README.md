@@ -38,6 +38,11 @@ A second MCP sidecar with the three **write-capable** tools that
 | `diagnose_dag(dag_id)` | latest failed run → failing task + log tail + full Dag source |
 | `fix_dag_code(dag_id, old, new)` | patches the source file (`old` must be unique), forces a reparse, returns a unified diff |
 | `revert_dag_code(dag_id)` | restores the pre-fix backup (rehearse the demo from the chat) |
+| `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas, conf changes, and the source diff between the runs' Dag versions |
+| `find_failure_clusters(hours)` | recent failed task instances across every Dag, grouped by normalised error signature |
+| `plan_backfill(dag_id, from, to)` | dry-run preview of a backfill — read-only |
+| `run_backfill(dag_id, from, to)` | creates the backfill previewed by `plan_backfill` |
+| `get_blast_radius(dag_id)` | assets this Dag produces/consumes and the Dags up- and downstream of them |
 | `rerun_dag(dag_id)` | unpauses if needed and triggers a **new** run |
 
 This goes past AIP-91 phase 1 (read-only) on purpose — it is the "what if the

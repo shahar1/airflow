@@ -54,6 +54,7 @@ class FakeAirflow:
         self.sources_by_version: dict[int, str] = {}
         self.logs_by_task: dict[tuple[str, str], str] = {}
         self.dry_run_dates: list[str] = []
+        self.assets: list[dict] = []
         self.bump_version_on_reparse = True
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
@@ -70,6 +71,8 @@ class FakeAirflow:
                 return run
             if path == f"/dags/{DAG_ID}{quoted}/taskInstances":
                 return {"task_instances": self.tis_by_run.get(run_id, [])}
+        if path == "/assets":
+            return {"assets": self.assets}
         if path == "/backfills/dry_run":
             return {
                 "backfills": [{"logical_date": d} for d in self.dry_run_dates],
@@ -461,6 +464,49 @@ def test_run_backfill_creates_the_backfill(airflow):
         "is_paused": False,
     }
     assert {"dag_id": DAG_ID, "from_date": "2026-07-01", "to_date": "2026-07-08"} in airflow.payloads
+
+
+def test_get_blast_radius_maps_both_directions_through_assets(airflow):
+    airflow.assets = [
+        {
+            "name": "sales_report",
+            "producing_tasks": [{"dag_id": DAG_ID, "task_id": "report"}],
+            # The self-reference must not put the Dag in its own blast radius.
+            "scheduled_dags": [{"dag_id": "revenue_dashboard"}, {"dag_id": DAG_ID}],
+            "consuming_tasks": [{"dag_id": "audit", "task_id": "check"}],
+        },
+        {
+            "name": "raw_events",
+            "producing_tasks": [{"dag_id": "ingest", "task_id": "collect"}],
+            "scheduled_dags": [{"dag_id": DAG_ID}],
+            "consuming_tasks": [],
+        },
+        {
+            "name": "unrelated",
+            "producing_tasks": [{"dag_id": "other", "task_id": "t"}],
+            "scheduled_dags": [{"dag_id": "elsewhere"}],
+            "consuming_tasks": [],
+        },
+    ]
+
+    result = server.get_blast_radius(DAG_ID)
+
+    assert result == {
+        "dag_id": DAG_ID,
+        "produces_assets": ["sales_report"],
+        "downstream_dags": ["audit", "revenue_dashboard"],
+        "consumes_assets": ["raw_events"],
+        "upstream_dags": ["ingest"],
+    }
+
+
+def test_get_blast_radius_of_an_asset_free_dag_is_empty(airflow):
+    airflow.assets = []
+
+    result = server.get_blast_radius(DAG_ID)
+
+    assert result["produces_assets"] == []
+    assert result["downstream_dags"] == []
 
 
 def test_rerun_dag_unpauses_first(airflow):
