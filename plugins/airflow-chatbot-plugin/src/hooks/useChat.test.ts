@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 import { describe, expect, it } from "vitest";
 
 import { Message } from "../components/types";
@@ -31,9 +30,7 @@ const blank = (): Message => ({
 
 describe("parseFrames", () => {
   it("parses whole frames and keeps the partial one for the next chunk", () => {
-    const { events, rest } = parseFrames(
-      'data: {"type":"text","delta":"hi"}\n\ndata: {"type":"do',
-    );
+    const { events, rest } = parseFrames('data: {"type":"text","delta":"hi"}\n\ndata: {"type":"do');
 
     expect(events).toEqual([{ delta: "hi", type: "text" }]);
     expect(rest).toBe('data: {"type":"do');
@@ -48,18 +45,14 @@ describe("parseFrames", () => {
   });
 
   it("handles CRLF-normalised frames", () => {
-    const { events, rest } = parseFrames(
-      'data: {"type":"text","delta":"hi"}\r\n\r\n',
-    );
+    const { events, rest } = parseFrames('data: {"type":"text","delta":"hi"}\r\n\r\n');
 
     expect(events).toEqual([{ delta: "hi", type: "text" }]);
     expect(rest).toBe("");
   });
 
   it("skips frames that are not JSON rather than killing the stream", () => {
-    const { events } = parseFrames(
-      'data: not json\n\ndata: {"type":"text","delta":"ok"}\n\n',
-    );
+    const { events } = parseFrames('data: not json\n\ndata: {"type":"text","delta":"ok"}\n\n');
 
     expect(events).toEqual([{ delta: "ok", type: "text" }]);
   });
@@ -99,13 +92,57 @@ describe("applyEvent", () => {
     ]);
     expect(called.tools?.[0]?.durationMs).toBeUndefined();
 
-    const done = applyEvent(
-      called,
-      { id: "c1", name: "diagnose_dag", type: "tool_result" },
-      2_400,
-    );
+    const done = applyEvent(called, { id: "c1", name: "diagnose_dag", type: "tool_result" }, 2_400);
 
     expect(done.tools?.[0]?.durationMs).toBe(1_400);
+  });
+
+  it("stores the result payload and failure flag when the result arrives", () => {
+    const called = applyEvent(blank(), { id: "c1", name: "diagnose_dag", type: "tool" }, 0);
+
+    const done = applyEvent(called, { failed: true, id: "c1", result: "boom", type: "tool_result" }, 100);
+
+    expect(done.tools?.[0]?.failed).toBe(true);
+    expect(done.tools?.[0]?.result).toBe("boom");
+  });
+
+  it("marks a suspended call as awaiting instead of done", () => {
+    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    message = applyEvent(
+      message,
+      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      500,
+    );
+
+    expect(message.tools?.[0]?.awaitingConfirm).toBe(true);
+    expect(message.tools?.[0]?.durationMs).toBe(500);
+  });
+
+  it("resolves an awaiting call when its result finally arrives", () => {
+    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    message = applyEvent(
+      message,
+      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      500,
+    );
+    message = applyEvent(message, { denied: true, id: "c1", result: "no", type: "tool_result" }, 900);
+
+    expect(message.tools?.[0]?.awaitingConfirm).toBeUndefined();
+    expect(message.tools?.[0]?.denied).toBe(true);
+  });
+
+  it("reuses the existing row when a resumed call streams under the same id", () => {
+    let message = applyEvent(blank(), { id: "c1", name: "fix_dag_code", type: "tool" }, 0);
+    message = applyEvent(
+      message,
+      { call_id: "c1", nonce: "n1", tool: "fix_dag_code", type: "confirm_required" },
+      500,
+    );
+    message = applyEvent(message, { id: "c1", name: "fix_dag_code", type: "tool" }, 1_000);
+
+    expect(message.tools).toHaveLength(1);
+    expect(message.tools?.[0]?.durationMs).toBeUndefined();
+    expect(message.tools?.[0]?.awaitingConfirm).toBeUndefined();
   });
 
   it("times each call separately when several are in flight", () => {

@@ -16,12 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 import { FC, useState } from "react";
 
+import { useChat, useHealth } from "../hooks/useChat";
 import { ChatButton } from "./ChatButton";
 import { ChatDrawer } from "./ChatDrawer";
-import { useChat, useHealth } from "../hooks/useChat";
 
 /**
  * Main Chatbot component that orchestrates the floating button and drawer.
@@ -29,7 +28,7 @@ import { useChat, useHealth } from "../hooks/useChat";
  */
 export const Chatbot: FC = () => {
   const [isOpen, setIsOpen] = useState(false);
-  const { clearMessages, isLoading, messages, resolveConfirm, sendMessage } = useChat();
+  const { clearMessages, isLoading, messages, resolveConfirm, sendMessage, streamingId } = useChat();
   const { health } = useHealth();
 
   const handleToggle = () => {
@@ -50,6 +49,7 @@ export const Chatbot: FC = () => {
         onSendMessage={sendMessage}
         onConfirmClick={resolveConfirm}
         isLoading={isLoading}
+        streamingId={streamingId}
         health={health}
       />
       <ChatButton onClick={handleToggle} isOpen={isOpen} />

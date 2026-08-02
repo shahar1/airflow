@@ -48,7 +48,7 @@ import socket
 import sys
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -57,6 +57,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from airflow.configuration import conf
@@ -199,6 +200,7 @@ def _create_chatbot_api() -> dict[str, Any]:
                 body.page_url,
                 can_write=_user_can_write(user),
                 user_id=str(user.get_id()),
+                user=user,
             )
         )
 
@@ -209,14 +211,22 @@ def _create_chatbot_api() -> dict[str, Any]:
 
         Streams the rest of the agent run as the same SSE frames as /chat.
         """
-        # Popped before the permission checks so a failed attempt burns the nonce.
-        pending = _pop_pending(body.nonce)
+        pending = _get_pending(body.nonce)
         if pending is None:
             return JSONResponse({"error": "Unknown or expired confirmation"}, status_code=404)
         if pending.user_id != str(user.get_id()) or not _user_can_write(user):
+            # A failed attempt still burns the nonce.
+            _drop_pending(body.nonce)
             return JSONResponse({"error": "Forbidden"}, status_code=403)
 
-        return _sse_response(_resume_agent(pending, body.approved))
+        # Not popped on the way in: a write can land and the connection drop before
+        # the browser sees it. The record outlives the stream so asking again
+        # replays what happened instead of running it a second time.
+        if pending.state in ("executing", "interrupted", "done"):
+            return _sse_response(_replay(pending))
+        pending.state = "executing"
+        pending.approved = body.approved
+        return _sse_response(_resume_agent(pending, body.approved, user))
 
     return {
         "app": app,
@@ -264,7 +274,8 @@ Work one step at a time:
 2. Call `fix_dag_code` with the smallest unique `old` snippet you can (it must
    occur exactly once in the file).
 3. After a successful fix, offer to re-run — do not re-run on your own.
-4. Call `revert_dag_code` only when the user wants a fix undone.
+4. `revert_dag_code` restores the *original* file and discards every fix you
+   applied, not just the last one. Say that before proposing it.
 """
 
 _READ_ONLY_PROMPT = """\
@@ -389,27 +400,355 @@ def _render_system_prompt(page_url: str | None, can_write: bool = False) -> str:
     return f"{prompt}\nCurrent page: {page}\n"
 
 
-def _user_can_write(user: Any) -> bool:
-    """Whether the auth manager grants the user Dag-edit rights (over any Dag)."""
+def _is_authorized_dag(
+    user: Any,
+    *,
+    method: str,
+    dag_id: str | None,
+    access_entity: Any = None,
+    team_name: str | None = None,
+) -> bool:
+    """Ask the auth manager about one Dag — or, with no ``dag_id``, about any Dag."""
     # Module singleton, not request.app.state: inside a mounted sub-app,
     # request.app is the sub-app and carries no auth manager.
     from airflow.api_fastapi.app import get_auth_manager
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagDetails
 
-    return get_auth_manager().is_authorized_dag(method="PUT", user=user)
+    return get_auth_manager().is_authorized_dag(
+        method=method,
+        user=user,
+        access_entity=access_entity,
+        details=DagDetails(id=dag_id, team_name=team_name) if dag_id else None,
+    )
 
 
-WRITE_TOOLS = frozenset({"fix_dag_code", "revert_dag_code", "rerun_dag", "run_backfill"})
+def _user_can_write(user: Any) -> bool:
+    """Whether the user may edit *some* Dag — the gate on offering write tools at all."""
+    return _is_authorized_dag(user, method="PUT", dag_id=None)
 
 
-def _gate_toolsets(toolsets: list[Any], can_write: bool) -> list[Any]:
-    """Viewers get Airy without the write tools; editors get them behind a confirm."""
+# The only tools Airy will run. A name-based *denylist* of writers fails open:
+# a sidecar that gains a new mutating tool would be treated as a read, needing
+# neither write permission nor a confirmation. So the policy is the allowlist,
+# and every entry states what the tool does.
+#
+#   writes        mutates Airflow — filtered out for viewers, confirmed for editors
+#   reads_source  hands back Dag source, so the whole source file must be readable
+#   reads_assets  derived from the asset table
+#   fleet         may be called with no dag_id, scoped by a ``dag_ids`` allowlist
+TOOL_POLICY: dict[str, dict[str, bool]] = {
+    "diagnose_dag": {"reads_source": True},
+    "compare_dag_runs": {"reads_source": True},
+    "find_failure_clusters": {"fleet": True},
+    "get_blast_radius": {"reads_assets": True},
+    "plan_backfill": {},
+    "fix_dag_code": {"writes": True, "reads_source": True},
+    "revert_dag_code": {"writes": True, "reads_source": True},
+    "rerun_dag": {"writes": True},
+    "run_backfill": {"writes": True},
+}
+
+WRITE_TOOLS = frozenset(name for name, policy in TOOL_POLICY.items() if policy.get("writes"))
+
+
+def _authorized_dag_ids(user: Any) -> set[str]:
+    """
+    Return the Dags this user may read.
+
+    Not ``is_authorized_dag(details=None)``: under FAB that answers "may you
+    *list* Dags", which is true for anyone holding read on a single Dag.
+    """
+    from airflow.api_fastapi.app import get_auth_manager
+
+    return get_auth_manager().get_authorized_dag_ids(user=user, method="GET")
+
+
+def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """
+    Return the ``(method, access_entity)`` pairs Airflow's routes demand of this tool.
+
+    A tool is a bundle of REST calls, and each call has its own permission on the
+    real API — ``diagnose_dag`` alone reads runs, task instances, logs and source.
+    Authorizing the bundle as one Dag-level read would hand over logs to someone
+    the log route itself would refuse, so every underlying call is checked.
+
+    Only tools in ``TOOL_POLICY`` get here; an unknown one is refused before this.
+    """
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    runs = (("GET", Entity.RUN), ("GET", Entity.TASK_INSTANCE))
+    # Patching a Dag's source edits the Dag, reads its code, and reads its
+    # versions to tell whether the reparse landed; there is no write-the-code
+    # permission in Airflow to mirror.
+    patch_source = (("PUT", None), ("GET", Entity.CODE), ("GET", Entity.VERSION))
+    requirements: dict[str, tuple[tuple[str, Any], ...]] = {
+        "diagnose_dag": (*runs, ("GET", Entity.TASK_LOGS), ("GET", Entity.CODE)),
+        # Scans task instances fleet-wide, then reads each failure's log.
+        "find_failure_clusters": (("GET", Entity.TASK_INSTANCE), ("GET", Entity.TASK_LOGS)),
+        "compare_dag_runs": (*runs, ("GET", Entity.CODE)),
+        # Cross-Dag neighbours are what DEPENDENCIES exists to expose; the asset
+        # rows the answer is derived from are checked separately.
+        "get_blast_radius": (("GET", Entity.DEPENDENCIES),),
+        "fix_dag_code": patch_source,
+        "revert_dag_code": patch_source,
+        # Unpausing is a separate, lasting edit — only demanded when actually asked for.
+        "rerun_dag": (("POST", Entity.RUN),) + ((("PUT", None),) if tool_args.get("unpause") else ()),
+        # Airflow gates even the backfill dry run on POST; mirror that.
+        "plan_backfill": (("POST", Entity.RUN),),
+        # Creating it is POST, but it then reads back what landed and may cancel
+        # it — all three are separate permissions on the real backfill routes.
+        "run_backfill": (("POST", Entity.RUN), ("GET", Entity.RUN), ("PUT", Entity.RUN)),
+    }
+    return requirements[tool_name]
+
+
+def _policy(tool_name: str, trait: str) -> bool:
+    return bool(TOOL_POLICY.get(tool_name, {}).get(trait))
+
+
+def _parsed_source_digest(dag_id: str) -> str | None:
+    """
+    Return the identity of the source the co-located check is being decided against.
+
+    The *content* hash, not the version number: ``DagCode.update_source_code``
+    rewrites the latest version's source in place when it changes, so version N
+    is not a stable set of bytes and pinning to it would still let a Dag appear
+    that nobody was checked against.
+    """
+    from airflow.models.dagcode import DagCode
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        code = DagCode.get_latest_dagcode(dag_id, session=session)
+        return code.source_code_hash if code else None
+
+
+def _dag_ids_sharing_file(dag_id: str) -> list[str]:
+    """Every Dag defined in the same file as ``dag_id`` — the real blast radius of a patch."""
+    from airflow.models.dag import DagModel
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        target = session.execute(
+            select(DagModel.bundle_name, DagModel.relative_fileloc).where(DagModel.dag_id == dag_id)
+        ).one_or_none()
+        if target is None:
+            return [dag_id]
+        siblings = session.scalars(
+            select(DagModel.dag_id).where(
+                DagModel.bundle_name == target.bundle_name,
+                DagModel.relative_fileloc == target.relative_fileloc,
+            )
+        ).all()
+    return sorted(set(siblings) | {dag_id})
+
+
+def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -> str | None:
+    """
+    Return the denial to send instead of running ``tool_name``, or ``None`` to allow it.
+
+    The sidecars call Airflow as one admin service account, so without this the
+    signed-in user's permissions would not reach the tools at all: any logged-in
+    user could read any Dag, and edit rights on one Dag would authorize writes
+    against every other.
+    """
+    from airflow.api_fastapi.app import get_auth_manager
+    from airflow.models.dag import DagModel
+
+    if tool_name not in TOOL_POLICY:
+        # Fail closed. Classifying an unknown tool by guesswork is how a sidecar
+        # that gains a mutating tool ends up running it as a read, with neither
+        # write permission nor a confirmation.
+        log.warning("Airy refused %s: not in TOOL_POLICY", tool_name)
+        return (
+            f"Access denied: {tool_name} is not a tool Airy is allowed to run. "
+            f"Tell the user this; do not retry."
+        )
+
+    # Scoping a fleet-wide call works by rewriting its arguments in place, which
+    # only reaches the sidecar if these *are* the arguments. Anything else and
+    # the narrowing would be silently dropped.
+    if not isinstance(tool_args, dict):
+        return f"Access denied: {tool_name} was called with arguments Airy cannot check. Do not retry."
+
+    args = tool_args
+    dag_id = args.get("dag_id")
+    if not isinstance(dag_id, str) or not dag_id:
+        return _authorize_fleet_wide_call(user, tool_name, args)
+
+    if _policy(tool_name, "reads_assets") and not get_auth_manager().is_authorized_asset(
+        method="GET", user=user
+    ):
+        return (
+            f"Access denied: {tool_name} reads the asset graph, which the signed-in user cannot. "
+            f"Tell the user this; do not retry."
+        )
+
+    if _policy(tool_name, "reads_source"):
+        # Authorization is about to be decided over the Dags in one *version* of
+        # this file. Pin the tool to that version, or it will go and fetch
+        # whatever the processor has landed by the time it runs — which may
+        # include a Dag that was never part of this decision.
+        digest = _parsed_source_digest(dag_id)
+        if digest is None:
+            return (
+                f"Access denied: Airflow has not parsed a version of Dag {dag_id!r} yet, so there is "
+                f"nothing {tool_name} can safely read. Tell the user this; do not retry."
+            )
+        args["source_digest"] = digest
+
+    targets = _authorization_targets(tool_name, dag_id, _tool_access_requirements(tool_name, args))
+    # The team scopes the permission: asking without it is a different question
+    # from the one the real route asks, and team-scoped managers answer it differently.
+    teams = DagModel.get_dag_id_to_team_name_mapping([target for target, _ in targets])
+    for target, requirements in targets:
+        for method, access_entity in requirements:
+            if _is_authorized_dag(
+                user,
+                method=method,
+                dag_id=target,
+                access_entity=access_entity,
+                team_name=teams.get(target),
+            ):
+                continue
+            needed = f"{method} on {access_entity.value}" if access_entity else f"{method} on the Dag"
+            log.warning("Airy denied %s: %s %s on Dag %s", tool_name, user, needed, target)
+            if target != dag_id:
+                # Naming the sibling would leak the cross-tenant Dag id that
+                # withholding the file exists to protect. /dagSources is generic
+                # for the same reason.
+                return (
+                    f"Access denied: {dag_id!r} shares a source file with another Dag the signed-in "
+                    f"user may not read. Tell the user this; do not retry."
+                )
+            return (
+                f"Access denied: {tool_name} needs {needed} for Dag {target!r}, which the "
+                f"signed-in user does not have. Tell the user this; do not retry."
+            )
+    return None
+
+
+def _authorization_targets(
+    tool_name: str, dag_id: str, requirements: tuple[tuple[str, Any], ...]
+) -> list[tuple[str, tuple[tuple[str, Any], ...]]]:
+    """Which Dags must clear which permissions — a source file can hold more than the one named."""
+    if not _policy(tool_name, "reads_source"):
+        return [(dag_id, requirements)]
+    co_located = [other for other in _dag_ids_sharing_file(dag_id) if other != dag_id]
+    if _policy(tool_name, "writes"):
+        # A patch rewrites the file, so every Dag in it is edited.
+        return [(dag_id, requirements), *((other, requirements) for other in co_located)]
+    # Source comes back whole. This is the rule /dagSources enforces by redacting:
+    # every Dag in the file has to be readable, or the caller sees code they cannot.
+    return [(dag_id, requirements), *((other, (("GET", None),)) for other in co_located)]
+
+
+def _readable_dag_ids_for(user: Any, tool_name: str) -> list[str]:
+    """Return the Dags this user may run ``tool_name`` against, cleared entity by entity."""
+    from airflow.models.dag import DagModel
+
+    candidates = sorted(_authorized_dag_ids(user))
+    if not candidates:
+        return []
+    teams = DagModel.get_dag_id_to_team_name_mapping(candidates)
+    requirements = _tool_access_requirements(tool_name, {})
+    return [
+        dag_id
+        for dag_id in candidates
+        if all(
+            _is_authorized_dag(
+                user,
+                method=method,
+                dag_id=dag_id,
+                access_entity=access_entity,
+                team_name=teams.get(dag_id),
+            )
+            for method, access_entity in requirements
+        )
+    ]
+
+
+def _authorize_fleet_wide_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -> str | None:
+    """
+    Authorize a tool that names no Dag — so it would otherwise speak for all of them.
+
+    A preflight "may you read every Dag?" would be a snapshot, and the sidecar's
+    wildcard scan runs as admin afterwards: a Dag created in between comes back
+    unauthorized.  So instead of gating the call, this narrows it — the readable
+    Dag ids are written into the arguments, overwriting whatever the model asked
+    for, and the sidecar filters to them.  Anything outside is never fetched.
+    """
+    if tool_name in WRITE_TOOLS:
+        return f"Access denied: {tool_name} must name the Dag it changes. Tell the user this; do not retry."
+
+    if not _policy(tool_name, "fleet"):
+        # No allowlist to narrow with — the read-only sidecar's listings, whose
+        # signatures are not ours. A "may you read every Dag?" gate would only be
+        # a snapshot, and the admin-backed call runs after it, so a Dag created in
+        # between comes back unauthorized. There is no safe version of this call.
+        return (
+            f"Access denied: {tool_name} names no Dag and cannot be scoped to the ones the signed-in "
+            f"user may read. Ask them for a specific dag_id instead."
+        )
+    cleared = _readable_dag_ids_for(user, tool_name)
+    if not cleared:
+        return (
+            f"Access denied: the signed-in user may not read any Dag that {tool_name} would report on. "
+            f"Ask them for a specific dag_id instead."
+        )
+    tool_args["dag_ids"] = cleared
+    return None
+
+
+_dag_auth_toolset_class: type | None = None
+
+
+def _dag_auth_toolset(wrapped: Any, user: Any) -> Any:
+    """
+    Wrap a toolset so every call is authorized as the signed-in user.
+
+    The class is built on first use because pydantic-ai is an optional import
+    in this module.
+    """
+    global _dag_auth_toolset_class
+    if _dag_auth_toolset_class is None:
+        from pydantic_ai.toolsets import WrapperToolset
+
+        @dataclass
+        class DagAuthToolset(WrapperToolset):
+            user: Any = None
+
+            async def call_tool(self, name, tool_args, ctx, tool):  # type: ignore[no-untyped-def]
+                denial = _authorize_tool_call(self.user, name, tool_args)
+                if denial:
+                    log.warning("Airy denied %s: %s", name, denial)
+                    return denial
+                return await super().call_tool(name, tool_args, ctx, tool)
+
+        _dag_auth_toolset_class = DagAuthToolset
+    return _dag_auth_toolset_class(wrapped, user)
+
+
+def _gate_toolsets(toolsets: list[Any], can_write: bool, user: Any = None) -> list[Any]:
+    """
+    Viewers get Airy without the write tools; editors get them behind a confirm.
+
+    Both layers sit *inside* the per-Dag authorization wrapper, so an approved
+    call is re-authorized when /confirm resumes it — approving a write against
+    one Dag can never execute against another.
+    """
+    # Unknown tools are not offered at all — the authorization wrapper would
+    # refuse them anyway, and a tool the model can see is a tool it will try.
+    known = [ts.filtered(lambda ctx, tool_def: tool_def.name in TOOL_POLICY) for ts in toolsets]
     if can_write:
         # The model can request a write, but the run suspends until the user
         # approves it in the UI (see /confirm) — prompt prose is not a gate.
-        return [
-            ts.approval_required(lambda ctx, tool_def, args: tool_def.name in WRITE_TOOLS) for ts in toolsets
+        gated = [
+            ts.approval_required(lambda ctx, tool_def, args: tool_def.name in WRITE_TOOLS) for ts in known
         ]
-    return [ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS) for ts in toolsets]
+    else:
+        gated = [ts.filtered(lambda ctx, tool_def: tool_def.name not in WRITE_TOOLS) for ts in known]
+    return [_dag_auth_toolset(ts, user) for ts in gated]
 
 
 _CONFIRM_TTL_S = 600.0
@@ -418,13 +757,21 @@ _CONFIRM_MAX_PENDING = 50
 
 @dataclass
 class _PendingApproval:
-    """A suspended agent run waiting for the user's verdict on a write tool."""
+    """
+    A suspended agent run waiting for the user's verdict on a write tool.
+
+    Outlives its own execution: ``state`` and ``frames`` are what let a second
+    /confirm for the same nonce report the outcome rather than repeat the write.
+    """
 
     user_id: str
     call_ids: list[str]
     messages: list[Any]
     page_url: str | None
     created_at: float
+    state: str = "pending"
+    approved: bool | None = None
+    frames: list[dict[str, Any]] = field(default_factory=list)
 
 
 # In-memory and per-process: enough for the demo's single api-server worker;
@@ -447,13 +794,51 @@ def _store_pending(*, user_id: str, call_ids: list[str], messages: list[Any], pa
     return nonce
 
 
-def _pop_pending(nonce: str) -> _PendingApproval | None:
-    """Single-use by construction: a nonce can only ever be popped once."""
+def _get_pending(nonce: str) -> _PendingApproval | None:
     _purge_expired_pending(time.monotonic())
-    return _pending_approvals.pop(nonce, None)
+    return _pending_approvals.get(nonce)
 
 
-def _build_agent(page_url: str | None = None, can_write: bool = False) -> tuple[Any, str | None]:
+def _drop_pending(nonce: str) -> None:
+    _pending_approvals.pop(nonce, None)
+
+
+# Frame that tells the drawer "still don't know" — without it, the terminating
+# `done` of a replay reads as settlement, which is the opposite of the truth.
+UNSETTLED_FRAME = {"type": "unsettled"}
+
+
+def _replay(pending: _PendingApproval) -> AsyncIterator[dict[str, Any]]:
+    """Re-send a decided confirmation's frames instead of executing it again."""
+
+    async def frames() -> AsyncIterator[dict[str, Any]]:
+        verdict = "approved" if pending.approved else "rejected"
+        if pending.state == "executing":
+            yield {"type": "text", "delta": f"_This action was {verdict} and is still running._\n\n"}
+            yield UNSETTLED_FRAME
+            return
+        if pending.state == "interrupted":
+            yield {
+                "type": "text",
+                "delta": (
+                    f"_This action was {verdict}, but the connection dropped while it ran, so whether "
+                    f"it finished is unknown. Check the Dag before trying again._\n\n"
+                ),
+            }
+            for frame in pending.frames:
+                yield frame
+            yield UNSETTLED_FRAME
+            return
+        yield {"type": "text", "delta": f"_This action was already {verdict}._\n\n"}
+        for frame in pending.frames:
+            yield frame
+
+    return frames()
+
+
+def _build_agent(
+    page_url: str | None = None, can_write: bool = False, user: Any = None
+) -> tuple[Any, str | None]:
     """Return ``(agent, None)``, or ``(None, markdown)`` explaining what is missing."""
     api_key = _get_llm_api_key()
     if not api_key:
@@ -487,7 +872,7 @@ def _build_agent(page_url: str | None = None, can_write: bool = False) -> tuple[
     return Agent(
         model=model,
         system_prompt=_render_system_prompt(page_url, can_write),
-        toolsets=_gate_toolsets(toolsets, can_write),
+        toolsets=_gate_toolsets(toolsets, can_write, user),
     ), None
 
 
@@ -502,6 +887,32 @@ def _to_message_history(history: list[dict[str, str]] | None) -> list[Any]:
         elif role == "assistant":
             message_history.append(ModelResponse(parts=[TextPart(content=text)]))
     return message_history
+
+
+_RESULT_CLIP_CHARS = 4000
+
+# Also matched in _event_payload: a denied write tool comes back as a plain
+# tool return carrying this text, and the drawer must not paint it as success.
+_DENIAL_MESSAGE = "The user rejected this action."
+
+
+def _clip_result(content: Any) -> str:
+    """
+    Render a tool result for the expandable row in the drawer.
+
+    Clipped hard: the browser keeps every turn in sessionStorage, and one
+    verbose log-fetch must not blow the quota that persists the whole chat.
+    """
+    if isinstance(content, str):
+        text = content
+    else:
+        try:
+            text = json.dumps(content, indent=2, default=str)
+        except (TypeError, ValueError):
+            text = str(content)
+    if len(text) > _RESULT_CLIP_CHARS:
+        return text[:_RESULT_CLIP_CHARS] + "\n… (truncated)"
+    return text
 
 
 def _event_payload(event: Any) -> dict[str, Any] | None:
@@ -526,7 +937,18 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
             "args": event.part.args,
         }
     if kind == "function_tool_result":
-        return {"type": "tool_result", "id": event.part.tool_call_id, "name": event.part.tool_name}
+        part = event.part
+        # A RetryPromptPart here means the tool call itself failed (bad args,
+        # MCP error); its content is the error the model is asked to recover from.
+        failed = getattr(part, "part_kind", None) == "retry-prompt"
+        return {
+            "type": "tool_result",
+            "id": part.tool_call_id,
+            "name": part.tool_name,
+            "failed": failed,
+            "denied": not failed and part.content == _DENIAL_MESSAGE,
+            "result": _clip_result(part.model_response() if failed else part.content),
+        }
     if kind == "part_delta":
         # Tool-call argument deltas share this event kind, and thinking deltas
         # also carry `content_delta` — neither belongs in the reply.
@@ -598,9 +1020,10 @@ async def _stream_agent(
     *,
     can_write: bool = False,
     user_id: str = "",
+    user: Any = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run the agent, yielding tool calls and text as they happen."""
-    agent, problem = _build_agent(page_url, can_write=can_write)
+    agent, problem = _build_agent(page_url, can_write=can_write, user=user)
     if problem:
         yield {"type": "text", "delta": problem}
         return
@@ -619,18 +1042,29 @@ async def _stream_agent(
         yield {"type": "error", "message": str(_root_cause(e))}
 
 
-async def _resume_agent(pending: _PendingApproval, approved: bool) -> AsyncIterator[dict[str, Any]]:
-    """Resume a suspended run with the user's verdict on the write tool."""
-    agent, problem = _build_agent(pending.page_url, can_write=True)
+async def _resume_agent(
+    pending: _PendingApproval, approved: bool, user: Any = None
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Resume a suspended run with the user's verdict on the write tool.
+
+    Every frame is recorded as it goes out, and the record is closed even if the
+    browser hangs up mid-stream: the write may already have landed, and the only
+    way the user can find that out is to ask again with the same nonce.
+    """
+    agent, problem = _build_agent(pending.page_url, can_write=True, user=user)
     if problem:
-        yield {"type": "text", "delta": problem}
+        pending.state = "done"
+        pending.frames = [{"type": "text", "delta": problem}]
+        yield pending.frames[0]
         return
 
     try:
         from pydantic_ai import DeferredToolResults, ToolDenied
 
         # One verdict for the whole suspension batch — in practice one call.
-        verdict = True if approved else ToolDenied("The user rejected this action.")
+        verdict = True if approved else ToolDenied(_DENIAL_MESSAGE)
+        settled = set()
         async for payload in _run_and_stream(
             agent,
             user_id=pending.user_id,
@@ -640,10 +1074,28 @@ async def _resume_agent(pending: _PendingApproval, approved: bool) -> AsyncItera
                 approvals={call_id: verdict for call_id in pending.call_ids}
             ),
         ):
+            # A clean return is the only proof the write reached a known end.
+            # A failed one is not: rerun_dag unpauses before it triggers, and a
+            # create request can time out after the server already created it.
+            if payload.get("type") == "tool_result" and not payload.get("failed"):
+                settled.add(payload.get("id"))
+            pending.frames.append(payload)
             yield payload
     except Exception as e:
         log.exception("Agent resume failed")
-        yield {"type": "error", "message": str(_root_cause(e))}
+        failure = {"type": "error", "message": str(_root_cause(e))}
+        pending.frames.append(failure)
+        pending.state = "interrupted"
+        yield failure
+        return
+    except BaseException:
+        # Cancellation — the browser hung up, or the worker is going down. The
+        # tool may have run; nothing here can say. Marking this "done" would let
+        # a retry replay a partial transcript and call it the outcome.
+        pending.state = "interrupted"
+        raise
+    # A rejection executes nothing, so there is nothing left in doubt.
+    pending.state = "done" if not approved or settled.issuperset(pending.call_ids) else "interrupted"
 
 
 def _sse_response(payloads: AsyncIterator[dict[str, Any]]) -> StreamingResponse:

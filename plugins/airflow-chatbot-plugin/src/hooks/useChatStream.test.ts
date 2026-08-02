@@ -453,9 +453,75 @@ describe("useChat streaming", () => {
       const assistant = result.current.messages[1];
       expect(assistant?.content).toBe("I can fix that. Applied.");
       expect(assistant?.confirms?.[0]?.resolution).toBe(approved ? "approved" : "rejected");
+      expect(assistant?.confirms?.[0]?.outcomeUnknown).toBe(false);
       expect(result.current.messages).toHaveLength(2);
     },
   );
+
+  it("keeps a confirm unsettled when the server says it still does not know", async () => {
+    // Every stream ends with `done`, replays included — so `done` alone cannot
+    // mean the action is settled.
+    const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("fix it");
+    });
+
+    fetchMock.mockReturnValue(
+      Promise.resolve(
+        streamingResponse([
+          frame({ delta: "still running", type: "text" }),
+          frame({ type: "unsettled" }),
+          frame({ type: "done" }),
+        ]),
+      ),
+    );
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+
+    expect(result.current.messages[1]?.confirms?.[0]?.outcomeUnknown).toBe(true);
+  });
+
+  it("leaves a confirm answerable when the reply never finishes", async () => {
+    // The write may well have landed; the only way to find out is to ask again.
+    const fetchMock = mockFetch(streamingResponse(confirmFrames));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("fix it");
+    });
+
+    // No `done` frame: the connection dropped mid-stream.
+    fetchMock.mockReturnValue(
+      Promise.resolve(streamingResponse([frame({ delta: " Applying", type: "text" })])),
+    );
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+
+    expect(result.current.messages[1]?.confirms?.[0]).toMatchObject({
+      outcomeUnknown: true,
+      resolution: "approved",
+    });
+
+    // Asking again with the same nonce is allowed, and settles it.
+    fetchMock.mockReturnValue(
+      Promise.resolve(
+        streamingResponse([frame({ delta: " Applied.", type: "text" }), frame({ type: "done" })]),
+      ),
+    );
+    await act(async () => {
+      await result.current.resolveConfirm("n1", true);
+    });
+
+    expect(result.current.messages[1]?.confirms?.[0]?.outcomeUnknown).toBe(false);
+    expect(JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body))).toEqual({
+      approved: true,
+      nonce: "n1",
+    });
+  });
 
   it("explains an expired confirmation", async () => {
     const fetchMock = mockFetch(streamingResponse(confirmFrames));
