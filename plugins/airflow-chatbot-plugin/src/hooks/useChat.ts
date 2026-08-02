@@ -28,6 +28,37 @@ const generateId = (): string =>
 const CHATBOT_BASE = () => `${globalThis.location.origin}/chatbot`;
 
 const HISTORY_TURNS = 20;
+const STORAGE_KEY = "airy-chat-history";
+
+/** Restore the conversation a page reload would otherwise wipe mid-demo. */
+export const loadStoredMessages = (): Message[] => {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(STORAGE_KEY);
+    if (raw === null || raw === undefined) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as Message[])
+      .filter((m) => m.content !== "" || (m.tools?.length ?? 0) > 0)
+      .map((m) => ({
+        ...m,
+        timestamp: new Date(m.timestamp),
+        // A chip still in flight when the page reloaded must not spin forever.
+        tools: m.tools?.map((tool) =>
+          tool.durationMs === undefined ? { ...tool, durationMs: 0 } : tool,
+        ),
+      }));
+  } catch {
+    return [];
+  }
+};
+
+const persistMessages = (messages: Message[]) => {
+  try {
+    globalThis.sessionStorage?.setItem(STORAGE_KEY, JSON.stringify(messages));
+  } catch {
+    // Storage full or blocked: the chat still works, it just won't survive reload.
+  }
+};
 
 /** The backend takes prior turns as history; the new turn is sent separately. */
 export const toHistory = (
@@ -181,13 +212,14 @@ export const useHealth = () => {
  * error the reply is marked `isError: true` so the UI can render it distinctly.
  */
 export const useChat = () => {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(loadStoredMessages);
   const [isLoading, setIsLoading] = useState(false);
-  const messagesRef = useRef<Message[]>([]);
+  const messagesRef = useRef<Message[]>(messages);
 
   const commit = useCallback((next: Message[]) => {
     messagesRef.current = next;
     setMessages(next);
+    persistMessages(next);
   }, []);
 
   const sendMessage = useCallback(
@@ -290,6 +322,11 @@ export const useChat = () => {
   const clearMessages = useCallback(() => {
     setMessages([]);
     messagesRef.current = [];
+    try {
+      globalThis.sessionStorage?.removeItem(STORAGE_KEY);
+    } catch {
+      // Nothing to clean up if storage is unavailable.
+    }
   }, []);
 
   return {

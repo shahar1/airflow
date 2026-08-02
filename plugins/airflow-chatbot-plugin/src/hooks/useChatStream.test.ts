@@ -46,6 +46,7 @@ const mockFetch = (response: Response | Promise<never>) => {
 };
 
 afterEach(() => {
+  sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
