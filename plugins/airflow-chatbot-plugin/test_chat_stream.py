@@ -207,7 +207,7 @@ def client(monkeypatch):
 
 
 def test_chat_endpoint_streams_sse_frames_and_always_terminates(client, monkeypatch):
-    async def fake_stream(message, history=None, page_url=None, *, can_write=False):
+    async def fake_stream(message, history=None, page_url=None, *, can_write=False, user_id=""):
         yield {"type": "tool", "id": "c1", "name": "diagnose_dag", "args": {}}
         yield {"type": "tool_result", "id": "c1", "name": "diagnose_dag"}
         yield {"type": "text", "delta": "Task summarize failed."}
@@ -229,7 +229,7 @@ def test_chat_endpoint_streams_sse_frames_and_always_terminates(client, monkeypa
 def test_chat_endpoint_disables_proxy_buffering(client, monkeypatch):
     # Without these a buffering proxy holds every frame until the end, which
     # silently undoes the whole point of streaming.
-    async def fake_stream(message, history=None, page_url=None, *, can_write=False):
+    async def fake_stream(message, history=None, page_url=None, *, can_write=False, user_id=""):
         yield {"type": "text", "delta": "hi"}
 
     monkeypatch.setattr(plugin, "_stream_agent", fake_stream)
@@ -241,7 +241,7 @@ def test_chat_endpoint_disables_proxy_buffering(client, monkeypatch):
 
 
 def test_chat_endpoint_reports_a_mid_stream_failure_then_terminates(client, monkeypatch):
-    async def exploding_stream(message, history=None, page_url=None, *, can_write=False):
+    async def exploding_stream(message, history=None, page_url=None, *, can_write=False, user_id=""):
         yield {"type": "text", "delta": "starting"}
         raise RuntimeError("stream died")
 
@@ -285,7 +285,7 @@ def test_injected_script_survives_a_missing_bundle(monkeypatch, tmp_path):
 def test_chat_endpoint_forwards_the_page_url(client, monkeypatch):
     seen = {}
 
-    async def capturing_stream(message, history=None, page_url=None, *, can_write=False):
+    async def capturing_stream(message, history=None, page_url=None, *, can_write=False, user_id=""):
         seen["page_url"] = page_url
         yield {"type": "text", "delta": "ok"}
 
@@ -318,7 +318,7 @@ def test_routes_reject_unauthenticated_requests(method, path):
 def test_chat_endpoint_passes_the_user_write_permission_to_the_agent(client, monkeypatch, can_write):
     seen = {}
 
-    async def capturing_stream(message, history=None, page_url=None, *, can_write=False):
+    async def capturing_stream(message, history=None, page_url=None, *, can_write=False, user_id=""):
         seen["can_write"] = can_write
         yield {"type": "text", "delta": "ok"}
 
@@ -343,12 +343,142 @@ def test_gate_toolsets_filters_write_tools_for_viewers():
     assert gated.filter_func(None, SimpleNamespace(name="diagnose_dag")) is True
 
 
-def test_gate_toolsets_leaves_editors_unrestricted():
-    from pydantic_ai.toolsets import FunctionToolset
+def test_gate_toolsets_pauses_write_tools_for_editors():
+    from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 
     toolset = FunctionToolset()
+    (gated,) = plugin._gate_toolsets([toolset], can_write=True)
 
-    assert plugin._gate_toolsets([toolset], can_write=True) == [toolset]
+    assert isinstance(gated, ApprovalRequiredToolset)
+    for name in plugin.WRITE_TOOLS:
+        assert gated.approval_required_func(None, SimpleNamespace(name=name), {}) is True
+    assert gated.approval_required_func(None, SimpleNamespace(name="diagnose_dag"), {}) is False
+
+
+@pytest.fixture
+def pending_store(monkeypatch):
+    store = {}
+    monkeypatch.setattr(plugin, "_pending_approvals", store)
+    return store
+
+
+def _store_pending(user_id="alice", call_ids=None, messages=None):
+    return plugin._store_pending(
+        user_id=user_id, call_ids=call_ids or ["c1"], messages=messages or [], page_url=None
+    )
+
+
+def test_pending_approval_nonce_is_single_use(pending_store):
+    nonce = _store_pending()
+
+    assert plugin._pop_pending(nonce) is not None
+    assert plugin._pop_pending(nonce) is None
+
+
+def test_pending_approval_expires(pending_store):
+    nonce = _store_pending()
+    pending_store[nonce].created_at -= plugin._CONFIRM_TTL_S + 1
+
+    assert plugin._pop_pending(nonce) is None
+
+
+def test_pending_approvals_evict_the_oldest_past_the_cap(pending_store):
+    first = _store_pending()
+    for _ in range(plugin._CONFIRM_MAX_PENDING):
+        _store_pending()
+
+    assert len(pending_store) == plugin._CONFIRM_MAX_PENDING
+    assert plugin._pop_pending(first) is None
+
+
+def test_confirm_endpoint_rejects_an_unknown_nonce(client):
+    assert client.post("/confirm", json={"nonce": "nope", "approved": True}).status_code == 404
+
+
+def test_confirm_endpoint_rejects_another_users_nonce(client, pending_store):
+    nonce = _store_pending(user_id="bob")
+
+    assert client.post("/confirm", json={"nonce": nonce, "approved": True}).status_code == 403
+    # The failed attempt burned the nonce.
+    assert plugin._pop_pending(nonce) is None
+
+
+def test_confirm_endpoint_requires_write_permission(client, monkeypatch, pending_store):
+    monkeypatch.setattr(plugin, "_user_can_write", lambda user: False)
+    nonce = _store_pending()
+
+    assert client.post("/confirm", json={"nonce": nonce, "approved": True}).status_code == 403
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_confirm_endpoint_streams_the_resumed_run(client, monkeypatch, pending_store, approved):
+    seen = {}
+
+    async def fake_resume(pending, approved):
+        seen["pending"], seen["approved"] = pending, approved
+        yield {"type": "text", "delta": "resumed"}
+
+    monkeypatch.setattr(plugin, "_resume_agent", fake_resume)
+    nonce = _store_pending(call_ids=["c9"])
+
+    with client.stream("POST", "/confirm", json={"nonce": nonce, "approved": approved}) as response:
+        assert response.status_code == 200
+        frames = [
+            json.loads(line.removeprefix("data:").strip())
+            for line in response.iter_lines()
+            if line.startswith("data:")
+        ]
+
+    assert [f["type"] for f in frames] == ["text", "done"]
+    assert seen["approved"] is approved
+    assert seen["pending"].call_ids == ["c9"]
+
+
+class FakeDeferredStream:
+    """An agent stream that requests approval for a write tool, then ends."""
+
+    def __init__(self):
+        approvals = [ToolCallPart(tool_name="fix_dag_code", args={"dag_id": "d"}, tool_call_id="c9")]
+        self._events = [
+            tool_call_event(name="fix_dag_code", call_id="c9"),
+            SimpleNamespace(
+                event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=approvals)
+            ),
+            SimpleNamespace(
+                event_kind="agent_run_result",
+                result=SimpleNamespace(all_messages=lambda: ["m1", "m2"]),
+            ),
+        ]
+
+    async def __aenter__(self):
+        async def gen():
+            for event in self._events:
+                yield event
+
+        return gen()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_run_and_stream_suspends_a_write_tool_behind_a_confirm_nonce(pending_store):
+    class FakeAgent:
+        def run_stream_events(self, *args, **kwargs):
+            return FakeDeferredStream()
+
+    payloads = [p async for p in plugin._run_and_stream(FakeAgent(), user_id="alice", page_url="/x")]
+
+    assert payloads[0]["type"] == "tool"
+    confirm = payloads[-1]
+    assert confirm["type"] == "confirm_required"
+    assert confirm["tool"] == "fix_dag_code"
+    assert confirm["call_id"] == "c9"
+    pending = plugin._pop_pending(confirm["nonce"])
+    assert pending.user_id == "alice"
+    assert pending.call_ids == ["c9"]
+    # The resumed run needs the suspended run's full message history.
+    assert pending.messages == ["m1", "m2"]
 
 
 def _injected_client(response_headers=None, content="<html><body>hi</body></html>"):

@@ -24,7 +24,7 @@ import remarkGfm from "remark-gfm";
 import { useColorMode } from "src/context/colorMode";
 
 import { SparkleIcon } from "./icons/SparkleIcon";
-import { Message, ToolCall } from "./types";
+import { ConfirmRequest, Message, ToolCall } from "./types";
 
 /**
  * `[ACTION: Re-run sales_summary]` lines are stripped from the rendered text and
@@ -46,13 +46,19 @@ interface MessageListProps {
   readonly messages: Message[];
   readonly isLoading?: boolean;
   readonly onSuggestionClick?: (text: string) => void;
+  readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
 }
 
 /**
  * Message list component displaying chat history.
  * Automatically scrolls to bottom on new messages.
  */
-export const MessageList: FC<MessageListProps> = ({ isLoading = false, messages, onSuggestionClick }) => {
+export const MessageList: FC<MessageListProps> = ({
+  isLoading = false,
+  messages,
+  onConfirmClick,
+  onSuggestionClick,
+}) => {
   const { colorMode } = useColorMode();
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -111,7 +117,7 @@ export const MessageList: FC<MessageListProps> = ({ isLoading = false, messages,
         },
       }}
     >
-      <VStack gap={4} align="stretch">
+      <VStack gap={5} align="stretch">
         {messages.map((message, index) =>
           isBlank(message) ? undefined : (
             <MessageBubble
@@ -120,6 +126,7 @@ export const MessageList: FC<MessageListProps> = ({ isLoading = false, messages,
               isStreaming={isLoading && index === messages.length - 1}
               // Chips do nothing while a stream is in flight, so don't offer them.
               onActionClick={isLoading ? undefined : onSuggestionClick}
+              onConfirmClick={isLoading ? undefined : onConfirmClick}
             />
           ),
         )}
@@ -134,6 +141,7 @@ interface MessageBubbleProps {
   readonly message: Message;
   readonly isStreaming?: boolean;
   readonly onActionClick?: (text: string) => void;
+  readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
 }
 
 const DIFF_LANG_RE = /\blanguage-diff\b/u;
@@ -185,76 +193,116 @@ const buildMarkdownComponents = (isDark: boolean): Components => ({
 const isBlank = (message?: Message): boolean =>
   message !== undefined && message.role === "assistant" && message.content === "" && !message.tools?.length;
 
-const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, message, onActionClick }) => {
+// Timestamps are projector noise; keep them one hover away.
+const timestampCss = {
+  "& .airy-timestamp": { opacity: 0, transition: "opacity 0.15s" },
+  "&:hover .airy-timestamp": { opacity: 1 },
+};
+
+const MessageBubble: FC<MessageBubbleProps> = memo(
+  ({ isStreaming = false, message, onActionClick, onConfirmClick }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
-  const isUser = message.role === "user";
   const { actions, text } = splitActions(message.content, isStreaming);
+  const tools = message.tools ?? [];
+  const confirms = message.confirms ?? [];
 
-  const userBg = "brand.500";
-  const userColor = "white";
-  const assistantBg = message.isError ? (isDark ? "red.900" : "red.50") : isDark ? "gray.800" : "gray.100";
-  const assistantColor = message.isError
-    ? isDark
-      ? "red.200"
-      : "red.700"
-    : isDark
-      ? "gray.100"
-      : "gray.800";
-
-  return (
-    <Flex justify={isUser ? "flex-end" : "flex-start"}>
-      {!isUser && (
-        <Flex
-          align="center"
-          justify="center"
-          bg={isDark ? "gray.700" : "gray.200"}
-          color="brand.500"
-          boxSize={8}
-          borderRadius="full"
-          mr={2}
-          flexShrink={0}
-          alignSelf="flex-start"
-        >
-          <SparkleIcon />
-        </Flex>
-      )}
-      <VStack align={isUser ? "flex-end" : "flex-start"} gap={2} maxWidth="85%">
+  if (message.role === "user") {
+    return (
+      <Flex justify="flex-end">
         <Box
-          bg={isUser ? userBg : assistantBg}
-          color={isUser ? userColor : assistantColor}
+          bg={isDark ? "gray.700" : "gray.200"}
+          color={isDark ? "gray.100" : "gray.900"}
           px={4}
           py={2.5}
           borderRadius="xl"
-          borderBottomRightRadius={isUser ? "sm" : "xl"}
-          borderBottomLeftRadius={isUser ? "xl" : "sm"}
-          width="100%"
+          borderBottomRightRadius="sm"
+          maxWidth="80%"
           wordBreak="break-word"
           fontSize="md"
           lineHeight="tall"
-          css={{
-            ...markdownCss(isDark),
-            // Timestamps are projector noise; keep them one hover away.
-            "& .airy-timestamp": { opacity: 0, transition: "opacity 0.15s" },
-            "&:hover .airy-timestamp": { opacity: 1 },
-          }}
+          css={{ ...markdownCss(isDark), ...timestampCss }}
         >
-          {(message.tools ?? []).map((tool) => (
-            <ToolChip key={tool.id} tool={tool} />
-          ))}
           <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
             {text}
           </Markdown>
           <Text
             className="airy-timestamp"
             fontSize="xs"
-            color={isUser ? "whiteAlpha.700" : "gray.500"}
+            color={isDark ? "gray.400" : "gray.500"}
             mt={1}
-            textAlign={isUser ? "right" : "left"}
+            textAlign="right"
           >
             {formatTime(message.timestamp)}
           </Text>
         </Box>
+      </Flex>
+    );
+  }
+
+  // Assistant: prose sits directly on the panel; only tool calls and errors keep a card.
+  return (
+    <Flex align="flex-start">
+      <Flex
+        align="center"
+        justify="center"
+        bg={isDark ? "gray.700" : "gray.200"}
+        color="brand.500"
+        boxSize={8}
+        borderRadius="full"
+        mr={3}
+        flexShrink={0}
+      >
+        <SparkleIcon />
+      </Flex>
+      <VStack align="flex-start" gap={2} flex="1" minWidth={0} maxWidth="720px" css={timestampCss}>
+        {tools.length > 0 && (
+          <VStack
+            align="stretch"
+            gap={1.5}
+            width="100%"
+            bg={isDark ? "gray.800" : "white"}
+            borderWidth="1px"
+            borderColor={isDark ? "gray.700" : "gray.200"}
+            borderRadius="lg"
+            px={3}
+            py={2}
+          >
+            {tools.map((tool) => (
+              <ToolChip key={tool.id} tool={tool} />
+            ))}
+          </VStack>
+        )}
+        {text ? (
+          <Box
+            width="100%"
+            bg={message.isError ? (isDark ? "red.900" : "red.50") : undefined}
+            color={message.isError ? (isDark ? "red.200" : "red.700") : isDark ? "gray.100" : "gray.800"}
+            borderWidth={message.isError ? "1px" : undefined}
+            borderColor={message.isError ? (isDark ? "red.700" : "red.200") : undefined}
+            borderRadius={message.isError ? "lg" : undefined}
+            px={message.isError ? 4 : 0}
+            py={message.isError ? 2.5 : 0}
+            wordBreak="break-word"
+            fontSize="md"
+            lineHeight="tall"
+            css={markdownCss(isDark)}
+          >
+            <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
+              {text}
+            </Markdown>
+          </Box>
+        ) : undefined}
+        {confirms.map((confirm) => (
+          <ConfirmPanel
+            key={`${confirm.nonce}-${confirm.callId}`}
+            confirm={confirm}
+            onDecide={onConfirmClick}
+          />
+        ))}
+        <Text className="airy-timestamp" fontSize="xs" color="gray.500">
+          {formatTime(message.timestamp)}
+        </Text>
         {onActionClick !== undefined &&
           actions.map((action, index) => (
             <SuggestionChip key={`${index}-${action}`} onClick={onActionClick}>
@@ -265,6 +313,84 @@ const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, messa
     </Flex>
   );
 });
+
+interface ConfirmPanelProps {
+  readonly confirm: ConfirmRequest;
+  readonly onDecide?: (nonce: string, approved: boolean) => void;
+}
+
+/** A write tool the server refuses to run without an explicit go-ahead. */
+const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirm, onDecide }) => {
+  const { colorMode } = useColorMode();
+  const isDark = colorMode === "dark";
+
+  return (
+    <Box
+      width="100%"
+      bg={isDark ? "gray.800" : "white"}
+      borderWidth="1px"
+      borderColor={isDark ? "orange.600" : "orange.300"}
+      borderRadius="lg"
+      px={3}
+      py={2.5}
+    >
+      <Text fontSize="xs" color={isDark ? "gray.400" : "gray.600"}>
+        Airy wants to run:
+      </Text>
+      <Text fontSize="xs" fontFamily="mono" color={isDark ? "gray.100" : "gray.900"} mt={1}>
+        {confirm.tool}
+        {formatArgs(confirm.args)}
+      </Text>
+      {confirm.resolution === undefined ? (
+        <Flex gap={2} mt={2}>
+          <ConfirmButton onClick={() => onDecide?.(confirm.nonce, true)} disabled={!onDecide} primary>
+            Confirm
+          </ConfirmButton>
+          <ConfirmButton onClick={() => onDecide?.(confirm.nonce, false)} disabled={!onDecide}>
+            Reject
+          </ConfirmButton>
+        </Flex>
+      ) : (
+        <Text fontSize="xs" color="gray.500" mt={2}>
+          {confirm.resolution === "approved" ? "Approved ✓" : "Rejected ✕"}
+        </Text>
+      )}
+    </Box>
+  );
+};
+
+interface ConfirmButtonProps {
+  readonly children: string;
+  readonly disabled?: boolean;
+  readonly onClick: () => void;
+  readonly primary?: boolean;
+}
+
+const ConfirmButton: FC<ConfirmButtonProps> = ({ children, disabled = false, onClick, primary = false }) => {
+  const { colorMode } = useColorMode();
+  const isDark = colorMode === "dark";
+
+  return (
+    <Box
+      as="button"
+      onClick={onClick}
+      disabled={disabled}
+      px={4}
+      py={1.5}
+      bg={primary ? "brand.500" : isDark ? "gray.800" : "white"}
+      color={primary ? "white" : isDark ? "gray.300" : "gray.700"}
+      borderWidth="1px"
+      borderColor={primary ? "brand.500" : isDark ? "gray.600" : "gray.300"}
+      borderRadius="full"
+      fontSize="sm"
+      cursor={disabled ? "not-allowed" : "pointer"}
+      opacity={disabled ? 0.6 : 1}
+      _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "2px" }}
+    >
+      {children}
+    </Box>
+  );
+};
 
 interface ToolChipProps {
   readonly tool: ToolCall;
@@ -277,14 +403,7 @@ const ToolChip: FC<ToolChipProps> = ({ tool }) => {
   const running = tool.durationMs === undefined;
 
   return (
-    <Flex
-      align="center"
-      gap={2}
-      fontSize="xs"
-      fontFamily="mono"
-      color={isDark ? "gray.400" : "gray.600"}
-      mb={1.5}
-    >
+    <Flex align="center" gap={2} fontSize="xs" fontFamily="mono" color={isDark ? "gray.400" : "gray.600"}>
       {running ? (
         <Spinner size="xs" color="brand.500" flexShrink={0} />
       ) : (
@@ -346,6 +465,7 @@ const markdownCss = (isDark: boolean) => ({
     padding: "0.6em",
   },
   "& pre code": { background: "transparent", padding: 0 },
+  "& table": { display: "block", maxWidth: "100%", overflowX: "auto", width: "fit-content" },
   "& th, & td": {
     borderBottom: isDark ? "1px solid rgba(255,255,255,0.15)" : "1px solid rgba(0,0,0,0.1)",
     padding: "0.2em 0.5em",
@@ -359,7 +479,7 @@ const LoadingIndicator: FC = () => {
   const isDark = colorMode === "dark";
 
   return (
-    <Flex align="center" gap={2}>
+    <Flex align="center" gap={3}>
       <Flex
         align="center"
         justify="center"
@@ -371,14 +491,10 @@ const LoadingIndicator: FC = () => {
       >
         <SparkleIcon />
       </Flex>
-      <Box bg={isDark ? "gray.800" : "gray.100"} px={4} py={3} borderRadius="xl" borderBottomLeftRadius="sm">
-        <Flex align="center" gap={2}>
-          <Spinner size="sm" color="brand.500" />
-          <Text fontSize="sm" color="gray.500">
-            Thinking...
-          </Text>
-        </Flex>
-      </Box>
+      <Spinner size="sm" color="brand.500" />
+      <Text fontSize="sm" color="gray.500">
+        Thinking...
+      </Text>
     </Flex>
   );
 };
@@ -412,9 +528,10 @@ const SuggestionChip: FC<SuggestionChipProps> = ({ children, onClick }) => {
       transition="all 0.2s"
       _hover={{
         bg: isDark ? "gray.700" : "gray.100",
-        color: isDark ? "gray.100" : "gray.900",
         borderColor: isDark ? "gray.600" : "gray.400",
+        color: isDark ? "gray.100" : "gray.900",
       }}
+      _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "2px" }}
     >
       {children}
     </Box>

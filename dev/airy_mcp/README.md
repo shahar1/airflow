@@ -128,13 +128,18 @@ Declared up front, all of them cheap to replace:
    send the text as the next user message. *Real answer:* structured UI parts
    streamed over SSE, so the button carries a typed tool call instead of a
    round-trip through the model.
-2. **Service-account auth.** The sidecar logs in as one admin user, so tool calls
-   are not attributed to the human in the chat. *Real answer:* AIP-91's identity
-   propagation — pass the user's JWT through and let RBAC decide.
-3. **No confirmation on the write itself.** The click *is* the gate; the tool
-   trusts whatever the model passes — beyond refusing a patch that would not
-   `compile()`. *Real answer:* a dry-run/confirm pair, plus an audit-log entry
-   per applied patch.
+2. **Service-account execution.** Every `/chatbot` route now requires a
+   logged-in Airflow user, and the write tools are only reachable for users the
+   auth manager grants Dag-edit rights — but the sidecar still *executes* as one
+   admin service account (loopback-only), so in-Airflow audit trails attribute
+   actions to that account, not the human. *Real answer:* AIP-91's identity
+   propagation — pass the user's JWT through and let RBAC decide per call.
+3. ~~No confirmation on the write itself.~~ Now server-enforced: write tools are
+   approval-required in pydantic-ai, so the run suspends and the UI shows
+   Confirm/Reject buttons backed by a single-use, TTL'd, user-bound nonce on
+   `POST /chatbot/confirm`. Remaining shortcuts: the pending-approval store is
+   in-memory and per-process, one verdict covers a whole suspension batch, and
+   there is still no audit-log entry per applied patch.
 4. **Full-file string replace instead of a real patch.** Requires `old` to be
    unique. Fine for a one-line fix, not for multi-hunk edits.
 

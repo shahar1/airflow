@@ -19,7 +19,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Message, ToolCall } from "../components/types";
+import { ConfirmRequest, Message, ToolCall } from "../components/types";
 
 /** Generate a unique ID for messages. */
 const generateId = (): string =>
@@ -133,6 +133,25 @@ export const applyEvent = (
             : tool,
         ),
       };
+    case "confirm_required":
+      return {
+        ...message,
+        confirms: [
+          ...(message.confirms ?? []),
+          {
+            args: event.args,
+            callId: String(event.call_id ?? ""),
+            nonce: String(event.nonce ?? ""),
+            tool: String(event.tool ?? "tool"),
+          } satisfies ConfirmRequest,
+        ],
+        // The suspended call's chip must not spin while the user decides.
+        tools: (message.tools ?? []).map((tool) =>
+          tool.id === event.call_id && tool.durationMs === undefined
+            ? { ...tool, durationMs: now - tool.startedAt }
+            : tool,
+        ),
+      };
     case "text":
       return { ...message, content: message.content + String(event.delta ?? "") };
     case "error":
@@ -145,6 +164,26 @@ export const applyEvent = (
     default:
       return message;
   }
+};
+
+/** Map an HTTP failure to a message the user can act on. */
+const errorForResponse = async (response: Response): Promise<Error> => {
+  if (response.status === 401) {
+    return new Error(
+      "Your Airflow session has expired — sign in again to keep chatting.",
+    );
+  }
+  if (response.status === 403) {
+    return new Error("You don't have permission to use Airy.");
+  }
+  if (response.status === 404) {
+    return new Error("This confirmation is no longer valid — ask Airy again.");
+  }
+  const errBody = await response.json().catch(() => null);
+  // FastAPI errors arrive as {detail}, our own as {error}.
+  return new Error(
+    errBody?.error ?? errBody?.detail ?? `Server error (${response.status})`,
+  );
 };
 
 // ── Health status ──────────────────────────────────────────────────────
@@ -222,6 +261,52 @@ export const useChat = () => {
     persistMessages(next);
   }, []);
 
+  /** Fold a /chat or /confirm SSE response into the given assistant message. */
+  const streamInto = useCallback(
+    async (assistantId: string, response: Response) => {
+      const update = (fn: (message: Message) => Message) =>
+        commit(
+          messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)),
+        );
+
+      const body = response.body;
+      if (!body) return;
+
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let complete = false;
+
+      const consume = (chunk: string) => {
+        buffer += chunk;
+        const { events, rest } = parseFrames(buffer);
+        buffer = rest;
+        for (const event of events) {
+          complete ||= event.type === "done";
+          update((message) => applyEvent(message, event));
+        }
+      };
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        consume(decoder.decode(value, { stream: true }));
+      }
+      // A frame left in the buffer only completes once the decoder is flushed.
+      consume(`${decoder.decode()}\n\n`);
+
+      if (!complete) {
+        update((message) => ({
+          ...message,
+          content: `${message.content}\n\n_The connection ended before Airy finished._`,
+          // Otherwise `toHistory` replays this notice as Airy's own words.
+          isError: true,
+        }));
+      }
+    },
+    [commit],
+  );
+
   const sendMessage = useCallback(
     async (content: string) => {
       const history = toHistory(messagesRef.current);
@@ -257,52 +342,10 @@ export const useChat = () => {
         });
 
         if (!response.ok || !response.body) {
-          if (response.status === 401) {
-            throw new Error(
-              "Your Airflow session has expired — sign in again to keep chatting.",
-            );
-          }
-          if (response.status === 403) {
-            throw new Error("You don't have permission to use Airy.");
-          }
-          const errBody = await response.json().catch(() => null);
-          // FastAPI errors arrive as {detail}, our own as {error}.
-          throw new Error(
-            errBody?.error ?? errBody?.detail ?? `Server error (${response.status})`,
-          );
+          throw await errorForResponse(response);
         }
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let complete = false;
-
-        const consume = (chunk: string) => {
-          buffer += chunk;
-          const { events, rest } = parseFrames(buffer);
-          buffer = rest;
-          for (const event of events) {
-            complete ||= event.type === "done";
-            update((message) => applyEvent(message, event));
-          }
-        };
-
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          consume(decoder.decode(value, { stream: true }));
-        }
-        // A frame left in the buffer only completes once the decoder is flushed.
-        consume(`${decoder.decode()}\n\n`);
-
-        if (!complete) {
-          update((message) => ({
-            ...message,
-            content: `${message.content}\n\n_The connection ended before Airy finished._`,
-            // Otherwise `toHistory` replays this notice as Airy's own words.
-            isError: true,
-          }));
-        }
+        await streamInto(assistantId, response);
       } catch (err) {
         update((message) => ({
           ...message,
@@ -327,7 +370,63 @@ export const useChat = () => {
         update((message) => finalizeTools(message, ended));
       }
     },
-    [commit],
+    [commit, streamInto],
+  );
+
+  /** Answer a confirm_required frame; the reply streams into the same bubble. */
+  const resolveConfirm = useCallback(
+    async (nonce: string, approved: boolean) => {
+      const owner = messagesRef.current.find((m) =>
+        m.confirms?.some((c) => c.nonce === nonce && c.resolution === undefined),
+      );
+      if (!owner) return;
+      const assistantId = owner.id;
+
+      const update = (fn: (message: Message) => Message) =>
+        commit(
+          messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)),
+        );
+
+      update((message) => ({
+        ...message,
+        confirms: message.confirms?.map((c) =>
+          c.nonce === nonce
+            ? { ...c, resolution: approved ? "approved" : "rejected" }
+            : c,
+        ),
+      }));
+      setIsLoading(true);
+
+      try {
+        const response = await fetch(`${CHATBOT_BASE()}/confirm`, {
+          body: JSON.stringify({ approved, nonce }),
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+
+        if (!response.ok || !response.body) {
+          throw await errorForResponse(response);
+        }
+
+        await streamInto(assistantId, response);
+      } catch (err) {
+        update((message) =>
+          applyEvent(message, {
+            message:
+              err instanceof Error
+                ? err.message
+                : "Failed to get a response from Airy.",
+            type: "error",
+          }),
+        );
+      } finally {
+        setIsLoading(false);
+        const ended = Date.now();
+        update((message) => finalizeTools(message, ended));
+      }
+    },
+    [commit, streamInto],
   );
 
   const clearMessages = useCallback(() => {
@@ -344,6 +443,7 @@ export const useChat = () => {
     clearMessages,
     isLoading,
     messages,
+    resolveConfirm,
     sendMessage,
   };
 };

@@ -32,6 +32,16 @@ export interface ToolCall {
   durationMs?: number;
 }
 
+/** A write tool call the server suspended, waiting for the user's verdict. */
+export interface ConfirmRequest {
+  nonce: string;
+  callId: string;
+  tool: string;
+  args?: unknown;
+  /** Set once the user has clicked; the buttons then freeze. */
+  resolution?: "approved" | "rejected";
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant";
@@ -39,6 +49,8 @@ export interface Message {
   timestamp: Date;
   /** Tool calls the assistant made while producing this message. */
   tools?: ToolCall[];
+  /** Write tool calls awaiting (or given) an explicit user verdict. */
+  confirms?: ConfirmRequest[];
   /** When true the message represents an error response. */
   isError?: boolean;
 }
