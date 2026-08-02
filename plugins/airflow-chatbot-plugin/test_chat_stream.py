@@ -121,6 +121,44 @@ def test_event_payload_marks_a_denied_tool_call():
     assert payload["failed"] is False
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"applied": False, "error": "'x = 1' appears 3 times in dag.py"},
+        {"reverted": False, "error": "no backup for dag.py"},
+        '{"applied": false, "error": "the patched file would not compile"}',
+    ],
+    ids=["not_applied", "not_reverted", "json_string"],
+)
+def test_event_payload_refuses_to_call_a_no_op_write_a_success(content):
+    # The tool reports a refused patch as an ordinary return, so without this
+    # the drawer paints "Edited Dag code" green over a file it never wrote.
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="fix_dag_code", content=content, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is True
+    assert payload["denied"] is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "content"),
+    [
+        ("fix_dag_code", {"applied": True, "diff": "--- a/dag.py"}),
+        ("rerun_dag", {"dag_run_id": "manual__1"}),
+        # A read tool that happens to carry the key is not a write outcome.
+        ("diagnose_dag", {"applied": False}),
+    ],
+    ids=["applied", "no_outcome_key", "read_tool"],
+)
+def test_event_payload_leaves_a_real_result_alone(tool, content):
+    event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
+
+    assert plugin._event_payload(event)["failed"] is False
+
+
 def test_event_payload_marks_a_failed_tool_call():
     event = FunctionToolResultEvent(
         part=RetryPromptPart(content="boom", tool_name="diagnose_dag", tool_call_id="c1")
@@ -934,7 +972,44 @@ async def test_a_resume_that_raises_is_interrupted_not_done(monkeypatch, pending
     frames = [f async for f in plugin._resume_agent(pending, True)]
 
     assert pending.state == "interrupted"
-    assert frames[-1]["type"] == "error"
+    assert frames[-2]["type"] == "error"
+    # Every stream ends with a tidy `done`, so without this the browser reads
+    # the failure as a settled outcome and reports the write as applied.
+    assert frames[-1] == plugin.UNSETTLED_FRAME
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_never_reported_back_is_streamed_as_unsettled(monkeypatch, pending_store):
+    """The stream ended tidily, but the write never returned a clean result."""
+
+    async def no_result(*args, **kwargs):
+        yield {"type": "tool", "id": "c1", "name": "fix_dag_code"}
+        yield {"type": "text", "delta": "hmm"}
+
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (object(), None))
+    monkeypatch.setattr(plugin, "_run_and_stream", no_result)
+    pending = plugin._get_pending(_store_pending(call_ids=["c1"]))
+
+    frames = [f async for f in plugin._resume_agent(pending, True)]
+
+    assert pending.state == "interrupted"
+    assert frames[-1] == plugin.UNSETTLED_FRAME
+
+
+@pytest.mark.asyncio
+async def test_a_settled_write_is_not_streamed_as_unsettled(monkeypatch, pending_store):
+    async def clean(*args, **kwargs):
+        yield {"type": "tool", "id": "c1", "name": "fix_dag_code"}
+        yield {"type": "tool_result", "id": "c1", "failed": False}
+
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (object(), None))
+    monkeypatch.setattr(plugin, "_run_and_stream", clean)
+    pending = plugin._get_pending(_store_pending(call_ids=["c1"]))
+
+    frames = [f async for f in plugin._resume_agent(pending, True)]
+
+    assert pending.state == "done"
+    assert plugin.UNSETTLED_FRAME not in frames
 
 
 @pytest.mark.asyncio

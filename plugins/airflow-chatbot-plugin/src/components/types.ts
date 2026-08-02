@@ -40,8 +40,10 @@ export interface ToolCall {
   denied?: boolean;
   /** A write the model has only asked for; nothing has run yet. */
   proposed?: boolean;
-  /** True when the user stopped the response before this call finished. */
+  /** True when the call never ran: stopped, reloaded away, or left unapproved. */
   cancelled?: boolean;
+  /** An approved write whose run died before it reported back: it may have landed. */
+  unsettled?: boolean;
 }
 
 /** A write tool call the server suspended, waiting for the user's verdict. */

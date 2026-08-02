@@ -577,6 +577,25 @@ describe("MessageList", () => {
     expect(screen.queryByText("Diagnosed Dag")).toBeNull();
   });
 
+  it("does not claim an edit when an approved write never reported back", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            content: "**Error:** the sidecar went away",
+            isError: true,
+            tools: [{ durationMs: 400, id: "c1", name: "fix_dag_code", startedAt: 0, unsettled: true }],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Fix Dag code — outcome unknown")).not.toBeNull();
+    expect(screen.queryByText("Edited Dag code")).toBeNull();
+    // A duration would imply the call ran to completion.
+    expect(screen.queryByText(/^· \d/u)).toBeNull();
+  });
+
   it("never derives a file name from the Dag id", () => {
     const { container } = show(
       <MessageList

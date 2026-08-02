@@ -900,6 +900,23 @@ _RESULT_CLIP_CHARS = 4000
 # tool return carrying this text, and the drawer must not paint it as success.
 _DENIAL_MESSAGE = "The user rejected this action."
 
+# The self-healing tools report a refused write as an ordinary return, not as an
+# error: ``{"applied": false, "error": …}`` when the snippet is not unique, the
+# file drifted under them, or the patch would not compile — and the same for
+# ``reverted``. Left alone, the drawer paints those green and tells the user
+# their Dag was edited when the file was never written.
+_WRITE_OUTCOME_KEYS = ("applied", "reverted")
+
+
+def _write_refused(content: Any) -> bool:
+    """Whether a write tool's own result says it changed nothing."""
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return False
+    return isinstance(content, dict) and any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS)
+
 
 def _clip_result(content: Any) -> str:
     """
@@ -954,12 +971,14 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
         # A RetryPromptPart here means the tool call itself failed (bad args,
         # MCP error); its content is the error the model is asked to recover from.
         failed = getattr(part, "part_kind", None) == "retry-prompt"
+        denied = not failed and part.content == _DENIAL_MESSAGE
+        refused = not failed and not denied and part.tool_name in WRITE_TOOLS
         return {
             "type": "tool_result",
             "id": part.tool_call_id,
             "name": part.tool_name,
-            "failed": failed,
-            "denied": not failed and part.content == _DENIAL_MESSAGE,
+            "failed": failed or (refused and _write_refused(part.content)),
+            "denied": denied,
             "result": _clip_result(part.model_response() if failed else part.content),
         }
     if kind == "part_delta":
@@ -1100,6 +1119,10 @@ async def _resume_agent(
         pending.frames.append(failure)
         pending.state = "interrupted"
         yield failure
+        # The write may already have landed — the run died after the tool was
+        # called, not before. Without this the browser reads the tidy `done`
+        # that terminates every stream as settlement and reports success.
+        yield UNSETTLED_FRAME
         return
     except BaseException:
         # Cancellation — the browser hung up, or the worker is going down. The
@@ -1109,6 +1132,11 @@ async def _resume_agent(
         raise
     # A rejection executes nothing, so there is nothing left in doubt.
     pending.state = "done" if not approved or settled.issuperset(pending.call_ids) else "interrupted"
+    if pending.state == "interrupted":
+        # The stream ended tidily but a write never returned a clean result, so
+        # the run is over without anyone knowing whether it landed. Say so here
+        # as well; a later replay of this nonce is not the user's only chance.
+        yield UNSETTLED_FRAME
 
 
 def _sse_response(payloads: AsyncIterator[dict[str, Any]]) -> StreamingResponse:

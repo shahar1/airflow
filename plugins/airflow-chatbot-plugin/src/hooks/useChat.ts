@@ -39,10 +39,9 @@ export const loadStoredMessages = (): Message[] => {
     return (parsed as Message[])
       .filter((m) => m.content !== "" || (m.tools?.length ?? 0) > 0)
       .map((m) =>
-        // A call in flight when the page reloaded lost its stream. It must not
-        // spin forever — and it must not be dressed up as a finished one
-        // either: a write proposed but never approved never ran at all.
-        cancelTools({ ...m, timestamp: new Date(m.timestamp) }, reloadedAt),
+        // A call in flight when the page reloaded lost its stream: it must
+        // neither spin forever nor be dressed up as a finished one.
+        finalizeTools({ ...m, timestamp: new Date(m.timestamp) }, reloadedAt),
       );
   } catch {
     return [];
@@ -85,28 +84,33 @@ export const parseFrames = (buffer: string): { events: Array<Record<string, unkn
   return { events, rest };
 };
 
-/** Stop the clock on any tool call still marked as running. */
-export const finalizeTools = (message: Message, now: number): Message => ({
-  ...message,
-  tools: message.tools?.map((tool) =>
-    tool.durationMs === undefined ? { ...tool, durationMs: now - tool.startedAt } : tool,
-  ),
-});
-
 /**
- * Mark whatever was still in flight as cancelled.
+ * Stop the clock on any call still in flight when the run ended.
  *
- * Must run before `finalizeTools`, which would otherwise stop the clock on an
- * abandoned call and let it render as a successful green check.
+ * A call that never returned a result did not demonstrably finish, so none of
+ * them may end up as a green check.  Which untruth to avoid depends on the
+ * call: an approved write may well have landed on the host and its outcome is
+ * simply unknown, while anything else — a read cut short, a proposal the run
+ * never came back to — never ran at all.
  */
-export const cancelTools = (message: Message, now: number): Message => ({
-  ...message,
-  tools: message.tools?.map((tool) =>
-    tool.durationMs === undefined
-      ? { ...tool, cancelled: true, durationMs: now - tool.startedAt, proposed: undefined }
-      : tool,
-  ),
-});
+export const finalizeTools = (message: Message, now: number): Message => {
+  const approved = new Set(
+    (message.confirms ?? []).filter((c) => c.resolution === "approved").map((c) => c.callId),
+  );
+  return {
+    ...message,
+    tools: message.tools?.map((tool) =>
+      tool.durationMs === undefined
+        ? {
+            ...tool,
+            ...(approved.has(tool.id) ? { unsettled: true } : { cancelled: true }),
+            durationMs: now - tool.startedAt,
+            proposed: undefined,
+          }
+        : tool,
+    ),
+  };
+};
 
 /** Fold one streamed event into the assistant message being built. */
 export const applyEvent = (
@@ -421,9 +425,9 @@ export const useChat = () => {
         if (isAbort(err)) {
           // The user's own stop is not a failure: keep the partial answer on
           // screen, but keep the half-turn out of what the model is told next.
-          const stoppedAt = Date.now();
+          // The tools left in flight are settled by `finalizeTools` below.
           update((message) => ({
-            ...cancelTools(message, stoppedAt),
+            ...message,
             content: `${message.content}\n\n_Stopped._`.trimStart(),
             excludeFromHistory: true,
             stopped: true,
@@ -544,9 +548,8 @@ export const useChat = () => {
         settle(!(await streamInto(assistantId, response)));
       } catch (err) {
         if (isAbort(err)) {
-          const stoppedAt = Date.now();
           update((message) => ({
-            ...cancelTools(message, stoppedAt),
+            ...message,
             content: `${message.content}\n\n_Stopped._`.trimStart(),
             // The marker is ours, not Airy's; it must never come back as history.
             excludeFromHistory: true,
