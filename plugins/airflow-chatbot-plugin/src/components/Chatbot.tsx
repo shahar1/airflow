@@ -29,7 +29,7 @@ import { useChat, useHealth } from "../hooks/useChat";
  */
 export const Chatbot: FC = () => {
   const [isOpen, setIsOpen] = useState(false);
-  const { isLoading, messages, sendMessage } = useChat();
+  const { clearMessages, isLoading, messages, sendMessage } = useChat();
   const { health } = useHealth();
 
   const handleToggle = () => {
@@ -45,6 +45,7 @@ export const Chatbot: FC = () => {
       <ChatDrawer
         isOpen={isOpen}
         onClose={handleClose}
+        onClear={clearMessages}
         messages={messages}
         onSendMessage={sendMessage}
         isLoading={isLoading}
