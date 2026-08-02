@@ -53,6 +53,7 @@ class FakeAirflow:
         self.tis_by_run: dict[str, list] = {}
         self.sources_by_version: dict[int, str] = {}
         self.logs_by_task: dict[tuple[str, str], str] = {}
+        self.dry_run_dates: list[str] = []
         self.bump_version_on_reparse = True
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
@@ -69,6 +70,14 @@ class FakeAirflow:
                 return run
             if path == f"/dags/{DAG_ID}{quoted}/taskInstances":
                 return {"task_instances": self.tis_by_run.get(run_id, [])}
+        if path == "/backfills/dry_run":
+            return {
+                "backfills": [{"logical_date": d} for d in self.dry_run_dates],
+                "total_entries": len(self.dry_run_dates),
+            }
+        if path == "/backfills":
+            body = kwargs["json"]
+            return {"id": 7, "is_paused": False, **body}
         if path == f"/dagSources/{DAG_ID}":
             version = kwargs["params"]["version_number"]
             return {"content": self.sources_by_version[version], "version_number": version}
@@ -427,6 +436,31 @@ def test_find_failure_clusters_scans_only_recent_failed_tis(airflow):
     assert listing["state"] == "failed"
     assert listing["limit"] == server.FAILURE_SCAN_LIMIT
     assert "start_date_gte" in listing
+
+
+def test_plan_backfill_previews_without_creating_anything(airflow):
+    airflow.dry_run_dates = [f"2026-07-{day:02}T00:00:00Z" for day in range(1, 26)]
+
+    plan = server.plan_backfill(DAG_ID, "2026-07-01", "2026-07-25")
+
+    assert plan["planned_run_count"] == 25
+    assert len(plan["planned_logical_dates"]) == 20
+    assert plan["planned_logical_dates"][0] == "2026-07-01T00:00:00Z"
+    # The whole point of the plan step: nothing may be written.
+    assert ("POST", "/backfills") not in airflow.calls
+
+
+def test_run_backfill_creates_the_backfill(airflow):
+    result = server.run_backfill(DAG_ID, "2026-07-01", "2026-07-08")
+
+    assert result == {
+        "backfill_id": 7,
+        "dag_id": DAG_ID,
+        "from_date": "2026-07-01",
+        "to_date": "2026-07-08",
+        "is_paused": False,
+    }
+    assert {"dag_id": DAG_ID, "from_date": "2026-07-01", "to_date": "2026-07-08"} in airflow.payloads
 
 
 def test_rerun_dag_unpauses_first(airflow):
