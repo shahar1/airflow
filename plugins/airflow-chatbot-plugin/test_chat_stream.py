@@ -276,3 +276,40 @@ def test_chat_endpoint_forwards_the_page_url(client, monkeypatch):
 
 def test_chat_endpoint_rejects_an_empty_message(client):
     assert client.post("/chat", json={"message": "   "}).status_code == 400
+
+
+def _injected_client(response_headers=None, content="<html><body>hi</body></html>"):
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    async def page(request):
+        return Response(content=content, media_type="text/html", headers=response_headers or {})
+
+    app = Starlette(routes=[Route("/", page)])
+    app.add_middleware(plugin.ChatbotInjectionMiddleware, bundle_url="/chatbot/static/main.iife.js")
+    return TestClient(app)
+
+
+def test_injection_recomputes_content_length_and_drops_the_stale_etag():
+    # The original content-length survives Starlette's rebuild (init_headers only
+    # fills it in when absent), so keeping it truncates every injected page.
+    response = _injected_client(response_headers={"etag": '"abc"'}).get("/")
+
+    assert "<script" in response.text
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert "etag" not in response.headers
+
+
+def test_injection_leaves_compressed_html_untouched():
+    import gzip
+
+    client = _injected_client(
+        response_headers={"content-encoding": "gzip"},
+        content=gzip.compress(b"<html><body>hi</body></html>"),
+    )
+    response = client.get("/")
+
+    # httpx transparently gunzips, so .text is the original document.
+    assert response.text == "<html><body>hi</body></html>"
+    assert response.headers["content-encoding"] == "gzip"
