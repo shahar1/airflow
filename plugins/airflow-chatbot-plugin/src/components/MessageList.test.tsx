@@ -219,6 +219,16 @@ describe("MessageList", () => {
     expect(screen.getByText("Re-run sales_summary")).not.toBeNull();
   });
 
+  it("keeps timestamps out of the way until the bubble is hovered", () => {
+    const { container } = show(
+      <MessageList messages={[assistant({ content: "done" })]} />,
+    );
+
+    const timestamp = container.querySelector(".airy-timestamp");
+    expect(timestamp).not.toBeNull();
+    expect(timestamp?.textContent).toMatch(/\d{1,2}:\d{2}/u);
+  });
+
   it("colours added and removed lines in a diff block", () => {
     const { container } = show(
       <MessageList
