@@ -18,7 +18,7 @@
  */
 import { Box, Flex, Spinner, Text, VStack } from "@chakra-ui/react";
 import { FC, memo, useEffect, useRef } from "react";
-import Markdown from "react-markdown";
+import Markdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { useColorMode } from "src/context/colorMode";
@@ -136,6 +136,51 @@ interface MessageBubbleProps {
   readonly onActionClick?: (text: string) => void;
 }
 
+const DIFF_LANG_RE = /\blanguage-diff\b/u;
+
+const diffLineKind = (line: string): "add" | "del" | undefined =>
+  line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined;
+
+/**
+ * The fix diff is the money shot of the self-healing flow; flat grey text
+ * undersells it. Colour +/- lines inside ```diff fences, leave every other
+ * code block to the default renderer.
+ */
+const buildMarkdownComponents = (isDark: boolean): Components => ({
+  code: ({ children, className, ...props }) => {
+    if (!DIFF_LANG_RE.test(className ?? "")) {
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      );
+    }
+    const palette = {
+      add: isDark ? "var(--chakra-colors-green-300)" : "var(--chakra-colors-green-600)",
+      del: isDark ? "var(--chakra-colors-red-300)" : "var(--chakra-colors-red-600)",
+    };
+    return (
+      <code className={className}>
+        {String(children)
+          .replace(/\n$/u, "")
+          .split("\n")
+          .map((line, index) => {
+            const kind = diffLineKind(line);
+            return (
+              <span
+                data-diff={kind}
+                key={`${index}-${line}`}
+                style={{ color: kind ? palette[kind] : undefined, display: "block" }}
+              >
+                {line || " "}
+              </span>
+            );
+          })}
+      </code>
+    );
+  },
+});
+
 /** An assistant bubble that has streamed nothing yet is not worth showing. */
 const isBlank = (message?: Message): boolean =>
   message !== undefined && message.role === "assistant" && message.content === "" && !message.tools?.length;
@@ -192,7 +237,9 @@ const MessageBubble: FC<MessageBubbleProps> = memo(({ isStreaming = false, messa
           {(message.tools ?? []).map((tool) => (
             <ToolChip key={tool.id} tool={tool} />
           ))}
-          <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>
+          <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
+            {text}
+          </Markdown>
           <Text
             fontSize="xs"
             color={isUser ? "whiteAlpha.700" : "gray.500"}

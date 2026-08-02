@@ -219,6 +219,36 @@ describe("MessageList", () => {
     expect(screen.getByText("Re-run sales_summary")).not.toBeNull();
   });
 
+  it("colours added and removed lines in a diff block", () => {
+    const { container } = show(
+      <MessageList
+        messages={[
+          assistant({
+            content: "The fix:\n\n```diff\n+new line\n-old line\ncontext\n```",
+          }),
+        ]}
+      />,
+    );
+
+    const added = container.querySelector('[data-diff="add"]');
+    const removed = container.querySelector('[data-diff="del"]');
+    expect(added?.textContent).toBe("+new line");
+    expect(removed?.textContent).toBe("-old line");
+    expect(added?.getAttribute("style")).toContain("color");
+    // Context lines stay uncoloured.
+    expect(container.querySelectorAll("[data-diff]")).toHaveLength(2);
+  });
+
+  it("leaves non-diff code blocks alone", () => {
+    const { container } = show(
+      <MessageList
+        messages={[assistant({ content: "```python\nx = 1 - 2\n```" })]}
+      />,
+    );
+
+    expect(container.querySelector("[data-diff]")).toBeNull();
+  });
+
   it("sends the action's own label when its chip is clicked", () => {
     const onSuggestionClick = vi.fn();
     show(
