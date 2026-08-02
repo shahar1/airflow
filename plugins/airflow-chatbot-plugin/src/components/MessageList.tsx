@@ -180,8 +180,7 @@ export const MessageList: FC<MessageListProps> = ({
         <VStack gap={5} align="stretch">
           {messages.map((message, index) => {
             const streaming =
-              isLoading &&
-              (streamingId == null ? index === messages.length - 1 : message.id === streamingId);
+              isLoading && (streamingId == null ? index === messages.length - 1 : message.id === streamingId);
             return isBlank(message, streaming) ? undefined : (
               <MessageBubble
                 key={message.id}
@@ -410,7 +409,13 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
             </Box>
           ) : undefined}
           {groupConfirmsByNonce(confirms).map((group) => (
-            <ConfirmPanel key={group[0]?.nonce} confirms={group} onDecide={onConfirmClick} />
+            <ConfirmPanel
+              key={group[0]?.nonce}
+              confirms={group}
+              isStreaming={isStreaming}
+              onDecide={onConfirmClick}
+              tools={tools}
+            />
           ))}
           {onRetry !== undefined && (
             <SuggestionChip onClick={() => onRetry(message.id)}>Retry</SuggestionChip>
@@ -441,6 +446,9 @@ const groupConfirmsByNonce = (confirms: ConfirmRequest[]): ConfirmRequest[][] =>
 interface ConfirmPanelProps {
   /** Every request sharing one nonce — the server decides them as one batch. */
   readonly confirms: ConfirmRequest[];
+  /** The turn's calls; the matching one is what says whether the write landed. */
+  readonly tools: ToolCall[];
+  readonly isStreaming: boolean;
   readonly onDecide?: (nonce: string, approved: boolean) => void;
 }
 
@@ -545,34 +553,66 @@ export const buildWriteEffect = (confirm: ConfirmRequest): WriteEffect => {
 };
 
 /**
- * Write tools the server refuses to run without an explicit go-ahead.  Reads
- * as an action card, not prose: what lastingly changes, a badge naming the
- * mutation, and — for a source patch — the diff itself, because that is the
+ * Write tools the server refuses to run without an explicit go-ahead.
+ *
+ * While the decision is open this is an action card, not prose: what lastingly
+ * changes, and — for a source patch — the diff itself, because that is the
  * thing being approved.  One nonce covers the whole batch, so a multi-tool
  * suspension is one card carrying every action's own effect: approving must
- * never silently authorize an unseen call.
+ * never silently authorize an unseen call.  Once decided the evidence has done
+ * its job and a `ConfirmReceipt` takes its place.
  */
-const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, onDecide }) => {
+const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, isStreaming, onDecide, tools }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
+  // Clicking a decision unmounts the button; the receipt that replaces it takes
+  // the focus, but only for the panel the click came from.
+  const decidedHere = useRef(false);
   const [first] = confirms;
   if (first === undefined) return undefined;
   const batch = confirms.length > 1;
   const effect = buildWriteEffect(first);
+  const states = confirms.map((confirm) => buildConfirmState(confirm, findTool(tools, confirm), isStreaming));
+
+  if (first.resolution !== undefined) {
+    return (
+      <ConfirmReceipt
+        confirms={confirms}
+        focusOnMount={decidedHere.current}
+        isDark={isDark}
+        onDecide={onDecide}
+        states={states}
+      />
+    );
+  }
+
+  const decide = (approved: boolean) => {
+    decidedHere.current = true;
+    onDecide?.(first.nonce, approved);
+  };
 
   return (
     <Box
       width="100%"
       bg={isDark ? "gray.800" : "white"}
       borderWidth="1px"
-      borderColor={isDark ? "orange.600" : "orange.300"}
+      borderColor={isDark ? "whiteAlpha.200" : "blackAlpha.200"}
+      borderLeftWidth="3px"
+      borderLeftColor={isDark ? "orange.300" : "orange.500"}
       borderRadius="lg"
       px={3}
       py={2.5}
     >
+      {/* Caution, not error: one amber cue plus the words, never colour alone. */}
+      <Flex align="center" gap={1.5} mb={1.5} color={isDark ? "orange.300" : "orange.700"}>
+        <ClockIcon />
+        <Text fontSize="xs" fontWeight="medium">
+          Approval required
+        </Text>
+      </Flex>
       {batch ? (
         <ConfirmHeading
-          badge="Modifies your Airflow"
+          effect="Modifies your Airflow"
           isDark={isDark}
           title={`Approve ${confirms.length} actions`}
         />
@@ -580,61 +620,225 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, onDecide }) => {
       {confirms.map((confirm) => (
         <ConfirmDetail key={confirm.callId} confirm={confirm} isDark={isDark} nested={batch} />
       ))}
-      {first.resolution === undefined ? (
-        <Flex gap={2} mt={2} wrap="wrap">
-          <ConfirmButton onClick={() => onDecide?.(first.nonce, true)} disabled={!onDecide} primary>
-            {batch ? "Approve all" : effect.approve}
-          </ConfirmButton>
-          <ConfirmButton onClick={() => onDecide?.(first.nonce, false)} disabled={!onDecide}>
-            {batch ? "Reject all" : "Reject"}
-          </ConfirmButton>
-        </Flex>
-      ) : first.outcomeUnknown === true ? (
-        // The reply never finished, so the action may or may not have run. The
-        // nonce still answers that question — asking again replays the outcome
-        // rather than repeating the write.
-        <Flex gap={2} mt={2} align="center" wrap="wrap">
-          <Text fontSize="xs" color={isDark ? "orange.300" : "orange.700"}>
-            {first.resolution === "approved" ? "Approved" : "Rejected"} — outcome unknown
+      <Flex gap={2} mt={2} wrap="wrap">
+        <ConfirmButton onClick={() => decide(true)} disabled={!onDecide} large primary>
+          {batch ? "Approve all" : effect.approve}
+        </ConfirmButton>
+        <ConfirmButton onClick={() => decide(false)} disabled={!onDecide} large>
+          {batch ? "Reject all" : "Reject"}
+        </ConfirmButton>
+      </Flex>
+    </Box>
+  );
+};
+
+/**
+ * The call this confirmation suspended.  A `confirm_required` frame always
+ * follows its own `tool` frame, so the row exists; a missing one is treated as
+ * "cannot verify" rather than assumed successful.
+ */
+const findTool = (tools: ToolCall[], confirm: ConfirmRequest): ToolCall | undefined =>
+  tools.find((tool) => tool.id === confirm.callId);
+
+/** What became of one decided confirmation — the user's verdict is only half of it. */
+export type ConfirmState = "applied" | "applying" | "failed" | "pending" | "rejected" | "unknown";
+
+/**
+ * The user's decision does not say whether the write landed; the matching tool
+ * does.  `resolution` is set optimistically the moment `/confirm` is posted,
+ * together with `outcomeUnknown: true` — so while the reply still streams the
+ * card reports progress rather than flashing an unknown-outcome warning.
+ */
+export const buildConfirmState = (
+  confirm: ConfirmRequest,
+  tool: ToolCall | undefined,
+  isStreaming: boolean,
+): ConfirmState => {
+  if (confirm.resolution === undefined) return "pending";
+  if (confirm.resolution === "rejected") {
+    // A rejection whose reply never arrived may not have reached the server at
+    // all, which leaves the run suspended — the nonce is still the way to ask.
+    return !isStreaming && confirm.outcomeUnknown === true ? "unknown" : "rejected";
+  }
+  if (isStreaming) return "applying";
+  const status = tool === undefined ? undefined : buildToolStatus(tool);
+  // A call that reported an error answered the question; anything else that is
+  // not demonstrably done leaves it open.
+  if (status === "failed") return "failed";
+  if (confirm.outcomeUnknown === true || status !== "done") return "unknown";
+  return "applied";
+};
+
+/** Worst-first: a group is only as settled as its least settled action. */
+const STATE_RANK: Record<ConfirmState, number> = {
+  applied: 5,
+  applying: 3,
+  failed: 1,
+  pending: 0,
+  rejected: 4,
+  unknown: 2,
+};
+
+export const buildGroupState = (states: ConfirmState[]): ConfirmState =>
+  states.reduce<ConfirmState>(
+    (worst, state) => (STATE_RANK[state] < STATE_RANK[worst] ? state : worst),
+    "applied",
+  );
+
+/** Which shared status icon stands for each decided state. */
+const RECEIPT_ICONS: Record<ConfirmState, ToolStatus> = {
+  applied: "done",
+  applying: "running",
+  failed: "failed",
+  pending: "awaiting",
+  rejected: "denied",
+  unknown: "unsettled",
+};
+
+/**
+ * One line naming the decision and what came of it.  Successful states borrow
+ * the tool row's own verbs so the two can never contradict each other; a
+ * rejection or a failure names the verdict instead, because repeating the row's
+ * wording would print the same sentence twice, one under the other.
+ */
+export const buildReceiptLabel = (
+  state: ConfirmState,
+  states: ConfirmState[],
+  confirm: ConfirmRequest,
+): string => {
+  const total = states.length;
+  if (total > 1) {
+    if (state === "applying") return `Approved · applying ${total} actions…`;
+    if (state === "applied") return `${total} actions applied · approved by you`;
+    if (state === "rejected") return `${total} actions rejected`;
+    const applied = states.filter((each) => each === "applied").length;
+    const open = total - applied;
+    return `${applied} of ${total} applied · ${open} need${open === 1 ? "s" : ""} attention`;
+  }
+  const known = TOOL_LABELS[confirm.tool];
+  const name = humanizeToolName(confirm.tool);
+  switch (state) {
+    case "applying":
+      return `Approved · ${known?.running ?? name}…`;
+    case "applied":
+      return `${known?.done ?? name} · approved by you`;
+    // The tool row above already reports the failure and the rejection in its
+    // own words; the receipt's job is to record whose decision it was.
+    case "failed":
+      return "Approved change failed";
+    case "rejected":
+      return "Rejected by you";
+    default:
+      return `${confirm.resolution === "approved" ? "Approved" : "Rejected"} — outcome unknown`;
+  }
+};
+
+interface ConfirmReceiptProps {
+  readonly confirms: ConfirmRequest[];
+  readonly focusOnMount: boolean;
+  readonly isDark: boolean;
+  readonly onDecide?: (nonce: string, approved: boolean) => void;
+  readonly states: ConfirmState[];
+}
+
+/**
+ * A decided approval, compressed to one row.
+ *
+ * The evidence mattered while the decision was open; afterwards the transcript
+ * needs a truthful record, not a stack of orange boxes.  The reviewed proposal
+ * stays one click away, but the decision itself cannot be taken again.
+ */
+const ConfirmReceipt: FC<ConfirmReceiptProps> = ({ confirms, focusOnMount, isDark, onDecide, states }) => {
+  const [open, setOpen] = useState(false);
+  // Typed as the element Chakra renders; `focus` comes from HTMLElement either way.
+  const disclosureRef = useRef<HTMLDivElement>(null);
+  const [first] = confirms;
+  const state = buildGroupState(states);
+
+  useEffect(() => {
+    if (focusOnMount) disclosureRef.current?.focus();
+    // Mount only: a later `applying` → `applied` update must not grab focus
+    // back from wherever the user has moved on to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (first === undefined) return undefined;
+  const muted = isDark ? "gray.400" : "gray.600";
+
+  return (
+    <Box width="100%">
+      <Flex align="center" gap={2} wrap="wrap">
+        <Flex
+          as="button"
+          ref={disclosureRef}
+          onClick={() => setOpen((was) => !was)}
+          aria-expanded={open}
+          align="center"
+          gap={2}
+          flex="1"
+          minWidth="180px"
+          textAlign="left"
+          px={1.5}
+          py={1}
+          borderRadius="md"
+          cursor="pointer"
+          _hover={{ bg: isDark ? "whiteAlpha.100" : "blackAlpha.100" }}
+          _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "-2px" }}
+        >
+          <ToolStatusIcon status={RECEIPT_ICONS[state]} />
+          <Text fontSize="sm" color={isDark ? "gray.200" : "gray.800"} flex="1" minWidth={0}>
+            {buildReceiptLabel(state, states, first)}
           </Text>
+          <Text as="span" fontSize="xs" color={muted} flexShrink={0}>
+            {state === "applied" ? "View change" : "View proposal"}
+          </Text>
+          <Box color={muted}>
+            <Chevron open={open} />
+          </Box>
+        </Flex>
+        {state === "unknown" && (
+          // The nonce still answers what happened: asking again replays the
+          // recorded outcome rather than repeating the write.
           <ConfirmButton
             onClick={() => onDecide?.(first.nonce, first.resolution === "approved")}
             disabled={!onDecide}
           >
             Check outcome
           </ConfirmButton>
-        </Flex>
-      ) : (
-        <Text fontSize="xs" color="gray.500" mt={2}>
-          {first.resolution === "approved" ? "Approved ✓" : "Rejected ✕"}
-        </Text>
+        )}
+      </Flex>
+      {open && (
+        <Box px={1.5} pb={1}>
+          {confirms.map((confirm) => (
+            <ConfirmDetail
+              key={confirm.callId}
+              confirm={confirm}
+              isDark={isDark}
+              nested={confirms.length > 1}
+            />
+          ))}
+        </Box>
       )}
     </Box>
   );
 };
 
 interface ConfirmHeadingProps {
-  readonly badge: string;
+  /** The lasting change this action makes, in four or five words. */
+  readonly effect: string;
   readonly isDark: boolean;
   readonly title: string;
 }
 
-const ConfirmHeading: FC<ConfirmHeadingProps> = ({ badge, isDark, title }) => (
-  <Flex align="center" gap={2} wrap="wrap">
+const ConfirmHeading: FC<ConfirmHeadingProps> = ({ effect, isDark, title }) => (
+  <Box>
     <Text fontSize="sm" fontWeight="medium" color={isDark ? "gray.100" : "gray.900"}>
       {title}
     </Text>
-    <Text
-      fontSize="xs"
-      px={1.5}
-      py={0.5}
-      borderRadius="sm"
-      bg={isDark ? "orange.900" : "orange.100"}
-      color={isDark ? "orange.200" : "orange.800"}
-    >
-      {badge}
+    <Text fontSize="xs" color={isDark ? "gray.400" : "gray.600"}>
+      {effect}
     </Text>
-  </Flex>
+  </Box>
 );
 
 /**
@@ -645,10 +849,7 @@ const ConfirmHeading: FC<ConfirmHeadingProps> = ({ badge, isDark, title }) => (
 export const buildDiffLines = (args: Record<string, unknown>): string[] | undefined => {
   const { new: added, old: removed } = args;
   if (typeof removed !== "string" || typeof added !== "string") return undefined;
-  return [
-    ...removed.split("\n").map((line) => `-${line}`),
-    ...added.split("\n").map((line) => `+${line}`),
-  ];
+  return [...removed.split("\n").map((line) => `-${line}`), ...added.split("\n").map((line) => `+${line}`)];
 };
 
 interface ConfirmDetailProps {
@@ -675,7 +876,7 @@ const ConfirmDetail: FC<ConfirmDetailProps> = ({ confirm, isDark, nested }) => {
       borderLeftWidth={nested ? "2px" : undefined}
       borderColor={isDark ? "whiteAlpha.300" : "blackAlpha.200"}
     >
-      <ConfirmHeading badge={effect.badge} isDark={isDark} title={effect.title} />
+      <ConfirmHeading effect={effect.badge} isDark={isDark} title={effect.title} />
       <Box fontSize="sm" color={isDark ? "gray.300" : "gray.700"} mt={1} css={markdownCss(isDark)}>
         <Markdown>{effect.summary(args)}</Markdown>
       </Box>
@@ -740,6 +941,8 @@ interface ConfirmButtonProps {
   readonly "aria-expanded"?: boolean;
   readonly children: string;
   readonly disabled?: boolean;
+  /** A decision button: the one target worth the full 44px. */
+  readonly large?: boolean;
   readonly onClick: () => void;
   readonly primary?: boolean;
 }
@@ -748,6 +951,7 @@ const ConfirmButton: FC<ConfirmButtonProps> = ({
   "aria-expanded": ariaExpanded,
   children,
   disabled = false,
+  large = false,
   onClick,
   primary = false,
 }) => {
@@ -761,6 +965,7 @@ const ConfirmButton: FC<ConfirmButtonProps> = ({
       disabled={disabled}
       px={4}
       py={1.5}
+      minHeight={large ? "44px" : undefined}
       bg={primary ? "brand.500" : isDark ? "gray.800" : "white"}
       color={primary ? "white" : isDark ? "gray.300" : "gray.700"}
       borderWidth="1px"
@@ -997,7 +1202,8 @@ const ToolStatusIcon: FC<{ readonly status: ToolStatus }> = ({ status }) => {
     cancelled: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
     denied: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
     done: { color: isDark ? "green.300" : "green.600", icon: <CheckIcon /> },
-    failed: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
+    // Red is reserved for a reported failure; amber stays with the unverifiable.
+    failed: { color: isDark ? "red.300" : "red.600", icon: <WarnIcon /> },
     proposed: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
     unsettled: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
   };
