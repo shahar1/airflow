@@ -2042,114 +2042,68 @@ async def test_a_resumed_run_that_narrates_its_next_plan_is_corrected_too(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_write_proposed_without_its_token_is_corrected(monkeypatch, pending_store):
-    """A card the tool can only refuse spends the user's decision on nothing."""
-    tokenless = [ToolCallPart(tool_name="apply_dag_code_changes", args={"dag_id": "d"}, tool_call_id="c9")]
-    agent = ScriptedAgent(
-        [
-            [
-                plan_result_event(),
-                SimpleNamespace(
-                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=tokenless)
-                ),
-                run_result_event(),
-            ],
-            [text_delta_event("Re-proposing with the token.")],
-        ]
-    )
-    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
-
-    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
-
-    assert "without the plan_token" in agent.prompts[1]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "tool",
-    ["apply_dag_code_changes", "apply_task_instance_clear", "revert_dag_code", "run_backfill"],
+    ("tool", "args"),
+    [
+        ("apply_dag_code_changes", {"dag_id": "d"}),
+        ("apply_task_instance_clear", {"dag_id": "d"}),
+        ("revert_dag_code", {"dag_id": "d"}),
+        ("run_backfill", {"dag_id": "d"}),
+        ("apply_dag_code_changes", {"dag_id": "d", "plan_token": "st4le"}),
+    ],
 )
-async def test_a_tokenless_token_required_write_is_corrected_even_without_a_plan(
-    monkeypatch, pending_store, tool
-):
-    """Not just the apply pair: revert_dag_code and run_backfill hard-require a plan_token too."""
-    tokenless = [ToolCallPart(tool_name=tool, args={"dag_id": "d"}, tool_call_id="c9")]
+async def test_a_suspended_write_is_never_text_corrected(monkeypatch, pending_store, tool, args):
+    """
+    A suspended history cannot take a new user prompt (pydantic-ai UserError).
+
+    A tokenless or stale-token card is enforced by the sidecar's refusal at
+    execution instead — the stream must not attempt a correction run.
+    """
+    proposals = [ToolCallPart(tool_name=tool, args=args, tool_call_id="c9")]
     agent = ScriptedAgent(
         [
             [
                 SimpleNamespace(
-                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=tokenless)
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=proposals)
                 ),
                 run_result_event(),
             ],
-            [text_delta_event("Planning first, then proposing.")],
         ]
     )
     monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
 
-    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+    payloads = [p async for p in plugin._stream_agent("fix it", user_id="alice")]
 
-    assert len(agent.prompts) == 2
-    assert "without the plan_token" in agent.prompts[1]
-
-
-@pytest.mark.asyncio
-async def test_a_stale_token_echoed_from_an_earlier_turn_is_corrected(monkeypatch, pending_store):
-    """Truthy is not issued: a prior turn's token in the args is still a doomed card."""
-    stale = [
-        ToolCallPart(
-            tool_name="apply_dag_code_changes",
-            args={"dag_id": "d", "plan_token": "st4le"},
-            tool_call_id="c9",
-        )
-    ]
-    agent = ScriptedAgent(
-        [
-            [
-                SimpleNamespace(
-                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=stale)
-                ),
-                run_result_event(),
-            ],
-            [text_delta_event("Planning first, then proposing.")],
-        ]
-    )
-    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
-
-    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
-
-    assert len(agent.prompts) == 2
-    assert "without the plan_token" in agent.prompts[1]
+    assert len(agent.prompts) == 1
+    assert any(p["type"] == "confirm_required" for p in payloads)
+    assert not any(p["type"] == "error" for p in payloads)
 
 
 @pytest.mark.asyncio
-async def test_a_write_carrying_a_token_this_run_did_not_issue_is_corrected(monkeypatch, pending_store):
-    """A plan ran, but the proposal carries some other token — the tool will refuse it."""
-    mismatched = [
-        ToolCallPart(
-            tool_name="apply_dag_code_changes",
-            args={"dag_id": "d", "plan_token": "st4le"},
-            tool_call_id="c9",
-        )
-    ]
+async def test_a_narrated_plan_with_a_suspension_elsewhere_is_not_corrected(monkeypatch, pending_store):
+    """
+    Even a planned-but-unproposed token cannot be chased once the run suspended.
+
+    The history is unresumable with a prompt, and the card is already the ask.
+    """
+    proposals = [ToolCallPart(tool_name="rerun_dag", args={"dag_id": "d"}, tool_call_id="c9")]
     agent = ScriptedAgent(
         [
             [
                 plan_result_event(),
                 SimpleNamespace(
-                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=mismatched)
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=proposals)
                 ),
                 run_result_event(),
             ],
-            [text_delta_event("Re-proposing with the fresh token.")],
         ]
     )
     monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
 
-    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+    payloads = [p async for p in plugin._stream_agent("fix it", user_id="alice")]
 
-    assert len(agent.prompts) == 2
-    assert "without the plan_token" in agent.prompts[1]
+    assert len(agent.prompts) == 1
+    assert not any(p["type"] == "error" for p in payloads)
 
 
 def test_the_correction_tells_the_model_to_plan_first_when_no_plan_ran():

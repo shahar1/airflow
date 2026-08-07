@@ -1575,15 +1575,14 @@ def _needs_correcting(outcome: dict[str, Any]) -> bool:
     corrected once: the model either proposes the write or says plainly that it
     will not.
 
-    Also fires for a token-requiring write proposed without a token this run's
-    plan tools issued — whether or not a plan was made this run, and a stale
-    token echoed from an earlier turn's transcript counts as missing — since
-    that card can only be refused.
+    A run that suspended for approval is out of scope: its history ends in
+    unprocessed tool calls, which pydantic-ai refuses to extend with a new
+    user prompt. A token-requiring write that suspended without a token from
+    this run is enforced at execution instead — the sidecar refuses it and
+    steers the model to plan first.
     """
-    if not outcome.get("messages"):
+    if not outcome.get("messages") or outcome.get("suspended"):
         return False
-    if outcome.get("tokenless_write"):
-        return True
     return bool(outcome.get("planned") and not outcome.get("proposed"))
 
 
@@ -1649,12 +1648,11 @@ async def _run_and_stream(
         if outcome is not None:
             issued = outcome.get("issued_tokens", set())
             outcome["proposed"] = any(_carries_a_plan(part, issued) for part in requests.approvals)
-            # rerun_dag is tokenless by design; every other write refuses a
-            # missing or stale token, whether or not a plan was made this run.
-            outcome["tokenless_write"] = any(
-                part.tool_name in TOKEN_REQUIRED_WRITES and not _carries_a_plan(part, issued)
-                for part in requests.approvals
-            )
+            # A history that ends in unprocessed tool calls cannot take a new
+            # user prompt (pydantic-ai UserError), so a suspended run can never
+            # be text-corrected — a tokenless write on the card is enforced by
+            # the sidecar's refusal at execution instead.
+            outcome["suspended"] = True
         nonce = _store_pending(
             user_id=user_id,
             call_ids=[part.tool_call_id for part in requests.approvals],
