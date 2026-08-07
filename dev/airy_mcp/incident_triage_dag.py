@@ -450,6 +450,9 @@ def incident_triage():
 
     @task.llm(
         llm_conn_id=LLM_CONN_ID,
+        # Summarising a handful of records is easy work, so it is pinned here:
+        # the connection's model can then be upgraded for harder tasks alone.
+        model_id="openai:gpt-4o-mini",
         system_prompt=(
             "You write a three-part executive summary of a triaged incident batch: "
             "a one-line headline, a short overview naming the most severe incidents, "
