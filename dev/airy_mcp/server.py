@@ -46,9 +46,10 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from pathlib import Path
@@ -113,6 +114,38 @@ def _dag_url(dag_id: str, suffix: str = "") -> str:
     return f"/dags/{quote(dag_id, safe='')}{suffix}"
 
 
+def _explain_unknown_dag(dag_id: str, e: httpx.HTTPStatusError) -> str | None:
+    """A relayable message for a Dag the caller cannot see — or ``None`` to re-raise.
+
+    A typo'd or unauthorized dag_id is a conversation, not a traceback: the raw
+    ``httpx`` error names internal URLs and reads as a crash, and the model
+    cannot relay it. 403 gets the same words as 404 on purpose — telling an
+    unauthorized caller "it exists, you just can't see it" confirms the id.
+    """
+    if e.response.status_code in (403, 404):
+        return f"Dag {dag_id!r} does not exist or you cannot see it"
+    return None
+
+
+def _explain_error(e: Exception) -> str:
+    """An error as words a refusal can carry.
+
+    ``str()`` of an ``httpx.HTTPStatusError`` names the internal URL it hit, so
+    it must never reach a relayable string; the response body's ``detail`` is
+    the API's own words for what went wrong, and the status code is the fallback.
+    """
+    if not isinstance(e, httpx.HTTPStatusError):
+        return str(e) or e.__class__.__name__
+    detail = None
+    with suppress(ValueError, AttributeError):  # non-JSON body, or a shapeless one
+        detail = e.response.json().get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    if detail is not None:
+        return json.dumps(detail)[:400]
+    return f"HTTP {e.response.status_code}"
+
+
 def _dag_path(dag_id: str, dag: dict[str, Any] | None = None) -> Path:
     """Resolve a Dag's source file, jailed to ``DAGS_DIR``.
 
@@ -168,13 +201,29 @@ def _exclusive(path: Path) -> Iterator[None]:
 
 
 def _write_if_unchanged(path: Path, expected: str, content: str) -> None:
-    """Replace the file, but only if it still holds what was checked."""
+    """Replace the file, but only if it still holds what was checked.
+
+    Written to a sibling tempfile and moved into place: the Dag processor takes
+    no lock, so an in-place truncate-then-write would let it read a torn file —
+    and a crash mid-write would leave one behind.
+    """
     if path.read_text() != expected:
         raise DagFileDriftError(
             f"{path.name} changed while the patch was being prepared, so applying it would "
             f"overwrite an edit nobody reviewed; try again"
         )
-    path.write_text(content)
+    # The tempfile lives next to the target so the move stays inside the jail
+    # (and on the same filesystem, which is what makes os.replace atomic).
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(tmp_name, path.stat().st_mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _backup_path(path: Path) -> Path:
@@ -431,23 +480,164 @@ def _static_checks(source: str, task_ids: set[str]) -> list[dict[str, str]]:
     return checks
 
 
-def diagnose_dag(dag_id: str, source_digest: str | None = None) -> dict[str, Any]:
-    """
-    Find out what is wrong with a Dag's latest run.
+def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Import errors for this Dag's file — the classic self-healing case.
 
-    Returns every task instance and its state, the log tail of **every** failed
-    one, the task graph, the full Dag source, and deterministic checks that spot
-    broken task references before they ever run. Report every finding, not only
-    the task that failed first.
+    A file that stops parsing never produces a failed run: the old Dag keeps
+    running its old code and every run-based signal looks healthy. The import
+    error list is the only place that failure shows up.
+    """
+    if not dag:
+        return []
+    names = {name for name in (dag.get("fileloc"), dag.get("relative_fileloc")) if name}
+    if not names:
+        return []
+    try:
+        resp = _api("GET", "/importErrors", params={"limit": 100})
+        errors = resp["import_errors"]
+    except (httpx.HTTPStatusError, KeyError):
+        return []
+    checks = []
+    dag_bundle = dag.get("bundle_name")
+    for entry in errors:
+        # The suffix match below is by file name, and two bundles can hold a
+        # file of the same name — without this, another team's stack trace
+        # would be attached to this Dag. Only enforced when both sides name
+        # their bundle; a missing name falls back to the name match alone.
+        entry_bundle = entry.get("bundle_name")
+        if dag_bundle and entry_bundle and entry_bundle != dag_bundle:
+            continue
+        filename = entry.get("filename") or ""
+        # The stored filename may be bundle-relative while the Dag reports an
+        # absolute fileloc, or the other way round; match either direction.
+        if filename in names or any(
+            filename.endswith(f"/{name}") or name.endswith(f"/{filename}") for name in names
+        ):
+            trace = (entry.get("stack_trace") or "").strip()
+            checks.append(
+                {
+                    "kind": "import_error",
+                    "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace[-400:]}",
+                }
+            )
+    total = resp.get("total_entries", len(errors))
+    if total > len(errors):
+        checks.append(
+            {
+                "kind": "import_errors_truncated",
+                "detail": (
+                    f"only the first {len(errors)} of {total} import errors were checked, so an "
+                    f"import error for this Dag's file may be missing from this diagnosis"
+                ),
+            }
+        )
+    return checks
+
+
+_CHECK_LABELS = {
+    "unknown_xcom_task_id": "Latent blocker",
+    "import_error": "Import error",
+    "import_errors_truncated": "Note",
+    "source_graph_disagreement": "Note",
+}
+
+
+def _summarize_failure(failure: dict[str, Any]) -> str:
+    where = failure["task_id"]
+    if failure.get("map_index", -1) >= 0:
+        where += f"[{failure['map_index']}]"
+    line = _extract_error_line(failure.get("log_tail") or "") or "no log available"
+    if failure.get("still_retrying"):
+        return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log)."
+    return f"Confirmed failure: {where} failed with {line} (see log)."
+
+
+def _build_diagnosis_summary(
+    run_id: str,
+    run_state: str,
+    failures: list[dict[str, Any]],
+    checks: list[dict[str, str]],
+    logs_omitted: int,
+) -> str:
+    """One deterministic digest the model can echo, enumerating every finding.
+
+    Built server-side because a small model reliably repeats a numbered list it
+    was handed, and just as reliably drops one finding out of two it has to
+    assemble from separate fields.
+    """
+    items = [_summarize_failure(failure) for failure in failures]
+    items += [f"{_CHECK_LABELS.get(check['kind'], 'Check')}: {check['detail']}." for check in checks]
+    if not items:
+        return f"No problems found: run {run_id} is {run_state} and no task instances failed."
+    numbered = " ".join(f"({position}) {text}" for position, text in enumerate(items, 1))
+    head = f"{len(items)} problem{'s' if len(items) != 1 else ''} found."
+    tail = (
+        f" The logs of {logs_omitted} more failed task instance(s) were omitted for size."
+        if logs_omitted
+        else ""
+    )
+    return f"{head} {numbered}{tail}"
+
+
+def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = None) -> dict[str, Any]:
+    """
+    Find out what is wrong with a run of this Dag.
+
+    ``dag_run_id`` names an exact run; left empty, the first failed of the last
+    5 runs is diagnosed (else the newest). Returns every task instance and its
+    state, the log tail of **every** failed or retrying one, the task graph,
+    the full Dag source, deterministic checks that spot broken task references
+    and import errors before they ever run, and a ``summary`` that enumerates
+    every finding. Relay the ``summary`` completely — every numbered item, not
+    only the first.
 
     ``source_digest`` is set by the caller's permissions, not by you.
     """
-    runs = _api("GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": 5})[
-        "dag_runs"
-    ]
-    if not runs:
-        return {"dag_id": dag_id, "diagnosis": "this Dag has never run"}
-    run = next((r for r in runs if r["state"] == "failed"), runs[0])
+    stale_note = ""
+    diagnosed_is_latest: bool | None = None
+    newest_run_info: dict[str, Any] | None = None
+    if dag_run_id:
+        run, error = _resolve_run(dag_id, dag_run_id)
+        if run is None:
+            return {"dag_id": dag_id, "dag_run_id": dag_run_id, "error": error}
+    else:
+        try:
+            runs = _api("GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": 5})[
+                "dag_runs"
+            ]
+        except httpx.HTTPStatusError as e:
+            message = _explain_unknown_dag(dag_id, e)
+            if message is None:
+                raise
+            return {"dag_id": dag_id, "error": message}
+        if not runs:
+            return {
+                "dag_id": dag_id,
+                "diagnosis": "this Dag has never run",
+                "summary": "This Dag has never run, so there is no run to diagnose.",
+            }
+        run = next((r for r in runs if r["state"] == "failed"), runs[0])
+        newest = runs[0]
+        diagnosed_is_latest = run is newest
+        # The first-failed-of-last-5 fallback can pick an old failed run while a
+        # fresh re-run is still in flight — and "the re-run failed again" is
+        # then a false report about a run this diagnosis never looked at. Said
+        # in the summary itself: a small model echoes the summary, not a flag.
+        if not diagnosed_is_latest:
+            newest_run_info = {"dag_run_id": newest["dag_run_id"], "state": newest["state"]}
+            if newest["state"] in ("queued", "running"):
+                stale_note = (
+                    f"Note: the newest run {newest['dag_run_id']} is still {newest['state']} — this "
+                    f"diagnosis is of the earlier run {run['dag_run_id']}, not of the run in progress."
+                )
+            else:
+                # A newest run that already finished (e.g. succeeded) must not be
+                # spoken for by an older failure either.
+                stale_note = (
+                    f"Note: the newest run {newest['dag_run_id']} finished with state "
+                    f"{newest['state']} — this diagnosis is of the EARLIER run "
+                    f"{run['dag_run_id']}, not of that newest run."
+                )
     run_path = f"/dagRuns/{quote(run['dag_run_id'], safe='')}"
 
     tis, omitted = _run_task_instances(dag_id, run_path)
@@ -467,17 +657,25 @@ def diagnose_dag(dag_id: str, source_digest: str | None = None) -> dict[str, Any
             for ti in tis
         ],
     }
+    if diagnosed_is_latest is not None:
+        result["diagnosed_run_is_latest"] = diagnosed_is_latest
+    if newest_run_info:
+        result["newest_run"] = newest_run_info
     if omitted:
         result["task_instances_omitted"] = omitted
+    try:
+        dag = _api("GET", _dag_url(dag_id))
+    except httpx.HTTPStatusError:
+        dag = None
     # The *parsed* source, not the file on disk. Permission to read this file was
     # granted against the Dags Airflow has parsed out of it; the live file may
     # already define one more, and handing that back would disclose a Dag nobody
     # authorized. A Dag outside the writable bundle is still worth reporting on.
     try:
         result["source"] = _parsed_source(dag_id, source_digest)
-        result["source_file"] = str(_dag_path(dag_id))
+        result["source_file"] = str(_dag_path(dag_id, dag))
     except (DagFileError, OSError, httpx.HTTPStatusError, KeyError) as e:
-        result.setdefault("source", f"unavailable: {e}")
+        result.setdefault("source", f"unavailable: {_explain_error(e)}")
 
     try:
         tasks = _tasks(dag_id)
@@ -496,12 +694,23 @@ def diagnose_dag(dag_id: str, source_digest: str | None = None) -> dict[str, Any
             },
         }
     source = result.get("source")
+    static_checks: list[dict[str, str]] | None = None
     if tasks and isinstance(source, str) and not source.startswith("unavailable:"):
-        result["checks"] = _static_checks(source, {task["task_id"] for task in tasks})
+        static_checks = _static_checks(source, {task["task_id"] for task in tasks})
+    import_checks = _find_import_errors(dag)
+    checks = (static_checks or []) + import_checks
+    if static_checks is not None or import_checks:
+        result["checks"] = checks
 
-    failed = [ti for ti in tis if ti.get("state") == "failed"]
+    # up_for_retry counts: the task already failed at least once, and waiting
+    # for the retries to burn down before diagnosing wastes exactly the time a
+    # diagnosis is for.
+    failed = [ti for ti in tis if ti.get("state") in ("failed", "up_for_retry")]
     if not failed:
         result["diagnosis"] = f"latest run is {run['state']}; no failed task instances"
+        result["summary"] = _build_diagnosis_summary(run["dag_run_id"], run["state"], [], checks, 0)
+        if stale_note:
+            result["summary"] = f"{stale_note} {result['summary']}"
         return result
 
     failures = []
@@ -509,26 +718,42 @@ def diagnose_dag(dag_id: str, source_digest: str | None = None) -> dict[str, Any
     for ti in failed:
         if budget <= 0:
             break
-        log = _api(
-            "GET",
-            _dag_url(
-                dag_id,
-                f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
-            ),
-            # The log route defaults to map_index=-1, which is a *different*
-            # instance from a mapped one: without this a fan-out reports the
-            # unmapped task's log, or none at all.
-            params={"map_index": ti.get("map_index", -1)},
-        )
+        try:
+            log = _api(
+                "GET",
+                _dag_url(
+                    dag_id,
+                    f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
+                ),
+                # The log route defaults to map_index=-1, which is a *different*
+                # instance from a mapped one: without this a fan-out reports the
+                # unmapped task's log, or none at all.
+                params={"map_index": ti.get("map_index", -1)},
+            )
+        except httpx.HTTPStatusError as e:
+            log = f"log unavailable: HTTP {e.response.status_code}"
         # From the end, like _tail itself: the exception and its traceback are
         # the last thing in the log, and keeping the first N characters of a
         # tail would spend the budget on the lines nobody needs.
         tail = _tail(log.get("content") if isinstance(log, dict) else log)[-budget:]
         budget -= len(tail)
-        failures.append({"task_id": ti["task_id"], "map_index": ti.get("map_index", -1), "log_tail": tail})
+        failures.append(
+            {
+                "task_id": ti["task_id"],
+                "map_index": ti.get("map_index", -1),
+                "log_tail": tail,
+                "still_retrying": ti.get("state") == "up_for_retry",
+            }
+        )
     result["failures"] = failures
-    if len(failures) < len(failed):
-        result["logs_omitted"] = len(failed) - len(failures)
+    logs_omitted = len(failed) - len(failures)
+    if logs_omitted:
+        result["logs_omitted"] = logs_omitted
+    result["summary"] = _build_diagnosis_summary(
+        run["dag_run_id"], run["state"], failures, checks, logs_omitted
+    )
+    if stale_note:
+        result["summary"] = f"{stale_note} {result['summary']}"
     # Kept for the single-failure case every prompt and card already speaks.
     result["failed_task_id"] = failures[0]["task_id"]
     result["log_tail"] = failures[0]["log_tail"]
@@ -670,7 +895,8 @@ def _change_impact(dag_id: str, source: str, patched: str) -> dict[str, Any]:
             "added_task_ids": [],
             "limits": limits,
             "blocking": [
-                f"the task graph could not be read ({e}), so this change cannot be checked against it"
+                f"the task graph could not be read ({_explain_error(e)}), so this change cannot "
+                f"be checked against it"
             ],
         }
     removed = sorted(
@@ -720,14 +946,156 @@ def _change_impact(dag_id: str, source: str, patched: str) -> dict[str, Any]:
     return impact
 
 
-def revert_dag_code(dag_id: str, source_digest: str | None = None) -> dict[str, Any]:
+def _find_unaddressed_findings(dag_id: str, patched: str) -> list[dict[str, str]]:
+    """The deterministic findings the patched source would still trip.
+
+    Report-only backstop for the one-plan rule: a plan that fixes one of two
+    diagnosed problems is legal — a deliberate partial fix stays approvable, so
+    the token is never withheld — but the plan has to say what it leaves
+    unfixed, or the model forgets the other finding until the next failed run.
+    The multi-Dag disagreement note is excluded: it says the checks were
+    skipped, not that a problem remains.
+    """
+    try:
+        task_ids = {task["task_id"] for task in _tasks(dag_id)}
+    except (httpx.HTTPStatusError, KeyError):
+        return []
+    return [
+        check for check in _static_checks(patched, task_ids) if check["kind"] != "source_graph_disagreement"
+    ]
+
+
+def _build_asset_note(dag_id: str) -> str:
+    """The asset context an asset-touching change must carry to its approval card.
+
+    Names only this Dag's own produced/consumed assets — never other Dags' ids,
+    which only get_blast_radius is authorized to hand back.
+    """
+    try:
+        assets = _api("GET", "/assets", params={"limit": 100})["assets"]
+    except (httpx.HTTPStatusError, KeyError):
+        return (
+            "this change touches assets, inlets/outlets or the schedule, and the asset catalog "
+            "could not be read; call get_blast_radius and tell the user what else is affected "
+            "before applying"
+        )
+    edges = _compute_asset_edges(dag_id, assets)
+    produces = ", ".join(repr(name) for name in edges["produces"]) or "no assets"
+    consumes = ", ".join(repr(name) for name in edges["consumes"]) or "no assets"
+    return (
+        f"this change touches assets, inlets/outlets or the schedule: {dag_id} produces "
+        f"{produces} and consumes {consumes}; Dags scheduled on those assets can be affected"
+    )
+
+
+def _build_revert_diff(path: Path, current: str, original: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            current.splitlines(keepends=True),
+            original.splitlines(keepends=True),
+            f"a/{path.name}",
+            f"b/{path.name}",
+        )
+    )
+
+
+def plan_revert_dag_code(dag_id: str, source_digest: str | None = None) -> dict[str, Any]:
+    """
+    Preview reverting a Dag's source to the original Airy backed up, without
+    writing anything.
+
+    Read-only. Reverting discards **every** change Airy applied — not just the
+    most recent one. Returns the diff that reverting would apply (the backup
+    against the current file), a ``summary`` to relay, and a single-use
+    ``plan_token``. Show the user the diff, then pass the token *and* the same
+    ``diff`` to revert_dag_code.
+
+    ``source_digest`` is set by the caller's permissions, not by you.
+    """
+    try:
+        dag = _api("GET", _dag_url(dag_id))
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"planned": False, "error": message}
+    try:
+        path = _dag_path(dag_id, dag)
+        backup = _backup_path(path)
+    except DagFileError as e:
+        return {"planned": False, "error": str(e)}
+    if not backup.exists():
+        return {
+            "planned": False,
+            "error": (
+                f"no backup for {path.name} — Airy has not changed this Dag, so there is nothing to revert"
+            ),
+        }
+    try:
+        current = _read_reviewed_file(dag_id, path, source_digest)
+    except DagFileDriftError as e:
+        return {"planned": False, "error": str(e)}
+    original = backup.read_text()
+    diff = _build_revert_diff(path, current, original)
+    return {
+        "planned": True,
+        "dag_id": dag_id,
+        "file": str(path),
+        "diff": diff,
+        "summary": (
+            f"Reverting restores {path.name} to the original Airy backed up, discarding "
+            f"every change Airy applied since — not just the most recent one."
+        ),
+        "plan_token": _issue_token(
+            "revert",
+            {
+                "dag_id": dag_id,
+                "current_digest": md5(current.encode("utf-8")).hexdigest(),
+                "diff": diff,
+            },
+        ),
+    }
+
+
+def revert_dag_code(
+    dag_id: str, plan_token: str = "", diff: str = "", source_digest: str | None = None
+) -> dict[str, Any]:
     """
     Restore a Dag's source to the original, discarding **every** change Airy
-    applied — not just the most recent one. Returns the diff of what was undone.
+    applied — not just the most recent one.
+
+    Pass back both the ``plan_token`` from plan_revert_dag_code *and* the exact
+    ``diff`` it returned. The diff goes in the arguments so the confirmation
+    the user clicks shows exactly what reverting discards; the token is what
+    proves they reviewed it.
+
+    ``source_digest`` is set by the caller's permissions, not by you.
     """
-    dag = _api("GET", _dag_url(dag_id))
-    path = _dag_path(dag_id, dag)
+    plan = _redeem_token("revert", plan_token)
+    if plan is None:
+        return {
+            "reverted": False,
+            "mutation_applied": False,
+            "error": "no reviewed plan for this revert; call plan_revert_dag_code and show the user the diff",
+        }
+    if plan["dag_id"] != dag_id or plan["diff"] != diff:
+        return {
+            "reverted": False,
+            "mutation_applied": False,
+            "error": (
+                "this is not the revert that was planned, so the diff the user reviewed is not "
+                "this one; re-plan and show them again"
+            ),
+        }
     try:
+        dag = _api("GET", _dag_url(dag_id))
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"reverted": False, "mutation_applied": False, "error": message}
+    try:
+        path = _dag_path(dag_id, dag)
         backup = _backup_path(path)
     except DagFileError as e:
         return {"reverted": False, "mutation_applied": False, "error": str(e)}
@@ -737,29 +1105,33 @@ def revert_dag_code(dag_id: str, source_digest: str | None = None) -> dict[str, 
     with _exclusive(path):
         try:
             current = _read_reviewed_file(dag_id, path, source_digest)
-            original = backup.read_text()
+        except DagFileDriftError as e:
+            return {"reverted": False, "mutation_applied": False, "error": str(e)}
+        if md5(current.encode("utf-8")).hexdigest() != plan["current_digest"]:
+            return {
+                "reverted": False,
+                "mutation_applied": False,
+                "error": (
+                    "the source changed since the revert was planned, so the diff the user "
+                    "reviewed is stale; re-plan and show them the new one"
+                ),
+            }
+        original = backup.read_text()
+        try:
             _write_if_unchanged(path, current, original)
         except DagFileDriftError as e:
             return {"reverted": False, "mutation_applied": False, "error": str(e)}
         backup.unlink()
-    diff = "".join(
-        difflib.unified_diff(
-            current.splitlines(keepends=True),
-            original.splitlines(keepends=True),
-            f"a/{path.name}",
-            f"b/{path.name}",
-        )
-    )
     version_after = version_before_write
     try:
         reparse, version_after = _force_reparse(dag_id, dag["file_token"], version_before_write)
     except Exception as e:  # the restore already landed; never raise past it
-        reparse = f"file restored, but the reparse request failed: {e}"
+        reparse = f"file restored, but the reparse request failed: {_explain_error(e)}"
     return {
         "reverted": True,
         "mutation_applied": True,
         "file": str(path),
-        "diff": diff,
+        "diff": _build_revert_diff(path, current, original),
         "reparse": reparse,
         **_definition_updates(dag_id, version_before_write, version_after),
     }
@@ -774,7 +1146,9 @@ def plan_dag_code_changes(
     Read-only. ``changes`` is a list of ``{"old": ..., "new": ...}``; each
     ``old`` must appear exactly once at the point it is applied. Put **every**
     fix you intend to make in one call — a second plan made after the first one
-    lands is a plan against source that no longer exists.
+    lands is a plan against source that no longer exists, and a second plan made
+    from the *same* source is refused outright and discards the earlier plan's
+    token: one repair is one plan.
 
     Returns the combined diff, what the change does to the task graph, and a
     single-use ``plan_token``. Show the user the diff and every ``blocking``
@@ -788,8 +1162,22 @@ def plan_dag_code_changes(
     try:
         source = _parsed_source(dag_id, source_digest)
         path = _dag_path(dag_id)
-    except (DagFileError, OSError, httpx.HTTPStatusError, KeyError) as e:
+    except httpx.HTTPStatusError as e:
+        return {"planned": False, "error": _explain_unknown_dag(dag_id, e) or _explain_error(e)}
+    except (DagFileError, OSError, KeyError) as e:
         return {"planned": False, "error": str(e)}
+
+    digest = md5(source.encode("utf-8")).hexdigest()
+    if _discard_same_source_plans(dag_id, digest):
+        # "An earlier plan", not "your plan": the store is cross-session, so the
+        # discarded plan may belong to a conversation this caller never saw.
+        return {
+            "planned": False,
+            "error": (
+                f"an earlier plan for {dag_id} from this same source was discarded; make ONE plan "
+                f"containing every change"
+            ),
+        }
 
     patched, error = _patch(source, pairs)
     if patched is None:
@@ -816,6 +1204,9 @@ def plan_dag_code_changes(
         "diff": diff,
         "impact": impact,
     }
+    asset_note = _build_asset_note(dag_id) if "asset_review_needed" in impact else None
+    if asset_note:
+        preview["asset_note"] = asset_note
     if impact["blocking"]:
         # No token: this plan is not one the user can be asked to approve as it
         # stands, and issuing one would let the model apply it anyway.
@@ -827,19 +1218,40 @@ def plan_dag_code_changes(
                 "and plan the rewiring too, rather than applying it as-is"
             ),
         }
+    unaddressed = _find_unaddressed_findings(dag_id, patched)
+    if unaddressed:
+        preview["unaddressed_findings"] = unaddressed
+        preview["unaddressed_note"] = (
+            f"this plan leaves {len(unaddressed)} deterministic finding(s) unfixed — include a fix "
+            f"in this same plan or tell the user why not"
+        )
     return {
         **preview,
         "plan_token": _issue_token(
             "dag_code",
-            {"dag_id": dag_id, "digest": md5(source.encode("utf-8")).hexdigest(), "changes": pairs},
+            {
+                "dag_id": dag_id,
+                "digest": digest,
+                "changes": pairs,
+                "asset_note": asset_note,
+            },
         ),
     }
+
+
+# Appended to apply-time drift refusals: a small model that hits one tends to
+# retry the doomed apply, so the refusal itself must spell out the way back.
+_REPLAN_STEER = (
+    "the file changed since this plan was made. Make a NEW plan from the current source "
+    "that contains every remaining change, show it, and apply that instead."
+)
 
 
 def apply_dag_code_changes(
     dag_id: str,
     changes: list[dict[str, str]],
     plan_token: str = "",
+    asset_note: str = "",
     source_digest: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -848,7 +1260,9 @@ def apply_dag_code_changes(
     Pass back both the ``plan_token`` *and* the exact ``changes`` list that was
     planned. The changes go in the arguments so the confirmation the user clicks
     spells out every edit it writes; the token is what proves they were planned
-    against the source that is still on disk.
+    against the source that is still on disk. When the plan returned an
+    ``asset_note``, repeat it verbatim too — the approval must show what the
+    change can knock over.
 
     ``source_digest`` is set by the caller's permissions, not by you.
     """
@@ -875,15 +1289,30 @@ def apply_dag_code_changes(
                 "this one; re-plan and show them again"
             ),
         }
+    if plan.get("asset_note") and asset_note != plan["asset_note"]:
+        return {
+            "applied": False,
+            "mutation_applied": False,
+            "error": (
+                "this change touches assets, so the approval must show what it can knock over; "
+                "pass back asset_note exactly as plan_dag_code_changes returned it"
+            ),
+        }
 
-    dag = _api("GET", _dag_url(dag_id))
+    try:
+        dag = _api("GET", _dag_url(dag_id))
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"applied": False, "mutation_applied": False, "error": message}
     path = _dag_path(dag_id, dag)
     version_before_write = _latest_version(dag_id)
     with _exclusive(path):
         try:
             source = _read_reviewed_file(dag_id, path, source_digest)
         except DagFileDriftError as e:
-            return {"applied": False, "mutation_applied": False, "error": str(e)}
+            return {"applied": False, "mutation_applied": False, "error": f"{e} — {_REPLAN_STEER}"}
         # The plan's impact findings were computed from these exact bytes; if
         # they still hash the same there is nothing to recompute, and if they do
         # not, no amount of recomputing makes the reviewed diff the right one.
@@ -891,7 +1320,7 @@ def apply_dag_code_changes(
             return {
                 "applied": False,
                 "mutation_applied": False,
-                "error": "the source changed since it was planned; re-plan and show the user the new diff",
+                "error": f"the source changed since it was planned — {_REPLAN_STEER}",
             }
         patched, error = _patch(source, pairs)
         if patched is None:
@@ -940,7 +1369,7 @@ def apply_dag_code_changes(
     try:
         reparse, version_after = _force_reparse(dag_id, dag["file_token"], version_before_write)
     except Exception as e:  # the write already landed; never raise past it
-        reparse = f"file patched, but the reparse request failed: {e}"
+        reparse = f"file patched, but the reparse request failed: {_explain_error(e)}"
     return {
         "applied": True,
         "mutation_applied": True,
@@ -953,9 +1382,111 @@ def apply_dag_code_changes(
     }
 
 
-def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> dict[str, Any]:
+_JSON_TYPE_CHECKS = {
+    "null": lambda value: value is None,
+    "boolean": lambda value: isinstance(value, bool),
+    "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+    "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
+    "string": lambda value: isinstance(value, str),
+    "array": lambda value: isinstance(value, list),
+    "object": lambda value: isinstance(value, dict),
+}
+
+
+def _describe_bounds(schema: dict[str, Any]) -> str:
+    """The schema's numeric bounds as words, leading space included — or ``""``.
+
+    The same words serve the catalog and the refusal, so a model that overshoots
+    a range is told the whole allowed range, not just the edge it hit.
+    """
+    minimum, maximum = schema.get("minimum"), schema.get("maximum")
+    exclusive_min, exclusive_max = schema.get("exclusiveMinimum"), schema.get("exclusiveMaximum")
+    if minimum is not None and maximum is not None and exclusive_min is None and exclusive_max is None:
+        return f" between {minimum} and {maximum}"
+    bounds = []
+    if exclusive_min is not None:
+        bounds.append(f"greater than {exclusive_min}")
+    elif minimum is not None:
+        bounds.append(f"at least {minimum}")
+    if exclusive_max is not None:
+        bounds.append(f"less than {exclusive_max}")
+    elif maximum is not None:
+        bounds.append(f"at most {maximum}")
+    return f" {' and '.join(bounds)}" if bounds else ""
+
+
+def _describe_params(params: dict[str, Any]) -> str:
+    """Every trigger parameter the Dag accepts, in one relayable line."""
+    parts = []
+    for name, spec in sorted(params.items()):
+        schema = spec.get("schema") or {} if isinstance(spec, dict) else {}
+        types = schema.get("type", "any")
+        if isinstance(types, list):
+            types = "/".join(str(t) for t in types)
+        constraint = (
+            f"one of {schema['enum']}" if schema.get("enum") else f"{types}{_describe_bounds(schema)}"
+        )
+        default = spec.get("value") if isinstance(spec, dict) else spec
+        parts.append(f"{name} ({constraint}, default {default!r})")
+    return "; ".join(parts)
+
+
+def _validate_conf(dag_id: str, conf: Any, params: dict[str, Any]) -> str | None:
+    """Why this conf cannot trigger this Dag — or ``None`` when it can.
+
+    Checked against the Dag's own ``params`` schema so a bad value is refused
+    here, in words, instead of producing a run that fails at parse time or a
+    422 the model cannot relay.
+    """
+    if not isinstance(conf, dict):
+        return "conf must be an object of parameter values"
+    if not params:
+        return f"{dag_id} takes no trigger parameters, so conf must be empty"
+    unknown = sorted(set(conf) - set(params))
+    if unknown:
+        return f"unknown conf key(s) {unknown}; {dag_id} accepts: {_describe_params(params)}"
+    for name in sorted(conf):
+        value = conf[name]
+        spec = params[name]
+        schema = spec.get("schema") or {} if isinstance(spec, dict) else {}
+        enum = schema.get("enum")
+        if enum and value not in enum:
+            return f"conf[{name!r}] must be one of {enum}, not {value!r}"
+        types = schema.get("type")
+        if types:
+            allowed = types if isinstance(types, list) else [types]
+            checks = [_JSON_TYPE_CHECKS.get(str(t)) for t in allowed]
+            if not any(check(value) for check in checks if check):
+                type_names = "/".join(str(t) for t in allowed)
+                return f"conf[{name!r}] must be of type {type_names}, not {type(value).__name__} ({value!r})"
+        # bool is an int to Python but not to a numeric range; a non-numeric
+        # value under a numeric schema was already refused by the type check.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out_of_range = (
+                (schema.get("minimum") is not None and value < schema["minimum"])
+                or (schema.get("maximum") is not None and value > schema["maximum"])
+                or (schema.get("exclusiveMinimum") is not None and value <= schema["exclusiveMinimum"])
+                or (schema.get("exclusiveMaximum") is not None and value >= schema["exclusiveMaximum"])
+            )
+            if out_of_range:
+                return f"conf[{name!r}] must be{_describe_bounds(schema)}, not {value!r}"
+    return None
+
+
+def rerun_dag(
+    dag_id: str,
+    conf: dict[str, Any] | None = None,
+    note: str = "",
+    unpause: bool = False,
+    unpause_token: str = "",
+) -> dict[str, Any]:
     """
     Trigger a fresh run of a Dag on the latest code.
+
+    ``conf`` sets the Dag's trigger parameters and is validated against the
+    Dag's own params schema — unknown keys and wrong types are refused with the
+    list of what the Dag accepts. Leave it out for a Dag without parameters.
+    ``note`` is attached to the created run.
 
     A paused Dag will not run until it is unpaused, and unpausing also resumes
     its *scheduled* runs — a lasting change beyond this one run. So it cannot be
@@ -963,7 +1494,21 @@ def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> di
     an ``unpause_token``. Put the warning to the user in your own words, and only
     if they agree call again with ``unpause=True`` and that token.
     """
-    if _api("GET", _dag_url(dag_id))["is_paused"]:
+    try:
+        dag = _api("GET", _dag_url(dag_id))
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"triggered": False, "mutation_applied": False, "error": message}
+    if conf:
+        # Validated before the pause flow so a bad conf cannot burn an
+        # unpause_token the user's warning was already spent on.
+        details = _api("GET", _dag_url(dag_id, "/details"))
+        error = _validate_conf(dag_id, conf, details.get("params") or {})
+        if error:
+            return {"triggered": False, "mutation_applied": False, "error": error}
+    if dag["is_paused"]:
         if not unpause:
             return {
                 "triggered": False,
@@ -990,7 +1535,11 @@ def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> di
     else:
         unpaused = False
     try:
-        run = _api("POST", _dag_url(dag_id, "/dagRuns"), json={"logical_date": None, "conf": {}})
+        run = _api(
+            "POST",
+            _dag_url(dag_id, "/dagRuns"),
+            json={"logical_date": None, "conf": conf or {}, "note": note or "Triggered via Airy"},
+        )
     except Exception as e:
         # The unpause already committed. Reporting only the failure would leave
         # the user thinking nothing happened, with the Dag now scheduling again.
@@ -1002,7 +1551,7 @@ def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> di
             "dag_id": dag_id,
             "unpaused": unpaused,
             "error": (
-                f"triggering the run failed: {e}"
+                f"triggering the run failed: {_explain_error(e)}"
                 + (f". {dag_id} was unpaused first and is still unpaused." if unpaused else "")
             ),
         }
@@ -1013,6 +1562,14 @@ def rerun_dag(dag_id: str, unpause: bool = False, unpause_token: str = "") -> di
         "dag_run_id": run["dag_run_id"],
         "state": run["state"],
         "unpaused": unpaused,
+        # A model that diagnoses right after triggering gets served the *old*
+        # failed run by the fallback and reports "it failed again"; the result
+        # itself has to say the outcome is not in yet.
+        "next_step": (
+            f"created run {run['dag_run_id']} in state {run['state']} — its outcome is not known "
+            f"yet; check it after it completes (diagnose_dag with dag_run_id={run['dag_run_id']!r}) "
+            f"and never assume success or failure"
+        ),
         "ui_updates": [{"kind": "dag_run", "dag_id": dag_id, "dag_run_id": run["dag_run_id"]}],
     }
 
@@ -1024,18 +1581,26 @@ def _run_version(run: dict[str, Any]) -> int | None:
 
 
 def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Turn ``latest`` into one exact run, or confirm the exact one still exists."""
-    if dag_run_id in ("", "latest"):
-        runs = _api("GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": 1})[
-            "dag_runs"
-        ]
-        if not runs:
-            return None, f"{dag_id} has no runs to clear"
-        return runs[0], None
+    """Turn ``latest``/``previous`` into one exact run, or confirm the exact one exists."""
+    if dag_run_id in ("", "latest", "previous"):
+        wanted = 2 if dag_run_id == "previous" else 1
+        try:
+            runs = _api(
+                "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": wanted}
+            )["dag_runs"]
+        except httpx.HTTPStatusError as e:
+            message = _explain_unknown_dag(dag_id, e)
+            if message is None:
+                raise
+            return None, message
+        if len(runs) < wanted:
+            missing = "no previous run — it has run once at most" if wanted == 2 else "no runs"
+            return None, f"{dag_id} has {missing}"
+        return runs[wanted - 1], None
     try:
         return _api("GET", _dag_url(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")), None
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
+        if e.response.status_code in (403, 404):
             return None, f"{dag_id} has no run {dag_run_id!r}"
         raise
 
@@ -1285,11 +1850,16 @@ def apply_task_instance_clear(
         plan["run_on_latest_version"],
     )
     if asked != planned:
+        # Said in words, not as a Python tuple: this refusal is relayed to the
+        # user, and a raw repr of six positional values explains nothing.
         return {
             "cleared": False,
             "mutation_applied": False,
             "error": (
-                f"these are not the task instances that were planned ({planned}); re-plan and show the user"
+                f"these are not the task instances that were planned — the plan was run "
+                f"{plan['dag_run_id']!r}, task_ids {plan['task_ids']}, only_failed={plan['only_failed']}, "
+                f"include_downstream={plan['include_downstream']}, "
+                f"run_on_latest_version={plan['run_on_latest_version']}; re-plan and show the user"
             ),
         }
 
@@ -1343,12 +1913,18 @@ def apply_task_instance_clear(
             "dag_run_id": dag_run_id,
             "error": f"the clear was refused: {e.response.text or e}",
         }
-    return {
+    # The dry run and the clear are still two calls; compare what actually
+    # cleared against what the user approved. The clear happened either way —
+    # this is truthful reporting of a drifted outcome, not a rollback.
+    cleared_identities = _identities(cleared)
+    planned_identities = plan["affected"]
+    result: dict[str, Any] = {
         "cleared": True,
         "mutation_applied": True,
         "dag_id": dag_id,
         "dag_run_id": dag_run_id,
         "task_instances": cleared,
+        "cleared_matches_plan": cleared_identities == planned_identities,
         # True of this call. The scheduler reconciles a re-queued run against the
         # latest version afterwards, which is why the plan refuses when that
         # version's task list differs.
@@ -1363,6 +1939,17 @@ def apply_task_instance_clear(
             }
         ],
     }
+    if not result["cleared_matches_plan"]:
+        result["cleared_delta"] = {
+            "missing": sorted(set(planned_identities) - set(cleared_identities)),
+            "extra": sorted(set(cleared_identities) - set(planned_identities)),
+        }
+        result["warning"] = (
+            f"the clear went through, but what it affected drifted from the reviewed plan "
+            f"({len(planned_identities)} instance(s) planned, {len(cleared_identities)} cleared); "
+            f"tell the user about cleared_delta"
+        )
+    return result
 
 
 def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | None = None) -> dict[str, Any]:
@@ -1370,8 +1957,12 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
     Compare two runs of a Dag: per-task duration changes and conf differences.
 
     Answers "was it my change?" after a run that used to work starts failing.
-    Names the Dag versions each run used, but does not diff them — an older
-    version can contain a co-located Dag this caller was never authorized for.
+    ``run_a``/``run_b`` take exact run ids, or ``latest``/``previous`` — so
+    "compare the last two runs" is run_a="previous", run_b="latest".
+    A mapped task is aggregated per task: instance count and the longest
+    instance's duration. Names the Dag versions each run used, but does not
+    diff them — an older version can contain a co-located Dag this caller was
+    never authorized for.
     ``source_digest`` is set by the caller's permissions, not by you.
     """
     # Fail closed before any of it: the caller was authorized against one exact
@@ -1380,12 +1971,19 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         _parsed_source(dag_id, source_digest)
     except DagFileDriftError as e:
         return {"dag_id": dag_id, "error": str(e)}
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"dag_id": dag_id, "error": message}
     summaries: dict[str, dict[str, Any]] = {}
-    durations: dict[str, dict[str, float | None]] = {}
-    for label, run_id in (("run_a", run_a), ("run_b", run_b)):
-        run_path = f"/dagRuns/{quote(run_id, safe='')}"
-        run = _api("GET", _dag_url(dag_id, run_path))
-        tis = _api("GET", _dag_url(dag_id, f"{run_path}/taskInstances"))["task_instances"]
+    instances: dict[str, dict[str, dict[str, Any]]] = {}
+    for label, requested in (("run_a", run_a), ("run_b", run_b)):
+        run, error = _resolve_run(dag_id, requested)
+        if run is None:
+            return {"dag_id": dag_id, "error": error}
+        run_id = run["dag_run_id"]
+        tis, omitted = _run_task_instances(dag_id, f"/dagRuns/{quote(run_id, safe='')}")
         summaries[label] = {
             "dag_run_id": run_id,
             "state": run.get("state"),
@@ -1393,19 +1991,35 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
             "version": _run_version(run),
             "conf": run.get("conf") or {},
         }
-        durations[label] = {ti["task_id"]: ti.get("duration") for ti in tis}
+        if omitted:
+            summaries[label]["task_instances_omitted"] = omitted
+        # Mapped instances aggregate to one row per task — the longest instance,
+        # not whichever map_index the API listed last.
+        per_task: dict[str, dict[str, Any]] = {}
+        for ti in tis:
+            info = per_task.setdefault(ti["task_id"], {"count": 0, "duration": None})
+            info["count"] += 1
+            duration = ti.get("duration")
+            if duration is not None and (info["duration"] is None or duration > info["duration"]):
+                info["duration"] = duration
+        instances[label] = per_task
 
     task_durations = []
-    for task_id in sorted(set(durations["run_a"]) | set(durations["run_b"])):
-        a, b = durations["run_a"].get(task_id), durations["run_b"].get(task_id)
-        task_durations.append(
-            {
-                "task_id": task_id,
-                "run_a": a,
-                "run_b": b,
-                "delta": round(b - a, 3) if a is not None and b is not None else None,
-            }
-        )
+    for task_id in sorted(set(instances["run_a"]) | set(instances["run_b"])):
+        info_a = instances["run_a"].get(task_id, {"count": 0, "duration": None})
+        info_b = instances["run_b"].get(task_id, {"count": 0, "duration": None})
+        a, b = info_a["duration"], info_b["duration"]
+        entry = {
+            "task_id": task_id,
+            "run_a": a,
+            "run_b": b,
+            "delta": round(b - a, 3) if a is not None and b is not None else None,
+        }
+        if max(info_a["count"], info_b["count"]) > 1:
+            entry["run_a_instances"] = info_a["count"]
+            entry["run_b_instances"] = info_b["count"]
+            entry["aggregation"] = "count of mapped instances; duration is the longest instance's"
+        task_durations.append(entry)
 
     conf_a, conf_b = summaries["run_a"].pop("conf"), summaries["run_b"].pop("conf")
     conf_changes = {
@@ -1436,13 +2050,46 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
     }
 
 
-def _error_signature(log_tail: str) -> str:
-    """Collapse an error message so equivalent failures land in one cluster."""
+def _clip_at_word(text: str, limit: int) -> str:
+    """Clip to the limit at a word boundary, marking the cut with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    head, _, _ = cut.rpartition(" ")
+    return f"{head or cut}…"
+
+
+def _extract_error_line(log_tail: str) -> str:
+    """The one log line that names the failure, reduced to the exception itself."""
     lines = [line.strip() for line in log_tail.splitlines() if line.strip()]
     if not lines:
-        return "unknown failure"
+        return ""
     hits = [line for line in lines if re.search(r"(?i)\b(error|exception|failed|traceback)\b", line)]
     line = (hits or lines)[-1]
+    # Airflow task logs are structured JSON lines; the exception lives in
+    # error_detail, not in the raw line the keyword match found.
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return line[:200]
+    if isinstance(record, dict):
+        for detail in record.get("error_detail") or []:
+            if isinstance(detail, dict) and detail.get("exc_type"):
+                # A wider cap than the raw-line one, and cut between words: the
+                # exception value is already the precise message, and clipping
+                # it mid-sentence loses exactly the instructions it carries.
+                return _clip_at_word(f"{detail['exc_type']}: {detail.get('exc_value', '')}", 400)
+        event = record.get("event")
+        if isinstance(event, str) and event:
+            return event[:200]
+    return line[:200]
+
+
+def _error_signature(log_tail: str) -> str:
+    """Collapse an error message so equivalent failures land in one cluster."""
+    line = _extract_error_line(log_tail)
+    if not line:
+        return "unknown failure"
     line = re.sub(r"'[^']*'", "'…'", line)
     line = re.sub(r'"[^"]*"', '"…"', line)
     line = re.sub(r"\d+", "N", line)
@@ -1470,7 +2117,11 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     }
     if dag_ids is not None:
         body["dag_ids"] = list(dag_ids)
-    tis = _api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)["task_instances"]
+    resp = _api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)
+    tis = resp["task_instances"]
+    # What the window really held, minus the page that was read: a truncated
+    # scan must say so, or "3 clusters" quietly means "of the 50 I looked at".
+    failures_omitted = max(resp.get("total_entries", len(tis)) - len(tis), 0)
     # Belt and braces: never fetch a log for a Dag outside the allowlist, whatever
     # the API returned.
     if dag_ids is not None:
@@ -1486,6 +2137,9 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
                 f"/dagRuns/{quote(ti['dag_run_id'], safe='')}/taskInstances/"
                 f"{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
             ),
+            # The log route defaults to map_index=-1 — a different instance from
+            # a mapped one, whose failure would then be signed by the wrong log.
+            params={"map_index": ti.get("map_index", -1)},
         )
         signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log))
         cluster = clusters.setdefault(signature, {"error": signature, "count": 0, "examples": []})
@@ -1498,6 +2152,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     return {
         "window_hours": hours,
         "failures_scanned": len(tis),
+        "failures_omitted": failures_omitted,
         "clusters": sorted(clusters.values(), key=lambda c: c["count"], reverse=True),
     }
 
@@ -1568,6 +2223,28 @@ def _redeem_token(kind: str, token: str) -> dict[str, Any] | None:
     return payload
 
 
+def _discard_same_source_plans(dag_id: str, digest: str) -> bool:
+    """Drop any live dag_code plan computed from these exact bytes, and say so.
+
+    Two plans from the same source are the split-repair anti-pattern: the first
+    apply bumps the Dag version, so the second approval is doomed before the
+    user ever sees it. The older token is popped as well — the refusal makes the
+    model re-plan, and the stale first apply must not land under it.
+    """
+    now = time.monotonic()
+    stale = [
+        token
+        for token, payload in _issued_tokens.items()
+        if payload["kind"] == "dag_code"
+        and payload["dag_id"] == dag_id
+        and payload["digest"] == digest
+        and now - payload["created_at"] <= _TOKEN_TTL_S
+    ]
+    for token in stale:
+        del _issued_tokens[token]
+    return bool(stale)
+
+
 def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
     """
     Preview the runs a backfill would create, without creating anything.
@@ -1576,7 +2253,13 @@ def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
     ``plan_token`` back to run_backfill — that is what proves the backfill you
     create is the one they reviewed.
     """
-    entries = _dry_run_backfill(dag_id, from_date, to_date)
+    try:
+        entries = _dry_run_backfill(dag_id, from_date, to_date)
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"dag_id": dag_id, "from_date": from_date, "to_date": to_date, "error": message}
     preview = {
         "dag_id": dag_id,
         "from_date": from_date,
@@ -1651,7 +2334,14 @@ def run_backfill(
         }
     # Re-run the dry run at the moment of execution: schedule or state drift
     # between the preview and now would silently change what gets created.
-    planned = [_run_identity(entry) for entry in _dry_run_backfill(dag_id, from_date, to_date)]
+    try:
+        entries = _dry_run_backfill(dag_id, from_date, to_date)
+    except httpx.HTTPStatusError as e:
+        message = _explain_unknown_dag(dag_id, e)
+        if message is None:
+            raise
+        return {"created": False, "mutation_applied": False, "error": message}
+    planned = [_run_identity(entry) for entry in entries]
     reviewed = plan["planned_runs"]
     count = len(planned)
     if not _same_runs(planned, reviewed):
@@ -1747,14 +2437,8 @@ def _abandon_backfill(
     }
 
 
-def get_blast_radius(dag_id: str) -> dict[str, Any]:
-    """
-    Show what a failure in this Dag knocks over: the assets it produces and
-    the Dags scheduled on or reading those assets — plus the upstream side,
-    the assets this Dag depends on and who produces them.
-    """
-    assets = _api("GET", "/assets", params={"limit": 100})["assets"]
-
+def _compute_asset_edges(dag_id: str, assets: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """This Dag's place in the asset graph, one hop out in both directions."""
     produces: list[str] = []
     consumes: list[str] = []
     downstream: set[str] = set()
@@ -1778,11 +2462,39 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
         bucket.discard(None)
 
     return {
+        "produces": sorted(produces),
+        "consumes": sorted(consumes),
+        "downstream": sorted(downstream),
+        "upstream": sorted(upstream),
+    }
+
+
+def get_blast_radius(dag_id: str) -> dict[str, Any]:
+    """
+    Show what a failure in this Dag knocks over: the assets it produces and
+    the Dags scheduled on or reading those assets — plus the upstream side,
+    the assets this Dag depends on and who produces them.
+    """
+    try:
+        assets = _api("GET", "/assets", params={"limit": 100})["assets"]
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (403, 404):
+            return {
+                "dag_id": dag_id,
+                "error": (
+                    f"the asset catalog could not be read (HTTP {e.response.status_code}), "
+                    f"so the blast radius of {dag_id} is unknown"
+                ),
+            }
+        raise
+
+    edges = _compute_asset_edges(dag_id, assets)
+    return {
         "dag_id": dag_id,
-        "produces_assets": sorted(produces),
-        "downstream_dags": sorted(downstream),
-        "consumes_assets": sorted(consumes),
-        "upstream_dags": sorted(upstream),
+        "produces_assets": edges["produces"],
+        "downstream_dags": edges["downstream"],
+        "consumes_assets": edges["consumes"],
+        "upstream_dags": edges["upstream"],
     }
 
 
@@ -1799,6 +2511,7 @@ for _tool in (
     apply_dag_code_changes,
     plan_task_instance_clear,
     apply_task_instance_clear,
+    plan_revert_dag_code,
     revert_dag_code,
     rerun_dag,
 ):

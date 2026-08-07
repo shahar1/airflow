@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import json
 import sys
 import types
 from hashlib import md5
@@ -71,6 +72,12 @@ class FakeAirflow:
         self.tasks: list[dict] = []
         self.cleared: list[dict] = []
         self.fail_clear: Exception | None = None
+        self.import_errors: list[dict] = []
+        self.import_errors_total: int | None = None
+        self.dag_params: dict = {}
+        self.fail_log: Exception | None = None
+        self.fail_sources: Exception | None = None
+        self.bundle_name = "dags-folder"
 
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path))
@@ -86,6 +93,15 @@ class FakeAirflow:
                 return {"task_instances": self.tis_by_run.get(run_id, [])}
         if path == "/assets":
             return {"assets": self.assets}
+        if path == "/importErrors":
+            return {
+                "import_errors": self.import_errors,
+                "total_entries": (
+                    len(self.import_errors) if self.import_errors_total is None else self.import_errors_total
+                ),
+            }
+        if path == f"/dags/{DAG_ID}/details":
+            return {"dag_id": DAG_ID, "params": self.dag_params}
         if path == f"/dags/{DAG_ID}/tasks":
             return {"tasks": self.tasks, "total_entries": len(self.tasks)}
         if path == f"/dags/{DAG_ID}/clearTaskInstances":
@@ -119,6 +135,8 @@ class FakeAirflow:
             self.cancelled = True
             return {}
         if path == f"/dagSources/{DAG_ID}":
+            if self.fail_sources:
+                raise self.fail_sources
             version = (kwargs.get("params") or {}).get("version_number")
             if version is None:
                 # What Airflow has parsed. Defaults to the file on disk — they
@@ -133,13 +151,15 @@ class FakeAirflow:
                 "relative_fileloc": self.relative_fileloc,
                 "file_token": "tok",
                 "is_paused": self.is_paused,
+                "bundle_name": self.bundle_name,
             }
         if path == f"/dags/{DAG_ID}/dagVersions":
             return {"dag_versions": [{"version_number": self.version}]}
         if path.startswith("/parseDagFile/"):
             if self.reparse_status:
+                # The message carries the URL, exactly as httpx's own does.
                 raise httpx.HTTPStatusError(
-                    "conflict",
+                    f"error for url 'http://internal-api:8080/api/v2{path}'",
                     request=httpx.Request("PUT", path),
                     response=httpx.Response(self.reparse_status),
                 )
@@ -161,14 +181,25 @@ class FakeAirflow:
             tis = self.task_instances
             if wanted is not None:
                 tis = [ti for ti in tis if ti["dag_id"] in set(wanted)]
-            return {"task_instances": tis[: (kwargs["json"]).get("page_limit", 100)]}
+            return {
+                "task_instances": tis[: (kwargs["json"]).get("page_limit", 100)],
+                "total_entries": len(tis),
+            }
         if path.endswith("/taskInstances"):
             return {"task_instances": self.task_instances}
         if "/logs/" in path:
+            if self.fail_log:
+                raise self.fail_log
             for (dag_id, task_id), content in self.logs_by_task.items():
                 if f"/dags/{dag_id}/" in path and f"/taskInstances/{task_id}/" in path:
                     return {"content": content}
             return {"content": self.log}
+        if method == "GET" and path.startswith(f"/dags/{DAG_ID}/dagRuns/"):
+            # An exact run id this stub was never told about is a 404, as it
+            # would be from the real API.
+            raise httpx.HTTPStatusError(
+                "not found", request=httpx.Request(method, path), response=httpx.Response(404)
+            )
         raise AssertionError(f"unexpected API call {method} {path}")
 
     def _clear(self, body: dict) -> dict:
@@ -216,6 +247,12 @@ def airflow(monkeypatch, tmp_path):
     (tmp_path / "sales_summary.py").write_text(SOURCE)
     fake.dags_dir = tmp_path
     return fake
+
+
+@pytest.fixture(autouse=True)
+def fresh_token_store():
+    """A token left unredeemed by one test must not refuse another test's plan."""
+    server._issued_tokens.clear()
 
 
 def _parses(airflow, tmp_path):
@@ -267,7 +304,11 @@ def test_dag_url_escapes_ids():
 
 
 def test_diagnose_dag_without_runs(airflow):
-    assert server.diagnose_dag(DAG_ID) == {"dag_id": DAG_ID, "diagnosis": "this Dag has never run"}
+    assert server.diagnose_dag(DAG_ID) == {
+        "dag_id": DAG_ID,
+        "diagnosis": "this Dag has never run",
+        "summary": "This Dag has never run, so there is no run to diagnose.",
+    }
 
 
 def test_diagnose_dag_reports_failed_task_log_and_source(airflow):
@@ -288,6 +329,64 @@ def test_diagnose_dag_prefers_the_failed_run_over_the_newest(airflow):
         {"dag_run_id": "manual__1", "state": "failed"},
     ]
     assert server.diagnose_dag(DAG_ID)["dag_run_id"] == "manual__1"
+
+
+def test_diagnose_dag_says_when_it_diagnoses_an_old_run_while_the_newest_is_in_flight(airflow):
+    """Right after a re-run, the fallback serves the OLD failed run — say so up front,
+    or the model reports "the re-run failed again" about a run still in progress."""
+    airflow.runs = [
+        {"dag_run_id": "manual__new", "state": "running"},
+        {"dag_run_id": "manual__old", "state": "failed"},
+    ]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.log = "KeyError: 'ammount'"
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["dag_run_id"] == "manual__old"
+    assert result["diagnosed_run_is_latest"] is False
+    assert result["newest_run"] == {"dag_run_id": "manual__new", "state": "running"}
+    assert result["summary"].startswith(
+        "Note: the newest run manual__new is still running — this diagnosis is of the earlier "
+        "run manual__old, not of the run in progress."
+    )
+    # The findings still follow the note; nothing is dropped.
+    assert "KeyError" in result["summary"]
+
+
+def test_diagnose_dag_says_when_it_diagnoses_an_old_run_while_the_newest_succeeded(airflow):
+    """ "Did the fix work?" after a green re-run must not be answered with the old failure."""
+    airflow.runs = [
+        {"dag_run_id": "manual__new", "state": "success"},
+        {"dag_run_id": "manual__old", "state": "failed"},
+    ]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.log = "KeyError: 'ammount'"
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["dag_run_id"] == "manual__old"
+    assert result["diagnosed_run_is_latest"] is False
+    assert result["newest_run"] == {"dag_run_id": "manual__new", "state": "success"}
+    assert result["summary"].startswith(
+        "Note: the newest run manual__new finished with state success — this diagnosis is of "
+        "the EARLIER run manual__old, not of that newest run."
+    )
+
+
+def test_diagnose_dag_adds_no_stale_note_when_the_newest_run_is_the_one_diagnosed(airflow):
+    airflow.runs = [
+        {"dag_run_id": "manual__new", "state": "failed"},
+        {"dag_run_id": "manual__old", "state": "failed"},
+    ]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["dag_run_id"] == "manual__new"
+    assert result["diagnosed_run_is_latest"] is True
+    assert "newest_run" not in result
+    assert not result["summary"].startswith("Note:")
 
 
 def test_diagnose_dag_escapes_the_run_and_task_ids(airflow):
@@ -330,6 +429,21 @@ def test_diagnose_dag_still_reports_when_the_source_is_out_of_reach(airflow):
     assert "source_file" not in result
 
 
+def test_diagnose_dag_source_fallback_relays_the_api_detail_not_the_url(airflow):
+    """str() of an httpx error names the internal API URL; the detail is the words."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.fail_sources = httpx.HTTPStatusError(
+        "Server error '500' for url 'http://internal-api:8080/api/v2/dagSources/sales_summary'",
+        request=httpx.Request("GET", "http://internal-api:8080/api/v2/dagSources/sales_summary"),
+        response=httpx.Response(500, json={"detail": "source store offline"}),
+    )
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["source"] == "unavailable: source store offline"
+    assert "internal-api" not in str(result)
+
+
 DEMO_TASKS = [
     {"task_id": "extract", "downstream_task_ids": ["summarize"]},
     {"task_id": "summarize", "downstream_task_ids": ["report"]},
@@ -357,6 +471,60 @@ def test_diagnose_dag_reports_every_task_state_and_every_failed_log(airflow):
     assert "ValueError" in result["failures"][1]["log_tail"]
     # The first failure stays where every prompt and card already looks for it.
     assert result["failed_task_id"] == "summarize"
+
+
+def test_diagnose_summary_names_the_exception_from_a_structured_log_line(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.logs_by_task = {
+        (DAG_ID, "summarize"): json.dumps(
+            {
+                "timestamp": "2026-08-06T20:51:40Z",
+                "event": "Task failed with exception",
+                "level": "error",
+                "error_detail": [{"exc_type": "KeyError", "exc_value": "'ammount'"}],
+            }
+        )
+    }
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert "KeyError: 'ammount'" in result["summary"]
+    assert '"timestamp"' not in result["summary"]
+
+
+def _structured_failure(airflow, exc_value: str) -> None:
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.logs_by_task = {
+        (DAG_ID, "summarize"): json.dumps(
+            {
+                "event": "Task failed with exception",
+                "error_detail": [{"exc_type": "RuntimeError", "exc_value": exc_value}],
+            }
+        )
+    }
+
+
+def test_diagnose_summary_carries_a_long_precise_error_whole(airflow):
+    """A ~340-char exception message carries its own instructions; the old
+    200-char cut dropped exactly the half that says how to recover."""
+    message = ("first drain the queue and only then clear the task, " * 6).strip().rstrip(",")
+    assert 200 < len(message) <= 400
+    _structured_failure(airflow, message)
+
+    assert message in server.diagnose_dag(DAG_ID)["summary"]
+
+
+def test_diagnose_summary_elides_an_oversized_error_between_words(airflow):
+    _structured_failure(airflow, " ".join(["alpha"] * 120))
+
+    summary = server.diagnose_dag(DAG_ID)["summary"]
+
+    line = summary.split("failed with ", 1)[1].rsplit(" (see log).", 1)[0]
+    # Clipped above the old 200-char cap, marked, and never cut mid-word.
+    assert line.endswith("alpha…")
+    assert 200 < len(line) <= 401
 
 
 def test_diagnose_dag_caps_the_total_log_it_returns(airflow, monkeypatch):
@@ -482,6 +650,149 @@ def test_diagnose_dag_says_when_a_run_is_longer_than_it_will_scan(airflow, monke
 
     assert len(result["task_instances"]) == 4
     assert result["task_instances_omitted"] == 5
+
+
+def test_diagnose_dag_summary_enumerates_every_failure_and_check(airflow):
+    """The demo-critical digest: one numbered list a small model echoes whole."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.tasks = DEMO_TASKS
+    airflow.logs_by_task = {(DAG_ID, "summarize"): "KeyError: 'ammount'"}
+    airflow.parsed_source = "op_kwargs={'total': \"{{ ti.xcom_pull(task_ids='summarise') }}\"}\n"
+
+    summary = server.diagnose_dag(DAG_ID)["summary"]
+
+    assert summary.startswith("2 problems found.")
+    assert "(1) Confirmed failure: summarize failed with KeyError: 'ammount' (see log)." in summary
+    assert "(2) Latent blocker: an XCom pull references task_ids='summarise'" in summary
+
+
+def test_diagnose_dag_summary_when_nothing_is_wrong(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.task_instances = [{"task_id": "extract", "try_number": 1, "state": "success"}]
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["summary"] == "No problems found: run manual__1 is success and no task instances failed."
+
+
+def test_diagnose_dag_summary_counts_the_logs_it_had_to_omit(airflow, monkeypatch):
+    monkeypatch.setattr(server, "DIAGNOSIS_LOG_BUDGET_CHARS", 10)
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{"task_id": f"t{i}", "try_number": 1, "state": "failed"} for i in range(3)]
+    airflow.log = f"{'x' * 100}KeyError"
+
+    summary = server.diagnose_dag(DAG_ID)["summary"]
+
+    assert "omitted for size" in summary
+
+
+def test_diagnose_dag_diagnoses_the_exact_run_it_was_asked_about(airflow):
+    airflow.runs = [{"dag_run_id": "manual__2", "state": "failed"}]  # would win by default
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
+    airflow.tis_by_run = {
+        "manual__1": [{"task_id": "summarize", "try_number": 1, "state": "failed", "map_index": -1}]
+    }
+    airflow.log = "KeyError: 'ammount'"
+
+    result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1")
+
+    assert result["dag_run_id"] == "manual__1"
+    assert result["failed_task_id"] == "summarize"
+    # The exact run was fetched; the last-5 scan never ran.
+    assert ("GET", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+
+
+def test_diagnose_dag_says_when_the_asked_run_does_not_exist(airflow):
+    result = server.diagnose_dag(DAG_ID, dag_run_id="manual__nope")
+
+    assert result["error"] == f"{DAG_ID} has no run 'manual__nope'"
+    assert "failures" not in result
+
+
+def test_diagnose_dag_reports_a_task_that_is_still_retrying(airflow):
+    """A retrying task already failed once; waiting out the retries wastes the point."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "running"}]
+    airflow.task_instances = [{"task_id": "flaky", "try_number": 1, "state": "up_for_retry"}]
+    airflow.log = "ValueError: boom"
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["failures"] == [
+        {"task_id": "flaky", "map_index": -1, "log_tail": "ValueError: boom", "still_retrying": True}
+    ]
+    assert "Still retrying: flaky" in result["summary"]
+    assert "diagnosis" not in result
+
+
+def test_diagnose_dag_surfaces_an_import_error_for_the_dag_file(airflow):
+    """A file that stops parsing never fails a run; the import error is the only trace."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.import_errors = [
+        {"filename": "/files/dags/sales_summary.py", "stack_trace": "ImportError: no module named pandas"},
+        {"filename": "/files/dags/other.py", "stack_trace": "SyntaxError: elsewhere"},
+    ]
+
+    result = server.diagnose_dag(DAG_ID)
+
+    import_checks = [c for c in result["checks"] if c["kind"] == "import_error"]
+    assert len(import_checks) == 1
+    assert "no module named pandas" in import_checks[0]["detail"]
+    assert "elsewhere" not in str(result["checks"])
+    assert "Import error:" in result["summary"]
+
+
+def test_diagnose_dag_ignores_an_import_error_from_another_bundle(airflow):
+    """Two bundles can hold a file of the same name; the name match alone would
+    attach the other team's stack trace to this Dag."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.import_errors = [
+        {
+            "filename": "dags/sales_summary.py",
+            "bundle_name": "other-team",
+            "stack_trace": "ImportError: their secret",
+        },
+        {
+            "filename": "dags/sales_summary.py",
+            "bundle_name": "dags-folder",
+            "stack_trace": "ImportError: ours",
+        },
+    ]
+
+    result = server.diagnose_dag(DAG_ID)
+
+    import_checks = [c for c in result["checks"] if c["kind"] == "import_error"]
+    assert len(import_checks) == 1
+    assert "ours" in import_checks[0]["detail"]
+    assert "their secret" not in str(result)
+
+
+def test_diagnose_dag_says_when_the_import_error_list_was_truncated(airflow):
+    """A silently short list would report "no import errors" off a page that
+    never held this Dag's entry."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.import_errors = [{"filename": "other.py", "stack_trace": "SyntaxError: elsewhere"}]
+    airflow.import_errors_total = 250
+
+    result = server.diagnose_dag(DAG_ID)
+
+    truncated = [c for c in result["checks"] if c["kind"] == "import_errors_truncated"]
+    assert len(truncated) == 1
+    assert "only the first 1 of 250 import errors were checked" in truncated[0]["detail"]
+    assert "may be missing" in truncated[0]["detail"]
+    assert "Note:" in result["summary"]
+
+
+def test_diagnose_dag_survives_an_unfetchable_log(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{"task_id": "summarize", "try_number": 1, "state": "failed"}]
+    airflow.fail_log = httpx.HTTPStatusError(
+        "gone", request=httpx.Request("GET", "/logs"), response=httpx.Response(404)
+    )
+
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["failures"][0]["log_tail"] == "log unavailable: HTTP 404"
 
 
 def test_display_order_marks_only_the_positions_a_branch_leaves_open():
@@ -675,6 +986,115 @@ def test_apply_dag_code_changes_refuses_when_the_source_moved_under_the_plan(air
 
     assert result["applied"] is False
     assert "changed since it was planned" in result["error"]
+    # The refusal steers the model to the way out, not just to the wall.
+    assert "Make a NEW plan from the current source" in result["error"]
+    assert "every remaining change" in result["error"]
+
+
+def test_apply_dag_code_changes_names_the_recovery_when_the_authorized_digest_drifted(airflow, tmp_path):
+    """The demo case: apply #1 landed, so the session's digest no longer matches."""
+    change = ("print", "pass  # print")
+    token = server.plan_dag_code_changes(DAG_ID, _changes(change))["plan_token"]
+    (tmp_path / "sales_summary.py").write_text(SOURCE + "landed = 1\n")
+    _parses(airflow, tmp_path)
+
+    result = server.apply_dag_code_changes(
+        DAG_ID, _changes(change), token, source_digest=md5(SOURCE.encode()).hexdigest()
+    )
+
+    assert result["applied"] is False
+    assert "no longer the version this request was authorized against" in result["error"]
+    assert "Make a NEW plan from the current source" in result["error"]
+
+
+def test_plan_dag_code_changes_refuses_a_second_plan_from_the_same_source(airflow):
+    """One repair = one plan: a second plan from identical bytes is the split anti-pattern."""
+    server.plan_dag_code_changes(DAG_ID, _changes(('"column": "ammount"', '"column": "amount"')))
+
+    second = server.plan_dag_code_changes(DAG_ID, _changes(("ammount is a typo", "amount is correct")))
+
+    assert second["planned"] is False
+    # Neutral wording: the store is cross-session, so the discarded plan may
+    # belong to a conversation this caller never saw.
+    assert f"an earlier plan for {DAG_ID} from this same source was discarded" in second["error"]
+    assert "ONE plan" in second["error"]
+    assert "plan_token" not in second
+
+
+def test_a_refused_second_plan_invalidates_the_first_plan_token(airflow, tmp_path):
+    """The refusal makes the model re-plan; the stale first apply must not land under it."""
+    change = ('"column": "ammount"', '"column": "amount"')
+    first = server.plan_dag_code_changes(DAG_ID, _changes(change))
+    server.plan_dag_code_changes(DAG_ID, _changes(("ammount is a typo", "amount is correct")))
+
+    stale = server.apply_dag_code_changes(DAG_ID, _changes(change), first["plan_token"])
+
+    assert stale["applied"] is False
+    assert "no reviewed plan" in stale["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_one_combined_plan_succeeds_after_the_split_refusal(airflow, tmp_path):
+    """The refusal's directive works: a re-plan carrying every change gets a token and lands."""
+    server.plan_dag_code_changes(DAG_ID, _changes(('"column": "ammount"', '"column": "amount"')))
+    refused = server.plan_dag_code_changes(DAG_ID, _changes(("ammount is a typo", "amount is correct")))
+    assert refused["planned"] is False
+
+    result = _apply(
+        ('"column": "ammount"', '"column": "amount"'),
+        ("ammount is a typo", "amount is correct"),
+    )
+
+    assert result["applied"] is True
+    assert result["change_count"] == 2
+    assert (tmp_path / "sales_summary.py").read_text() == (
+        'op_kwargs={"column": "amount"}\nprint("amount is correct")\n'
+    )
+
+
+def test_plan_dag_code_changes_allows_a_second_plan_after_the_source_moved(airflow, tmp_path):
+    """A re-plan from different bytes is the legitimate path, not the split anti-pattern."""
+    server.plan_dag_code_changes(DAG_ID, _changes(("ammount is a typo", "amount is correct")))
+    (tmp_path / "sales_summary.py").write_text(SOURCE + "extra = 1\n")
+    _parses(airflow, tmp_path)
+
+    replan = server.plan_dag_code_changes(DAG_ID, _changes(('"column": "ammount"', '"column": "amount"')))
+
+    assert replan["planned"] is True
+    assert replan["plan_token"]
+
+
+def test_plan_dag_code_changes_reports_the_findings_the_plan_leaves_unfixed(airflow):
+    """The demo case: fixing only the KeyError leaves the 'summarise' reference
+    firing on the patched source — the plan must say so, token intact."""
+    airflow.tasks = DEMO_TASKS
+    airflow.parsed_source = (
+        "op_kwargs={'column': 'ammount', 'total': \"{{ ti.xcom_pull(task_ids='summarise') }}\"}\n"
+    )
+    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+
+    partial = server.plan_dag_code_changes(DAG_ID, _changes(("'ammount'", "'amount'")))
+
+    # A deliberate partial fix stays approvable: refused would push the model to
+    # widen the diff without the user asking for it.
+    assert partial["planned"] is True
+    assert partial["plan_token"]
+    assert [f["kind"] for f in partial["unaddressed_findings"]] == ["unknown_xcom_task_id"]
+    assert "summarise" in partial["unaddressed_findings"][0]["detail"]
+    assert "this plan leaves 1 deterministic finding(s) unfixed" in partial["unaddressed_note"]
+    assert "include a fix in this same plan or tell the user why not" in partial["unaddressed_note"]
+
+
+def test_plan_dag_code_changes_reports_nothing_when_the_plan_fixes_every_finding(airflow):
+    airflow.tasks = DEMO_TASKS
+    airflow.parsed_source = "op_kwargs={'total': \"{{ ti.xcom_pull(task_ids='summarise') }}\"}\n"
+    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+
+    fixed = server.plan_dag_code_changes(DAG_ID, _changes(("'summarise'", "'summarize'")))
+
+    assert fixed["planned"] is True
+    assert "unaddressed_findings" not in fixed
+    assert "unaddressed_note" not in fixed
 
 
 @pytest.mark.parametrize("quote", ["'", '"'], ids=["single", "double"])
@@ -873,18 +1293,69 @@ def test_apply_dag_code_changes_leaves_no_backup_behind_when_it_refuses(airflow,
     assert not (tmp_path / "sales_summary.py.airy-bak").exists()
 
 
-def test_plan_dag_code_changes_sends_an_asset_change_to_the_authorized_tool(airflow):
-    """The neighbours are other Dags' ids; only get_blast_radius is checked for those."""
+ASSET_FIXTURE = [
+    {
+        "name": "sales_report",
+        "producing_tasks": [{"dag_id": DAG_ID, "task_id": "report"}],
+        "scheduled_dags": [{"dag_id": "revenue_dashboard"}],
+        "consuming_tasks": [],
+    },
+    {
+        "name": "raw_events",
+        "producing_tasks": [{"dag_id": "ingest", "task_id": "collect"}],
+        "scheduled_dags": [{"dag_id": DAG_ID}],
+        "consuming_tasks": [],
+    },
+]
+
+
+def test_plan_dag_code_changes_carries_an_asset_note_for_an_asset_change(airflow):
     airflow.parsed_source = "outlets=[Asset('sales')]\nprint('unrelated')\n"
     (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    airflow.assets = ASSET_FIXTURE
 
     touching = server.plan_dag_code_changes(DAG_ID, _changes(("Asset('sales')", "Asset('sales_v2')")))
-    unrelated = server.plan_dag_code_changes(DAG_ID, _changes(("'unrelated'", "'still unrelated'")))
 
     assert "get_blast_radius" in touching["impact"]["asset_review_needed"]
-    assert ("GET", "/assets") not in airflow.calls
-    # A change elsewhere in a Dag that happens to mention assets is not one.
+    # The note names this Dag's own assets, both directions.
+    assert "'sales_report'" in touching["asset_note"]
+    assert "'raw_events'" in touching["asset_note"]
+    # Never the neighbours: other Dags' ids are only get_blast_radius's to hand back.
+    assert "revenue_dashboard" not in touching["asset_note"]
+    assert "ingest" not in touching["asset_note"]
+
+
+def test_plan_dag_code_changes_skips_the_asset_note_for_an_unrelated_change(airflow):
+    """A change elsewhere in a Dag that happens to mention assets is not one."""
+    airflow.parsed_source = "outlets=[Asset('sales')]\nprint('unrelated')\n"
+    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    airflow.assets = ASSET_FIXTURE
+
+    unrelated = server.plan_dag_code_changes(DAG_ID, _changes(("'unrelated'", "'still unrelated'")))
+
     assert "asset_review_needed" not in unrelated["impact"]
+    assert "asset_note" not in unrelated
+
+
+def test_apply_dag_code_changes_requires_the_planned_asset_note(airflow, tmp_path):
+    """The note goes in the arguments so the approval card must show it."""
+    airflow.parsed_source = "outlets=[Asset('sales')]\n"
+    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    airflow.assets = ASSET_FIXTURE
+    changes = _changes(("Asset('sales')", "Asset('sales_v2')"))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+
+    without = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+
+    assert without["applied"] is False
+    assert "asset_note" in without["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == airflow.parsed_source
+
+    replan = server.plan_dag_code_changes(DAG_ID, changes)
+    applied = server.apply_dag_code_changes(DAG_ID, changes, replan["plan_token"], replan["asset_note"])
+
+    assert applied["applied"] is True
+    assert "Asset('sales_v2')" in (tmp_path / "sales_summary.py").read_text()
 
 
 @pytest.mark.parametrize(
@@ -903,11 +1374,27 @@ def test_apply_dag_code_changes_keeps_the_write_when_the_reparse_request_fails(a
     assert '"column": "amount"' in (tmp_path / "sales_summary.py").read_text()
 
 
+def test_apply_dag_code_changes_reports_a_reparse_refusal_without_the_url(airflow):
+    """The HTTP error's own str names the internal parseDagFile URL."""
+    airflow.reparse_status = 500
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    assert result["applied"] is True
+    assert result["reparse"] == "file patched, but the reparse request failed: HTTP 500"
+
+
+def _revert(dag_id=DAG_ID):
+    """Plan then revert, the way the prompt requires every revert to go."""
+    plan = server.plan_revert_dag_code(dag_id)
+    return server.revert_dag_code(dag_id, plan.get("plan_token", ""), plan.get("diff", ""))
+
+
 def test_revert_dag_code_restores_the_backup(airflow, tmp_path):
     _apply(('"column": "ammount"', '"column": "amount"'))
     _parses(airflow, tmp_path)
 
-    result = server.revert_dag_code(DAG_ID)
+    result = _revert()
 
     assert result["reverted"] is True
     assert (tmp_path / "sales_summary.py").read_text() == SOURCE
@@ -920,7 +1407,7 @@ def test_revert_dag_code_reports_every_fix_it_discards(airflow, tmp_path):
     _apply(("ammount is a typo", "amount is correct"))
     _parses(airflow, tmp_path)
 
-    result = server.revert_dag_code(DAG_ID)
+    result = _revert()
 
     assert (tmp_path / "sales_summary.py").read_text() == SOURCE
     # Both fixes are undone, so the diff has to show both coming back.
@@ -933,34 +1420,113 @@ def test_revert_dag_code_keeps_the_restore_when_the_reparse_request_fails(airflo
     _parses(airflow, tmp_path)
     airflow.fail_reparse = TypeError("'NoneType' object is not subscriptable")
 
-    result = server.revert_dag_code(DAG_ID)
+    result = _revert()
 
     assert result["reverted"] is True
     assert "the reparse request failed" in result["reparse"]
     assert (tmp_path / "sales_summary.py").read_text() == SOURCE
 
 
-@pytest.mark.parametrize(
-    ("tool", "call"),
-    [
-        (
-            "apply_dag_code_changes",
-            lambda token: server.apply_dag_code_changes(DAG_ID, _changes(("print", "pass  # print")), token),
-        ),
-        ("revert_dag_code", lambda token: server.revert_dag_code(DAG_ID)),
-    ],
-)
-def test_writes_refuse_a_file_airflow_has_not_parsed(airflow, tmp_path, tool, call):
+def test_plan_revert_dag_code_previews_the_revert_without_writing(airflow, tmp_path):
+    _apply(('"column": "ammount"', '"column": "amount"'))
+    _parses(airflow, tmp_path)
+
+    plan = server.plan_revert_dag_code(DAG_ID)
+
+    assert plan["planned"] is True
+    assert plan["plan_token"]
+    # The diff shows the original coming back — reviewed before anything moves.
+    assert '+op_kwargs={"column": "ammount"}' in plan["diff"]
+    assert "discarding" in plan["summary"]
+    assert '"column": "amount"' in (tmp_path / "sales_summary.py").read_text()
+    assert (tmp_path / "sales_summary.py.airy-bak").exists()
+
+
+def test_plan_revert_dag_code_without_a_backup(airflow):
+    plan = server.plan_revert_dag_code(DAG_ID)
+
+    assert plan["planned"] is False
+    assert "nothing to revert" in plan["error"]
+    assert "plan_token" not in plan
+
+
+def test_revert_dag_code_refuses_without_a_reviewed_plan(airflow, tmp_path):
+    _apply(('"column": "ammount"', '"column": "amount"'))
+    _parses(airflow, tmp_path)
+
+    result = server.revert_dag_code(DAG_ID)
+
+    assert result["reverted"] is False
+    assert result["mutation_applied"] is False
+    assert "no reviewed plan" in result["error"]
+    assert '"column": "amount"' in (tmp_path / "sales_summary.py").read_text()
+
+
+def test_revert_dag_code_refuses_a_diff_the_user_did_not_review(airflow, tmp_path):
+    """The diff goes in the arguments so the card shows it; it must be the planned one."""
+    _apply(('"column": "ammount"', '"column": "amount"'))
+    _parses(airflow, tmp_path)
+    plan = server.plan_revert_dag_code(DAG_ID)
+
+    result = server.revert_dag_code(DAG_ID, plan["plan_token"], "--- a different diff")
+
+    assert result["reverted"] is False
+    assert "not the revert that was planned" in result["error"]
+    assert '"column": "amount"' in (tmp_path / "sales_summary.py").read_text()
+
+
+def test_revert_dag_code_plan_token_is_single_use(airflow, tmp_path):
+    _apply(('"column": "ammount"', '"column": "amount"'))
+    _parses(airflow, tmp_path)
+    plan = server.plan_revert_dag_code(DAG_ID)
+
+    assert server.revert_dag_code(DAG_ID, plan["plan_token"], plan["diff"])["reverted"] is True
+    again = server.revert_dag_code(DAG_ID, plan["plan_token"], plan["diff"])
+
+    assert again["reverted"] is False
+    assert "no reviewed plan" in again["error"]
+
+
+def test_revert_dag_code_aborts_when_the_source_moved_after_the_plan(airflow, tmp_path):
+    """The reviewed diff was computed from bytes that are no longer on disk."""
+    _apply(('"column": "ammount"', '"column": "amount"'))
+    _parses(airflow, tmp_path)
+    plan = server.plan_revert_dag_code(DAG_ID)
+    # A later reviewed edit lands: disk and parsed agree, but the bytes moved.
+    moved = (tmp_path / "sales_summary.py").read_text().replace("a typo", "still a typo")
+    (tmp_path / "sales_summary.py").write_text(moved)
+    _parses(airflow, tmp_path)
+
+    result = server.revert_dag_code(DAG_ID, plan["plan_token"], plan["diff"])
+
+    assert result["reverted"] is False
+    assert "changed since the revert was planned" in result["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == moved
+    assert (tmp_path / "sales_summary.py.airy-bak").exists()
+
+
+def _prepared_apply():
+    token = server.plan_dag_code_changes(DAG_ID, _changes(("print", "pass  # print")))["plan_token"]
+    return lambda: server.apply_dag_code_changes(DAG_ID, _changes(("print", "pass  # print")), token)
+
+
+def _prepared_revert():
+    plan = server.plan_revert_dag_code(DAG_ID)
+    return lambda: server.revert_dag_code(DAG_ID, plan["plan_token"], plan["diff"])
+
+
+@pytest.mark.parametrize("prepare", [_prepared_apply, _prepared_revert], ids=["apply", "revert"])
+def test_writes_refuse_a_file_airflow_has_not_parsed(airflow, tmp_path, prepare):
     """Access was authorized against the parsed Dags; unparsed bytes are not those."""
     _apply(('"column": "ammount"', '"column": "amount"'))
     _parses(airflow, tmp_path)
-    token = server.plan_dag_code_changes(DAG_ID, _changes(("print", "pass  # print")))["plan_token"]
+    call = prepare()
     # Someone edits the file directly; the Dag processor has not caught up.
     path = tmp_path / "sales_summary.py"
     path.write_text(path.read_text() + "\nother_dag = DAG('other')\n")
     before = path.read_text()
 
-    result = call(token)
+    result = call()
 
     assert "has not been reviewed" in result["error"]
     assert path.read_text() == before
@@ -1152,6 +1718,8 @@ def test_apply_task_instance_clear_clears_the_existing_instance(cleared_run):
 
     assert result["cleared"] is True
     assert result["mutation_applied"] is True
+    assert result["cleared_matches_plan"] is True
+    assert "cleared_delta" not in result
     assert result["created_dag_run"] is False
     assert result["created_task_instances"] == []
     assert result["ui_updates"] == [
@@ -1203,6 +1771,43 @@ def test_apply_task_instance_clear_refuses_a_target_that_was_not_planned(cleared
     assert cleared_run.cleared == []
 
 
+def test_apply_task_instance_clear_reports_a_clear_that_drifted_from_the_plan(cleared_run, monkeypatch):
+    """The clear happened; a drifted outcome is reported truthfully, not rolled back."""
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
+    real_clear = cleared_run._clear
+
+    def loses_an_instance_on_the_real_clear(body):
+        result = real_clear(body)
+        if not body["dry_run"]:
+            return {"task_instances": [], "total_entries": 0}
+        return result
+
+    monkeypatch.setattr(cleared_run, "_clear", loses_an_instance_on_the_real_clear)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+    )
+
+    assert result["cleared"] is True
+    assert result["mutation_applied"] is True
+    assert result["cleared_matches_plan"] is False
+    assert result["cleared_delta"] == {"missing": [("report", -1)], "extra": []}
+    assert "drifted" in result["warning"]
+
+
+def test_apply_task_instance_clear_refusal_names_the_plan_in_words(cleared_run):
+    """The refusal is relayed to the user; a raw Python tuple explains nothing."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+
+    error = server.apply_task_instance_clear(DAG_ID, plan["dag_run_id"], ["summarize"], plan["plan_token"])[
+        "error"
+    ]
+
+    assert "run 'manual__1'" in error
+    assert "include_downstream=True" in error
+    assert f"('{DAG_ID}'," not in error
+
+
 def test_apply_task_instance_clear_reports_a_refused_clear_without_a_fallback(cleared_run):
     plan = server.plan_task_instance_clear(DAG_ID, position=3)
     cleared_run.fail_clear = httpx.HTTPStatusError(
@@ -1252,22 +1857,32 @@ def test_rerun_dag_says_the_dag_is_still_unpaused_when_the_trigger_fails(airflow
     assert "is still unpaused" in result["error"]
 
 
-def test_revert_dag_code_without_a_backup(airflow):
-    result = server.revert_dag_code(DAG_ID)
+def test_rerun_dag_relays_the_api_detail_when_the_trigger_is_refused(airflow):
+    """str() of an httpx error names the internal API URL; the detail is the words."""
+    airflow.fail_trigger = httpx.HTTPStatusError(
+        "Client error '409' for url 'http://internal-api:8080/api/v2/dags/sales_summary/dagRuns'",
+        request=httpx.Request("POST", "http://internal-api:8080/api/v2/dags/sales_summary/dagRuns"),
+        response=httpx.Response(409, json={"detail": "a run with this logical date already exists"}),
+    )
 
-    assert result["reverted"] is False
-    assert "no backup" in result["error"]
+    result = server.rerun_dag(DAG_ID)
+
+    assert result["triggered"] is False
+    assert "triggering the run failed: a run with this logical date already exists" in result["error"]
+    assert "internal-api" not in result["error"]
 
 
 def seed_two_runs(airflow):
     airflow.runs_by_id = {
         "old": {
+            "dag_run_id": "old",
             "state": "success",
             "duration": 30.0,
             "conf": {"column": "amount"},
             "dag_versions": [{"version_number": 1}],
         },
         "new": {
+            "dag_run_id": "new",
             "state": "failed",
             "duration": 45.0,
             "conf": {"column": "ammount", "retries": 2},
@@ -1345,6 +1960,78 @@ def test_compare_dag_runs_skips_the_diff_when_versions_match(airflow):
     assert not any(params and "version_number" in params for params in airflow.params)
 
 
+def test_compare_dag_runs_resolves_latest_and_previous(airflow):
+    """'Compare the last two runs' needs no detour through another tool."""
+    seed_two_runs(airflow)
+    airflow.runs = [airflow.runs_by_id["new"], airflow.runs_by_id["old"]]  # newest first
+
+    result = server.compare_dag_runs(DAG_ID, "previous", "latest")
+
+    assert result["run_a"]["dag_run_id"] == "old"
+    assert result["run_b"]["dag_run_id"] == "new"
+
+
+def test_compare_dag_runs_says_when_there_is_no_previous_run(airflow):
+    seed_two_runs(airflow)
+    airflow.runs = [airflow.runs_by_id["new"]]
+
+    result = server.compare_dag_runs(DAG_ID, "previous", "latest")
+
+    assert "no previous run" in result["error"]
+    assert "task_durations" not in result
+
+
+def test_compare_dag_runs_says_when_a_run_does_not_exist(airflow):
+    seed_two_runs(airflow)
+
+    result = server.compare_dag_runs(DAG_ID, "old", "manual__nope")
+
+    assert result["error"] == f"{DAG_ID} has no run 'manual__nope'"
+
+
+def test_compare_dag_runs_aggregates_mapped_instances(airflow):
+    """One row per mapped task — the longest instance, not whichever came last."""
+    seed_two_runs(airflow)
+    airflow.tis_by_run = {
+        "old": [
+            {"task_id": "load", "map_index": 0, "duration": 1.0},
+            {"task_id": "load", "map_index": 1, "duration": 5.0},
+        ],
+        "new": [
+            {"task_id": "load", "map_index": 0, "duration": 2.0},
+            {"task_id": "load", "map_index": 1, "duration": 9.0},
+            {"task_id": "load", "map_index": 2, "duration": None},
+        ],
+    }
+
+    rows = server.compare_dag_runs(DAG_ID, "old", "new")["task_durations"]
+
+    assert rows == [
+        {
+            "task_id": "load",
+            "run_a": 5.0,
+            "run_b": 9.0,
+            "delta": 4.0,
+            "run_a_instances": 2,
+            "run_b_instances": 3,
+            "aggregation": "count of mapped instances; duration is the longest instance's",
+        }
+    ]
+
+
+def test_compare_dag_runs_paginates_each_run(airflow):
+    """A run longer than one API page must not silently compare a prefix."""
+    seed_two_runs(airflow)
+
+    server.compare_dag_runs(DAG_ID, "old", "new")
+
+    ti_params = [
+        params for (_, path), params in zip(airflow.calls, airflow.params) if path.endswith("/taskInstances")
+    ]
+    assert ti_params
+    assert all(params and "limit" in params and "offset" in params for params in ti_params)
+
+
 @pytest.mark.parametrize(
     ("log_tail", "expected"),
     [
@@ -1408,6 +2095,33 @@ def test_find_failure_clusters_drops_dags_outside_the_allowlist(airflow):
     seen = {ex["dag_id"] for cluster in result["clusters"] for ex in cluster["examples"]}
     assert seen == {"sales_summary"}
     assert result["failures_scanned"] == 1
+
+
+def test_find_failure_clusters_asks_for_the_mapped_instance_own_log(airflow):
+    """The log route defaults to map_index=-1 — a different instance entirely."""
+    airflow.task_instances = [
+        {"dag_id": "etl", "task_id": "load", "dag_run_id": "r1", "try_number": 1, "map_index": 7},
+    ]
+    airflow.log = "ValueError: boom"
+
+    server.find_failure_clusters(hours=6)
+
+    log_params = [params for (_, path), params in zip(airflow.calls, airflow.params) if "/logs/" in path]
+    assert log_params == [{"map_index": 7}]
+
+
+def test_find_failure_clusters_counts_the_failures_beyond_its_scan(airflow, monkeypatch):
+    """A truncated scan must say so, or '3 clusters' means 'of the 50 I saw'."""
+    monkeypatch.setattr(server, "FAILURE_SCAN_LIMIT", 2)
+    airflow.task_instances = [
+        {"dag_id": "etl", "task_id": f"t{i}", "dag_run_id": f"r{i}", "try_number": 1} for i in range(5)
+    ]
+    airflow.log = "ValueError: boom"
+
+    result = server.find_failure_clusters(hours=6)
+
+    assert result["failures_scanned"] == 2
+    assert result["failures_omitted"] == 3
 
 
 def _approve(dag_id, from_date, to_date, plan=None):
@@ -1709,6 +2423,7 @@ def test_rerun_dag_unpauses_once_the_warning_was_delivered(airflow):
         "dag_run_id": "manual__new",
         "state": "queued",
         "unpaused": True,
+        "next_step": result["next_step"],
         "ui_updates": [{"kind": "dag_run", "dag_id": DAG_ID, "dag_run_id": "manual__new"}],
     }
 
@@ -1721,10 +2436,118 @@ def test_rerun_dag_leaves_an_active_dag_alone(airflow):
     assert result["unpaused"] is False
 
 
+def test_rerun_dag_tells_the_model_to_check_the_new_run_not_assume(airflow):
+    """A model that diagnoses straight after triggering is served the OLD failed
+    run by the fallback; the trigger result itself must point at the new run."""
+    result = server.rerun_dag(DAG_ID)
+
+    assert result["triggered"] is True
+    assert "created run manual__new in state queued" in result["next_step"]
+    assert "diagnose_dag with dag_run_id='manual__new'" in result["next_step"]
+    assert "never assume success or failure" in result["next_step"]
+
+
 def test_rerun_dag_sends_the_required_logical_date(airflow):
     # TriggerDAGRunPostBody.logical_date has no default: omitting it is a 422.
     server.rerun_dag(DAG_ID)
-    assert {"logical_date": None, "conf": {}} in airflow.payloads
+    assert {"logical_date": None, "conf": {}, "note": "Triggered via Airy"} in airflow.payloads
+
+
+DAG_PARAMS = {
+    "skip_invalid": {"value": False, "schema": {"type": "boolean"}},
+    "severity_threshold": {"value": "high", "schema": {"type": "string", "enum": ["low", "high"]}},
+    "window_hours": {"value": 24, "schema": {"type": "integer", "minimum": 1, "maximum": 168}},
+    "sample_rate": {
+        "value": 0.5,
+        "schema": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+    },
+}
+
+
+def test_rerun_dag_passes_a_valid_conf_with_a_note(airflow):
+    airflow.dag_params = DAG_PARAMS
+
+    # 168 sits exactly on the inclusive bound — allowed, not off-by-one refused.
+    result = server.rerun_dag(
+        DAG_ID, conf={"skip_invalid": True, "window_hours": 168}, note="retry after the fix"
+    )
+
+    assert result["triggered"] is True
+    assert {
+        "logical_date": None,
+        "conf": {"skip_invalid": True, "window_hours": 168},
+        "note": "retry after the fix",
+    } in airflow.payloads
+
+
+@pytest.mark.parametrize(
+    ("conf", "expected"),
+    [
+        ({"skip_invlaid": True}, "unknown conf key"),
+        ({"severity_threshold": "urgent"}, "must be one of"),
+        ({"window_hours": "24"}, "must be of type integer"),
+        ({"skip_invalid": 1}, "must be of type boolean"),
+        ("not an object", "must be an object"),
+        ({"window_hours": 999}, "must be between 1 and 168, not 999"),
+        ({"window_hours": 0}, "must be between 1 and 168, not 0"),
+        ({"sample_rate": 0}, "must be greater than 0 and less than 1, not 0"),
+        ({"sample_rate": 1.0}, "must be greater than 0 and less than 1, not 1.0"),
+    ],
+    ids=[
+        "unknown-key",
+        "enum",
+        "string-for-int",
+        "int-for-bool",
+        "not-a-dict",
+        "above-max",
+        "below-min",
+        "at-exclusive-min",
+        "at-exclusive-max",
+    ],
+)
+def test_rerun_dag_refuses_a_conf_that_does_not_fit_the_params(airflow, conf, expected):
+    airflow.dag_params = DAG_PARAMS
+
+    result = server.rerun_dag(DAG_ID, conf=conf)
+
+    assert result["triggered"] is False
+    assert result["mutation_applied"] is False
+    assert expected in result["error"]
+    assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+
+
+def test_rerun_dag_lists_what_the_dag_accepts_for_an_unknown_key(airflow):
+    airflow.dag_params = DAG_PARAMS
+
+    error = server.rerun_dag(DAG_ID, conf={"nope": 1})["error"]
+
+    # Every valid param, its constraint, and its default — enough to self-correct.
+    assert "skip_invalid (boolean, default False)" in error
+    assert "severity_threshold (one of ['low', 'high'], default 'high')" in error
+    assert "window_hours (integer between 1 and 168, default 24)" in error
+    assert "sample_rate (number greater than 0 and less than 1, default 0.5)" in error
+
+
+def test_rerun_dag_refuses_conf_for_a_dag_without_params(airflow):
+    result = server.rerun_dag(DAG_ID, conf={"anything": 1})
+
+    assert result["triggered"] is False
+    assert "takes no trigger parameters" in result["error"]
+    assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+
+
+def test_rerun_dag_validates_conf_before_spending_the_unpause_token(airflow):
+    """A bad conf must not burn the warning the user already agreed to."""
+    airflow.is_paused = True
+    airflow.dag_params = DAG_PARAMS
+    token = server.rerun_dag(DAG_ID)["unpause_token"]
+
+    bad = server.rerun_dag(DAG_ID, conf={"nope": 1}, unpause=True, unpause_token=token)
+    good = server.rerun_dag(DAG_ID, conf={"skip_invalid": True}, unpause=True, unpause_token=token)
+
+    assert bad["triggered"] is False
+    assert good["triggered"] is True
+    assert good["unpaused"] is True
 
 
 def test_force_reparse_tolerates_an_already_queued_request(airflow):
@@ -1754,3 +2577,73 @@ def test_tail_handles_every_log_shape(content, expected):
 
 def test_tail_truncates_long_logs():
     assert len(server._tail("x" * 10_000)) == server.LOG_TAIL_CHARS
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    return httpx.HTTPStatusError("err", request=httpx.Request("GET", "/x"), response=httpx.Response(status))
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: server.diagnose_dag("nope"),
+        lambda: server.rerun_dag("nope"),
+        lambda: server.plan_task_instance_clear("nope", task_id="report"),
+        lambda: server.compare_dag_runs("nope", "previous", "latest"),
+        lambda: server.plan_dag_code_changes("nope", _changes(("a", "b"))),
+        lambda: server.plan_backfill("nope", "2026-07-01", "2026-07-02"),
+        lambda: server.plan_revert_dag_code("nope"),
+    ],
+    ids=["diagnose", "rerun", "plan-clear", "compare", "plan-code", "plan-backfill", "plan-revert"],
+)
+def test_tools_say_when_a_dag_cannot_be_seen(monkeypatch, status, call):
+    """A typo'd dag_id is a conversation, not an httpx traceback."""
+
+    def gone(method, path, **kwargs):
+        raise _http_status_error(status)
+
+    monkeypatch.setattr(server, "_api", gone)
+
+    result = call()
+
+    assert result["error"] == "Dag 'nope' does not exist or you cannot see it"
+
+
+def test_tools_do_not_swallow_other_api_errors(monkeypatch):
+    def broken(method, path, **kwargs):
+        raise _http_status_error(500)
+
+    monkeypatch.setattr(server, "_api", broken)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        server.diagnose_dag("nope")
+
+
+def test_get_blast_radius_reports_an_unreadable_asset_catalog(monkeypatch):
+    def forbidden(method, path, **kwargs):
+        raise _http_status_error(403)
+
+    monkeypatch.setattr(server, "_api", forbidden)
+
+    result = server.get_blast_radius(DAG_ID)
+
+    assert "asset catalog could not be read" in result["error"]
+
+
+def test_write_if_unchanged_replaces_instead_of_truncating(tmp_path, monkeypatch):
+    """A failure mid-write must leave the Dag file whole, not torn."""
+    target = tmp_path / "dag.py"
+    target.write_text("original\n")
+
+    def refuse(src, dst):
+        raise OSError("no rename for you")
+
+    monkeypatch.setattr(server.os, "replace", refuse)
+
+    with pytest.raises(OSError, match="no rename for you"):
+        server._write_if_unchanged(target, "original\n", "patched\n")
+
+    assert target.read_text() == "original\n"
+    # The failed tempfile does not linger next to the Dag file.
+    assert list(tmp_path.iterdir()) == [target]
