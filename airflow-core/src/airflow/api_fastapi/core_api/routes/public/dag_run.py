@@ -454,7 +454,7 @@ def clear_dag_runs(
     responses=create_openapi_http_exception_doc([status.HTTP_400_BAD_REQUEST, status.HTTP_404_NOT_FOUND]),
     dependencies=[
         Depends(requires_access_dag(method="PUT", access_entity=DagAccessEntity.RUN)),
-        Depends(action_logging()),
+        Depends(action_logging(body_attribution_fields=("run_id",))),
     ],
 )
 def clear_dag_run_partitions(
@@ -732,7 +732,7 @@ def get_dag_runs(
     ),
     dependencies=[
         Depends(requires_access_dag(method="POST", access_entity=DagAccessEntity.RUN)),
-        Depends(action_logging()),
+        Depends(action_logging(body_attribution_fields=("dag_run_id",))),
     ],
 )
 def trigger_dag_run(
