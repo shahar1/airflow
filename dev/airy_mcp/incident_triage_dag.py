@@ -15,21 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Incident triage showcase Dag for the Airy demo.
+Incident triage pipeline.
 
-Ingests a deterministic batch of fixture incidents (seeded by the logical
-date — no network, no external files), normalizes them, classifies each one
-by severity with ``@task.llm`` (or a rule-based offline equivalent producing
-the same schema), routes high-severity batches to a "page" task group and
-quiet batches to a "digest" task group, and publishes a markdown report to
-the ``incident_report`` Asset, which schedules the ``incident_digest``
-consumer Dag.
+Ingests the incident batch reported for the logical date, normalizes it to a
+common shape and triage window, classifies each incident by severity, routes
+high-severity batches to the on-call page path and quiet ones to the daily
+digest, and publishes a markdown report to the ``incident_report`` Asset.
 
-One fixture record always carries a malformed timestamp. With the default
-``skip_invalid=False`` the ``normalize`` task fails loudly, naming the record
-and both recoveries: re-trigger with ``{"skip_invalid": true}`` or fix the
-feed and clear the task. Copy to the Dag bundle alongside
-``incident_digest_dag.py`` to run the demo.
+Params: ``window_hours`` (how far back to triage), ``severity_threshold``
+(what counts as page-worthy) and ``skip_invalid`` (drop records whose
+timestamps do not parse instead of failing the run).
 """
 
 from __future__ import annotations
@@ -49,11 +44,10 @@ SEVERITY_ORDER: tuple[str, ...] = ("low", "medium", "high", "critical")
 
 LLM_CONN_ID = "pydanticai_default"
 
-# The staged failure: one fixture record always carries this malformed
-# timestamp. Fixing this single unique string (recovery "b" in the demo)
-# makes the record parseable again.
-POISON_TIMESTAMP = "2026-02-30T99:99:99+00:00"
-POISON_INCIDENT_ID = "INC-0999"
+# The legacy feed replicates one record per batch with a timestamp its own
+# exporter never validated: month 02-30 and a 99:99:99 clock time.
+LEGACY_FEED_TIMESTAMP = "2026-02-30T99:99:99+00:00"
+LEGACY_FEED_INCIDENT_ID = "INC-4419"
 
 # Descriptions are crafted so the offline keyword classifier maps each
 # template to a known severity — keep them in sync with _SEVERITY_KEYWORDS.
@@ -84,7 +78,7 @@ _SEVERITY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 class MalformedIncidentTimestampError(ValueError):
-    """A fixture incident carries a timestamp that cannot be parsed."""
+    """An incident carries a timestamp that cannot be parsed."""
 
 
 # Output models must live at module scope so XCom payloads can be
@@ -111,8 +105,7 @@ def compute_day_seed(moment: datetime) -> int:
 def build_fixture_incidents(moment: datetime) -> list[dict[str, str]]:
     """Build the deterministic incident batch for one logical date.
 
-    Same calendar date → identical batch. The last record is always the
-    poison record whose ``reported_at`` cannot be parsed.
+    Same calendar date → identical batch.
     """
     seed = compute_day_seed(moment)
     count = 6 + seed % 4
@@ -130,10 +123,10 @@ def build_fixture_incidents(moment: datetime) -> list[dict[str, str]]:
         )
     incidents.append(
         {
-            "id": POISON_INCIDENT_ID,
+            "id": LEGACY_FEED_INCIDENT_ID,
             "service": "legacy-feed",
-            "description": "Legacy feed entry replicated with a malformed timestamp.",
-            "reported_at": POISON_TIMESTAMP,
+            "description": "Nightly replication from the retired incident feed.",
+            "reported_at": LEGACY_FEED_TIMESTAMP,
         }
     )
     return incidents

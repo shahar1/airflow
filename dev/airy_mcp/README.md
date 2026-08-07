@@ -72,7 +72,7 @@ drawer carries an **Experimental** badge.
 
 ```bash
 # 1. the demo Dags: sales_summary plus the incident showcase pair (both
-#    incident files must land in the write jail so Airy can patch the poison
+#    incident files must land in the write jail so Airy can patch the malformed
 #    record — AIRY_MCP_DAGS_DIR defaults to /files/dags)
 cp dev/airy_mcp/demo_dag.py files/dags/sales_summary.py
 cp dev/airy_mcp/incident_triage_dag.py dev/airy_mcp/incident_digest_dag.py files/dags/
@@ -203,8 +203,8 @@ the code-fix loop legible. The incident pair exercises everything else:
   report in full. That makes `get_blast_radius` demoable for the first time:
   `incident_triage` → `incident_report` → `incident_digest`.
 
-**The staged failure.** One fixture record, `INC-0999`, always carries the
-malformed timestamp `2026-02-30T99:99:99+00:00` (the `POISON_TIMESTAMP`
+**The staged failure.** One fixture record, `INC-4419`, always carries the
+malformed timestamp `2026-02-30T99:99:99+00:00` (the `LEGACY_FEED_TIMESTAMP`
 constant — exactly one occurrence in the file, so the string-replace patch
 applies cleanly). With the default `skip_invalid=False` the `normalize` task
 fails loudly, and its error names the record and both recoveries:
@@ -213,7 +213,7 @@ fails loudly, and its error names the record and both recoveries:
    turns the natural-language ask into typed conf that the params schema
    validates.
 2. **Fix the feed and clear** — `plan`/`apply_dag_code_changes` replacing the
-   poison literal with a parseable timestamp, then
+   malformed literal with a parseable timestamp, then
    `plan`/`apply_task_instance_clear` on `normalize`.
 
 ## Demo run-book
@@ -274,7 +274,7 @@ approved — or use the file-level reset below.
 ### Incident triage beats
 
 1. Trigger `incident_triage` with defaults → `normalize` fails within seconds;
-   its log names `INC-0999`, the malformed value, and both recoveries.
+   its log names `INC-4419`, the malformed value, and both recoveries.
 2. **"What's wrong with incident_triage?"** → `diagnose_dag` → the `summary`
    carries the confirmed failure straight from the log.
 3. **Recovery A** — *"re-run it, but skip the invalid records"* → `rerun_dag`
@@ -282,7 +282,7 @@ approved — or use the file-level reset below.
    `severity_threshold: "urgent"` or `window_hours: "yesterday"` — both are
    refused with the full catalog of valid params, types and defaults.
 4. **Recovery B** (rehearse from a fresh failure, not after A) — *"fix the
-   feed"* → `plan_dag_code_changes` replacing the poison timestamp (it occurs
+   feed"* → `plan_dag_code_changes` replacing the malformed timestamp (it occurs
    exactly once), then `plan`/`apply_task_instance_clear` on `normalize`. The
    repaired record parses but falls outside the default 24 h window, so the
    run succeeds with one record visible in the report's "dropped" line.

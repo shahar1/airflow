@@ -33,8 +33,8 @@ import incident_triage_dag as triage
 import pytest
 from incident_triage_dag import (
     INCIDENT_TEMPLATES,
-    POISON_INCIDENT_ID,
-    POISON_TIMESTAMP,
+    LEGACY_FEED_INCIDENT_ID,
+    LEGACY_FEED_TIMESTAMP,
     SEVERITY_ORDER,
     ExecutiveSummary,
     IncidentAssessment,
@@ -90,10 +90,10 @@ class TestFixtureIncidents:
         b = build_fixture_incidents(MOMENT + timedelta(days=1))
         assert a != b
 
-    def test_poison_record_is_always_last(self):
+    def test_malformed_record_is_always_last(self):
         incidents = build_fixture_incidents(MOMENT)
-        assert incidents[-1]["id"] == POISON_INCIDENT_ID
-        assert incidents[-1]["reported_at"] == POISON_TIMESTAMP
+        assert incidents[-1]["id"] == LEGACY_FEED_INCIDENT_ID
+        assert incidents[-1]["reported_at"] == LEGACY_FEED_TIMESTAMP
 
     def test_ids_unique_and_shape(self):
         incidents = build_fixture_incidents(MOMENT)
@@ -104,7 +104,7 @@ class TestFixtureIncidents:
 
 
 class TestNormalizeIncidents:
-    def test_poison_record_fails_by_default(self):
+    def test_malformed_record_fails_by_default(self):
         with pytest.raises(MalformedIncidentTimestampError) as exc_info:
             normalize_incidents(
                 build_fixture_incidents(MOMENT),
@@ -113,8 +113,8 @@ class TestNormalizeIncidents:
                 window_end=MOMENT,
             )
         message = str(exc_info.value)
-        assert POISON_INCIDENT_ID in message
-        assert POISON_TIMESTAMP in message
+        assert LEGACY_FEED_INCIDENT_ID in message
+        assert LEGACY_FEED_TIMESTAMP in message
         assert '"skip_invalid": true' in message
         assert "clear" in message
         # Prose recoveries, not "(1)/(2)" — numbers nest confusingly inside
@@ -124,15 +124,15 @@ class TestNormalizeIncidents:
         assert "either re-trigger" in message
         assert len(message) <= 340
 
-    def test_skip_invalid_drops_poison_record(self):
+    def test_skip_invalid_drops_malformed_record(self):
         result = normalize_incidents(
             build_fixture_incidents(MOMENT),
             skip_invalid=True,
             window_hours=48,
             window_end=MOMENT,
         )
-        assert [incident["id"] for incident in result["invalid"]] == [POISON_INCIDENT_ID]
-        assert POISON_INCIDENT_ID not in {incident["id"] for incident in result["kept"]}
+        assert [incident["id"] for incident in result["invalid"]] == [LEGACY_FEED_INCIDENT_ID]
+        assert LEGACY_FEED_INCIDENT_ID not in {incident["id"] for incident in result["kept"]}
 
     @pytest.mark.parametrize(
         ("age_hours", "window_hours", "bucket"),
