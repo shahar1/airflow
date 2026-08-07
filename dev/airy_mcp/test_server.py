@@ -4174,7 +4174,11 @@ def test_event_log_content_at_every_clamp_cannot_scale_the_result(airflow):
     assert small_result["event_history"]["attribution_reduced_for_size"] == 0
     context = _attribution(small_result, "forged_000")["events"][0]
     assert "extra" not in context
-    assert context["targeting_is_request_settable"] is False
+    # `_maximal_event` carries an event name this tool has never heard of AND the
+    # audit marker, so the context row reports its targeting as request-settable
+    # off the marker rather than off a list of names.
+    assert context["targeting_is_request_settable"] is True
+    assert context["interface"] == "rest_api"
 
 
 def test_the_attribution_ceiling_reports_zero_when_it_never_bites(airflow):
@@ -4197,7 +4201,7 @@ def test_the_caveats_ship_as_codes_with_one_legend_at_the_top(airflow):
     seen = _attribution(result, "remit_payment_batch")
     legend = result["event_history"]["unknowns_legend"]
 
-    assert seen["unknowns"] == ["U1", "U3", "U11", "U13", "U10", "U7", "U6"]
+    assert seen["unknowns"] == ["U1", "U3", "U11", "U13", "U10", "U7", "U2", "U12", "U6"]
     # Every code cited resolves, and nothing uncited is carried.
     assert set(legend) == {code for ti in result["task_instances"] for code in _codes_of(ti)}
     assert all(code in server._UNKNOWNS for code in legend)
@@ -4335,7 +4339,12 @@ def test_the_patch_sentence_names_the_row_and_never_that_a_person_acted(airflow)
 
     detail = _findings(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]))[0]["detail"]
 
-    assert "does not classify as a state change" in detail
+    # MAJOR-C: the tool recognises `patch_task_instance` by name, so the demoted
+    # sentence must say why it was demoted, not claim the name was unrecognised.
+    assert "recognises as a state-changing action but does not attribute" in detail
+    assert "settable by the request" in detail
+    assert "does not classify as a state change" not in detail
+    assert "not one this tool recognises" not in detail
     assert '"patch_task_instance"' in detail
     # The demoted branch asserts NOTHING about `owner`: the row may well record
     # an authenticated principal, and it may equally have been planted.
@@ -4501,7 +4510,17 @@ def test_a_cli_owner_is_an_operating_system_user_and_never_an_api_principal(airf
     """`airflow dags test --mark-success-pattern` records owner 'root'. Folding it
     under the API-principal state would make an OS username read as one."""
     _with_own_history(airflow)
-    rows = [{**PATCH_EVENT, "event": event, "owner": "root", "owner_display_name": "root"}]
+    # A real `cli_*` row is written by `utils/cli_action_loggers.py`, not by the
+    # REST logging dependency, so it carries no `method` key.
+    rows = [
+        {
+            **PATCH_EVENT,
+            "event": event,
+            "owner": "root",
+            "owner_display_name": "root",
+            "extra": '{"new_state": "success"}',
+        }
+    ]
 
     result = _audited_run(airflow, FORGED_TI, events=rows)
     seen = _attribution(result, "remit_payment_batch")
@@ -4865,8 +4884,300 @@ def test_an_event_the_tool_does_not_recognise_is_reported_not_silenced(airflow):
     # event. `not_recorded` would be a false statement about the row.
     assert seen["recorded_principal_kind"] == "not_classified"
     assert seen["event_owner"] == "admin"
-    assert seen["interface"] is None
+    # The row carries the audit marker, so its interface is decided structurally
+    # even though its NAME means nothing to this tool.
+    assert seen["interface"] == "rest_api"
+    assert seen["targeting_is_request_settable"] is True
     assert seen["attribution"] != "no_event_found"
+
+
+def test_an_unrecognised_row_without_the_audit_marker_stays_uninterfaced(airflow):
+    """The marker only ever ADDS. A row that carries none leaves the name-based
+    classification exactly where it was — absence may not upgrade a row."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "quantum_reconciliation_v9", "extra": '{"new_state": "success"}'}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "unrecognised"
+    assert seen["interface"] is None
+    assert seen["targeting_is_request_settable"] is False
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL-A: the REST interface is decided structurally, never by a list of
+# event names this tool has to keep in step with Airflow's routing table.
+# ---------------------------------------------------------------------------
+
+_ROUTES_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "airflow-core"
+    / "src"
+    / "airflow"
+    / "api_fastapi"
+    / "core_api"
+    / "routes"
+)
+# `action_logging()` is always called with no event argument, so the recorded
+# event name is the endpoint function's own `__name__` (decorators.py:148).
+_AUDIT_MARKER = {"method": "POST"}
+
+
+def _audit_logged_endpoint_names() -> set[str]:
+    """Every endpoint in the live tree whose route declares `Depends(action_logging())`.
+
+    Read out of the routing table by introspection rather than transcribed: a
+    transcribed list is the defect this covers, so the test may not contain one.
+    """
+    import ast
+
+    names: set[str] = set()
+    for path in sorted(_ROUTES_DIR.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if "action_logging" in ast.dump(decorator):
+                    names.add(node.name)
+    return names
+
+
+@pytest.mark.skipif(not _ROUTES_DIR.is_dir(), reason="airflow-core routing tree not in this checkout")
+def test_every_route_carrying_action_logging_reports_request_settable_targeting():
+    """The enumeration covered six of them. All of them write the audit marker,
+    so all of them must report their targeting as the request's to choose."""
+    names = _audit_logged_endpoint_names()
+
+    # The tree really does carry far more of these than any list ever held.
+    assert len(names) >= 40, names
+    assert len(names - set(server._AUDITED_TI_STATE_ACTIONS) - {"patch_task_instance"}) >= 30
+
+    for name in names:
+        assert server._is_request_settable_targeting(name, _AUDIT_MARKER) is True, name
+        assert server._classify_event(name, _AUDIT_MARKER)[1] == "rest_api", name
+
+
+# Every distinct `Log.event` value on the live instance, split by whether the
+# row carries `extra.method`. Taken from the instance, not from server.py.
+_LIVE_REST_EVENT_NAMES = (
+    "delete_dag",
+    "delete_dag_run",
+    "get_task_instances_batch",
+    "patch_dag",
+    "patch_dag_run",
+    "patch_task_instance",
+    "patch_variable",
+    "post_clear_task_instances",
+    "post_variable",
+    "reparse_dag_file",
+    "trigger_dag_run",
+)
+_LIVE_CLI_EVENT_NAMES = (
+    "cli_api_server",
+    "cli_dag_processor",
+    "cli_dag_reserialize",
+    "cli_dag_test",
+    "cli_scheduler",
+    "cli_triggerer",
+)
+_LIVE_PLATFORM_EVENT_NAMES = (
+    "deferred",
+    "failed",
+    "running",
+    "skipped",
+    "state mismatch",
+    "success",
+    "up_for_reschedule",
+    "up_for_retry",
+)
+
+
+@pytest.mark.parametrize("name", _LIVE_REST_EVENT_NAMES)
+def test_every_live_rest_audited_event_name_is_request_settable(name):
+    assert server._is_request_settable_targeting(name, _AUDIT_MARKER) is True
+    assert server._classify_event(name, _AUDIT_MARKER)[1] == "rest_api"
+
+
+@pytest.mark.parametrize("name", _LIVE_CLI_EVENT_NAMES + _LIVE_PLATFORM_EVENT_NAMES)
+def test_no_live_platform_or_cli_event_name_carries_the_marker_or_the_rest_interface(name):
+    """The marker separates the two populations cleanly on the live instance:
+    none of these rows carries `extra.method`, so none of them is read as REST."""
+    assert server._is_request_settable_targeting(name, {"host_name": "b256b32ddda1"}) is False
+    assert server._classify_event(name, {})[1] in ("cli", "platform")
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["trigger_dag_run", "patch_dag", "delete_dag_run", "patch_variable", "reparse_dag_file"],
+)
+def test_a_rest_row_outside_the_old_enumeration_never_claims_untouchable_targeting(airflow, event):
+    """The defect: these reported `targeting_is_request_settable: False` - an
+    affirmative false statement - and displaced the caveats that ride on having
+    no usable row."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": event}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["targeting_is_request_settable"] is True
+    assert seen["interface"] == "rest_api"
+    assert seen["attribution"] == "other_recorded_event"
+    # U2 (absence of a row is not evidence of a direct database write), U12 (a
+    # completion inside the triggerer records nothing either) and U13 (the
+    # targeting itself) all survive the row's mere presence.
+    for unknown in ("U2", "U12", "U13"):
+        assert unknown in seen["unknowns"], seen["unknowns"]
+    # Nothing is claimed about what the request was allowed to do or did.
+    detail = seen["attribution_detail"] + " " + _findings(result)[0]["detail"]
+    for banned in ("was authorized", "was accepted", "this request wrote", "was affected"):
+        assert banned not in detail
+    assert "What wrote this state is not established by this diagnosis" in detail
+
+
+def test_the_single_instance_patch_still_reports_its_targeting_as_the_requests(airflow):
+    """The in-set case is unchanged by the structural rule."""
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]), "remit_payment_batch")
+
+    assert seen["interface"] == "rest_api"
+    assert seen["targeting_is_request_settable"] is True
+    for unknown in ("U2", "U12", "U13"):
+        assert unknown in seen["unknowns"]
+
+
+def test_a_platform_row_carrying_a_method_key_is_demoted_and_never_promoted(airflow):
+    """(iv) A coincidental marker may only cost a row its standing. It must not
+    turn a platform row into a REST one, nor read its `owner` as a principal."""
+    _with_own_history(airflow)
+    executed = _executed("remit_payment_batch")
+    rows = [
+        {
+            **SUCCESS_EVENT,
+            "event_log_id": 77,
+            "task_id": "remit_payment_batch",
+            "extra": '{"host_name": "b256b32ddda1", "method": "PATCH"}',
+        }
+    ]
+
+    seen = _attribution(_audited_run(airflow, executed, events=rows), "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["targeting_is_request_settable"] is True
+    # Demoted, not promoted: the interface and the owner-kind stay what the
+    # event NAME established, so `airflow` never reads as an API principal.
+    assert seen["interface"] == "platform"
+    assert seen["recorded_principal_kind"] == "dag_task_owner"
+    assert seen["recorded_principal"] is None
+    assert "U4" in seen["unknowns"]
+    assert "U3" not in seen["unknowns"]
+
+
+def test_a_cli_row_carrying_a_method_key_is_demoted_and_never_promoted(airflow):
+    """The same, for the other population the marker must never promote."""
+    _with_own_history(airflow)
+    rows = [
+        {
+            **PATCH_EVENT,
+            "event": "cli_task_clear",
+            "owner": "root",
+            "owner_display_name": "root",
+            "extra": '{"method": "POST"}',
+        }
+    ]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["targeting_is_request_settable"] is True
+    assert seen["interface"] == "cli"
+    assert seen["recorded_principal_kind"] == "os_user_from_cli"
+    assert "U5" in seen["unknowns"]
+    assert "U3" not in seen["unknowns"]
+    # U7 is a REST-row caveat, and the marker does not make this one a REST row.
+    assert "U7" not in seen["unknowns"]
+
+
+def test_the_marker_is_read_from_extra_and_a_forged_method_value_cannot_escape_it(airflow):
+    """`decorators.py:207` overwrites whatever the body supplied, so the KEY is
+    the signal and its value is never trusted to decide anything."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "trigger_dag_run", "extra": '{"method": "not-a-verb"}'}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["targeting_is_request_settable"] is True
+    assert seen["interface"] == "rest_api"
+    # The value is quoted back, never adopted as a verb.
+    assert seen["method"] is None
+    assert seen["method_raw"] == '"not-a-verb"'
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-C: a demoted row is a RECOGNISED row, and the prose must say so.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("event", ["patch_task_instance", "post_clear_task_instances", "cli_task_clear"])
+def test_a_demoted_but_recognised_row_never_says_the_tool_did_not_recognise_it(airflow, event):
+    """The tool recognises all three by name. Routing them through the
+    `unrecognised` prose put a false statement into the summary the model
+    reads aloud."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": event, "owner": "root", "owner_display_name": "root"}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+    prose = seen["attribution_detail"] + " " + _findings(result)[0]["detail"]
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert "does not classify as a state change" not in prose
+    assert "not one this tool recognises" not in prose
+    assert "does not record a state change" not in prose
+    assert "DOES recognise as an action that can change a task instance's state" in prose
+    assert "recognises as a state-changing action but does not attribute" in prose
+    # It still claims nothing about what the row did.
+    assert "no state transition is claimed from it" in prose
+
+
+def test_a_genuinely_unrecognised_row_keeps_the_unrecognised_prose(airflow):
+    """The correction is scoped to the demoted case; the case the prose was
+    written for is untouched."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "quantum_reconciliation_v9", "extra": "{}"}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["classification"] == "unrecognised"
+    assert seen["attribution_detail"] == server._ATTRIBUTION_DETAIL["other_recorded_event"]
+    assert "not one this tool recognises" in seen["attribution_detail"]
+
+
+def test_an_uncorroborated_demotion_says_which_of_the_two_reasons_it_was(airflow):
+    """The two demotions are not the same fact, and the prose distinguishes
+    them rather than collapsing both into one sentence."""
+    _with_own_history(airflow)
+    rows = [
+        {
+            **PATCH_EVENT,
+            "event": "cli_task_clear",
+            "owner": "root",
+            "owner_display_name": "root",
+            "extra": '{"new_state": "success"}',
+        }
+    ]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["classification"] == "uncorroborated_association"
+    assert seen["attribution_detail"] == server._DEMOTED_DETAIL["uncorroborated_association"]
+    assert "map_index` column" in _findings(result)[0]["detail"]
+    assert "settable by the request" not in _findings(result)[0]["detail"]
 
 
 def test_old_state_is_written_out_as_null_with_the_reason_it_cannot_be_known(airflow):
@@ -5431,7 +5742,10 @@ def test_the_finding_and_the_projected_row_carry_the_same_attribution_object(air
 
     assert _findings(result)[0]["last_state_change"] == _attribution(result, "remit_payment_batch")
     assert _findings(result)[0]["attribution"] == "other_recorded_event"
-    assert _findings(result)[0]["attribution_detail"] == server._ATTRIBUTION_DETAIL["other_recorded_event"]
+    assert (
+        _findings(result)[0]["attribution_detail"]
+        == server._DEMOTED_DETAIL["request_settable_targeting_fields"]
+    )
 
 
 def test_the_attribution_sentence_composes_into_the_finding_and_the_summary(airflow):

@@ -1186,6 +1186,54 @@ _ATTRIBUTION_SENTENCE = {
     _ATTR_UNKNOWN: "The event history was not consulted for this task instance",
 }
 
+# A row DEMOTED into ``other_recorded_event`` is not the ``unrecognised`` case
+# the prose above was written for, and must not borrow its words: this tool DOES
+# recognise ``patch_task_instance``, ``post_clear_task_instances`` and
+# ``cli_task_clear`` by name, so telling the reader it "does not classify [it]
+# as a state change" or that the name is "not one this tool recognises" is false
+# about the row - and that text reaches the summary the model reads aloud. Keyed
+# by ``classification``, which names WHICH of the two demotions happened.
+_DEMOTED_DETAIL = {
+    "request_settable_targeting_fields": (
+        "The event log holds a row whose event name this tool DOES recognise as an action that can "
+        "change a task instance's state. It is not attributed to this task instance, because the "
+        "`dag_id`, `run_id` and `task_id` columns it recorded are settable by the request itself, "
+        "so the row cannot establish WHICH task instance it concerned. The row is reported in "
+        "full; no state transition is claimed from it."
+    ),
+    "uncorroborated_association": (
+        "The event log holds a row whose event name this tool DOES recognise as an action that can "
+        "change a task instance's state. It is not attributed to this task instance, because "
+        "nothing on the row corroborates that it concerned this one: the association rests on what "
+        "the row claims about itself rather than on the row's own `map_index` column. The row is "
+        "reported in full; no state transition is claimed from it."
+    ),
+}
+_DEMOTED_SENTENCE = {
+    "request_settable_targeting_fields": (
+        "The newest event-log row for this task instance is one this diagnosis recognises as a "
+        "state-changing action but does not attribute, because the `dag_id`, `run_id` and "
+        "`task_id` it recorded are settable by the request and so cannot establish which task "
+        "instance it concerned"
+    ),
+    "uncorroborated_association": (
+        "The newest event-log row for this task instance is one this diagnosis recognises as a "
+        "state-changing action but does not attribute, because the row's own `map_index` column "
+        "does not corroborate that it concerned this task instance"
+    ),
+}
+
+
+def _attribution_detail(state: str, classification: str | None = None) -> str:
+    """The paragraph for one attribution — demoted rows get their own, not the unrecognised one."""
+    return _DEMOTED_DETAIL.get(classification or "", _ATTRIBUTION_DETAIL[state])
+
+
+def _attribution_sentence(state: str, classification: str | None = None) -> str:
+    """The one summary sentence for one attribution, chosen the same way."""
+    return _DEMOTED_SENTENCE.get(classification or "", _ATTRIBUTION_SENTENCE[state])
+
+
 _AUDIT_NOT_PERMITTED = "the caller is not authorized to read this Dag's audit log"
 _AUDIT_NOT_SCOPED = "no audit scope was supplied, so the audit log was not read"
 _EVENT_QUERY = "GET /api/v2/eventLogs?dag_id=<dag>&run_id=<run> (order_by=-when)"
@@ -1198,8 +1246,30 @@ def _clamped_event_text(value: Any, limit: int) -> tuple[Any, bool]:
     return value, False
 
 
-def _classify_event(name: Any) -> tuple[str, str | None, str]:
-    """``(attribution state, interface, recorded_principal_kind)`` for one event name.
+def _has_rest_audit_marker(extra: dict[str, Any] | None) -> bool:
+    """Whether this row was written by the REST audit dependency, structurally.
+
+    ``action_logging`` sets ``extra_fields["method"] = request.method``
+    UNCONDITIONALLY at api_fastapi/logging/decorators.py:207 - after the
+    variable (:186), connection (:190) and json-body (:194) branches have each
+    already rebuilt or merged ``extra_fields``, and as the last write before
+    ``json.dumps(extra_fields)`` at :215. So a request body carrying its own
+    ``"method"`` key is merged at :195 and then OVERWRITTEN at :207; nothing a
+    requester supplies can remove the key or decide its value. Every one of the
+    46 routes carrying ``Depends(action_logging())`` reaches :207 or writes no
+    row at all - the sole early return, :167-168, returns before ``Log(...)``.
+
+    The key is read for one purpose only: to ADD request-settable targeting.
+    Its ABSENCE never removes what the event NAME already established, so a
+    missing marker cannot upgrade a row; and its coincidental presence on a
+    platform or ``cli_*`` row demotes that row rather than promoting it to
+    ``rest_api``.
+    """
+    return extra is not None and "method" in extra
+
+
+def _classify_event(name: Any, extra: dict[str, Any] | None = None) -> tuple[str, str | None, str]:
+    """``(attribution state, interface, recorded_principal_kind)`` for one event row.
 
     An event name in none of the sets is ``other_recorded_event`` and is still
     listed in full: a future Airflow event name must degrade to "a row I cannot
@@ -1209,9 +1279,18 @@ def _classify_event(name: Any) -> tuple[str, str | None, str]:
     this tool does not recognise DO record a principal (``trigger_dag_run``
     carries owner "admin" live), and calling that "not recorded" is a false
     statement about the row rather than an honest one about the classifier.
+
+    The INTERFACE of an otherwise unclassified row is decided structurally, by
+    the audit marker, not by a hand-maintained list of REST event names: 46
+    routes carry ``Depends(action_logging())`` and only six of them are names
+    this tool knows, so an enumeration reports ``targeting_is_request_settable:
+    False`` - an affirmative false statement - for every other one. The marker
+    is never allowed to CHANGE an interface the name already decided, which is
+    what keeps a platform or ``cli_*`` row from being promoted by it.
     """
+    marker_interface = "rest_api" if _has_rest_audit_marker(extra) else None
     if not isinstance(name, str):
-        return _ATTR_OTHER, None, "not_classified"
+        return _ATTR_OTHER, marker_interface, "not_classified"
     if name == "patch_task_instance":
         return _ATTR_AUDITED_PATCH, "rest_api", "authenticated_api_principal"
     if name.startswith("cli_") or name in _CLI_STATE_ACTIONS:
@@ -1220,7 +1299,19 @@ def _classify_event(name: Any) -> tuple[str, str | None, str]:
         return _ATTR_AUDITED_OTHER, "rest_api", "authenticated_api_principal"
     if name in _PLATFORM_STATE_EVENTS:
         return _ATTR_PLATFORM, "platform", "dag_task_owner"
-    return _ATTR_OTHER, None, "not_classified"
+    return _ATTR_OTHER, marker_interface, "not_classified"
+
+
+def _is_request_settable_targeting(name: Any, extra: dict[str, Any] | None) -> bool:
+    """Whether this row's ``dag_id``/``run_id``/``task_id`` columns are the request's to choose.
+
+    The UNION of the two signals, never either alone. The marker catches every
+    REST-audited route including ones this tool has never heard of; the name
+    catches a recognised REST event whose ``extra`` did not survive to here - a
+    row whose ``extra`` is unparsable, clamped away, or absent must not be read
+    as "not request-settable", which is the claim the enumeration got wrong.
+    """
+    return _has_rest_audit_marker(extra) or _classify_event(name)[1] == "rest_api"
 
 
 def _recorded_principal_kind(name: Any, owner: Any) -> str:
@@ -1349,7 +1440,7 @@ def _projected_extra(row: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_event(row: dict[str, Any]) -> dict[str, Any]:
     """One event-log row, clamped, classified, and never spliced into prose."""
-    _, interface, _ = _classify_event(row.get("event"))
+    _, interface, _ = _classify_event(row.get("event"), _parsed_extra_of(row))
     owner, _ = _clamped_event_text(row.get("owner"), EVENT_OWNER_CLAMP_CHARS)
     principal_kind = _recorded_principal_kind(row.get("event"), row.get("owner"))
     event, _ = _clamped_event_text(row.get("event"), EVENT_NAME_CLAMP_CHARS)
@@ -1396,22 +1487,26 @@ def _event_association(row: dict[str, Any], ti: dict[str, Any]) -> str | None:
     return "row.task_id"
 
 
-def _classification(state: str, request_settable: bool, demoted_audited: bool) -> str | None:
-    """Why an ``other_recorded_event`` is one — the three reasons are not the same."""
+def _classification(state: str, request_settable: bool, demoted: bool) -> str | None:
+    """Why an ``other_recorded_event`` is one — the three reasons are not the same.
+
+    ``demoted`` is asked FIRST. A row that was never recognised is
+    ``unrecognised`` however request-settable its targeting is: being demoted
+    and never having been classified are different facts, and the prose the
+    summary reads out is chosen from this value.
+    """
     if state != _ATTR_OTHER:
         return None
-    if request_settable:
-        return "request_settable_targeting_fields"
-    if demoted_audited:
-        return "uncorroborated_association"
-    return "unrecognised"
+    if not demoted:
+        return "unrecognised"
+    return "request_settable_targeting_fields" if request_settable else "uncorroborated_association"
 
 
 def _bare_attribution(state: str, unknowns: list[str]) -> dict[str, Any]:
     """An attribution with no row behind it. Nulls are written out, never dropped."""
     return {
         "attribution": state,
-        "attribution_detail": _ATTRIBUTION_DETAIL[state],
+        "attribution_detail": _attribution_detail(state),
         "event": None,
         "when": None,
         "event_log_id": None,
@@ -1479,20 +1574,20 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     matched.sort(key=lambda pair: 0 if pair[1] == "row.task_id+map_index" else 1)
     row, via = matched[0]
     compact = _compact_event(row)
-    raw_state, interface, _ = _classify_event(row.get("event"))
+    extra = _parsed_extra_of(row)
+    raw_state, interface, _ = _classify_event(row.get("event"), extra)
     # The headline and the context rows must not report two different principal
     # kinds for the same row: both go through ``_recorded_principal_kind``.
     principal_kind = _recorded_principal_kind(row.get("event"), row.get("owner"))
-    extra = _parsed_extra_of(row)
 
-    # Keyed on the INTERFACE, never on ``extra``. Every REST audit row's
+    # Never keyed on a LIST OF EVENT NAMES. Every REST audit row's
     # dag_id/run_id/task_id columns are request-settable - a query parameter or a
-    # body key merged over the path (decorators.py:196-203, :213-217) - and
-    # ``extra`` is structurally incapable of showing it, because :169-178 strips
-    # exactly those key names out of ``extra`` at :180-184. So a demotion keyed
-    # on ``extra`` is blind to the query-string variant, and every rest_api row
-    # is DEMOTED out of the audited states: it is reported in full, and it is not
-    # counted as a state-change claim about this task instance.
+    # body key merged over the path (decorators.py:196-203, :213-217) - and there
+    # are 46 such routes, of which six were ever enumerated here. So the signal
+    # is the structural audit marker (see ``_has_rest_audit_marker``) UNION the
+    # names already recognised, and every request-settable row is DEMOTED out of
+    # the attributing states: it is reported in full, and it is not counted as a
+    # state-change claim about this task instance.
     #
     # ACCEPTED COST: legitimate ``post_clear_task_instances`` rows are demoted
     # too. ``decorators.py:217`` is ``params.get("run_id") or
@@ -1500,14 +1595,22 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     # separates a genuine clear from a plant. Carving ``dag_run_id`` back out
     # would restore the exact vector; under-claiming on a real clear is the
     # correct direction to fail.
-    targeting_is_request_settable = interface == "rest_api"
-    demoted_audited = raw_state in (_ATTR_AUDITED_PATCH, _ATTR_AUDITED_OTHER) and (
-        # An audited state survives ONLY on an association the row's own
-        # map_index column corroborates, which a REST audit row structurally
-        # cannot reach (decorators.py:209-218 never passes map_index).
-        targeting_is_request_settable or via != "row.task_id+map_index"
+    targeting_is_request_settable = _is_request_settable_targeting(row.get("event"), extra)
+    demoted = (
+        raw_state in (_ATTR_AUDITED_PATCH, _ATTR_AUDITED_OTHER)
+        and (
+            # An audited state survives ONLY on an association the row's own
+            # map_index column corroborates, which a REST audit row structurally
+            # cannot reach (decorators.py:209-218 never passes map_index).
+            targeting_is_request_settable or via != "row.task_id+map_index"
+        )
+    ) or (
+        # A platform-named row that carries the REST audit marker is a row whose
+        # targeting the request could have chosen. It is demoted for that, never
+        # promoted to ``rest_api`` on the strength of a key it merely carries.
+        raw_state == _ATTR_PLATFORM and targeting_is_request_settable
     )
-    state = _ATTR_OTHER if demoted_audited else raw_state
+    state = _ATTR_OTHER if demoted else raw_state
 
     # ``extra.map_index`` is a value the requester wrote and ``map_index`` is NOT
     # in ``fields_skip_logging``, so a ``?map_index=3`` on a rejected request
@@ -1531,6 +1634,8 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     elif state == _ATTR_PLATFORM and row.get("event") in _TI_STATE_VALUES:
         new_state, new_state_source = row["event"], "event_name"
 
+    classification = _classification(state, targeting_is_request_settable, demoted)
+
     unknowns: list[str] = []
     if state == _ATTR_AUDITED_PATCH:
         unknowns = ["U1", "U3", "U11", "U13"]
@@ -1538,11 +1643,12 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
         unknowns = ["U1", "U5" if principal_kind == "os_user_from_cli" else "U3", "U11", "U13"]
     elif state == _ATTR_PLATFORM:
         unknowns = ["U4"]
-    elif demoted_audited:
-        # A demoted row is still an audited row. It keeps every caveat the
-        # audited states carry - including the one naming what its `owner` field
-        # is - and gains U13, the reason it was demoted.
-        unknowns = ["U1", "U5" if principal_kind == "os_user_from_cli" else "U3", "U11", "U13"]
+    elif demoted:
+        # A demoted row is still a recognised row. It keeps every caveat its
+        # undemoted state carries - including the one naming what its `owner`
+        # field is - and gains U13, the reason it was demoted.
+        owner_caveat = {"os_user_from_cli": "U5", "dag_task_owner": "U4"}.get(principal_kind, "U3")
+        unknowns = ["U1", owner_caveat, "U11", "U13"]
     else:
         unknowns = ["U11"]
     if new_state_source == "extra.new_state":
@@ -1552,6 +1658,14 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     # or which mapped instance it named.
     if interface == "rest_api":
         unknowns.append("U7")
+    # A row whose targeting the request could choose establishes nothing about
+    # THIS task instance, so the caveats that ride on having no usable row must
+    # survive it. Presence of such a row USED TO displace them, which let a
+    # `trigger_dag_run` or `patch_dag` row silently drop U2 (absence of a row is
+    # not evidence of a direct database write), U12 (a completion inside the
+    # triggerer records nothing either) and U13 (the targeting itself).
+    if targeting_is_request_settable:
+        unknowns.extend(code for code in ("U2", "U12", "U13") if code not in unknowns)
     if any(bool(extra.get(key)) for key in _EXTRA_INCLUDE_KEYS):
         unknowns.append("U15")
     # ``old_state`` is hard-null for every state that has a row, so the reason it
@@ -1569,8 +1683,10 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
             "event": _clamped_event_text(other.get("event"), EVENT_NAME_CLAMP_CHARS)[0],
             "event_owner": _clamped_event_text(other.get("owner"), EVENT_OWNER_CLAMP_CHARS)[0],
             "recorded_principal_kind": _recorded_principal_kind(other.get("event"), other.get("owner")),
-            "interface": _classify_event(other.get("event"))[1],
-            "targeting_is_request_settable": _classify_event(other.get("event"))[1] == "rest_api",
+            "interface": _classify_event(other.get("event"), _parsed_extra_of(other))[1],
+            "targeting_is_request_settable": _is_request_settable_targeting(
+                other.get("event"), _parsed_extra_of(other)
+            ),
             "event_map_index": other.get("map_index"),
             "event_try_number": other.get("try_number"),
             "associated_via": other_via,
@@ -1579,7 +1695,7 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     ]
     return {
         "attribution": state,
-        "attribution_detail": _ATTRIBUTION_DETAIL[state],
+        "attribution_detail": _attribution_detail(state, classification),
         "event": compact["event"],
         "when": compact["when"],
         "event_log_id": compact["event_log_id"],
@@ -1604,7 +1720,7 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
         "pins_try_number": pins_try_number,
         "matches_recorded_attempt": matches_attempt,
         "associated_via": via,
-        "classification": _classification(state, targeting_is_request_settable, demoted_audited),
+        "classification": classification,
         "extra": compact["extra"],
         "extra_parsed": compact["extra_parsed"],
         "extra_keys": compact["extra_keys"],
@@ -1943,7 +2059,7 @@ def _dispatch_finding(
     # Exactly one sentence, chosen by attribution state and built only from
     # values this tool wrote or ``_quoted``/``_fenced`` neutralised. ``extra`` is
     # never spliced into it — it is structured-only.
-    attribution_text = _ATTRIBUTION_SENTENCE[attribution["attribution"]]
+    attribution_text = _attribution_sentence(attribution["attribution"], attribution.get("classification"))
     if attribution["attribution"] in (_ATTR_AUDITED_PATCH, _ATTR_AUDITED_OTHER):
         principal = (
             "the operating-system user name" if attribution["interface"] == "cli" else "the principal name"
