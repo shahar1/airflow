@@ -841,8 +841,8 @@ def get_mapped_task_instance_try_details(
     "/clearTaskInstances",
     responses=create_openapi_http_exception_doc([status.HTTP_404_NOT_FOUND, status.HTTP_409_CONFLICT]),
     dependencies=[
-        Depends(action_logging()),
         Depends(requires_access_dag(method="PUT", access_entity=DagAccessEntity.TASK_INSTANCE)),
+        Depends(action_logging(body_attribution_fields=("dag_run_id",))),
     ],
 )
 def post_clear_task_instances(
