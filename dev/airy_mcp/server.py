@@ -1955,6 +1955,11 @@ def _attribution_reader(history: dict[str, Any]) -> Callable[[dict[str, Any]], d
 _DISPATCH_FINDING_KIND = "success_without_attempt_dispatch_fields"
 _DISPATCH_TRUNCATED_KIND = "dispatch_findings_folded"
 
+# The sentence a dispatch finding always ends on. Anything added to the finding
+# later goes BEFORE it: the restraint is the last thing read, not the first
+# thing buried.
+_NOT_ESTABLISHED = "What wrote this state is not established by this diagnosis"
+
 
 def _dispatch_finding(
     ti: dict[str, Any], history: dict[str, Any], attribution: dict[str, Any] | None = None
@@ -2082,6 +2087,16 @@ def _dispatch_finding(
         # whose owner IS an authenticated principal - and the platform sentence
         # would have converted that principal into "not an actor".
         attribution_text += f", event {_quoted(attribution['event'])} at {_quoted(attribution['when'])}"
+        if attribution.get("classification"):
+            # A DEMOTED row is one whose name this tool does recognise as a
+            # state-changing action, so what the row does establish is worth
+            # saying in the same breath as what it does not - otherwise the only
+            # place it is said is the legend, which is not what gets read out.
+            attribution_text += (
+                "; a row like that establishes only that a request naming that action was received "
+                "and logged, and never that the request succeeded, cleared authorization, or "
+                "wrote this state"
+            )
 
     finding: dict[str, Any] = {
         "kind": _DISPATCH_FINDING_KIND,
@@ -2090,7 +2105,7 @@ def _dispatch_finding(
                 core,
                 history_text,
                 f"{attribution_text}.",
-                "What wrote this state is not established by this diagnosis",
+                _NOT_ESTABLISHED,
             ]
         ),
         "task_id": ti["task_id"],
@@ -2579,6 +2594,231 @@ def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
     return runs, resp.get("total_entries", len(runs))
 
 
+# How many runs a dispatch finding may name when it contrasts this attempt with
+# the same task's rows elsewhere. A finding is a paragraph, not a run list.
+DISPATCH_CONTRAST_RUN_LIMIT = 4
+# The same ceiling for the downstream tasks a finding names.
+DISPATCH_IMPACT_TASK_LIMIT = 6
+
+
+def _carries_worker_field(row: dict[str, Any]) -> bool:
+    """Whether one compared row carries a field only a worker writes."""
+    return bool(row.get("hostname")) or row.get("pid") is not None
+
+
+def _compared_rows_by_run(
+    comparison: dict[str, Any], task_id: str, map_index: int
+) -> dict[str, dict[str, Any]]:
+    """The compared task's newest row per run, for the one instance a finding names."""
+    rows: dict[str, dict[str, Any]] = {}
+    for row in (comparison.get("tasks") or {}).get(task_id) or []:
+        run_id = row.get("dag_run_id")
+        if row.get("map_index", -1) != map_index or not isinstance(run_id, str):
+            continue
+        rows.setdefault(run_id, row)
+    return rows
+
+
+def _recurrence_clause(order: list[str], rows: dict[str, dict[str, Any]], run_id: str) -> str:
+    """How far back this run's missing dispatch evidence goes, counted rather than implied.
+
+    "1 problem found" is a statement about one run. A task that has recorded no
+    worker field for four cycles is a different fact, and it is one the compared
+    rows already hold — so it is stated instead of left for the reader to count.
+    """
+    if run_id not in order:
+        return ""
+    streak = []
+    for other in order[order.index(run_id) :]:
+        row = rows.get(other)
+        if row is None or _carries_worker_field(row):
+            break
+        streak.append(other)
+    if len(streak) < 2:
+        return ""
+    named = streak[:DISPATCH_CONTRAST_RUN_LIMIT]
+    text = (
+        f"This is not confined to this run: the same task carries no worker-written field "
+        f"(hostname empty, pid null) on {len(streak)} consecutive run(s) ending with this one, out "
+        f"of the {len(order)} most recent run(s) this diagnosis compared — "
+        f"{', '.join(_fenced(other) for other in named)}"
+    )
+    if len(streak) > len(named):
+        text += f" and {len(streak) - len(named)} more"
+    return text
+
+
+def _contrast_clause(
+    order: list[str],
+    rows: dict[str, dict[str, Any]],
+    run_id: str,
+    dag_version: int | None,
+    versions: dict[str, int | None],
+) -> str:
+    """The same task's dispatched rows elsewhere — what they exclude, and what they do not.
+
+    Two explanations for a bare attempt are otherwise left open by the finding
+    itself: a task instance that completes entirely inside the triggerer (which
+    writes no hostname or pid on any run), and a task that legitimately does
+    nothing. Another run of the SAME task carrying a worker field, and work, is
+    what closes them — so the closing fact is written down rather than left as
+    rows for a reader to compare.
+    """
+    for other in order:
+        row = rows.get(other)
+        if other == run_id or row is None or not _carries_worker_field(row):
+            continue
+        duration = row.get("duration")
+        did_work = isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0
+        text = (
+            f"The same task was dispatched on run {_fenced(other)}: that row records hostname "
+            f"{_quoted(row.get('hostname'))} and pid {_quoted(row.get('pid'))}"
+        )
+        if did_work:
+            text += (
+                f" with duration {duration}, so this task does record worker fields and real work "
+                f"when it is dispatched — neither a completion entirely inside the triggerer, which "
+                f"records no hostname or pid on any run, nor a task that does nothing accounts for "
+                f"the attempt diagnosed here"
+            )
+        else:
+            text += (
+                ", so this task does record worker fields when it is dispatched — a completion "
+                "entirely inside the triggerer, which records no hostname or pid on any run, does "
+                "not account for the attempt diagnosed here"
+            )
+        other_version = versions.get(other)
+        if other_version is not None and dag_version is not None:
+            if other_version == dag_version:
+                # Stated as what the record says and no further: ``_R1`` is why
+                # "same recorded version" is not "same code executed".
+                text += (
+                    f". Both runs are recorded at dag_version {dag_version}, so the recorded Dag "
+                    f"version does not differ between the run where this task was dispatched and "
+                    f"this one"
+                )
+            else:
+                text += (
+                    f". That run is recorded at dag_version {other_version} and this one at "
+                    f"dag_version {dag_version}, so the two runs do not carry the same recorded "
+                    f"Dag version"
+                )
+        return text
+    return ""
+
+
+def _downstream_task_ids(task_id: str, edges: dict[str, list[str]]) -> list[str]:
+    """Every task the graph puts downstream of this one, transitively."""
+    seen = {task_id}
+    queue = [task_id]
+    reached: list[str] = []
+    while queue:
+        for nxt in edges.get(queue.pop(), ()):
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            queue.append(nxt)
+            reached.append(nxt)
+    return sorted(reached)
+
+
+def _impact_clause(
+    task_id: str,
+    run_state: str,
+    edges: dict[str, list[str]],
+    ti_states: dict[str, list[str]],
+) -> str:
+    """What a run carrying this finding still reports, and what ran behind it.
+
+    The one thing no field in this result says today: a green run raises nothing,
+    so a task instance with no dispatch evidence is carried past every alert the
+    deployment has.
+    """
+    reached = [other for other in _downstream_task_ids(task_id, edges) if other in ti_states]
+    # The no-alert claim is earned by the run state and by nothing else: on a run
+    # that is recorded failed, alerting HAS fired, and saying otherwise would be
+    # a false statement about the deployment rather than a finding about a task.
+    text = (
+        "Operational effect: the run is recorded success, so this finding raises no failure and "
+        "fires no alert of its own"
+        if run_state == "success"
+        else f"Operational effect: the run is recorded {run_state}, so whatever that state raises "
+        f"is raised by the run and not by this finding"
+    )
+    if not reached:
+        return text
+    named = reached[:DISPATCH_IMPACT_TASK_LIMIT]
+    listed = ", ".join(f"{_fenced(other)} ({'/'.join(ti_states[other])})" for other in named)
+    text += (
+        f", and {len(reached)} task(s) downstream of it in the task graph are recorded in this run "
+        f"with this attempt already marked success: {listed}"
+    )
+    if len(reached) > len(named):
+        text += f" and {len(reached) - len(named)} more"
+    return text
+
+
+def _augment_dispatch_findings(
+    checks: list[dict[str, Any]],
+    run_id: str,
+    run_state: str,
+    dag_version: int | None,
+    run_history: dict[str, Any],
+    tasks: dict[str, Any] | None,
+    tis: list[dict[str, Any]],
+) -> None:
+    """Fold the evidence that is only in the raw rows into the finding's own prose.
+
+    Everything here is already in this result — the compared rows, the run
+    versions, the task graph, the instance states. It is folded into ``detail``
+    because ``detail`` is what reaches ``summary``, and ``summary`` is the only
+    part of a 40 kB payload a small model reliably reads out. A reader that has
+    to join four top-level keys to rule out "it was a no-op" will not do it.
+    """
+    findings = [
+        check for check in checks if check.get("kind") == _DISPATCH_FINDING_KIND and "task_id" in check
+    ]
+    if not findings:
+        return
+    order = [
+        entry["dag_run_id"]
+        for entry in run_history.get("runs") or []
+        if isinstance(entry.get("dag_run_id"), str)
+    ]
+    versions = {
+        entry["dag_run_id"]: entry.get("dag_version")
+        for entry in run_history.get("runs") or []
+        if isinstance(entry.get("dag_run_id"), str)
+    }
+    comparison = run_history.get("task_comparison") or {}
+    edges = (tasks or {}).get("edges") or {}
+    ti_states: dict[str, list[str]] = {}
+    for ti in tis:
+        state = ti.get("state")
+        if isinstance(state, str) and state not in ti_states.setdefault(ti["task_id"], []):
+            ti_states[ti["task_id"]].append(state)
+    for check in findings:
+        rows = _compared_rows_by_run(comparison, check["task_id"], check.get("map_index", -1))
+        clauses = [
+            clause
+            for clause in (
+                _contrast_clause(order, rows, run_id, dag_version, versions),
+                _recurrence_clause(order, rows, run_id),
+                _impact_clause(check["task_id"], run_state, edges, ti_states),
+            )
+            if clause
+        ]
+        if not clauses:
+            continue
+        added = ". ".join(clauses)
+        detail = check["detail"]
+        if detail.endswith(_NOT_ESTABLISHED):
+            head = detail[: -len(_NOT_ESTABLISHED)].rstrip()
+            check["detail"] = f"{head} {added}. {_NOT_ESTABLISHED}"
+        else:
+            check["detail"] = f"{detail}. {added}"
+
+
 _CHECK_LABELS = {
     "unknown_xcom_task_id": "Latent blocker",
     "import_error": "Import error",
@@ -2736,7 +2976,14 @@ def _build_diagnosis_summary(
     folded_away = health["dispatch_findings_suppressed"] + health["static_checks_suppressed"]
     fold_entries = sum(1 for check in checks if check["kind"] in _FOLD_KINDS)
     problems = len(items) - fold_entries + folded_away
-    head = f"{problems} problem{'s' if problems != 1 else ''} found."
+    # The run's id and state, in the branch that reports findings. The clean
+    # branch always named them; this one did not, so the sentence a model had to
+    # assemble to say "the run is green and something in it still did not run"
+    # was spread over three keys — two of which say "success" on their own.
+    head = (
+        f"Run {_fenced(run_id)} is recorded {run_state}, and this diagnosis still found "
+        f"{problems} problem{'s' if problems != 1 else ''}."
+    )
     tail = (
         f" The logs of {logs_omitted} more failed task instance(s) were omitted for size."
         if logs_omitted
@@ -2753,8 +3000,10 @@ def diagnose_dag(
     """
     Find out what is wrong with a run of this Dag.
 
-    ``dag_run_id`` names an exact run; left empty, the first failed of the last
-    5 runs is diagnosed (else the newest). Returns every task instance with the
+    ``dag_run_id`` takes an exact run id, or ``latest``/``previous`` — use those
+    rather than composing a run id from a date, which is how a run that exists
+    comes back as "no such run". Left empty, the first failed of the last 5 runs
+    is diagnosed (else the newest). Returns every task instance with the
     fields that show whether its recorded attempt was dispatched, the log tail
     of **every** failed or retrying one, the task graph, the full Dag source,
     deterministic checks that spot broken task references, import errors and
@@ -2921,6 +3170,17 @@ def diagnose_dag(
         )
     import_checks = _find_import_errors(dag)
     checks: list[dict[str, Any]] = (static_checks or []) + import_checks + dispatch_checks
+    # After the graph and the run history are both in hand, and before the
+    # summary is built off ``detail``.
+    _augment_dispatch_findings(
+        checks,
+        run["dag_run_id"],
+        run["state"],
+        result["dag_version"],
+        run_history,
+        result.get("tasks"),
+        tis,
+    )
     if static_checks is not None or checks:
         result["checks"] = checks
 
@@ -2932,9 +3192,23 @@ def diagnose_dag(
         result["run_health"] = _run_health(
             run, tis, [], checks, omitted, coverage, attribution_census, event_history, run_history
         )
-        result["diagnosis"] = f"latest run is {run['state']}; no failed task instances"
+        # Never a second verdict. This field used to read "latest run is success;
+        # no failed task instances" beside a summary saying a task in it never
+        # ran — and it is the key literally called ``diagnosis``, so that is the
+        # sentence that got read out. It now says what ``summary`` says, and
+        # points at it.
         result["summary"] = _build_diagnosis_summary(
             run["dag_run_id"], run["state"], [], checks, 0, result["run_health"]
+        )
+        # Not a count of its own — the count belongs to ``summary`` and a second
+        # computation of it is a second thing to drift.
+        result["diagnosis"] = (
+            f"run {run['dag_run_id']} is {run['state']} and no task instance in it failed"
+            + (
+                ", but this diagnosis found problems in it — read `summary`, not this line"
+                if checks
+                else "; see `summary` for what was and was not established"
+            )
         )
         if stale_note:
             result["summary"] = f"{stale_note} {result['summary']}"
@@ -3829,8 +4103,21 @@ def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, s
     try:
         return _api("GET", _dag_url(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")), None
     except httpx.HTTPStatusError as e:
-        if e.response.status_code in (403, 404):
-            return None, f"{dag_id} has no run {dag_run_id!r}"
+        if e.response.status_code == 403:
+            # Collapsing this into "no such run" made an authorization failure
+            # read as a typo, and a caller that believes the run is absent looks
+            # for another one instead of reporting what happened. The Dag itself
+            # is already known to this caller by the time a run under it is
+            # fetched, so saying which of the two it was leaks nothing new.
+            return None, (
+                f"the run {dag_run_id!r} of {dag_id} could not be read (HTTP 403); this is a "
+                f"permission refusal, not evidence that the run does not exist"
+            )
+        if e.response.status_code == 404:
+            return None, (
+                f"{dag_id} has no run {dag_run_id!r}. Run ids are exact, including the UTC offset "
+                f"— pass 'latest' or 'previous' instead of composing one"
+            )
         raise
 
 
@@ -4189,7 +4476,11 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
     ``run_a``/``run_b`` take exact run ids, or ``latest``/``previous`` — so
     "compare the last two runs" is run_a="previous", run_b="latest".
     A mapped task is aggregated per task: instance count and the longest
-    instance's duration. Names the Dag versions each run used, but does not
+    instance's duration. Each row also carries ``run_a_worker_field`` /
+    ``run_b_worker_field`` — whether any instance of that task on that run
+    recorded a hostname or pid. A task whose duration is unchanged at 0 on both
+    runs has NOT been stable if those flags differ, or if both are false.
+    Names the Dag versions each run used, but does not
     diff them — an older version can contain a co-located Dag this caller was
     never authorized for.
     ``source_digest`` is set by the caller's permissions, not by you.
@@ -4226,23 +4517,37 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         # not whichever map_index the API listed last.
         per_task: dict[str, dict[str, Any]] = {}
         for ti in tis:
-            info = per_task.setdefault(ti["task_id"], {"count": 0, "duration": None})
+            info = per_task.setdefault(
+                ti["task_id"], {"count": 0, "duration": None, "worker_dispatched": False}
+            )
             info["count"] += 1
             duration = ti.get("duration")
             if duration is not None and (info["duration"] is None or duration > info["duration"]):
                 info["duration"] = duration
+            # Durations alone cannot answer "was it my change?" for a task that
+            # stopped being dispatched: a task recorded success without ever
+            # running has duration 0 on BOTH runs, and this comparison then
+            # reports it as the most stable task in the Dag.
+            if _carries_worker_field(ti):
+                info["worker_dispatched"] = True
         instances[label] = per_task
 
     task_durations = []
+    empty = {"count": 0, "duration": None, "worker_dispatched": False}
     for task_id in sorted(set(instances["run_a"]) | set(instances["run_b"])):
-        info_a = instances["run_a"].get(task_id, {"count": 0, "duration": None})
-        info_b = instances["run_b"].get(task_id, {"count": 0, "duration": None})
+        info_a = instances["run_a"].get(task_id, empty)
+        info_b = instances["run_b"].get(task_id, empty)
         a, b = info_a["duration"], info_b["duration"]
         entry = {
             "task_id": task_id,
             "run_a": a,
             "run_b": b,
             "delta": round(b - a, 3) if a is not None and b is not None else None,
+            # Named for what was observed - a worker-written field on the row -
+            # and not for what ran: this says nothing about who or what wrote
+            # the state.
+            "run_a_worker_field": info_a["worker_dispatched"],
+            "run_b_worker_field": info_b["worker_dispatched"],
         }
         if max(info_a["count"], info_b["count"]) > 1:
             entry["run_a_instances"] = info_a["count"]
@@ -4382,6 +4687,14 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
         "window_hours": hours,
         "failures_scanned": len(tis),
         "failures_omitted": failures_omitted,
+        # An empty result here is not an all-clear, and nothing else in this
+        # payload says so: the scan only ever sees task instances in state
+        # `failed`, which is exactly the state the interesting cases are not in.
+        "scope": (
+            "task instances recorded state=failed only. No clusters means no FAILED task "
+            "instance in the window — it does not mean the Dags are healthy. A run recorded "
+            "success whose task never ran is invisible here; diagnose_dag finds those."
+        ),
         "clusters": sorted(clusters.values(), key=lambda c: c["count"], reverse=True),
     }
 
@@ -4724,6 +5037,14 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
         "downstream_dags": edges["downstream"],
         "consumes_assets": edges["consumes"],
         "upstream_dags": edges["upstream"],
+        # Four empty lists read as "nothing depends on this Dag". They mean the
+        # asset catalog holds no edge for it, which is the common case for a Dag
+        # that has real consequences and simply does not declare assets.
+        "scope": (
+            "asset edges only. Empty lists mean this Dag declares no asset dependency in the "
+            "catalog — not that a failure in it has no consequences. Task-level impact inside a "
+            "run is in diagnose_dag's task graph, not here."
+        ),
     }
 
 

@@ -462,7 +462,10 @@ def test_diagnose_dag_escapes_the_run_and_task_ids(airflow):
 
 def test_diagnose_dag_without_failed_task_instances(airflow):
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
-    assert "no failed task instances" in server.diagnose_dag(DAG_ID)["diagnosis"]
+    diagnosis = server.diagnose_dag(DAG_ID)["diagnosis"]
+
+    assert "no task instance in it failed" in diagnosis
+    assert "manual__1" in diagnosis
 
 
 def test_diagnose_dag_reads_the_parsed_source_not_the_file(airflow, tmp_path):
@@ -725,7 +728,9 @@ def test_diagnose_dag_summary_enumerates_every_failure_and_check(airflow):
 
     summary = server.diagnose_dag(DAG_ID)["summary"]
 
-    assert summary.startswith("2 problems found.")
+    assert summary.startswith(
+        "Run `manual__1` is recorded failed, and this diagnosis still found 2 problems."
+    )
     assert """(1) Confirmed failure: `summarize` failed with "KeyError: 'ammount'" (see log).""" in summary
     assert "(2) Latent blocker: an XCom pull references task_ids=`summarise`" in summary
 
@@ -786,7 +791,10 @@ def test_diagnose_dag_diagnoses_the_exact_run_it_was_asked_about(airflow):
 def test_diagnose_dag_says_when_the_asked_run_does_not_exist(airflow):
     result = server.diagnose_dag(DAG_ID, dag_run_id="manual__nope")
 
-    assert result["error"] == f"{DAG_ID} has no run 'manual__nope'"
+    assert result["error"] == (
+        f"{DAG_ID} has no run 'manual__nope'. Run ids are exact, including the UTC offset "
+        f"— pass 'latest' or 'previous' instead of composing one"
+    )
     assert "failures" not in result
 
 
@@ -1991,8 +1999,22 @@ def test_compare_dag_runs_reports_duration_deltas(airflow):
     result = server.compare_dag_runs(DAG_ID, "old", "new")
 
     assert result["task_durations"] == [
-        {"task_id": "extract", "run_a": 1.0, "run_b": 1.5, "delta": 0.5},
-        {"task_id": "summarize", "run_a": 4.0, "run_b": None, "delta": None},
+        {
+            "task_id": "extract",
+            "run_a": 1.0,
+            "run_b": 1.5,
+            "delta": 0.5,
+            "run_a_worker_field": False,
+            "run_b_worker_field": False,
+        },
+        {
+            "task_id": "summarize",
+            "run_a": 4.0,
+            "run_b": None,
+            "delta": None,
+            "run_a_worker_field": False,
+            "run_b_worker_field": False,
+        },
     ]
     assert result["run_a"]["state"] == "success"
     assert result["run_b"]["state"] == "failed"
@@ -2066,7 +2088,7 @@ def test_compare_dag_runs_says_when_a_run_does_not_exist(airflow):
 
     result = server.compare_dag_runs(DAG_ID, "old", "manual__nope")
 
-    assert result["error"] == f"{DAG_ID} has no run 'manual__nope'"
+    assert result["error"].startswith(f"{DAG_ID} has no run 'manual__nope'.")
 
 
 def test_compare_dag_runs_aggregates_mapped_instances(airflow):
@@ -2092,6 +2114,8 @@ def test_compare_dag_runs_aggregates_mapped_instances(airflow):
             "run_a": 5.0,
             "run_b": 9.0,
             "delta": 4.0,
+            "run_a_worker_field": False,
+            "run_b_worker_field": False,
             "run_a_instances": 2,
             "run_b_instances": 3,
             "aggregation": "count of mapped instances; duration is the longest instance's",
@@ -2444,7 +2468,9 @@ def test_get_blast_radius_maps_both_directions_through_assets(airflow):
         "downstream_dags": ["audit", "revenue_dashboard"],
         "consumes_assets": ["raw_events"],
         "upstream_dags": ["ingest"],
+        "scope": result["scope"],
     }
+    assert "asset edges only" in result["scope"]
 
 
 def test_get_blast_radius_of_an_asset_free_dag_is_empty(airflow):
@@ -3082,7 +3108,9 @@ def test_diagnose_finding_detail_composes_into_the_check_line(airflow):
     assert not detail.endswith(".")
     label = "Success with no worker-dispatch fields for the recorded attempt"
     assert f"(1) {label}: {detail}." in result["summary"]
-    assert result["summary"].startswith("1 problem found.")
+    assert result["summary"].startswith(
+        "Run `manual__1` is recorded success, and this diagnosis still found 1 problem."
+    )
 
 
 def test_diagnose_finding_blocks_the_no_problems_sentence(airflow):
@@ -3555,7 +3583,7 @@ def test_diagnose_reports_coverage_next_to_the_problems_it_did_find(airflow):
 
     summary = server.diagnose_dag(DAG_ID)["summary"]
 
-    assert summary.startswith("1 problem found.")
+    assert summary.startswith("Run `manual__1` is recorded failed, and this diagnosis still found 1 problem.")
     assert "1 successful task instance(s) did not report the fields needed" in summary
 
 
@@ -3693,7 +3721,7 @@ def test_the_summary_numbering_cannot_be_forged_from_a_log_line(airflow):
 
     summary = server.diagnose_dag(DAG_ID)["summary"]
 
-    assert summary.startswith("1 problem found.")
+    assert summary.startswith("Run `manual__1` is recorded failed, and this diagnosis still found 1 problem.")
     assert len(re.findall(r"\(\d+\)", summary)) == 1
     assert "\n" not in summary
 
@@ -4258,7 +4286,9 @@ def test_the_headline_counts_problems_and_not_the_entry_that_folds_them(airflow)
 
     summary = _green_run(airflow, *forged)["summary"]
 
-    assert summary.startswith("500 problems found.")
+    assert summary.startswith(
+        "Run `manual__1` is recorded success, and this diagnosis still found 500 problems."
+    )
     assert "(1) Note: 500 successful task instance(s)" in summary
 
 
@@ -5989,3 +6019,322 @@ def test_a_run_list_failure_never_reads_as_this_dag_has_never_run(airflow, monke
 
     with pytest.raises(httpx.ConnectError):
         server.diagnose_dag(DAG_ID)
+
+
+# ---------------------------------------------------------------------------
+# The evidence a small model must not have to assemble for itself
+# ---------------------------------------------------------------------------
+
+# The graph the evaluation fixtures have: the flagged task feeds two tasks that
+# recorded success in the same run.
+FORGED_GRAPH = [
+    {"task_id": "prepare_disbursement_file", "downstream_task_ids": ["remit_payment_batch"]},
+    {"task_id": "remit_payment_batch", "downstream_task_ids": ["archive_bundles"]},
+    {"task_id": "archive_bundles", "downstream_task_ids": ["publish_cycle_summary"]},
+    {"task_id": "publish_cycle_summary", "downstream_task_ids": []},
+]
+
+
+def _history_run(run_id: str, hours_ago: int, version: int | None = 2) -> dict:
+    run: dict = {
+        "dag_run_id": run_id,
+        "state": "success",
+        "run_after": f"2026-08-07T{12 - hours_ago:02d}:00:00Z",
+    }
+    if version is not None:
+        run["dag_versions"] = [{"version_number": version}]
+    return run
+
+
+def _recurring_forgery(
+    airflow,
+    *,
+    bare: int = 2,
+    dispatched: bool = True,
+    dispatched_version: int = 2,
+    dispatched_duration: float = 60.252736,
+    graph: list[dict] | None = None,
+) -> dict:
+    """A run whose flagged task also has rows in the runs before it.
+
+    ``bare`` newest runs record it success with no worker field; the run before
+    those either shows it genuinely dispatched or does not exist.
+    """
+    runs, cross = [], []
+    for index in range(bare):
+        run_id = f"manual__{9 - index}"
+        runs.append(_history_run(run_id, index))
+        cross.append({**FORGED_TI, "dag_run_id": run_id})
+    if dispatched:
+        run_id = f"manual__{9 - bare}"
+        runs.append(_history_run(run_id, bare, dispatched_version))
+        cross.append(
+            {
+                **EXECUTED_TI,
+                "task_id": FORGED_TI["task_id"],
+                "duration": dispatched_duration,
+                "dag_run_id": run_id,
+            }
+        )
+    airflow.runs = runs
+    airflow.cross_run_tis = cross
+    airflow.tasks = graph if graph is not None else FORGED_GRAPH
+    airflow.task_instances = [
+        FORGED_TI,
+        _executed("prepare_disbursement_file"),
+        _executed("archive_bundles"),
+        _executed("publish_cycle_summary"),
+    ]
+    _with_own_history(airflow)
+    return server.diagnose_dag(DAG_ID)
+
+
+def test_the_headline_names_the_run_and_its_state_beside_the_problem_count(airflow):
+    """ "The run is green and something in it did not run" was spread over three
+    keys, two of which say success on their own."""
+    _with_own_history(airflow)
+
+    summary = _green_run(airflow, EXECUTED_TI, FORGED_TI)["summary"]
+
+    assert summary.startswith(
+        "Run `manual__1` is recorded success, and this diagnosis still found 1 problem."
+    )
+
+
+def test_the_diagnosis_field_stops_contradicting_the_summary(airflow):
+    """It is the key literally called ``diagnosis``, so it is the one read out."""
+    _with_own_history(airflow)
+
+    result = _green_run(airflow, EXECUTED_TI, FORGED_TI)
+
+    assert "no failed task instances" not in result["diagnosis"]
+    assert result["diagnosis"] == (
+        "run manual__1 is success and no task instance in it failed, but this diagnosis found "
+        "problems in it — read `summary`, not this line"
+    )
+
+
+def test_the_diagnosis_field_still_says_so_when_nothing_was_found(airflow):
+    result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
+
+    assert result["diagnosis"] == (
+        "run manual__1 is success and no task instance in it failed; see `summary` for what was "
+        "and was not established"
+    )
+
+
+def test_the_finding_closes_the_triggerer_and_no_op_readings_with_another_run(airflow):
+    """The finding raises the triggerer explanation itself and used to leave it
+    open; the row that closes it was in `run_history` and nowhere in the prose."""
+    detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
+
+    assert "The same task was dispatched on run `manual__8`" in detail
+    assert 'hostname "b256b32ddda1" and pid 119178 with duration 60.252736' in detail
+    assert "nor a task that does nothing accounts for the attempt diagnosed here" in detail
+
+
+def test_the_finding_reports_the_recorded_dag_version_of_both_runs(airflow):
+    detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
+
+    assert (
+        "Both runs are recorded at dag_version 2, so the recorded Dag version does not differ "
+        "between the run where this task was dispatched and this one"
+    ) in detail
+
+
+def test_the_finding_says_so_when_the_two_runs_do_not_carry_the_same_version(airflow):
+    """A version difference is not silently reported as a version match."""
+    detail = _findings(_recurring_forgery(airflow, bare=1, dispatched_version=1))[0]["detail"]
+
+    assert "That run is recorded at dag_version 1 and this one at dag_version 2" in detail
+    assert "does not differ" not in detail
+
+
+def test_the_finding_counts_the_consecutive_runs_it_is_missing_from(airflow):
+    """One diagnosed run is one problem; four cycles of it is a different fact."""
+    detail = _findings(_recurring_forgery(airflow, bare=4))[0]["detail"]
+
+    assert (
+        "the same task carries no worker-written field (hostname empty, pid null) on 4 "
+        "consecutive run(s) ending with this one, out of the 5 most recent run(s) this diagnosis "
+        "compared — `manual__9`, `manual__8`, `manual__7`, `manual__6`"
+    ) in detail
+
+
+def test_the_recurrence_clause_names_no_more_runs_than_its_ceiling(airflow, monkeypatch):
+    monkeypatch.setattr(server, "DISPATCH_CONTRAST_RUN_LIMIT", 2)
+
+    detail = _findings(_recurring_forgery(airflow, bare=4))[0]["detail"]
+
+    assert "`manual__9`, `manual__8` and 2 more" in detail
+
+
+def test_a_single_bare_run_is_not_reported_as_a_recurrence(airflow):
+    detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
+
+    assert "consecutive run(s) ending with this one" not in detail
+
+
+def test_no_contrast_is_invented_when_no_other_run_carries_a_worker_field(airflow):
+    """The clause that excludes the triggerer is earned off a row, or withheld."""
+    detail = _findings(_recurring_forgery(airflow, bare=2, dispatched=False))[0]["detail"]
+
+    assert "was dispatched on run" not in detail
+    assert "accounts for the attempt diagnosed here" not in detail
+    assert "consecutive run(s) ending with this one" in detail
+
+
+def test_the_finding_names_what_ran_downstream_of_it_and_that_nothing_alerted(airflow):
+    """The one thing no field in this result said: a green run raises nothing."""
+    detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
+
+    assert (
+        "Operational effect: the run is recorded success, so this finding raises no failure and "
+        "fires no alert of its own, and 2 task(s) downstream of it in the task graph are recorded "
+        "in this run with this attempt already marked success: `archive_bundles` (success), "
+        "`publish_cycle_summary` (success)"
+    ) in detail
+
+
+def test_the_impact_clause_still_reports_the_run_with_nothing_downstream(airflow):
+    graph = [{"task_id": FORGED_TI["task_id"], "downstream_task_ids": []}]
+
+    detail = _findings(_recurring_forgery(airflow, bare=1, graph=graph))[0]["detail"]
+
+    assert detail.endswith(
+        "Operational effect: the run is recorded success, so this finding raises no failure and "
+        f"fires no alert of its own. {server._NOT_ESTABLISHED}"
+    )
+
+
+def test_the_impact_clause_never_says_a_failed_run_raised_no_alert(airflow):
+    """Observed live on gate0_version_drop: the run IS failed, so alerting fired,
+    and the clause said the opposite."""
+    airflow.runs = [_history_run("manual__9", 0)]
+    airflow.runs[0]["state"] = "failed"
+    airflow.cross_run_tis = [{**FORGED_TI, "dag_run_id": "manual__9"}]
+    airflow.tasks = FORGED_GRAPH
+    airflow.task_instances = [FORGED_TI, {"task_id": "archive_bundles", "try_number": 1, "state": "failed"}]
+    _with_own_history(airflow)
+
+    detail = _findings(server.diagnose_dag(DAG_ID))[0]["detail"]
+
+    assert "raises no failure" not in detail
+    assert (
+        "Operational effect: the run is recorded failed, so whatever that state raises is raised "
+        "by the run and not by this finding"
+    ) in detail
+
+
+def test_the_impact_clause_names_no_more_tasks_than_its_ceiling(airflow, monkeypatch):
+    monkeypatch.setattr(server, "DISPATCH_IMPACT_TASK_LIMIT", 1)
+
+    detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
+
+    assert "`archive_bundles` (success) and 1 more" in detail
+
+
+def test_the_added_evidence_never_displaces_the_closing_restraint(airflow):
+    """Everything folded in goes BEFORE the sentence that withholds attribution."""
+    detail = _findings(_recurring_forgery(airflow, bare=2))[0]["detail"]
+
+    assert detail.endswith(server._NOT_ESTABLISHED)
+    assert detail.index("The same task was dispatched") < detail.index(server._NOT_ESTABLISHED)
+
+
+def test_every_folded_clause_reaches_the_summary_verbatim(airflow):
+    """`detail` is folded into rather than added beside because `summary` is the
+    only part of a 40 kB payload a small model reliably reads out."""
+    result = _recurring_forgery(airflow, bare=2)
+
+    detail = _findings(result)[0]["detail"]
+    label = "Success with no worker-dispatch fields for the recorded attempt"
+    assert f"(1) {label}: {detail}." in result["summary"]
+
+
+def test_the_folded_evidence_never_names_an_actor_or_an_interface(airflow):
+    """Attribution stays where it was: nothing added here may assert who acted."""
+    detail = _findings(_recurring_forgery(airflow, bare=2))[0]["detail"]
+    added = detail[detail.index("The same task was dispatched") :]
+
+    for banned in ("admin", "rest_api", "PATCH", "the user", "someone", "was authorized"):
+        assert banned not in added
+
+
+def test_a_demoted_row_says_what_it_does_establish_as_well_as_what_it_does_not(airflow):
+    """A positive audit record proves a request was received and logged — a fact
+    that lived only in the legend, which is not what gets read out."""
+    _with_own_history(airflow)
+
+    detail = _findings(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]))[0]["detail"]
+
+    assert (
+        "a row like that establishes only that a request naming that action was received and "
+        "logged, and never that the request succeeded, cleared authorization, or wrote this state"
+    ) in detail
+
+
+def test_a_run_the_caller_may_not_read_is_not_reported_as_a_missing_one(airflow, monkeypatch):
+    """403 and 404 collapsed into one sentence, so an authorization failure read
+    as a typo and sent the caller looking for a different run."""
+
+    def refuse(method, path, **kwargs):
+        if path == f"/dags/{DAG_ID}/dagRuns/manual__1":
+            raise httpx.HTTPStatusError(
+                "no", request=httpx.Request(method, "http://internal/x"), response=httpx.Response(403)
+            )
+        return airflow(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_api", refuse)
+
+    result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1")
+
+    assert result["error"] == (
+        "the run 'manual__1' of sales_summary could not be read (HTTP 403); this is a permission "
+        "refusal, not evidence that the run does not exist"
+    )
+
+
+def test_the_missing_run_error_says_how_to_name_a_run_instead(airflow):
+    """The occasion to guess a run id is a date the caller retyped without its offset."""
+    result = server.diagnose_dag(DAG_ID, dag_run_id="scheduled__2026-08-07T13:15:00")
+
+    assert "pass 'latest' or 'previous' instead of composing one" in result["error"]
+
+
+def test_diagnose_dag_documents_the_run_aliases_it_already_accepts(airflow):
+    """They were only ever documented on ``compare_dag_runs``, so a model that
+    wanted one exact run composed the id by hand."""
+    assert "``latest``/``previous``" in server.diagnose_dag.__doc__
+
+
+def test_compare_dag_runs_reports_a_task_that_stopped_being_dispatched(airflow):
+    """Durations alone call a recurrent forgery the most stable task in the Dag."""
+    seed_two_runs(airflow)
+    airflow.tis_by_run = {
+        "old": [{**EXECUTED_TI, "task_id": "remit_payment_batch", "duration": 0.0}],
+        "new": [{**FORGED_TI, "duration": 0.0}],
+    }
+
+    row = server.compare_dag_runs(DAG_ID, "old", "new")["task_durations"][0]
+
+    assert row["delta"] == 0.0
+    assert row["run_a_worker_field"] is True
+    assert row["run_b_worker_field"] is False
+
+
+def test_find_failure_clusters_says_an_empty_result_is_not_an_all_clear(airflow):
+    result = server.find_failure_clusters(hours=48, dag_ids=[DAG_ID])
+
+    assert result["clusters"] == []
+    assert "does not mean the Dags are healthy" in result["scope"]
+    assert "diagnose_dag finds those" in result["scope"]
+
+
+def test_get_blast_radius_says_empty_lists_mean_no_asset_edges(airflow):
+    airflow.assets = []
+
+    result = server.get_blast_radius(DAG_ID)
+
+    assert result["downstream_dags"] == []
+    assert "not that a failure in it has no consequences" in result["scope"]

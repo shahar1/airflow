@@ -508,6 +508,45 @@ def test_system_prompt_demands_every_finding_be_reported():
         assert field in plugin._SYSTEM_PROMPT
 
 
+def test_system_prompt_ranks_summary_above_the_green_fields_beside_it():
+    """Four fields say the run succeeded and one `summary` says otherwise."""
+    normalized = " ".join(plugin._SYSTEM_PROMPT.split())
+
+    assert "`summary` outranks every other field" in normalized
+    for beaten in ("`diagnosis`", "`run_state`", "`run_health.state`"):
+        assert beaten in normalized
+    assert "A green run is not automatically a healthy one" in normalized
+
+
+def test_every_session_gets_the_diagnosis_discipline_not_only_writers():
+    """It lived in the write prompt, so read-only users got none of it."""
+    read_only = plugin._render_system_prompt(None, can_write=False)
+    normalized = " ".join(read_only.split())
+
+    assert "confirmed failure" in normalized
+    assert "latent blocker" in normalized
+    assert "copied verbatim from `log_tail`" in normalized
+    assert "never tell the user a task has no logs" in normalized
+
+
+def test_the_diagnosis_shape_names_the_sections_it_must_keep_apart():
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=False).split())
+
+    for section in ("observed", "rules out", "unknown", "operational impact"):
+        assert section in normalized
+
+
+def test_system_prompt_forbids_naming_who_acted():
+    """`last_state_change` hands over a principal, an interface and a method."""
+    normalized = " ".join(plugin._SYSTEM_PROMPT.split())
+
+    assert "Never say who acted" in normalized
+    assert "received and logged" in normalized
+    assert "leave the actor unnamed" in normalized
+    assert "not evidence of a direct database write" in normalized
+    assert "`try_number` is not a verdict on its own" in normalized
+
+
 def test_system_prompt_separates_fact_from_inference():
     assert "Fact versus inference" in plugin._SYSTEM_PROMPT
     assert "never present a guess" in plugin._SYSTEM_PROMPT
