@@ -18,13 +18,15 @@
  */
 
 import { Box, IconButton } from "@chakra-ui/react";
-import { FC } from "react";
+import { FC, Ref } from "react";
 
 import { ChatIcon } from "./icons/ChatIcon";
 
 interface ChatButtonProps {
   readonly onClick: () => void;
   readonly isOpen: boolean;
+  /** Lets the owner hand focus back here when the drawer closes. */
+  readonly ref?: Ref<HTMLButtonElement>;
 }
 
 /**
@@ -32,7 +34,7 @@ interface ChatButtonProps {
  * Uses Airflow's brand colors and follows the design system.
  * Hidden when the chat drawer is open.
  */
-export const ChatButton: FC<ChatButtonProps> = ({ isOpen, onClick }) => {
+export const ChatButton: FC<ChatButtonProps> = ({ isOpen, onClick, ref }) => {
   // Hide the button when drawer is open
   if (isOpen) {
     return null;
@@ -46,6 +48,7 @@ export const ChatButton: FC<ChatButtonProps> = ({ isOpen, onClick }) => {
       zIndex="popover"
     >
       <IconButton
+        ref={ref}
         aria-label="Open Airy"
         onClick={onClick}
         borderRadius="full"

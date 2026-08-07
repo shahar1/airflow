@@ -17,20 +17,24 @@
  * under the License.
  */
 import { Box, chakra, Flex, Spinner, Text, VisuallyHidden, VStack } from "@chakra-ui/react";
-import { FC, memo, ReactNode, useEffect, useRef, useState } from "react";
+import { FC, memo, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import Markdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { useColorMode } from "src/context/colorMode";
 
+import { hostBasePrefix } from "../basePath";
+import { frameProvenDagIds } from "../hooks/useChat";
+import { useLocationPathname } from "../hooks/useLocationPathname";
 import { SparkleIcon } from "./icons/SparkleIcon";
 import { ConfirmRequest, Message, ToolCall } from "./types";
 
 /**
  * `[ACTION: Re-run sales_summary]` lines are stripped from the rendered text and
  * turned into chips that send their own label as the next user message.
+ * Case-insensitive: the model sometimes emits `[action: …]`.
  */
-const ACTION_RE = /^[\s>*-]*\**\[ACTION:\s*(.+?)\]\**\s*$/gmu;
+const ACTION_RE = /^[\s>*-]*\**\[ACTION:\s*(.+?)\]\**\s*$/gimu;
 
 export const splitActions = (content: string, streaming = false): { actions: string[]; text: string } => {
   const actions = [...content.matchAll(ACTION_RE)].map((m) => m[1]?.trim() ?? "").filter(Boolean);
@@ -55,6 +59,16 @@ interface MessageListProps {
 /** Distance from the bottom still counted as "following the stream". */
 const AT_BOTTOM_SLACK_PX = 80;
 
+/**
+ * Scroll the log container itself — never `scrollIntoView` on a sentinel.
+ * That walks every scrollable ancestor, and programmatic scrolling reaches
+ * even the drawer's overflow-clipped wrapper, which has no scrollbar to bring
+ * it back: one nudge and the transcript sits above the viewport for good.
+ */
+const scrollToEnd = (el: HTMLElement | null, behavior: ScrollBehavior) => {
+  el?.scrollTo({ behavior, top: el.scrollHeight });
+};
+
 // Not anchored at the start: Airflow is often served below a URL prefix, so
 // `/prod/dags/sales_summary/grid` has to match as readily as `/dags/…`.
 const DAG_PATH_RE = /\/dags\/([^/?#]+)/u;
@@ -78,8 +92,53 @@ export const buildPrompts = (pathname: string): string[] => {
   const dagId = dagIdFromPath(pathname);
   return dagId === undefined
     ? GENERIC_PROMPTS
-    : [`Why did ${dagId} fail?`, `Check ${dagId} for warnings`, `Summarise recent runs of ${dagId}`];
+    : [`Why did ${dagId} fail?`, `Check ${dagId} for warnings`, `Summarize recent runs of ${dagId}`];
 };
+
+/**
+ * Dag ids the transcript can prove exist: named in a tool call's arguments, a
+ * confirm card, or a `resource_changed` frame. Prose alone proves nothing, so
+ * a backticked id is only ever linkified against this set.
+ */
+export const collectKnownDagIds = (messages: Message[]): ReadonlySet<string> => {
+  const ids = new Set(frameProvenDagIds);
+  for (const message of messages) {
+    for (const source of [...(message.tools ?? []), ...(message.confirms ?? [])]) {
+      const dagId = parseArgs(source.args).dag_id;
+      if (typeof dagId === "string" && dagId !== "") ids.add(dagId);
+    }
+  }
+  return ids;
+};
+
+/**
+ * Where a markdown link should go, and how.
+ *
+ * External links open in a new tab with `rel` hardening so a model-emitted URL
+ * can never navigate the Airflow tab away or reach back via window.opener.
+ * Same-origin absolute paths are resolved against the deployment's base-path
+ * prefix and stay in this tab.
+ */
+export const resolveMarkdownHref = (
+  href: string | undefined,
+  prefix: string,
+  origin: string,
+): { external: boolean; href: string } | undefined => {
+  if (href === undefined || href === "") return undefined;
+  if (href.startsWith("#")) return { external: false, href };
+  try {
+    const url = new URL(href, `${origin}/`);
+    if (url.origin !== origin) return { external: true, href };
+    if (href.startsWith("/") && prefix !== "" && href !== prefix && !href.startsWith(`${prefix}/`)) {
+      return { external: false, href: `${prefix}${href}` };
+    }
+    return { external: false, href };
+  } catch {
+    return { external: false, href };
+  }
+};
+
+const buildDagHref = (dagId: string): string => `${hostBasePrefix()}/dags/${encodeURIComponent(dagId)}`;
 
 /**
  * Message list component displaying chat history.
@@ -96,37 +155,94 @@ export const MessageList: FC<MessageListProps> = ({
   streamingId,
 }) => {
   const { colorMode } = useColorMode();
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const pathname = useLocationPathname();
   const containerRef = useRef<HTMLDivElement>(null);
   // A ref, not state: a render caused by a new token would otherwise measure
   // the freshly-grown scrollHeight and mistake it for the user's position.
   const atBottomRef = useRef(true);
   const [hasNewer, setHasNewer] = useState(false);
+  const wasLoadingRef = useRef(isLoading);
+  const [completionNote, setCompletionNote] = useState("");
+  // Identity only changes when the contents do, so MessageBubble's memo holds
+  // across the token-by-token re-renders of a streaming reply.
+  const knownDagIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const collected = collectKnownDagIds(messages);
+  if (
+    collected.size !== knownDagIdsRef.current.size ||
+    ![...collected].every((id) => knownDagIdsRef.current.has(id))
+  ) {
+    knownDagIdsRef.current = collected;
+  }
+  const knownDagIds = knownDagIdsRef.current;
 
   const isDark = colorMode === "dark";
 
-  const scrollToBottom = (behavior: ScrollBehavior) => {
+  // A smooth programmatic scroll fires scroll events at every intermediate
+  // position; read as the user's own scrolling, one of those (>80px from the
+  // bottom) would silently switch the auto-follow off mid-stream.
+  const programmaticScrollRef = useRef(false);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior) => {
+    programmaticScrollRef.current = true;
     atBottomRef.current = true;
     setHasNewer(false);
-    bottomRef.current?.scrollIntoView({ behavior });
-  };
+    scrollToEnd(containerRef.current, behavior);
+  }, []);
+
+  // The visible end of a streamed answer is silent for a screen-reader user;
+  // one polite note marks it without interrupting anything mid-sentence.
+  useEffect(() => {
+    if (wasLoadingRef.current && !isLoading) setCompletionNote("Airy finished responding");
+    if (!wasLoadingRef.current && isLoading) setCompletionNote("");
+    wasLoadingRef.current = isLoading;
+  }, [isLoading]);
 
   const handleScroll = () => {
     const el = containerRef.current;
     if (!el) return;
     const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - AT_BOTTOM_SLACK_PX;
+    if (programmaticScrollRef.current) {
+      // Our own scroll in flight: its intermediate positions are not the
+      // user's doing. It has arrived once the bottom reads true.
+      if (atBottom) programmaticScrollRef.current = false;
+      return;
+    }
     atBottomRef.current = atBottom;
     if (atBottom) setHasNewer(false);
   };
 
+  /** The user taking over (wheel, touch, keys) always outranks the guard. */
+  const handleUserScrollIntent = () => {
+    programmaticScrollRef.current = false;
+  };
+
   useEffect(() => {
     if (atBottomRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
-      setHasNewer(false);
+      scrollToBottom(isLoading ? "auto" : "smooth");
     } else {
       setHasNewer(true);
     }
-  }, [messages, isLoading]);
+  }, [messages, isLoading, scrollToBottom]);
+
+  // The decision card must end on screen: a new suspended approval, and the
+  // turn settling, both force the view back to the bottom.
+  const pendingConfirms = messages.reduce(
+    (count, message) =>
+      count + (message.confirms?.filter((confirm) => confirm.resolution === undefined).length ?? 0),
+    0,
+  );
+  const prevPendingRef = useRef(pendingConfirms);
+  useEffect(() => {
+    // A new suspended approval outranks a reading position: the decision card
+    // is the turn's purpose. The end of an ordinary stream does not — a user
+    // who scrolled up on purpose keeps their place and the Jump-to-latest
+    // pill; the programmatic-scroll guard already prevents the accidental
+    // strandings that used to end turns below the fold.
+    if (pendingConfirms > prevPendingRef.current) {
+      scrollToBottom("auto");
+    }
+    prevPendingRef.current = pendingConfirms;
+  }, [pendingConfirms, scrollToBottom]);
 
   if (messages.length === 0 && !isLoading) {
     return (
@@ -144,7 +260,7 @@ export const MessageList: FC<MessageListProps> = ({
             </Text>
           </VStack>
           <VStack gap={2} mt={4} width="100%">
-            {buildPrompts(globalThis.location.pathname).map((prompt) => (
+            {buildPrompts(pathname).map((prompt) => (
               <SuggestionChip key={prompt} onClick={onSuggestionClick}>
                 {prompt}
               </SuggestionChip>
@@ -160,6 +276,18 @@ export const MessageList: FC<MessageListProps> = ({
       <Box
         ref={containerRef}
         onScroll={handleScroll}
+        onWheel={handleUserScrollIntent}
+        onTouchStart={handleUserScrollIntent}
+        onKeyDown={handleUserScrollIntent}
+        role="log"
+        aria-label="Conversation with Airy"
+        // role=log is implicitly polite: token-by-token re-renders would spam
+        // a screen reader for the whole reply. The dedicated status regions
+        // below announce tool activity and completion instead.
+        aria-live={isLoading ? "off" : "polite"}
+        // Focusable so the transcript can be scrolled from the keyboard.
+        tabIndex={0}
+        _focusVisible={{ outline: "2px solid", outlineColor: "brand.500", outlineOffset: "-2px" }}
         height="100%"
         overflowY="auto"
         px={4}
@@ -186,6 +314,7 @@ export const MessageList: FC<MessageListProps> = ({
                 key={message.id}
                 message={message}
                 isStreaming={streaming}
+                knownDagIds={knownDagIds}
                 // Chips do nothing while a stream is in flight, so don't offer them.
                 onActionClick={isLoading ? undefined : onSuggestionClick}
                 onConfirmClick={isLoading ? undefined : onConfirmClick}
@@ -194,13 +323,15 @@ export const MessageList: FC<MessageListProps> = ({
             );
           })}
           {isLoading && isBlank(messages[messages.length - 1], true) && <LoadingIndicator />}
-          <div ref={bottomRef} />
         </VStack>
       </Box>
       {/* Mounted before its text ever changes: a region that appears together
           with its message is announced far less reliably. */}
       <VisuallyHidden role="status" aria-live="polite" aria-atomic="true">
         {buildToolAnnouncement(messages)}
+      </VisuallyHidden>
+      <VisuallyHidden role="status" aria-live="polite" aria-atomic="true">
+        {completionNote}
       </VisuallyHidden>
       {hasNewer && (
         <Box
@@ -243,6 +374,7 @@ export const buildToolAnnouncement = (messages: Message[]): string => {
 interface MessageBubbleProps {
   readonly message: Message;
   readonly isStreaming?: boolean;
+  readonly knownDagIds?: ReadonlySet<string>;
   readonly onActionClick?: (text: string) => void;
   readonly onConfirmClick?: (nonce: string, approved: boolean) => void;
   readonly onRetry?: (errorMessageId: string) => void;
@@ -258,6 +390,8 @@ interface MessageBubbleProps {
 export const canRetry = (messages: Message[], index: number): boolean => {
   const message = messages[index];
   if (message?.isError !== true || message.role !== "assistant") return false;
+  // The server said retrying cannot help (bad API key, for instance).
+  if (message.retryable === false) return false;
   if (message.confirms?.some((confirm) => confirm.resolution === "approved")) return false;
   if (message.tools?.some((tool) => WRITE_EFFECTS[tool.name] && !UNSTARTED.has(buildToolStatus(tool)))) {
     return false;
@@ -272,7 +406,8 @@ const diffLineKind = (line: string): "add" | "del" | undefined =>
 
 const diffPalette = (isDark: boolean) => ({
   add: isDark ? "var(--chakra-colors-green-300)" : "var(--chakra-colors-green-600)",
-  del: isDark ? "var(--chakra-colors-red-300)" : "var(--chakra-colors-red-600)",
+  // red-600 on the light diff background is under the AA contrast floor.
+  del: isDark ? "var(--chakra-colors-red-300)" : "var(--chakra-colors-red-700)",
 });
 
 /** One `-`/`+` prefixed line, coloured by kind; the unit both diff views share. */
@@ -300,19 +435,53 @@ const DiffLines: FC<{ readonly isDark: boolean; readonly lines: string[] }> = ({
  * The fix diff is the money shot of the self-healing flow; flat grey text
  * undersells it. Colour +/- lines inside ```diff fences, leave every other
  * code block to the default renderer.
+ *
+ * Also: safe `a` handling (external links hardened, internal ones resolved
+ * against the base path) and linkification of backticked Dag ids the
+ * transcript has proven to exist.
  */
-const buildMarkdownComponents = (isDark: boolean): Components => ({
+const buildMarkdownComponents = (isDark: boolean, dagIds?: ReadonlySet<string>): Components => ({
+  a: ({ children, href, ...props }) => {
+    delete (props as Record<string, unknown>).node;
+    const resolved = resolveMarkdownHref(href, hostBasePrefix(), globalThis.location.origin);
+    if (resolved === undefined) {
+      return <a {...props}>{children}</a>;
+    }
+    return resolved.external ? (
+      <a {...props} href={resolved.href} rel="noopener noreferrer" target="_blank">
+        {children}
+      </a>
+    ) : (
+      <a {...props} href={resolved.href}>
+        {children}
+      </a>
+    );
+  },
   code: ({ children, className, ...props }) => {
-    if (!DIFF_LANG_RE.test(className ?? "")) {
+    if (DIFF_LANG_RE.test(className ?? "")) {
       return (
-        <code className={className} {...props}>
-          {children}
+        <code className={className}>
+          <DiffLines isDark={isDark} lines={String(children).replace(/\n$/u, "").split("\n")} />
         </code>
       );
     }
+    // Inline code (fenced blocks carry a className or a newline) naming a
+    // proven Dag id becomes a link to that Dag's page.
+    if (
+      className === undefined &&
+      typeof children === "string" &&
+      !children.includes("\n") &&
+      dagIds?.has(children) === true
+    ) {
+      return (
+        <a data-dag-link={children} href={buildDagHref(children)}>
+          <code {...props}>{children}</code>
+        </a>
+      );
+    }
     return (
-      <code className={className}>
-        <DiffLines isDark={isDark} lines={String(children).replace(/\n$/u, "").split("\n")} />
+      <code className={className} {...props}>
+        {children}
       </code>
     );
   },
@@ -338,7 +507,7 @@ const isBlank = (message?: Message, streaming = false): boolean => {
 };
 
 const MessageBubble: FC<MessageBubbleProps> = memo(
-  ({ isStreaming = false, message, onActionClick, onConfirmClick, onRetry }) => {
+  ({ isStreaming = false, knownDagIds, message, onActionClick, onConfirmClick, onRetry }) => {
     const { colorMode } = useColorMode();
     const isDark = colorMode === "dark";
     const { actions, text } = splitActions(message.content, isStreaming);
@@ -359,11 +528,11 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
             wordBreak="break-word"
             fontSize="md"
             lineHeight="tall"
-            css={{ ...markdownCss(isDark), ...buildSelectionCss(isDark) }}
+            css={buildSelectionCss(isDark)}
           >
-            <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
-              {text}
-            </Markdown>
+            <VisuallyHidden>You said:</VisuallyHidden>
+            {/* The user's own words, exactly as typed — never parsed as markdown. */}
+            <Text whiteSpace="pre-wrap">{message.content}</Text>
           </Box>
         </Flex>
       );
@@ -371,7 +540,13 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
 
     // Assistant: prose sits directly on the panel; only tool calls and errors keep a card.
     return (
-      <Flex align="flex-start">
+      <Flex
+        align="flex-start"
+        css={{
+          "& .airy-message-actions": { opacity: 0, transition: "opacity 0.15s" },
+          "&:hover .airy-message-actions, & .airy-message-actions:focus-within": { opacity: 1 },
+        }}
+      >
         <Flex
           align="center"
           justify="center"
@@ -385,6 +560,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
           <SparkleIcon />
         </Flex>
         <VStack align="flex-start" gap={2} flex="1" minWidth={0} maxWidth="720px">
+          <VisuallyHidden>Airy said:</VisuallyHidden>
           {tools.length > 0 && <ToolActivity tools={tools} />}
           {text ? (
             <Box
@@ -403,7 +579,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
               lineHeight="tall"
               css={markdownCss(isDark)}
             >
-              <Markdown components={buildMarkdownComponents(isDark)} remarkPlugins={[remarkGfm]}>
+              <Markdown components={buildMarkdownComponents(isDark, knownDagIds)} remarkPlugins={[remarkGfm]}>
                 {text}
               </Markdown>
             </Box>
@@ -417,6 +593,7 @@ const MessageBubble: FC<MessageBubbleProps> = memo(
               tools={tools}
             />
           ))}
+          {!isStreaming && text !== "" && <MessageCopyControl isDark={isDark} text={text} />}
           {onRetry !== undefined && (
             <SuggestionChip onClick={() => onRetry(message.id)}>Retry</SuggestionChip>
           )}
@@ -501,7 +678,8 @@ const WRITE_EFFECTS: Record<string, WriteEffect> = {
     approve: "Re-run Dag",
     badge: "Creates a Dag run",
     proposed: "Proposed Dag run",
-    summary: (args) => `Creates one manual run of ${describeDag(args)} using the latest parsed code.`,
+    summary: (args) =>
+      `Creates one manual run of ${describeDag(args)} using the latest parsed code.${describeRunExtras(args)}`,
     title: "Trigger a new Dag run",
   },
   revert_dag_code: {
@@ -529,7 +707,7 @@ const UNPAUSE_EFFECT: WriteEffect = {
   badge: "Unpauses Dag · resumes scheduled runs",
   proposed: "Proposed Dag run",
   summary: (args) =>
-    `Unpauses ${describeDag(args)}, resumes its future scheduled runs, and creates one manual run now.`,
+    `Unpauses ${describeDag(args)}, resumes its future scheduled runs, and creates one manual run now.${describeRunExtras(args)}`,
   title: "Re-run and resume this Dag's schedule",
 };
 
@@ -565,6 +743,36 @@ const describeTaskIds = (args: Record<string, unknown>): string => {
 
 const describeArg = (value: unknown): string =>
   typeof value === "string" && value ? `\`${value}\`` : "the requested date";
+
+/** Inline-code span that survives content containing backticks. */
+const wrapCodeSpan = (text: string): string =>
+  text.includes("`") ? `\`\` ${text} \`\`` : `\`${text}\``;
+
+const formatConfValue = (value: unknown): string => {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+};
+
+/**
+ * The conf and note a `rerun_dag` approval would apply, one code line each.
+ * They change what the approved run does, so the card has to show them.
+ */
+const describeRunExtras = (args: Record<string, unknown>): string => {
+  const conf =
+    typeof args.conf === "object" && args.conf !== null && !Array.isArray(args.conf)
+      ? Object.entries(args.conf as Record<string, unknown>)
+      : [];
+  const note = typeof args.note === "string" && args.note !== "" ? args.note : undefined;
+  const lines = [
+    ...conf.map(([key, value]) => wrapCodeSpan(`${key}: ${formatConfValue(value)}`)),
+    ...(note === undefined ? [] : [wrapCodeSpan(`note: ${formatConfValue(note)}`)]),
+  ];
+  // Hard line breaks (trailing double space) keep one key: value pair per line.
+  return lines.length === 0 ? "" : ` The run is created with:  \n${lines.join("  \n")}`;
+};
 
 export const parseArgs = (args: unknown): Record<string, unknown> => {
   const parsed = typeof args === "string" ? tryParse(args) : args;
@@ -643,7 +851,7 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, isStreaming, onDecide, 
       </Flex>
       {batch ? (
         <ConfirmHeading
-          effect="Modifies your Airflow"
+          effect={`Modifies your Airflow — one decision covers all ${confirms.length} actions`}
           isDark={isDark}
           title={`Approve ${confirms.length} actions`}
         />
@@ -795,6 +1003,8 @@ const ConfirmReceipt: FC<ConfirmReceiptProps> = ({ confirms, focusOnMount, isDar
 
   if (first === undefined) return undefined;
   const muted = isDark ? "gray.400" : "gray.600";
+  const label = buildReceiptLabel(state, states, first);
+  const hint = state === "applied" ? "View change" : "View proposal";
 
   return (
     <Box width="100%">
@@ -804,6 +1014,9 @@ const ConfirmReceipt: FC<ConfirmReceiptProps> = ({ confirms, focusOnMount, isDar
           ref={disclosureRef}
           onClick={() => setOpen((was) => !was)}
           aria-expanded={open}
+          // The visible texts would otherwise concatenate without a separator
+          // ("approved by youView change") as the accessible name.
+          aria-label={`${label} — ${hint}`}
           align="center"
           gap={2}
           flex="1"
@@ -818,10 +1031,10 @@ const ConfirmReceipt: FC<ConfirmReceiptProps> = ({ confirms, focusOnMount, isDar
         >
           <ToolStatusIcon status={RECEIPT_ICONS[state]} />
           <Text fontSize="sm" color={isDark ? "gray.200" : "gray.800"} flex="1" minWidth={0}>
-            {buildReceiptLabel(state, states, first)}
+            {label}
           </Text>
           <Text as="span" fontSize="xs" color={muted} flexShrink={0}>
-            {state === "applied" ? "View change" : "View proposal"}
+            {hint}
           </Text>
           <Box color={muted}>
             <Chevron open={open} />
@@ -996,6 +1209,11 @@ const ConfirmButton: FC<ConfirmButtonProps> = ({
 }) => {
   const { colorMode } = useColorMode();
   const isDark = colorMode === "dark";
+  // White on brand.500 is 4.38:1, under AA — the same darker blue the send
+  // button uses (Airflow's "Sign in" pair, 6.9:1), as literals because the
+  // host-provided Chakra system does not carry these tokens.
+  const primaryBg = "oklch(0.469 0.084 257.657)";
+  const primaryHoverBg = "oklch(0.399 0.084 257.850)";
 
   return (
     <chakra.button
@@ -1005,10 +1223,11 @@ const ConfirmButton: FC<ConfirmButtonProps> = ({
       px={4}
       py={1.5}
       minHeight={large ? "44px" : undefined}
-      bg={primary ? "brand.500" : isDark ? "gray.800" : "white"}
+      bg={primary ? primaryBg : isDark ? "gray.800" : "white"}
       color={primary ? "white" : isDark ? "gray.300" : "gray.700"}
+      _hover={primary && !disabled ? { bg: primaryHoverBg } : undefined}
       borderWidth="1px"
-      borderColor={primary ? "brand.500" : isDark ? "gray.600" : "gray.300"}
+      borderColor={primary ? primaryBg : isDark ? "gray.600" : "gray.300"}
       borderRadius="full"
       fontSize="sm"
       cursor={disabled ? "not-allowed" : "pointer"}
@@ -1024,10 +1243,17 @@ interface CodeBlockProps {
   readonly children?: ReactNode;
 }
 
+/** Collapse threshold for tall code blocks in message bodies. */
+const CODE_COLLAPSE_HEIGHT_PX = 320;
+/** Only clip when the hidden part is worth a click, not a sliver. */
+const CODE_COLLAPSE_SLACK_PX = 48;
+
 /**
  * A fenced code block with hover-revealed Copy and Wrap/Scroll controls.
  * Wrap is offered only when a line actually overflows, so short snippets keep
- * their exact formatting and no controls clutter.
+ * their exact formatting and no controls clutter.  Tall blocks (a quoted log,
+ * a whole Dag file) collapse to a fixed height so they cannot bury the
+ * conversation, with an explicit control to expand.
  */
 const CodeBlock: FC<CodeBlockProps> = ({ children, ...props }) => {
   // react-markdown hands its AST node along; that must not reach the DOM.
@@ -1039,6 +1265,8 @@ const CodeBlock: FC<CodeBlockProps> = ({ children, ...props }) => {
   const [wrapped, setWrapped] = useState(false);
   const [copyLabel, setCopyLabel] = useState("Copy");
   const [overflows, setOverflows] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [collapsible, setCollapsible] = useState(false);
 
   // Re-measure while unwrapped (content still streaming in, panel resized);
   // once wrapped there is nothing to measure and the toggle must stay.
@@ -1052,6 +1280,19 @@ const CodeBlock: FC<CodeBlockProps> = ({ children, ...props }) => {
     return () => observer.disconnect();
   }, [children, wrapped]);
 
+  // scrollHeight reports the full content height even while clipped, so this
+  // keeps measuring truthfully as the block streams in.
+  useEffect(() => {
+    const el = preRef.current;
+    if (!el) return undefined;
+    const measure = () =>
+      setCollapsible(el.scrollHeight > CODE_COLLAPSE_HEIGHT_PX + CODE_COLLAPSE_SLACK_PX);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [children]);
+
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(preRef.current?.textContent ?? "");
@@ -1062,6 +1303,8 @@ const CodeBlock: FC<CodeBlockProps> = ({ children, ...props }) => {
     }
     setTimeout(() => setCopyLabel("Copy"), 1500);
   };
+
+  const clipped = collapsible && !expanded;
 
   return (
     <Box
@@ -1083,26 +1326,88 @@ const CodeBlock: FC<CodeBlockProps> = ({ children, ...props }) => {
       </Flex>
       <pre
         ref={preRef}
-        style={wrapped ? { whiteSpace: "pre-wrap", wordBreak: "break-word" } : undefined}
+        style={{
+          ...(wrapped ? { whiteSpace: "pre-wrap", wordBreak: "break-word" } : {}),
+          ...(clipped ? { maxHeight: `${CODE_COLLAPSE_HEIGHT_PX}px`, overflowY: "hidden" } : {}),
+        }}
         {...preProps}
       >
         {children}
       </pre>
+      {collapsible && (
+        <Box
+          as="button"
+          onClick={() => setExpanded((e) => !e)}
+          aria-expanded={expanded}
+          width="100%"
+          py={1}
+          fontSize="xs"
+          borderRadius="sm"
+          bg={isDark ? "whiteAlpha.100" : "blackAlpha.50"}
+          color={isDark ? "gray.300" : "gray.600"}
+          cursor="pointer"
+          _hover={{ bg: isDark ? "whiteAlpha.200" : "blackAlpha.100" }}
+          _focusVisible={{ outline: "2px solid", outlineColor: "brand.500" }}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+interface MessageCopyControlProps {
+  readonly isDark: boolean;
+  /** The message's markdown, as streamed — what a ticket wants pasted. */
+  readonly text: string;
+}
+
+/**
+ * Hover/focus-revealed copy for a whole assistant answer. Same clipboard
+ * honesty as the code-block control: a blocked clipboard says "Copy failed"
+ * instead of pretending.
+ */
+const MessageCopyControl: FC<MessageCopyControlProps> = ({ isDark, text }) => {
+  const [label, setLabel] = useState("Copy message");
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setLabel("Copied");
+    } catch {
+      setLabel("Copy failed");
+    }
+    setTimeout(() => setLabel("Copy message"), 1500);
+  };
+
+  return (
+    <Box className="airy-message-actions">
+      <CodeControl aria-label="Copy message" isDark={isDark} onClick={copy}>
+        {label}
+      </CodeControl>
     </Box>
   );
 };
 
 interface CodeControlProps {
+  readonly "aria-label"?: string;
   readonly children: string;
   readonly isDark: boolean;
   readonly onClick: () => void;
   readonly pressed?: boolean;
 }
 
-const CodeControl: FC<CodeControlProps> = ({ children, isDark, onClick, pressed }) => (
+const CodeControl: FC<CodeControlProps> = ({
+  "aria-label": ariaLabel,
+  children,
+  isDark,
+  onClick,
+  pressed,
+}) => (
   <Box
     as="button"
     onClick={onClick}
+    aria-label={ariaLabel}
     aria-pressed={pressed}
     // Every other target already clears the 24px minimum; this one did not.
     minHeight="24px"
@@ -1451,8 +1756,10 @@ const formatArgs = (args: unknown): string => {
     // Malformed argument JSON still deserves a glimpse in the compact line.
     return typeof args === "string" && args !== "" ? `(${truncate(args)})` : "";
   }
+  // JSON for objects and arrays — String() would print "[object Object]".
   const pairs = Object.entries(parsed as Record<string, unknown>).map(
-    ([key, value]) => `${key}=${truncate(String(value))}`,
+    ([key, value]) =>
+      `${key}=${truncate(typeof value === "string" ? value : (JSON.stringify(value) ?? String(value)))}`,
   );
   return `(${pairs.join(", ")})`;
 };
@@ -1502,10 +1809,15 @@ const markdownCss = (isDark: boolean) => ({
   },
   "& pre code": { background: "transparent", padding: 0 },
   "& table": { display: "block", maxWidth: "100%", overflowX: "auto", width: "fit-content" },
+  // The message body's break-word would let table columns shrink below their
+  // content and wrap code identifiers one letter per line; cells keep whole
+  // words and the table scrolls in its own container instead.
+  "& table code": { whiteSpace: "nowrap" },
   "& th, & td": {
     borderBottom: isDark ? "1px solid rgba(255,255,255,0.15)" : "1px solid rgba(0,0,0,0.1)",
     padding: "0.2em 0.5em",
     textAlign: "left",
+    wordBreak: "normal",
   },
   "& ul, & ol": { paddingLeft: "1.25em" },
 });

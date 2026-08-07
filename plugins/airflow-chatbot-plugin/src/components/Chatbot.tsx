@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { FC, useState } from "react";
+import { FC, useEffect, useRef, useState } from "react";
 
 import { useChat, useHealth } from "../hooks/useChat";
 import { ChatButton } from "./ChatButton";
@@ -28,6 +28,8 @@ import { ChatDrawer } from "./ChatDrawer";
  */
 export const Chatbot: FC = () => {
   const [isOpen, setIsOpen] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const wasOpenRef = useRef(false);
   const {
     canStop,
     clearMessages,
@@ -40,7 +42,14 @@ export const Chatbot: FC = () => {
     stopResponse,
     streamingId,
   } = useChat();
-  const { health } = useHealth();
+  const { health, recheckHealth } = useHealth();
+
+  // The trigger unmounts while the drawer is open, so focus cannot be captured
+  // and given back — instead it lands on the freshly remounted button on close.
+  useEffect(() => {
+    if (wasOpenRef.current && !isOpen) buttonRef.current?.focus();
+    wasOpenRef.current = isOpen;
+  }, [isOpen]);
 
   const handleToggle = () => {
     setIsOpen((prev) => !prev);
@@ -66,8 +75,9 @@ export const Chatbot: FC = () => {
         onStop={stopResponse}
         streamingId={streamingId}
         health={health}
+        onRecheckHealth={recheckHealth}
       />
-      <ChatButton onClick={handleToggle} isOpen={isOpen} />
+      <ChatButton onClick={handleToggle} isOpen={isOpen} ref={buttonRef} />
     </>
   );
 };

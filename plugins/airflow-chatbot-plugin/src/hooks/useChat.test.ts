@@ -16,10 +16,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { describe, expect, it } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Message } from "../components/types";
-import { applyEvent, dispatchResourceChanged, finalizeTools, parseFrames } from "./useChat";
+import {
+  applyEvent,
+  dispatchResourceChanged,
+  finalizeTools,
+  frameProvenDagIds,
+  parseFrames,
+  useHealth,
+} from "./useChat";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 const blank = (): Message => ({
   content: "",
@@ -247,9 +259,51 @@ describe("applyEvent", () => {
     expect(message.content).toBe("**Error:** boom");
   });
 
+  it.each([
+    ["llm_auth", /could not sign in to its language model/u],
+    ["rate_limited", /rate-limiting/u],
+    ["mcp_unreachable", /could not reach its Airflow tools/u],
+    ["cancelled", /cancelled/u],
+    ["internal", /server log/u],
+  ])("renders a friendly message for the %s error code", (code, expected) => {
+    const message = applyEvent(blank(), { code, message: "sanitized", retryable: false, type: "error" });
+
+    expect(message.isError).toBe(true);
+    expect(message.content).toMatch(expected);
+    expect(message.content).not.toContain("sanitized");
+  });
+
+  it("falls back to the frame's message for a code this build does not know", () => {
+    const message = applyEvent(blank(), { code: "brand_new", message: "the fallback", type: "error" });
+
+    expect(message.content).toBe("**Error:** the fallback");
+  });
+
+  it.each([
+    [false, false],
+    [true, true],
+  ])("records retryable=%s so the UI can gate the Retry chip", (retryable, expected) => {
+    const message = applyEvent(blank(), { code: "internal", retryable, type: "error" });
+
+    expect(message.retryable).toBe(expected);
+  });
+
+  it("leaves retryable unset when the frame does not say", () => {
+    const message = applyEvent(blank(), { message: "boom", type: "error" });
+
+    expect(message.retryable).toBeUndefined();
+  });
+
   it("leaves the message untouched for unknown event types", () => {
     const before = blank();
     expect(applyEvent(before, { type: "done" })).toEqual(before);
+  });
+
+  it("ignores a ping frame entirely", () => {
+    // The server sends pings to keep the connection alive through proxies; the
+    // client's contract is to ignore frame types it does not know.
+    const before = blank();
+    expect(applyEvent(before, { type: "ping" })).toEqual(before);
   });
 });
 
@@ -332,5 +386,67 @@ describe("dispatchResourceChanged", () => {
     ["an update naming no Dag", { updates: [{ kind: "dag_definition" }] }],
   ])("dispatches nothing for %s", (_label, frame) => {
     expect(captured(frame)).toEqual([]);
+  });
+
+  it("records the frame's Dag ids as proven to exist, for entity links", () => {
+    captured({
+      type: "resource_changed",
+      updates: [{ dag_id: "frame_proven_dag", kind: "dag_run" }],
+    });
+
+    expect(frameProvenDagIds.has("frame_proven_dag")).toBe(true);
+  });
+
+  it("does not record ids from frames it refuses to dispatch", () => {
+    captured({ updates: [{ dag_id: "unproven_dag", kind: "everything" }] });
+
+    expect(frameProvenDagIds.has("unproven_dag")).toBe(false);
+  });
+});
+
+describe("useHealth", () => {
+  const healthResponse = (body: Record<string, unknown>) =>
+    ({
+      json: () => Promise.resolve(body),
+      ok: true,
+      status: 200,
+    }) as unknown as Response;
+
+  it("surfaces the server's read-only and write-availability verdicts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        healthResponse({
+          llm: { configured: true },
+          mcp: { reachable: true, toolset_importable: true, unreachable: [] },
+          read_only: true,
+          write_tools_available: false,
+        }),
+      ),
+    );
+
+    const { result } = renderHook(() => useHealth());
+
+    await waitFor(() => expect(result.current.health.loading).toBe(false));
+    expect(result.current.health.readOnly).toBe(true);
+    expect(result.current.health.writeToolsAvailable).toBe(false);
+  });
+
+  it("assumes writes work when an older backend omits the fields", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        healthResponse({
+          llm: { configured: true },
+          mcp: { reachable: true, toolset_importable: true, unreachable: [] },
+        }),
+      ),
+    );
+
+    const { result } = renderHook(() => useHealth());
+
+    await waitFor(() => expect(result.current.health.loading).toBe(false));
+    expect(result.current.health.readOnly).toBe(false);
+    expect(result.current.health.writeToolsAvailable).toBe(true);
   });
 });

@@ -386,6 +386,26 @@ describe("useChat streaming", () => {
     expect(body.history[0]).toEqual({ content: "turn 1", role: "user" });
   });
 
+  it("streams straight through ping frames", async () => {
+    // Keep-alive pings are noise to the client: no text, no error, no state.
+    mockFetch(
+      streamingResponse([
+        frame({ type: "ping" }),
+        frame({ delta: "still here", type: "text" }),
+        frame({ type: "ping" }),
+        frame({ type: "done" }),
+      ]),
+    );
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("hi");
+    });
+
+    expect(result.current.messages[1]?.content).toBe("still here");
+    expect(result.current.messages[1]?.isError).toBeUndefined();
+  });
+
   it("recovers a final frame whose terminator never arrived", async () => {
     // The decoder and the leftover buffer both have to be flushed, or the last
     // thing Airy said is silently dropped.
@@ -520,6 +540,143 @@ describe("useChat streaming", () => {
     expect(JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body))).toEqual({
       approved: true,
       nonce: "n1",
+    });
+  });
+
+  const applyArgs = (n: number) => ({
+    changes: [{ new: `fixed ${n}`, old: `broken ${n}` }],
+    dag_id: "sales_summary",
+  });
+
+  /** Two proposed writes suspended as one nonce batch, as the incident produced. */
+  const batchConfirmFrames = [
+    frame({ args: applyArgs(1), id: "p1", name: "plan_dag_code_changes", type: "tool" }),
+    frame({ id: "p1", result: "plan token 1", type: "tool_result" }),
+    frame({ args: applyArgs(2), id: "p2", name: "plan_dag_code_changes", type: "tool" }),
+    frame({ id: "p2", result: "plan token 2", type: "tool_result" }),
+    frame({ delta: "I can fix both.", type: "text" }),
+    frame({ args: applyArgs(1), id: "a1", name: "apply_dag_code_changes", proposed: true, type: "tool" }),
+    frame({ args: applyArgs(2), id: "a2", name: "apply_dag_code_changes", proposed: true, type: "tool" }),
+    frame({ args: applyArgs(1), call_id: "a1", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" }),
+    frame({ args: applyArgs(2), call_id: "a2", nonce: "n1", tool: "apply_dag_code_changes", type: "confirm_required" }),
+    frame({ type: "done" }),
+  ];
+
+  /** One write lands, the other is refused, and the server flags the batch unsettled. */
+  const mixedOutcomeFrames = [
+    frame({ args: applyArgs(1), id: "a1", name: "apply_dag_code_changes", proposed: true, type: "tool" }),
+    frame({ id: "a1", result: '{"mutation_applied": true}', type: "tool_result" }),
+    frame({ type: "resource_changed", updates: [{ dag_id: "sales_summary", kind: "dag_definition" }] }),
+    frame({ args: applyArgs(2), id: "a2", name: "apply_dag_code_changes", proposed: true, type: "tool" }),
+    frame({ failed: true, id: "a2", result: "digest drift", type: "tool_result" }),
+    frame({ delta: " One applied, one refused.", type: "text" }),
+    frame({ type: "unsettled" }),
+    frame({ type: "done" }),
+  ];
+
+  describe("a batch whose actions end differently", () => {
+    it("settles each approved call by its own reported result", async () => {
+      // The server's `unsettled` frame speaks for the batch; the first apply's
+      // clean result and the second's failure each answer for their own call.
+      const fetchMock = mockFetch(streamingResponse(batchConfirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("Fix both problems");
+      });
+
+      fetchMock.mockReturnValue(Promise.resolve(streamingResponse(mixedOutcomeFrames)));
+      await act(async () => {
+        await result.current.resolveConfirm("n1", true);
+      });
+
+      const assistant = result.current.messages[1];
+      expect(assistant?.tools?.find((tool) => tool.id === "a1")?.failed).toBe(false);
+      expect(assistant?.tools?.find((tool) => tool.id === "a2")?.failed).toBe(true);
+      expect(assistant?.confirms?.[0]).toMatchObject({
+        callId: "a1",
+        outcomeUnknown: false,
+        resolution: "approved",
+      });
+      expect(assistant?.confirms?.[1]).toMatchObject({
+        callId: "a2",
+        outcomeUnknown: false,
+        resolution: "approved",
+      });
+    });
+
+    it("leaves only the call that never reported in doubt when the stream dies mid-batch", async () => {
+      const fetchMock = mockFetch(streamingResponse(batchConfirmFrames));
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("Fix both problems");
+      });
+
+      // The first apply reports cleanly, then the connection drops: no result
+      // for the second, no `done`.
+      fetchMock.mockReturnValue(
+        Promise.resolve(
+          streamingResponse([
+            frame({ args: applyArgs(1), id: "a1", name: "apply_dag_code_changes", proposed: true, type: "tool" }),
+            frame({ id: "a1", result: '{"mutation_applied": true}', type: "tool_result" }),
+          ]),
+        ),
+      );
+      await act(async () => {
+        await result.current.resolveConfirm("n1", true);
+      });
+
+      const assistant = result.current.messages[1];
+      expect(assistant?.confirms?.[0]?.outcomeUnknown).toBe(false);
+      expect(assistant?.confirms?.[1]?.outcomeUnknown).toBe(true);
+    });
+
+    it("keeps the whole transcript when the user sends a follow-up after the receipt", async () => {
+      // The live incident: diagnose, a two-write batch approved with a mixed
+      // outcome, then a follow-up send — the transcript must survive it all,
+      // in memory and in the stored copy a reload would restore.
+      const fetchMock = mockFetch(
+        streamingResponse([
+          frame({ args: { dag_id: "sales_summary" }, id: "d1", name: "diagnose_dag", type: "tool" }),
+          frame({ id: "d1", result: "two problems", type: "tool_result" }),
+          frame({ delta: "Two problems found.", type: "text" }),
+          frame({ type: "done" }),
+        ]),
+      );
+
+      const { result } = renderHook(() => useChat());
+      await act(async () => {
+        await result.current.sendMessage("what is wrong with sales_summary?");
+      });
+
+      fetchMock.mockReturnValue(Promise.resolve(streamingResponse(batchConfirmFrames)));
+      await act(async () => {
+        await result.current.sendMessage("Fix both problems");
+      });
+
+      fetchMock.mockReturnValue(Promise.resolve(streamingResponse(mixedOutcomeFrames)));
+      await act(async () => {
+        await result.current.resolveConfirm("n1", true);
+      });
+
+      fetchMock.mockReturnValue(
+        Promise.resolve(
+          streamingResponse([frame({ delta: "Retrying.", type: "text" }), frame({ type: "done" })]),
+        ),
+      );
+      await act(async () => {
+        await result.current.sendMessage("retry the second fix");
+      });
+
+      expect(result.current.messages).toHaveLength(6);
+      expect(result.current.messages[0]?.content).toBe("what is wrong with sales_summary?");
+      expect(result.current.messages[1]?.content).toBe("Two problems found.");
+      expect(result.current.messages[5]?.content).toBe("Retrying.");
+      // The receipt still reads per call: one applied, one failed.
+      expect(result.current.messages[3]?.confirms?.map((c) => c.outcomeUnknown)).toEqual([false, false]);
+      const stored = JSON.parse(sessionStorage.getItem("airy-chat-history") ?? "[]");
+      expect(stored).toHaveLength(6);
     });
   });
 

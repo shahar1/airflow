@@ -148,3 +148,112 @@ describe("useChat persistence", () => {
     expect(sessionStorage.getItem(KEY)).toBeNull();
   });
 });
+
+describe("useChat persistence throttling", () => {
+  const encoder = new TextEncoder();
+  const frame = (payload: Record<string, unknown>) => `data: ${JSON.stringify(payload)}\n\n`;
+
+  /** A stream held open by the test, so commits happen with no flush yet. */
+  const gatedFetch = () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ body, ok: true, status: 200 } as Response));
+    return {
+      close: () => controller.close(),
+      enqueue: (payload: Record<string, unknown>) => controller.enqueue(encoder.encode(frame(payload))),
+    };
+  };
+
+  const settle = async () => {
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+
+  it("does not serialize the whole transcript once per streamed frame", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const delta of ["a", "b", "c", "d", "e"]) {
+          controller.enqueue(encoder.encode(frame({ delta, type: "text" })));
+        }
+        controller.enqueue(encoder.encode(frame({ type: "done" })));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ body, ok: true, status: 200 } as Response));
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => {
+      await result.current.sendMessage("hello");
+    });
+
+    // Trailing throttle plus the end-of-turn flush — never one write per frame.
+    expect(setItem.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(result.current.messages[1]?.content).toBe("abcde");
+    const persisted = JSON.parse(sessionStorage.getItem(KEY) ?? "[]");
+    expect(persisted[1].content).toBe("abcde");
+    setItem.mockRestore();
+  });
+
+  it("flushes the pending write on beforeunload", async () => {
+    const stream = gatedFetch();
+
+    const { result } = renderHook(() => useChat());
+    let pending: Promise<void> | undefined;
+    act(() => {
+      pending = result.current.sendMessage("hello");
+    });
+    await act(async () => {
+      stream.enqueue({ delta: "half an answer", type: "text" });
+      await settle();
+    });
+
+    // Mid-stream, mid-throttle: nothing persisted yet.
+    expect(sessionStorage.getItem(KEY) ?? "").not.toContain("half an answer");
+
+    act(() => {
+      globalThis.dispatchEvent(new Event("beforeunload"));
+    });
+    expect(sessionStorage.getItem(KEY) ?? "").toContain("half an answer");
+
+    await act(async () => {
+      stream.enqueue({ type: "done" });
+      stream.close();
+      await pending;
+    });
+  });
+
+  it("does not let a pending throttled write resurrect a cleared conversation", async () => {
+    const stream = gatedFetch();
+
+    const { result } = renderHook(() => useChat());
+    let pending: Promise<void> | undefined;
+    act(() => {
+      pending = result.current.sendMessage("hello");
+    });
+    await act(async () => {
+      stream.enqueue({ delta: "soon cleared", type: "text" });
+      await settle();
+    });
+
+    act(() => {
+      result.current.clearMessages();
+    });
+    // Outlive the throttle interval: the cancelled timer must not fire.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    });
+
+    expect(sessionStorage.getItem(KEY)).toBeNull();
+
+    await act(async () => {
+      stream.enqueue({ type: "done" });
+      stream.close();
+      await pending;
+    });
+  });
+});

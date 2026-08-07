@@ -18,15 +18,16 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { CHATBOT_BASE } from "../basePath";
 import { ConfirmRequest, Message, ToolCall } from "../components/types";
 
 /** Generate a unique ID for messages. */
 const generateId = (): string => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-const CHATBOT_BASE = () => `${globalThis.location.origin}/chatbot`;
-
 const HISTORY_TURNS = 20;
 const STORAGE_KEY = "airy-chat-history";
+/** Trailing-edge persistence throttle: at most one storage write per interval. */
+const PERSIST_INTERVAL_MS = 500;
 
 /** Restore the conversation a page reload would otherwise wipe mid-demo. */
 export const loadStoredMessages = (): Message[] => {
@@ -68,6 +69,15 @@ export const RESOURCE_CHANGED_EVENT = "airflow:resource-changed:v1";
 const UPDATE_KINDS = new Set(["dag_definition", "dag_run", "task_instances"]);
 
 /**
+ * Dag ids the server itself has named in `resource_changed` frames.
+ *
+ * Part of the transcript-proven set used for entity links: a Dag id is only
+ * linkified when a tool call, confirm card, or one of these frames names it —
+ * never guessed from prose alone.
+ */
+export const frameProvenDagIds = new Set<string>();
+
+/**
  * Tell the host UI that a mutation landed — nothing more.
  *
  * The detail carries no data and no authority: it asks queries the user is
@@ -87,6 +97,7 @@ export const dispatchResourceChanged = (event: Record<string, unknown>): boolean
       )
     : [];
   if (updates.length === 0) return false;
+  for (const update of updates) frameProvenDagIds.add(String(update.dag_id));
   globalThis.dispatchEvent(new CustomEvent(RESOURCE_CHANGED_EVENT, { detail: { updates } }));
   return true;
 };
@@ -145,6 +156,21 @@ export const finalizeTools = (message: Message, now: number): Message => {
         : tool,
     ),
   };
+};
+
+/**
+ * Friendly wording for the typed error codes the server now sends.
+ *
+ * The raw exception text stays in the server log; the code is the contract, so
+ * an unknown code falls back to whatever sanitized `message` the frame carries.
+ */
+const ERROR_TEXT_BY_CODE: Record<string, string> = {
+  cancelled: "The request was cancelled before it finished.",
+  internal: "Something went wrong on Airy's server — the details are in the server log.",
+  llm_auth:
+    "Airy could not sign in to its language model. An administrator needs to check the configured API key.",
+  mcp_unreachable: "Airy could not reach its Airflow tools. They may be restarting.",
+  rate_limited: "The language model is rate-limiting requests right now. Give it a moment, then retry.",
 };
 
 /** Fold one streamed event into the assistant message being built. */
@@ -239,12 +265,18 @@ export const applyEvent = (
       };
     case "text":
       return { ...message, content: message.content + String(event.delta ?? "") };
-    case "error":
+    case "error": {
+      const code = typeof event.code === "string" ? event.code : undefined;
+      const text =
+        (code === undefined ? undefined : ERROR_TEXT_BY_CODE[code]) ??
+        String(event.message ?? "unknown error");
       return {
         ...finalizeTools(message, now),
-        content: `${message.content}\n\n**Error:** ${String(event.message ?? "unknown error")}`.trimStart(),
+        content: `${message.content}\n\n**Error:** ${text}`.trimStart(),
         isError: true,
+        ...(typeof event.retryable === "boolean" ? { retryable: event.retryable } : {}),
       };
+    }
     default:
       return message;
   }
@@ -285,7 +317,16 @@ export interface HealthStatus {
   /** Some MCP endpoints are down, or the MCP extra is missing: Airy answers, but tool-less. */
   degraded: boolean;
   loading: boolean;
+  /** An admin turned writes off for everyone (the `airy_read_only` Variable). */
+  readOnly: boolean;
+  /** The health check got a 401: a session problem, not a misconfiguration. */
+  unauthenticated: boolean;
+  /** False when the write sidecar is down this turn: reads work, writes cannot. */
+  writeToolsAvailable: boolean;
 }
+
+/** The first health check races the host's session cookie; retry once, quietly. */
+const HEALTH_RETRY_DELAY_MS = 1_500;
 
 /**
  * Periodically polls `/chatbot/health` and exposes connectivity state.
@@ -299,31 +340,62 @@ export const useHealth = () => {
     loading: true,
     mcp: false,
     ok: false,
+    readOnly: false,
+    unauthenticated: false,
+    writeToolsAvailable: true,
   });
+  const retriedRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchHealth = useCallback(async () => {
+    let status: number | undefined;
     try {
-      const res = await fetch(`${CHATBOT_BASE()}/health`, {
+      const res = await fetch(`${CHATBOT_BASE}/health`, {
         credentials: "include",
       });
+      status = res.status;
       if (!res.ok) throw new Error(`status ${res.status}`);
       const data = await res.json();
+      retriedRef.current = true;
       setHealth({
         degraded: (data.mcp?.unreachable?.length ?? 0) > 0 || data.mcp?.toolset_importable === false,
         llm: data.llm?.configured ?? false,
         loading: false,
         mcp: data.mcp?.reachable ?? false,
         ok: data.llm?.configured ?? false,
+        readOnly: data.read_only === true,
+        unauthenticated: false,
+        // Absent on an older backend: assume writes work rather than warn falsely.
+        writeToolsAvailable: data.write_tools_available !== false,
       });
     } catch {
-      setHealth({ degraded: false, llm: false, loading: false, mcp: false, ok: false });
+      // The very first check races the host's session cookie on page load:
+      // retry once and stay in "connecting" rather than flash a false red.
+      if (!retriedRef.current) {
+        retriedRef.current = true;
+        retryTimerRef.current = setTimeout(fetchHealth, HEALTH_RETRY_DELAY_MS);
+        return;
+      }
+      setHealth({
+        degraded: false,
+        llm: false,
+        loading: false,
+        mcp: false,
+        ok: false,
+        readOnly: false,
+        unauthenticated: status === 401,
+        writeToolsAvailable: true,
+      });
     }
   }, []);
 
   useEffect(() => {
     fetchHealth();
     const id = setInterval(fetchHealth, 30_000);
-    return () => clearInterval(id);
+    return () => {
+      clearInterval(id);
+      if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
+    };
   }, [fetchHealth]);
 
   return { health, recheckHealth: fetchHealth };
@@ -357,17 +429,49 @@ export const useChat = () => {
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const messagesRef = useRef<Message[]>(messages);
   const abortRef = useRef<AbortController | null>(null);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isLoading = phase !== "idle";
 
+  const flushPersist = useCallback(() => {
+    if (persistTimerRef.current !== null) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    persistMessages(messagesRef.current);
+  }, []);
+
+  // Serializing the whole transcript on every streamed token is O(conversation)
+  // work on the UI thread; a trailing-edge throttle keeps storage close enough,
+  // and the turn's end (plus beforeunload) makes it exact.
   const commit = useCallback((next: Message[]) => {
     messagesRef.current = next;
     setMessages(next);
-    persistMessages(next);
+    if (persistTimerRef.current === null) {
+      persistTimerRef.current = setTimeout(() => {
+        persistTimerRef.current = null;
+        persistMessages(messagesRef.current);
+      }, PERSIST_INTERVAL_MS);
+    }
   }, []);
+
+  useEffect(() => {
+    globalThis.addEventListener("beforeunload", flushPersist);
+    return () => {
+      globalThis.removeEventListener("beforeunload", flushPersist);
+      // Cancel rather than flush: a write firing after unmount could clobber
+      // whatever a newer owner of the storage key has since done.
+      if (persistTimerRef.current !== null) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    };
+  }, [flushPersist]);
 
   /** Fold a /chat or /confirm SSE response into the given assistant message. */
   const streamInto = useCallback(
-    async (assistantId: string, response: Response) => {
+    // Annotated because the flags are set inside a closure, which TS's flow
+    // analysis cannot see — it would otherwise narrow the return to `false`.
+    async (assistantId: string, response: Response, resuming = false): Promise<boolean | undefined> => {
       const update = (fn: (message: Message) => Message) =>
         commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
 
@@ -379,6 +483,11 @@ export const useChat = () => {
       let buffer = "";
       let complete = false;
       let unsettled = false;
+      // A resumed confirmation streams into a bubble that already ends in a
+      // sentence; without a separator the continuation glues onto it
+      // ("…the Dag?The changes have been…"). Only when neither side brings
+      // its own whitespace to the boundary.
+      let needsSeparator = resuming;
 
       const consume = (chunk: string) => {
         buffer += chunk;
@@ -392,7 +501,16 @@ export const useChat = () => {
           // Not folded into the message: this frame is not part of the reply,
           // it is the reply's side effect on the page around it.
           if (event.type === "resource_changed") dispatchResourceChanged(event);
-          update((message) => applyEvent(message, event));
+          update((message) => {
+            let payload = event;
+            if (needsSeparator && event.type === "text") {
+              needsSeparator = false;
+              if (message.content !== "" && !/\s$/u.test(message.content) && !/^\s/u.test(String(event.delta ?? ""))) {
+                payload = { ...event, delta: `\n\n${String(event.delta ?? "")}` };
+              }
+            }
+            return applyEvent(message, payload);
+          });
         }
       };
 
@@ -442,7 +560,7 @@ export const useChat = () => {
         commit(messagesRef.current.map((m) => (m.id === assistantId ? fn(m) : m)));
 
       try {
-        const response = await fetch(`${CHATBOT_BASE()}/chat`, {
+        const response = await fetch(`${CHATBOT_BASE}/chat`, {
           body: JSON.stringify({
             history,
             message: content,
@@ -496,9 +614,10 @@ export const useChat = () => {
         // leave that chip spinning for the rest of the session.
         const ended = Date.now();
         update((message) => finalizeTools(message, ended));
+        flushPersist();
       }
     },
-    [commit, streamInto],
+    [commit, flushPersist, streamInto],
   );
 
   const sendMessage = useCallback(
@@ -567,7 +686,7 @@ export const useChat = () => {
       abortRef.current = approved ? null : controller;
 
       try {
-        const response = await fetch(`${CHATBOT_BASE()}/confirm`, {
+        const response = await fetch(`${CHATBOT_BASE}/confirm`, {
           body: JSON.stringify({ approved, nonce }),
           credentials: "include",
           headers: { "Content-Type": "application/json" },
@@ -579,7 +698,20 @@ export const useChat = () => {
           throw await errorForResponse(response);
         }
 
-        settle(!(await streamInto(assistantId, response)));
+        const settled = (await streamInto(assistantId, response, true)) === true;
+        // The server's `unsettled` frame speaks for the whole batch, but each
+        // call that reported back — cleanly, failed or denied — has answered
+        // for itself; only a call whose report never arrived stays open.
+        update((message) => ({
+          ...message,
+          confirms: message.confirms?.map((confirm) => {
+            if (confirm.nonce !== nonce) return confirm;
+            const call = message.tools?.find((tool) => tool.id === confirm.callId);
+            const reported =
+              call !== undefined && call.durationMs !== undefined && call.awaitingConfirm !== true;
+            return { ...confirm, outcomeUnknown: !settled && !reported };
+          }),
+        }));
       } catch (err) {
         if (isAbort(err)) {
           update((message) => ({
@@ -603,12 +735,18 @@ export const useChat = () => {
         setStreamingId(null);
         const ended = Date.now();
         update((message) => finalizeTools(message, ended));
+        flushPersist();
       }
     },
-    [commit, streamInto],
+    [commit, flushPersist, streamInto],
   );
 
   const clearMessages = useCallback(() => {
+    // A pending throttled write would resurrect what was just cleared.
+    if (persistTimerRef.current !== null) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
     setMessages([]);
     messagesRef.current = [];
     try {

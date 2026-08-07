@@ -39,8 +39,8 @@ export const useColorMode = () => {
     });
 
     observer.observe(document.documentElement, {
-      attributes: true,
       attributeFilter: ["class"],
+      attributes: true,
     });
 
     // Set initial value

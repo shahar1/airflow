@@ -42,7 +42,10 @@ const PluginComponent: FC<PluginComponentProps> = () => {
   // Use the globalChakraUISystem provided by the Airflow Core UI,
   // so the plugin has a consistent theming with the host Airflow UI,
   // fallback to localSystem for local development.
-  const system = globalThis.ChakraUISystem ?? localSystem;
+  // Typed inline because the lib build (tsconfig.lib.json) compiles only this
+  // entry file and never sees the ambient declaration in global.d.ts.
+  const system =
+    (globalThis as { ChakraUISystem?: typeof localSystem }).ChakraUISystem ?? localSystem;
 
   return (
     <ChakraProvider value={system}>

@@ -73,6 +73,8 @@ export interface Message {
   confirms?: ConfirmRequest[];
   /** When true the message represents an error response. */
   isError?: boolean;
+  /** Server verdict on whether re-asking can help; false hides the Retry chip. */
+  retryable?: boolean;
   /** Set when the user stopped this response; visible, but not an error. */
   stopped?: boolean;
   /** Kept on screen, kept out of the history the model is given. */

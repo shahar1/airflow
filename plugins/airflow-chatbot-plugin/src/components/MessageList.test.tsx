@@ -17,7 +17,7 @@
  * under the License.
  */
 import { ChakraProvider } from "@chakra-ui/react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -30,11 +30,15 @@ import {
   buildPrompts,
   buildReceiptLabel,
   buildSelectionCss,
+  buildWriteEffect,
   canRetry,
+  collectKnownDagIds,
   ConfirmState,
   MessageList,
+  resolveMarkdownHref,
   splitActions,
 } from "./MessageList";
+import { frameProvenDagIds } from "../hooks/useChat";
 import { ConfirmRequest, Message, ToolCall } from "./types";
 
 const show = (ui: ReactElement) =>
@@ -89,6 +93,13 @@ describe("splitActions", () => {
     expect(splitActions("see [the grid](http://x) for details").text).toBe(
       "see [the grid](http://x) for details",
     );
+  });
+
+  it.each(["action", "Action", "ACTION"])("matches a [%s: …] marker regardless of case", (marker) => {
+    const { actions, text } = splitActions(`Here.\n\n[${marker}: Show me the log for summarize]`);
+
+    expect(actions).toEqual(["Show me the log for summarize"]);
+    expect(text).toBe("Here.");
   });
 });
 
@@ -170,6 +181,73 @@ describe("buildGroupState", () => {
     expect(
       buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }),
     ).toBe("1 of 3 applied · 2 need attention");
+  });
+});
+
+describe("buildWriteEffect rerun_dag run options", () => {
+  const rerun = (args: unknown): ConfirmRequest => ({
+    args,
+    callId: "c1",
+    nonce: "n1",
+    tool: "rerun_dag",
+  });
+
+  it("shows every conf entry the approved run would carry, one code line each", () => {
+    const summary = buildWriteEffect(rerun({ dag_id: "incident_triage" })).summary({
+      conf: { retries: 2, severity_threshold: "urgent" },
+      dag_id: "incident_triage",
+    });
+
+    expect(summary).toContain('`severity_threshold: "urgent"`');
+    expect(summary).toContain("`retries: 2`");
+    // One entry per line, so the card reads as a compact key: value list.
+    expect(summary.split("\n").slice(-2)).toEqual(["`retries: 2`  ", '`severity_threshold: "urgent"`']);
+  });
+
+  it("shows the run note being approved", () => {
+    const summary = buildWriteEffect(rerun({ dag_id: "incident_triage" })).summary({
+      dag_id: "incident_triage",
+      note: "Checking urgent incidents",
+    });
+
+    expect(summary).toContain('`note: "Checking urgent incidents"`');
+  });
+
+  it("keeps the unpause card's conf as visible as the plain one's", () => {
+    const summary = buildWriteEffect(rerun({ dag_id: "incident_triage", unpause: true })).summary({
+      conf: { severity_threshold: "urgent" },
+      dag_id: "incident_triage",
+      unpause: true,
+    });
+
+    expect(summary).toContain("Unpauses");
+    expect(summary).toContain('`severity_threshold: "urgent"`');
+  });
+
+  it.each([
+    ["absent", { dag_id: "incident_triage" }],
+    ["empty", { conf: {}, dag_id: "incident_triage" }],
+  ])("keeps today's wording when conf is %s", (_label, args) => {
+    expect(buildWriteEffect(rerun(args)).summary(args)).toBe(
+      "Creates one manual run of `incident_triage` using the latest parsed code.",
+    );
+  });
+
+  it("renders the conf pairs on the approval card", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              rerun({ conf: { severity_threshold: "urgent" }, dag_id: "incident_triage" }),
+            ],
+            content: "",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('severity_threshold: "urgent"')).not.toBeNull();
   });
 });
 
@@ -892,18 +970,52 @@ describe("MessageList", () => {
 
   describe("following the stream", () => {
     let scrollIntoView: ReturnType<typeof vi.fn>;
+    let scrollTo: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
       scrollIntoView = vi.fn();
       Element.prototype.scrollIntoView = scrollIntoView;
+      scrollTo = vi.fn();
+      Element.prototype.scrollTo = scrollTo;
     });
 
-    /** Pretend the container is taller than its viewport and scrolled up. */
+    it("scrolls the log itself, never a sentinel that drags scrollable ancestors", () => {
+      // scrollIntoView walks every scrollable ancestor. The drawer wraps this
+      // list in an overflow-clipped box that the status regions overflow by a
+      // few pixels, so a sentinel scroll displaces that wrapper too — and with
+      // no scrollbar to bring it back, the whole transcript sits above the
+      // viewport and the drawer looks empty for the rest of the session.
+      const { container, rerender } = show(
+        <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
+      );
+      const scroller = container.querySelector('[role="log"]') as HTMLElement;
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 2_000 });
+      const containerScrollTo = vi.fn();
+      scroller.scrollTo = containerScrollTo;
+      scrollIntoView.mockClear();
+
+      rerender(
+        <ChakraProvider value={localSystem}>
+          <ColorModeProvider>
+            <MessageList messages={[user("why?"), assistant({ content: "one two" })]} isLoading />
+          </ColorModeProvider>
+        </ChakraProvider>,
+      );
+
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(containerScrollTo).toHaveBeenCalledWith({ behavior: "auto", top: 2_000 });
+    });
+
+    /** Pretend the container is taller than its viewport and scrolled up.
+     * A real user's scroll always starts with a wheel/touch/key gesture —
+     * that gesture is what tells the programmatic-scroll guard to stand down,
+     * so the simulation must send it too. */
     const scrollUp = (container: HTMLElement) => {
       const scroller = container.firstElementChild?.firstElementChild as HTMLElement;
       Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
       Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 2_000 });
       scroller.scrollTop = 0;
+      fireEvent.wheel(scroller);
       fireEvent.scroll(scroller);
       return scroller;
     };
@@ -913,7 +1025,7 @@ describe("MessageList", () => {
         <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
       );
       const scroller = scrollUp(container);
-      scrollIntoView.mockClear();
+      scrollTo.mockClear();
 
       rerender(
         <ChakraProvider value={localSystem}>
@@ -926,11 +1038,11 @@ describe("MessageList", () => {
         </ChakraProvider>,
       );
 
-      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(scrollTo).not.toHaveBeenCalled();
       const pill = screen.getByText("Jump to latest");
 
       fireEvent.click(pill);
-      expect(scrollIntoView).toHaveBeenCalled();
+      expect(scrollTo).toHaveBeenCalled();
       expect(screen.queryByText("Jump to latest")).toBeNull();
       expect(scroller).not.toBeNull();
     });
@@ -939,7 +1051,7 @@ describe("MessageList", () => {
       const { rerender } = show(
         <MessageList messages={[user("why?"), assistant({ content: "one" })]} isLoading />,
       );
-      scrollIntoView.mockClear();
+      scrollTo.mockClear();
 
       rerender(
         <ChakraProvider value={localSystem}>
@@ -949,7 +1061,7 @@ describe("MessageList", () => {
         </ChakraProvider>,
       );
 
-      expect(scrollIntoView).toHaveBeenCalled();
+      expect(scrollTo).toHaveBeenCalled();
       expect(screen.queryByText("Jump to latest")).toBeNull();
     });
 
@@ -984,12 +1096,12 @@ describe("MessageList", () => {
           ]}
         />,
       );
-      scrollIntoView.mockClear();
+      scrollTo.mockClear();
 
       fireEvent.click(screen.getByRole("button", { expanded: false }));
 
       expect(screen.getByText(/42 rows/u)).not.toBeNull();
-      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(scrollTo).not.toHaveBeenCalled();
     });
   });
 
@@ -1025,7 +1137,8 @@ describe("MessageList", () => {
       // The same node, updated — not a newly mounted one.
       expect(container.querySelector('[role="status"]')).toBe(region);
       expect(region?.textContent).toBe("Airy: Diagnosed Dag");
-      expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
+      // Exactly two: this tool region plus the completion announcement region.
+      expect(container.querySelectorAll('[role="status"]')).toHaveLength(2);
     });
 
     it("raises an error response as an assertive alert", () => {
@@ -1056,7 +1169,7 @@ describe("MessageList", () => {
       expect(buildPrompts(pathname)).toEqual([
         `Why did ${dagId} fail?`,
         `Check ${dagId} for warnings`,
-        `Summarise recent runs of ${dagId}`,
+        `Summarize recent runs of ${dagId}`,
       ]);
     });
 
@@ -1079,7 +1192,27 @@ describe("MessageList", () => {
       fireEvent.click(screen.getByText("Why did sales_summary fail?"));
 
       expect(onSuggestionClick).toHaveBeenCalledWith("Why did sales_summary fail?");
-      globalThis.history.pushState({}, "", "/");
+      act(() => {
+        globalThis.history.pushState({}, "", "/");
+      });
+    });
+
+    it("resamples the prompts when the host SPA navigates", () => {
+      // The chatbot is its own React root: the host router never re-renders it,
+      // so route changes must be observed, not assumed.
+      globalThis.history.pushState({}, "", "/home");
+      show(<MessageList messages={[]} />);
+      expect(screen.getByText("How do I create a Dag?")).not.toBeNull();
+
+      act(() => {
+        globalThis.history.pushState({}, "", "/dags/nav_dag/grid");
+      });
+
+      expect(screen.getByText("Why did nav_dag fail?")).not.toBeNull();
+      expect(screen.queryByText("How do I create a Dag?")).toBeNull();
+      act(() => {
+        globalThis.history.pushState({}, "", "/");
+      });
     });
   });
 
@@ -1309,5 +1442,257 @@ describe("MessageList", () => {
     fireEvent.click(screen.getByText("Re-run sales_summary"));
 
     expect(onSuggestionClick).toHaveBeenCalledWith("Re-run sales_summary");
+  });
+});
+
+describe("conversation log semantics", () => {
+  it("exposes the transcript as a labelled log", () => {
+    const { container } = show(<MessageList messages={[user("why?")]} />);
+
+    const log = container.querySelector('[role="log"]');
+    expect(log?.getAttribute("aria-label")).toBe("Conversation with Airy");
+  });
+
+  it("attributes each turn to its speaker for screen readers", () => {
+    show(<MessageList messages={[user("why?"), assistant({ content: "a typo" })]} />);
+
+    expect(screen.getByText("You said:")).not.toBeNull();
+    expect(screen.getByText("Airy said:")).not.toBeNull();
+  });
+
+  it("announces politely when the answer finishes", () => {
+    const messages = [user("why?"), assistant({ content: "a typo" })];
+    const { rerender } = show(<MessageList messages={messages} isLoading />);
+    expect(screen.queryByText("Airy finished responding")).toBeNull();
+
+    rerender(
+      <ChakraProvider value={localSystem}>
+        <ColorModeProvider>
+          <MessageList messages={messages} />
+        </ColorModeProvider>
+      </ChakraProvider>,
+    );
+
+    expect(screen.getByText("Airy finished responding")).not.toBeNull();
+  });
+});
+
+describe("user messages", () => {
+  it("renders the user's words as typed, never as markdown", () => {
+    const { container } = show(<MessageList messages={[user("**not bold** and `not code`")]} />);
+
+    expect(container.querySelector("strong")).toBeNull();
+    expect(container.querySelector("code")).toBeNull();
+    expect(screen.getByText(/\*\*not bold\*\* and `not code`/u)).not.toBeNull();
+  });
+});
+
+describe("safe links", () => {
+  it("opens an external link in a new tab with a hardened rel", () => {
+    const { container } = show(
+      <MessageList messages={[assistant({ content: "see [the docs](https://example.com/x)" })]} />,
+    );
+
+    const anchor = container.querySelector("a");
+    expect(anchor?.getAttribute("href")).toBe("https://example.com/x");
+    expect(anchor?.getAttribute("target")).toBe("_blank");
+    expect(anchor?.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("keeps a same-origin path link in this tab", () => {
+    const { container } = show(
+      <MessageList messages={[assistant({ content: "open [the grid](/dags/sales_summary/grid)" })]} />,
+    );
+
+    const anchor = container.querySelector("a");
+    expect(anchor?.getAttribute("href")).toBe("/dags/sales_summary/grid");
+    expect(anchor?.getAttribute("target")).toBeNull();
+  });
+
+  const origin = "http://airflow.example";
+
+  it.each([
+    ["a path under a prefixed deployment", "/dags/x", "/prod/dags/x", false],
+    ["an already-prefixed path", "/prod/dags/x", "/prod/dags/x", false],
+    ["a cross-origin URL", "https://evil.example/x", "https://evil.example/x", true],
+    ["a same-origin absolute URL", `${origin}/dags/x`, `${origin}/dags/x`, false],
+  ])("resolves %s", (_label, href, expected, external) => {
+    expect(resolveMarkdownHref(href, "/prod", origin)).toEqual({ external, href: expected });
+  });
+
+  it("leaves fragments and empty hrefs alone", () => {
+    expect(resolveMarkdownHref("#section", "/prod", origin)).toEqual({
+      external: false,
+      href: "#section",
+    });
+    expect(resolveMarkdownHref(undefined, "/prod", origin)).toBeUndefined();
+  });
+});
+
+describe("entity links", () => {
+  it("collects Dag ids only from tool args, confirm cards, and server frames", () => {
+    frameProvenDagIds.add("from_frame");
+    const messages = [
+      assistant({
+        confirms: [{ args: { dag_id: "from_confirm" }, callId: "c2", nonce: "n1", tool: "rerun_dag" }],
+        content: "text mentions `from_prose` only",
+        tools: [
+          { args: { dag_id: "from_tool" }, durationMs: 1, id: "c1", name: "diagnose_dag", startedAt: 0 },
+        ],
+      }),
+    ];
+
+    const ids = collectKnownDagIds(messages);
+
+    expect(ids.has("from_tool")).toBe(true);
+    expect(ids.has("from_confirm")).toBe(true);
+    expect(ids.has("from_frame")).toBe(true);
+    expect(ids.has("from_prose")).toBe(false);
+    frameProvenDagIds.delete("from_frame");
+  });
+
+  it("links a backticked Dag id the transcript has proven to exist", () => {
+    const { container } = show(
+      <MessageList
+        messages={[
+          assistant({
+            content: "The Dag `linkify_me` failed twice.",
+            tools: [
+              { args: { dag_id: "linkify_me" }, durationMs: 1, id: "c1", name: "diagnose_dag", startedAt: 0 },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    const link = container.querySelector('a[data-dag-link="linkify_me"]');
+    expect(link?.getAttribute("href")).toBe("/dags/linkify_me");
+    expect(link?.querySelector("code")?.textContent).toBe("linkify_me");
+  });
+
+  it("never linkifies an id the transcript cannot prove", () => {
+    const { container } = show(
+      <MessageList messages={[assistant({ content: "Maybe check `some_guess` too." })]} />,
+    );
+
+    expect(container.querySelector("a[data-dag-link]")).toBeNull();
+    expect(screen.getByText("some_guess")).not.toBeNull();
+  });
+});
+
+describe("per-message copy", () => {
+  it("copies the whole answer and reports honestly", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    show(<MessageList messages={[assistant({ content: "the diagnosis" })]} />);
+
+    fireEvent.click(screen.getByLabelText("Copy message"));
+
+    await screen.findByText("Copied");
+    expect(writeText).toHaveBeenCalledWith("the diagnosis");
+  });
+
+  it("says Copy failed when the clipboard is blocked", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+    show(<MessageList messages={[assistant({ content: "the diagnosis" })]} />);
+
+    fireEvent.click(screen.getByLabelText("Copy message"));
+
+    await screen.findByText("Copy failed");
+  });
+
+  it("offers no copy on user bubbles or while the answer still streams", () => {
+    show(
+      <MessageList
+        messages={[user("why?"), assistant({ content: "still writing" })]}
+        isLoading
+        streamingId="a1"
+      />,
+    );
+
+    expect(screen.queryByLabelText("Copy message")).toBeNull();
+  });
+});
+
+describe("long code blocks", () => {
+  it("collapses a tall block and expands it on request", () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get: () => 1_000,
+    });
+    try {
+      const { container } = show(
+        <MessageList messages={[assistant({ content: "```text\nlots of log lines\n```" })]} />,
+      );
+
+      const pre = container.querySelector("pre");
+      expect(pre?.getAttribute("style")).toContain("max-height: 320px");
+      const toggle = screen.getByText("Show more");
+
+      fireEvent.click(toggle);
+
+      expect(screen.getByText("Show less")).not.toBeNull();
+      expect(container.querySelector("pre")?.getAttribute("style") ?? "").not.toContain("max-height");
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight;
+    }
+  });
+
+  it("offers no collapse control on a short block", () => {
+    show(<MessageList messages={[assistant({ content: "```python\nx = 1\n```" })]} />);
+
+    expect(screen.queryByText("Show more")).toBeNull();
+  });
+});
+
+describe("typed error frames", () => {
+  it("suppresses Retry when the server says retrying cannot help", () => {
+    show(
+      <MessageList
+        messages={[
+          user("why?"),
+          assistant({ content: "**Error:** bad key", id: "a1", isError: true, retryable: false }),
+        ]}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Retry")).toBeNull();
+  });
+
+  it("keeps Retry when the server says the error is transient", () => {
+    show(
+      <MessageList
+        messages={[
+          user("why?"),
+          assistant({ content: "**Error:** rate limited", id: "a1", isError: true, retryable: true }),
+        ]}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Retry")).not.toBeNull();
+  });
+});
+
+describe("grouped approvals", () => {
+  it("says that one decision covers the whole batch", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              { args: { dag_id: "a" }, callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" },
+              { args: { dag_id: "a" }, callId: "c2", nonce: "n1", tool: "rerun_dag" },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(/one decision covers all 2 actions/u)).not.toBeNull();
   });
 });

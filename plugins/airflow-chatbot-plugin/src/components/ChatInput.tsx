@@ -18,7 +18,7 @@
  */
 
 import { Flex, IconButton, Spinner, Textarea } from "@chakra-ui/react";
-import { FC, KeyboardEvent, useRef, useState } from "react";
+import { FC, KeyboardEvent, useEffect, useRef, useState } from "react";
 
 import { useColorMode } from "src/context/colorMode";
 
@@ -26,8 +26,12 @@ import { SendIcon } from "./icons/SendIcon";
 
 interface ChatInputProps {
   readonly onSend: (message: string) => void;
-  readonly disabled?: boolean;
-  /** When true, only the send button is blocked — the textarea stays editable. */
+  /**
+   * A turn is in flight. Sending is gated, but the textarea stays editable so
+   * the next question can be composed while Airy is still answering.
+   */
+  readonly busy?: boolean;
+  /** When true, only sending is blocked — the textarea stays editable. */
   readonly buttonDisabled?: boolean;
   readonly placeholder?: string;
   readonly value?: string;
@@ -45,15 +49,17 @@ const StopIcon: FC = () => (
   </svg>
 );
 
+const MAX_TEXTAREA_HEIGHT_PX = 120;
+
 /**
  * Chat input component with auto-resizing textarea.
  * Supports Enter to send (Shift+Enter for new line).
  * Can be controlled via value/onValueChange props.
  */
 export const ChatInput: FC<ChatInputProps> = ({
+  busy = false,
   buttonDisabled = false,
   canStop = false,
-  disabled = false,
   isApplyingChange = false,
   onSend,
   onStop,
@@ -65,43 +71,59 @@ export const ChatInput: FC<ChatInputProps> = ({
   const value = controlledValue ?? internalValue;
   const setValue = onValueChange ?? setInternalValue;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const wasBusyRef = useRef(busy);
   const { colorMode } = useColorMode();
 
   const isDark = colorMode === "dark";
   const inputBg = isDark ? "gray.800" : "white";
   const inputBorder = isDark ? "gray.600" : "gray.300";
 
+  // Autofocus: the input mounts exactly when the drawer opens.
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, []);
+
+  // Give the keyboard back the moment the turn ends; without this every
+  // exchange costs a re-click even though the user never left the input.
+  useEffect(() => {
+    if (wasBusyRef.current && !busy) textareaRef.current?.focus();
+    wasBusyRef.current = busy;
+  }, [busy]);
+
+  // Grow with the draft, shrink when it is cleared — including a clear that
+  // arrives via the value prop rather than through handleSend.
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    if (value !== "") {
+      textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_TEXTAREA_HEIGHT_PX)}px`;
+    }
+  }, [value]);
+
   const handleSend = () => {
     const trimmed = value.trim();
-    if (trimmed && !disabled && !buttonDisabled) {
+    if (trimmed && !busy && !buttonDisabled) {
       onSend(trimmed);
       setValue("");
-      // Reset textarea height
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-      }
     }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Send on Enter without Shift (only when sending is allowed)
     if (e.key === "Enter" && !e.shiftKey) {
+      // Enter inside IME composition confirms the conversion, not the message.
+      if (e.nativeEvent.isComposing) return;
       e.preventDefault();
-      if (!disabled && !buttonDisabled) {
-        handleSend();
-      }
+      handleSend();
     }
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setValue(e.target.value);
-    // Auto-resize textarea
-    const textarea = e.target;
-    textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
   };
 
-  const canSend = value.trim().length > 0 && !disabled && !buttonDisabled;
+  const canSend = value.trim().length > 0 && !busy && !buttonDisabled;
 
   // Button colors — exact match of the Airflow "Sign in" button (brand.600 / brand.700)
   const buttonBg = "oklch(0.469 0.084 257.657)";
@@ -109,14 +131,13 @@ export const ChatInput: FC<ChatInputProps> = ({
   const buttonDisabledBg = isDark ? "gray.600" : "gray.300";
 
   return (
-    <Flex gap={3} alignItems="center" height="44px">
+    <Flex gap={3} alignItems="flex-end" minHeight="44px">
       <Textarea
         ref={textareaRef}
         value={value}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        disabled={disabled}
         bg={inputBg}
         borderColor={inputBorder}
         borderRadius="xl"
@@ -125,6 +146,7 @@ export const ChatInput: FC<ChatInputProps> = ({
         flex={1}
         height="44px"
         minHeight="44px"
+        maxHeight={`${MAX_TEXTAREA_HEIGHT_PX}px`}
         py={3}
         px={4}
         fontSize="sm"
