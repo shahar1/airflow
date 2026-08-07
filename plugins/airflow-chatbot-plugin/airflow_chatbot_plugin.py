@@ -833,6 +833,31 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
     return requirements[tool_name]
 
 
+def _tool_optional_access_requirements(tool_name: str) -> tuple[tuple[str, Any], ...]:
+    """
+    Return permissions that WIDEN a tool rather than gate it.
+
+    Evaluated separately from ``_tool_access_requirements`` on purpose: appending
+    audit-log access to the mandatory tuple would cost every user who lacks it
+    the whole of ``diagnose_dag``, which is a read they are otherwise entitled
+    to. The answer here decides how much the tool may read, never whether it may
+    run — and the sidecar fails closed on anything but "granted".
+
+    ``AUDIT_LOG`` is a first-class per-Dag entity, not a fleet-wide one:
+    ``requires_access_dag(method, DagAccessEntity.AUDIT_LOG, dag_id)``
+    (api_fastapi/core_api/security.py:493-496) is what
+    ``GET /eventLogs`` is gated on when the query names a Dag
+    (routes/public/event_logs.py:61,86), and the entity is declared at
+    auth/managers/models/resource_details.py:121.
+    """
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    optional: dict[str, tuple[tuple[str, Any], ...]] = {
+        "diagnose_dag": (("GET", Entity.AUDIT_LOG),),
+    }
+    return optional.get(tool_name, ())
+
+
 def _policy(tool_name: str, trait: str) -> bool:
     return bool(TOOL_POLICY.get(tool_name, {}).get(trait))
 
@@ -1006,6 +1031,30 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
     # The team scopes the permission: asking without it is a different question
     # from the one the real route asks, and team-scoped managers answer it differently.
     teams = DagModel.get_dag_id_to_team_name_mapping([target for target, _ in targets])
+
+    # UNCONDITIONALLY overwritten, exactly like ``source_digest``: the sidecar
+    # gates a privileged read on this value, so leaving a model-chosen one in
+    # place would let the model grant itself the permission. Evaluated over the
+    # same targets — a source file holding a second Dag is read whole, so the
+    # audit read has to clear every Dag in it too.
+    optional = _tool_optional_access_requirements(tool_name)
+    if optional:
+        args["audit_scope"] = (
+            "granted"
+            if all(
+                _is_authorized_dag(
+                    user,
+                    method=method,
+                    dag_id=target,
+                    access_entity=access_entity,
+                    team_name=teams.get(target),
+                )
+                for target, _ in targets
+                for method, access_entity in optional
+            )
+            else "denied"
+        )
+
     for target, requirements in targets:
         for method, access_entity in requirements:
             if _is_authorized_dag(

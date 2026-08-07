@@ -22,6 +22,7 @@ import sys
 import types
 from hashlib import md5
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -84,6 +85,17 @@ class FakeAirflow:
         self.tries_by_task: dict[tuple[str, int], list[dict]] = {}
         self.tries_total: int | None = None
         self.fail_tries: Exception | None = None
+        # /eventLogs: the audit + execution rows of one run, newest first, as the
+        # route returns them.
+        self.event_logs: list[dict] = []
+        self.event_logs_total: int | None = None
+        self.fail_event_logs: Exception | None = None
+        self.event_log_pages: list[list[dict]] | None = None
+        self.runs_total: int | None = None
+        # /dags/{dag}/dagRuns/~/taskInstances — the cross-run comparison route.
+        self.cross_run_tis: list[dict] = []
+        self.cross_run_total: int | None = None
+        self.fail_cross_run: Exception | None = None
 
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path))
@@ -97,6 +109,30 @@ class FakeAirflow:
                 return run
             if path == f"/dags/{DAG_ID}{quoted}/taskInstances":
                 return {"task_instances": self.tis_by_run.get(run_id, [])}
+        if path == "/eventLogs":
+            if self.fail_event_logs:
+                raise self.fail_event_logs
+            params = kwargs.get("params") or {}
+            if self.event_log_pages is not None:
+                index = params["offset"] // params["limit"]
+                page = self.event_log_pages[index] if index < len(self.event_log_pages) else []
+            else:
+                page = self.event_logs[params["offset"] : params["offset"] + params["limit"]]
+            total = (
+                sum(len(p) for p in self.event_log_pages)
+                if self.event_log_pages is not None and self.event_logs_total is None
+                else (len(self.event_logs) if self.event_logs_total is None else self.event_logs_total)
+            )
+            # The real route filters server-side; the stub echoes the scoping so
+            # a test can prove the tool asked for the right run.
+            return {"event_logs": page, "total_entries": total}
+        if path == f"/dags/{DAG_ID}/dagRuns/~/taskInstances":
+            if self.fail_cross_run:
+                raise self.fail_cross_run
+            wanted = (kwargs.get("params") or {}).get("task_id")
+            rows = [ti for ti in self.cross_run_tis if ti["task_id"] == wanted]
+            total = len(rows) if self.cross_run_total is None else self.cross_run_total
+            return {"task_instances": rows, "total_entries": total}
         if path == "/assets":
             return {"assets": self.assets}
         if path == "/importErrors":
@@ -181,7 +217,10 @@ class FakeAirflow:
                 if self.fail_trigger:
                     raise self.fail_trigger
                 return {"dag_run_id": "manual__new", "state": "queued"}
-            return {"dag_runs": self.runs}
+            return {
+                "dag_runs": self.runs,
+                "total_entries": len(self.runs) if self.runs_total is None else self.runs_total,
+            }
         if path == "/dags/~/dagRuns/~/taskInstances/list":
             wanted = (kwargs.get("json") or {}).get("dag_ids")
             tis = self.task_instances
@@ -320,11 +359,17 @@ def test_dag_url_escapes_ids():
 
 
 def test_diagnose_dag_without_runs(airflow):
-    assert server.diagnose_dag(DAG_ID) == {
-        "dag_id": DAG_ID,
-        "diagnosis": "this Dag has never run",
-        "summary": "This Dag has never run, so there is no run to diagnose.",
-    }
+    result = server.diagnose_dag(DAG_ID)
+
+    assert result["diagnosis"] == "this Dag has never run"
+    assert result["summary"] == "This Dag has never run, so there is no run to diagnose."
+    # The run list is emitted even when it is empty: this is precisely the path
+    # on which a model with nothing in front of it invents a run id.
+    assert result["run_history"]["runs"] == []
+    assert result["run_history"]["total_entries"] == 0
+    assert result["run_history"]["window"] == "this Dag has no runs"
+    assert result["run_history"]["task_comparison"]["tasks"] == {}
+    assert "event_history" not in result
 
 
 def test_diagnose_dag_reports_failed_task_log_and_source(airflow):
@@ -686,11 +731,15 @@ def test_diagnose_dag_summary_enumerates_every_failure_and_check(airflow):
 
 
 def test_diagnose_dag_summary_when_nothing_is_wrong(airflow):
-    """The strong sentence is now earned, so the instance has to carry the fields."""
+    """The strong sentence is now earned, so the instance has to carry the fields.
+
+    ``audit_scope`` has to be granted for it: an unread event history is the
+    absence of a measurement, and the strong sentence is not earned off one.
+    """
     airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
     airflow.task_instances = [_executed("extract")]
 
-    result = server.diagnose_dag(DAG_ID)
+    result = server.diagnose_dag(DAG_ID, audit_scope="granted")
 
     assert result["summary"] == (
         "No problems found: run `manual__1` is success; all 1 task instances succeeded, and every "
@@ -724,8 +773,14 @@ def test_diagnose_dag_diagnoses_the_exact_run_it_was_asked_about(airflow):
 
     assert result["dag_run_id"] == "manual__1"
     assert result["failed_task_id"] == "summarize"
-    # The exact run was fetched; the last-5 scan never ran.
-    assert ("GET", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+    # The exact run was fetched rather than resolved by scanning: the only
+    # dagRuns listing is the run-history read, and it never picked the run.
+    listings = [
+        params
+        for (_, path), params in zip(airflow.calls, airflow.params)
+        if path == f"/dags/{DAG_ID}/dagRuns"
+    ]
+    assert all(params["limit"] == server.RUN_HISTORY_LIMIT for params in listings)
 
 
 def test_diagnose_dag_says_when_the_asked_run_does_not_exist(airflow):
@@ -2882,10 +2937,85 @@ def _findings(result: dict) -> list[dict]:
     return [check for check in result.get("checks", []) if check["kind"] == FINDING]
 
 
-def _green_run(airflow, *tis: dict, state: str = "success") -> dict:
+def _green_run(airflow, *tis: dict, state: str = "success", audit_scope: str = "") -> dict:
     airflow.runs = [{"dag_run_id": "manual__1", "state": state}]
     airflow.task_instances = list(tis)
-    return server.diagnose_dag(DAG_ID)
+    return server.diagnose_dag(DAG_ID, audit_scope=audit_scope)
+
+
+def _audited_run(airflow, *tis: dict, events: list | None = None, state: str = "success") -> dict:
+    """A run diagnosed by a caller the plugin found authorized for the audit log."""
+    airflow.event_logs = list(events or [])
+    return _green_run(airflow, *tis, state=state, audit_scope="granted")
+
+
+def _event(**overrides) -> dict:
+    """One /eventLogs row with every column the route returns."""
+    return {
+        "event_log_id": 1,
+        "when": "2026-08-07T07:57:25.244109Z",
+        "dag_id": DAG_ID,
+        "task_id": None,
+        "run_id": "manual__1",
+        "map_index": None,
+        "try_number": None,
+        "event": "trigger_dag_run",
+        "logical_date": None,
+        "owner": "admin",
+        "owner_display_name": "admin",
+        "extra": None,
+        "dag_display_name": DAG_ID,
+        "task_display_name": None,
+        **overrides,
+    }
+
+
+# The audited single-instance PATCH, captured verbatim from the live deployment:
+# gate0_forge_ordered / g0r1_ordered_001, event_log_id 1026. map_index and
+# try_number really are null on it — that is why it pins neither.
+PATCH_EVENT = _event(
+    event_log_id=1026,
+    when="2026-08-07T07:57:25.244109Z",
+    task_id="remit_payment_batch",
+    event="patch_task_instance",
+    owner="admin",
+    owner_display_name="admin",
+    extra='{"new_state": "success", "method": "PATCH"}',
+)
+
+# The platform's own execution rows for the executed sibling, same run.
+RUNNING_EVENT = _event(
+    event_log_id=1025,
+    when="2026-08-07T07:57:22.711568Z",
+    task_id="prepare_disbursement_file",
+    map_index=-1,
+    try_number=1,
+    event="running",
+    owner="airflow",
+    owner_display_name="airflow",
+    extra='{"host_name": "b256b32ddda1"}',
+)
+SUCCESS_EVENT = {
+    **RUNNING_EVENT,
+    "event_log_id": 1032,
+    "when": "2026-08-07T07:58:22.960489Z",
+    "event": "success",
+}
+
+# gate0_forge_chain / gate0_forge_002, event_log_id 905 — a run-scoped clear that
+# names its targets only in ``extra``.
+CLEAR_EVENT = _event(
+    event_log_id=905,
+    when="2026-08-07T07:07:17.591221Z",
+    task_id=None,
+    event="post_clear_task_instances",
+    owner="admin",
+    extra=(
+        '{"dag_run_id": "gate0_forge_002", "task_ids": ["remit_payment_batch"], '
+        '"only_failed": false, "reset_dag_runs": true, "include_downstream": true, '
+        '"dry_run": false, "method": "POST"}'
+    ),
+)
 
 
 def _with_own_history(airflow, ti: dict = FORGED_TI) -> None:
@@ -2907,7 +3037,11 @@ def test_diagnose_flags_a_success_carrying_no_dispatch_evidence(airflow):
     assert finding["task_id"] == "remit_payment_batch"
     assert finding["attempt_history"] == "checked"
     assert finding["current_attempt_dispatched"] is False
-    assert finding["attribution"] == "not established"
+    # No audit scope was injected, so the event history was never read — and an
+    # unread history establishes nothing in either direction. It is reported as
+    # NOT SCOPED rather than not permitted: no argument arrived, so no permission
+    # was refused.
+    assert finding["attribution"] == "event_history_not_scoped"
     assert "`remit_payment_batch` is recorded state=success at try_number 0" in finding["detail"]
     assert (
         "hostname is empty, pid is null, queued_when is null and scheduled_when is null"
@@ -3275,7 +3409,7 @@ def test_diagnose_never_infers_a_field_the_response_did_not_carry(airflow, missi
 
 
 def test_diagnose_says_no_problems_only_for_a_run_that_earned_it(airflow):
-    result = _green_run(airflow, EXECUTED_TI, _executed("notify_treasury_complete"))
+    result = _audited_run(airflow, EXECUTED_TI, _executed("notify_treasury_complete"))
 
     assert result["run_health"] == {
         "state": "success",
@@ -3292,6 +3426,13 @@ def test_diagnose_says_no_problems_only_for_a_run_that_earned_it(airflow):
         "dispatch_findings_suppressed": 0,
         "static_checks_suppressed": 0,
         "task_instances_omitted": 0,
+        "state_change_attribution": {
+            "by_attribution": {"no_event_found": 2},
+            "corroborated": {},
+            "row_claimed": {},
+            "instances_attributed_by_unpinned_row": 0,
+            "distinct_event_log_ids": 0,
+        },
         "clean": True,
         "clean_blockers": [],
     }
@@ -3361,7 +3502,7 @@ def test_diagnose_does_not_call_an_empty_run_problem_free(airflow):
 )
 def test_diagnose_does_not_call_a_run_with_unrun_instances_problem_free(airflow, state, clause):
     """'Nothing failed' is not 'nothing wrong' — the census says what is there."""
-    result = _green_run(airflow, EXECUTED_TI, {**EXECUTED_TI, "task_id": "other", "state": state})
+    result = _audited_run(airflow, EXECUTED_TI, {**EXECUTED_TI, "task_id": "other", "state": state})
 
     assert _findings(result) == []
     assert result["summary"].startswith(f"No failures found: run `manual__1` is success. {clause}")
@@ -3383,7 +3524,7 @@ def test_diagnose_census_lists_every_unrun_state_in_order(airflow):
 
 
 def test_diagnose_does_not_call_an_in_flight_run_problem_free(airflow):
-    result = _green_run(
+    result = _audited_run(
         airflow, EXECUTED_TI, {**EXECUTED_TI, "task_id": "b", "state": "running"}, state="running"
     )
 
@@ -3422,7 +3563,7 @@ def test_diagnose_projects_every_dispatch_field_without_dropping_nulls(airflow):
     result = _green_run(airflow, FORGED_TI, EXECUTED_TI)
 
     projected = result["task_instances"][0]
-    assert set(projected) == set(server._TASK_INSTANCE_DETAIL_KEYS)
+    assert set(projected) == set(server._TASK_INSTANCE_DETAIL_KEYS) | {"last_state_change"}
     assert projected["pid"] is None
     assert projected["queued_when"] is None
     assert projected["scheduled_when"] is None
@@ -3440,7 +3581,9 @@ def test_diagnose_reduces_the_projection_but_keeps_the_rows_that_matter(airflow,
     result = _green_run(airflow, *crowd, FORGED_TI)
 
     projected = {ti["task_id"]: ti for ti in result["task_instances"]}
-    assert set(projected["remit_payment_batch"]) == set(server._TASK_INSTANCE_DETAIL_KEYS)
+    assert set(projected["remit_payment_batch"]) == set(server._TASK_INSTANCE_DETAIL_KEYS) | {
+        "last_state_change"
+    }
     assert set(projected["t3"]) == {"task_id", "state", "try_number", "map_index"}
     assert result["task_instance_detail_reduced"] == 4
 
@@ -3454,7 +3597,7 @@ def test_diagnose_keeps_the_full_projection_for_failed_instances(airflow, monkey
 
     result = server.diagnose_dag(DAG_ID)
 
-    assert set(result["task_instances"][0]) == set(server._TASK_INSTANCE_DETAIL_KEYS)
+    assert set(result["task_instances"][0]) == set(server._TASK_INSTANCE_DETAIL_KEYS) | {"last_state_change"}
     assert "task_instance_detail_reduced" not in result
 
 
@@ -3700,7 +3843,7 @@ def test_a_run_id_cannot_forge_numbering_through_the_clean_sentence(airflow):
     airflow.runs = [{"dag_run_id": f"manual__1{POISON}", "state": "success"}]
     airflow.task_instances = [EXECUTED_TI]
 
-    result = server.diagnose_dag(DAG_ID)
+    result = server.diagnose_dag(DAG_ID, audit_scope="granted")
 
     assert result["summary"].startswith("No problems found: run `manual__1")
     _assert_numbering_is_the_tools_own(result, entries=0)
@@ -3898,9 +4041,171 @@ def test_diagnose_clamps_a_giant_operator_at_both_sites(airflow):
 
 
 def test_a_giant_operator_cannot_scale_the_size_of_the_result(airflow):
-    forged = [{**FORGED_TI, "task_id": f"forged_{index:03d}", "operator": "P" * 1000} for index in range(500)]
+    """What the Dag author chooses cannot scale the result — the tool's own
+    constants can, and only they do.
 
-    assert len(json.dumps(_green_run(airflow, *forged))) < 150_000
+    The test that matters is the difference between a 1000-char operator and a
+    1-char one: it must be the clamp, not the operator.
+    """
+    forged = [{**FORGED_TI, "task_id": f"forged_{index:03d}", "operator": "P" * 1000} for index in range(500)]
+    tiny = [{**ti, "operator": "P"} for ti in forged]
+
+    giant_size = len(json.dumps(_green_run(airflow, *forged)))
+    tiny_size = len(json.dumps(_green_run(airflow, *tiny)))
+
+    assert giant_size < 420_000
+    # 500 rows, but only TASK_INSTANCE_DETAIL_LIMIT of them carry an operator at
+    # all, and each is clamped — so the 999 extra characters buy ~119 apiece.
+    assert giant_size - tiny_size < server.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
+
+
+# The size of the result must not be a function of what the event log holds.
+# Every field an attacker controls, at its clamp: the event name, both owner
+# fields, and an ``extra`` of 60 five-kilobyte keys.
+def _maximal_event(event_log_id: int, task_id: str) -> dict:
+    """Every lever a requester holds, at its clamp, on one row.
+
+    The round-2 shape poisoned only the levers the round-2 guard measured, which
+    is why the guard passed at ~700 KB while the real worst case was ~997 KB. The
+    two it missed are ordinary body keys plantable by the same rejected-request
+    mechanism: a RELAYED ``task_ids`` list (EXTRA_LIST_LIMIT entries, each at
+    EVENT_EXTRA_CLAMP_CHARS) and withheld key NAMES at EXTRA_KEY_CLAMP_CHARS
+    rather than the two characters ``k0`` used before.
+    """
+    long_key = "K" * server.EXTRA_KEY_CLAMP_CHARS
+    return _event(
+        event_log_id=event_log_id,
+        task_id=task_id,
+        event="patch_task_instance" + "E" * 400,
+        owner="O" * 900,
+        owner_display_name="D" * 900,
+        extra=json.dumps(
+            {
+                "new_state": "S" * 5000,
+                "method": "M" * 5000,
+                "map_index": "X" * 5000,
+                # Relayed, not withheld: the list survives to EXTRA_LIST_LIMIT
+                # entries and each entry to its own character clamp.
+                "task_ids": ["T" * 5000 for _ in range(server.EXTRA_LIST_LIMIT * 3)],
+                **{f"{long_key}{index:04d}": "V" * 2000 for index in range(60)},
+            }
+        ),
+    )
+
+
+def test_event_log_content_at_every_clamp_cannot_scale_the_result(airflow):
+    """The worst case the audit log can hand back, poisoned at every clamp at once.
+
+    Three numbers, because they answer three different questions. The RUNTIME
+    ceiling is the one the tool enforces rather than argues for - the serialized
+    attribution payload is measured and reduced past it. The absolute ceiling is
+    what a caller must be ready to receive. The delta is the only part of it an
+    attacker chooses; everything under it is TASK_INSTANCE_DETAIL_LIMIT rows of
+    this tool's own constant prose.
+    """
+    forged = [{**FORGED_TI, "task_id": f"forged_{index:03d}"} for index in range(500)]
+    # EVENT_SCAN_LIMIT rows is every row the scan will ever hold, spread four to
+    # an instance so more are matched than EVENT_HISTORY_PER_INSTANCE keeps.
+    rows = [
+        _maximal_event(index * 10 + copy, forged[index]["task_id"])
+        for index in range(server.EVENT_SCAN_LIMIT // 4)
+        for copy in range(4)
+    ]
+    benign = [_event(event_log_id=row["event_log_id"], task_id=row["task_id"]) for row in rows]
+
+    result = _audited_run(airflow, *forged, events=rows)
+    size = len(json.dumps(result))
+    benign_size = len(json.dumps(_audited_run(airflow, *forged, events=benign)))
+    history = result["event_history"]
+
+    # The enforced ceiling, asserted against the tool's own reported measurement
+    # AND recomputed from the payload, so a report that lies about itself fails.
+    measured = sum(
+        len(json.dumps(ti["last_state_change"]))
+        for ti in result["task_instances"]
+        if ti.get("last_state_change")
+    )
+    assert history["attribution_payload_limit"] == server.ATTRIBUTION_PAYLOAD_LIMIT_CHARS
+    assert measured <= server.ATTRIBUTION_PAYLOAD_LIMIT_CHARS, f"attribution payload was {measured}"
+    assert history["attribution_payload_bytes"] == measured
+    assert history["attribution_payload_over_limit"] is False
+    # It bit, and it said so.
+    assert history["attribution_reduced_for_size"] > 0
+    reduced = [
+        ti["last_state_change"]
+        for ti in result["task_instances"]
+        if (ti.get("last_state_change") or {}).get("size_reduced")
+    ]
+    assert len(reduced) == history["attribution_reduced_for_size"]
+    # Honest truncation: what was taken is counted where a reader will look.
+    for seen in reduced:
+        assert seen["events"] == []
+        assert seen["events_omitted_for_instance"] == seen["events_recorded"]
+        # The claims are never what gets dropped.
+        assert seen["attribution"] == "other_recorded_event"
+        assert seen["unknowns"]
+
+    assert size < 700_000, f"result grew to {size} bytes"
+    assert size - benign_size < 150_000, f"event content bought {size - benign_size} bytes"
+    # A withheld key's 2000-character value never appears at any site, and a
+    # relayed one survives only through its own clamp, never whole.
+    # (Counted rather than `in`: a failing `in` on a 700 KB string sends the
+    # assertion-diff machinery into a grind that reads as a hang.)
+    whole = json.dumps(result)
+    assert whole.count("V" * 20) == 0
+    assert whole.count("S" * (server.EVENT_EXTRA_CLAMP_CHARS + 1)) == 0
+    assert whole.count("M" * (server.EVENT_EXTRA_CLAMP_CHARS + 1)) == 0
+    assert whole.count("X" * (server.EVENT_EXTRA_CLAMP_CHARS + 1)) == 0
+    assert whole.count("T" * (server.EVENT_EXTRA_CLAMP_CHARS + 1)) == 0
+    seen = _attribution(result, "forged_000")
+    assert len(seen["event_owner"]) == server.EVENT_OWNER_CLAMP_CHARS
+    assert len(seen["extra_keys"]) == server.EXTRA_KEY_LIMIT
+    assert seen["extra_keys_omitted"] == 60 - server.EXTRA_KEY_LIMIT
+    assert all(len(key) <= server.EXTRA_KEY_CLAMP_CHARS for key in seen["extra_keys"])
+    assert len(seen["extra"]["task_ids"]) == server.EXTRA_LIST_LIMIT
+    # Under the ceiling the context rows survive, and a context row carries no
+    # `extra` projection at all — one per row was the largest repeated structure
+    # in the result. Measured on a run small enough that the ceiling never bites.
+    small = [{**FORGED_TI, "task_id": f"forged_{index:03d}"} for index in range(2)]
+    small_rows = [
+        _maximal_event(index * 10 + copy, small[0]["task_id"]) for index in range(2) for copy in range(2)
+    ]
+    small_result = _audited_run(airflow, *small, events=small_rows)
+    assert small_result["event_history"]["attribution_reduced_for_size"] == 0
+    context = _attribution(small_result, "forged_000")["events"][0]
+    assert "extra" not in context
+    assert context["targeting_is_request_settable"] is False
+
+
+def test_the_attribution_ceiling_reports_zero_when_it_never_bites(airflow):
+    """The ceiling is measured on every run, not only the poisoned one, so the
+    number a reader sees is the real payload size rather than a flag."""
+    _with_own_history(airflow)
+
+    history = _audited_run(airflow, FORGED_TI, events=[PATCH_EVENT])["event_history"]
+
+    assert history["attribution_reduced_for_size"] == 0
+    assert 0 < history["attribution_payload_bytes"] < server.ATTRIBUTION_PAYLOAD_LIMIT_CHARS
+
+
+def test_the_caveats_ship_as_codes_with_one_legend_at_the_top(airflow):
+    """Six constant paragraphs repeated on 200 detailed rows was ~197 KB. The
+    prose is constant and this tool wrote it, so it is said once."""
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, EXECUTED_TI, FORGED_TI, events=[SUCCESS_EVENT, PATCH_EVENT])
+    seen = _attribution(result, "remit_payment_batch")
+    legend = result["event_history"]["unknowns_legend"]
+
+    assert seen["unknowns"] == ["U1", "U3", "U11", "U13", "U10", "U7", "U6"]
+    # Every code cited resolves, and nothing uncited is carried.
+    assert set(legend) == {code for ti in result["task_instances"] for code in _codes_of(ti)}
+    assert all(code in server._UNKNOWNS for code in legend)
+    assert legend["U1"] == server._U1
+
+
+def _codes_of(ti: dict) -> list[str]:
+    return (ti.get("last_state_change") or {}).get("unknowns", [])
 
 
 # ---------------------------------------------------------------------------
@@ -3951,3 +4256,1422 @@ def test_the_headline_counts_problems_and_not_the_entry_that_folds_them(airflow)
 
     assert summary.startswith("500 problems found.")
     assert "(1) Note: 500 successful task instance(s)" in summary
+
+
+# ---------------------------------------------------------------------------
+# What the event log recorded — and what it cannot establish
+#
+# Every fixture below is a real /eventLogs row captured from the live
+# deployment (gate-0 evidence base), except where a shape had to be written out
+# to exercise a cap or a rejection.
+# ---------------------------------------------------------------------------
+
+
+def _attribution(result: dict, task_id: str, map_index: int = -1) -> dict:
+    for ti in result["task_instances"]:
+        if ti["task_id"] == task_id and ti.get("map_index", -1) == map_index:
+            return ti["last_state_change"]
+    raise AssertionError(f"no detailed row for {task_id}[{map_index}]")
+
+
+def _event_calls(airflow) -> list:
+    return [params for (_, path), params in zip(airflow.calls, airflow.params) if path == "/eventLogs"]
+
+
+def test_a_single_instance_patch_row_is_reported_in_full_and_never_as_audited(airflow):
+    """The canonical audited forgery: gate0_forge_ordered / g0r1_ordered_001.
+
+    Every field of the row is relayed. What it is NOT is an audited headline: it
+    is a REST row, so its dag_id/run_id/task_id columns were settable by the
+    request that planted it and nothing on the row separates the two cases.
+    """
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, EXECUTED_TI, FORGED_TI, events=[SUCCESS_EVENT, PATCH_EVENT, RUNNING_EVENT])
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["targeting_is_request_settable"] is True
+    assert seen["event"] == "patch_task_instance"
+    assert seen["when"] == "2026-08-07T07:57:25.244109Z"
+    assert seen["event_log_id"] == 1026
+    assert seen["event_owner"] == "admin"
+    assert seen["recorded_principal"] == "admin"
+    assert seen["recorded_principal_kind"] == "authenticated_api_principal"
+    assert seen["interface"] == "rest_api"
+    assert seen["method"] == "PATCH"
+    assert seen["new_state"] == "success"
+    assert seen["new_state_source"] == "extra.new_state"
+    assert seen["associated_via"] == "row.task_id"
+
+
+def test_the_audited_patch_row_pins_neither_attempt_nor_mapped_instance(airflow):
+    """map_index and try_number really are null on it (verified: event_log_id 1026)."""
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]), "remit_payment_batch")
+
+    assert seen["event_map_index"] is None
+    assert seen["event_try_number"] is None
+    assert seen["pins_map_index"] is False
+    assert seen["pins_try_number"] is False
+    assert seen["matches_recorded_attempt"] is None
+    assert "U7" in seen["unknowns"]
+
+
+def test_the_audited_patch_carries_every_unknown_the_row_cannot_settle(airflow):
+    """A demoted row keeps every caveat the audited states carry, and gains U13."""
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]), "remit_payment_batch")
+
+    for unknown in ("U1", "U3", "U7", "U10", "U11", "U13"):
+        assert unknown in seen["unknowns"]
+
+
+def test_the_patch_sentence_names_the_row_and_never_that_a_person_acted(airflow):
+    _with_own_history(airflow)
+
+    detail = _findings(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]))[0]["detail"]
+
+    assert "does not classify as a state change" in detail
+    assert '"patch_task_instance"' in detail
+    # The demoted branch asserts NOTHING about `owner`: the row may well record
+    # an authenticated principal, and it may equally have been planted.
+    assert "not an actor" not in detail
+    assert "owner attribute from the Dag file" not in detail
+    # Never the accusation the row cannot carry.
+    for banned in ("forged", "admin marked", "someone", "a human", "the user"):
+        assert banned not in detail
+
+
+def test_no_shipped_prose_says_a_recorded_row_proves_an_attempt(airflow):
+    """MINOR-6: a row committed before validation AND before authorization proves
+    a request was received and logged. `was ATTEMPTED` was a stronger claim than
+    the row carries, and it contradicted U13 in the same object."""
+    audited = (
+        server._ATTRIBUTION_DETAIL[server._ATTR_AUDITED_PATCH],
+        server._ATTRIBUTION_DETAIL[server._ATTR_AUDITED_OTHER],
+        server._ATTRIBUTION_SENTENCE[server._ATTR_AUDITED_PATCH],
+        server._ATTRIBUTION_SENTENCE[server._ATTR_AUDITED_OTHER],
+    )
+
+    for text in audited:
+        assert "ATTEMPTED" not in text
+        assert "was attempted" not in text
+        assert "RECEIVED AND LOGGED" in text or "received and logged" in text
+    assert "received and logged" in server._U1
+
+
+def test_a_bulk_patch_leaves_no_row_and_is_never_read_as_a_database_write(airflow):
+    """gate0_forge_ordered / gate0_ordered_bulk_001: the forged task has NO row
+    while its executed siblings have running/success pairs.
+
+    The single most dangerous sentence this tool could produce is 'no event was
+    found, so the state was written directly to the database'. This is the test
+    that it does not.
+    """
+    _with_own_history(airflow)
+
+    result = _audited_run(
+        airflow,
+        EXECUTED_TI,
+        FORGED_TI,
+        events=[SUCCESS_EVENT, RUNNING_EVENT, _event(event_log_id=912)],
+    )
+    seen = _attribution(result, "remit_payment_batch")
+    spoken = f"{_findings(result)[0]['detail']} {result['summary']}".lower()
+
+    assert seen["attribution"] == "no_event_found"
+    assert seen["unknowns"] == ["U2", "U11", "U12", "U13"]
+    assert "not evidence of a direct database write" in seen["attribution_detail"]
+    assert "not evidence of a direct database write" in spoken
+    for banned in (
+        "written directly to the database",
+        "direct database write, so",
+        "no api call",
+        "nobody called",
+        "was not called",
+    ):
+        assert banned not in spoken
+    # The trigger row is task-scoped to nothing, so it lands in the run bucket.
+    assert [row["event"] for row in result["event_history"]["run_scoped_events"]] == ["trigger_dag_run"]
+
+
+def test_the_no_event_state_names_every_mechanism_that_produces_it(airflow):
+    _with_own_history(airflow)
+
+    detail = _attribution(_audited_run(airflow, FORGED_TI), "remit_payment_batch")["attribution_detail"]
+
+    for mechanism in (
+        "bulk PATCH route",
+        "direct database UPDATE",
+        "TaskInstance.set_state",
+        "EmptyOperator fast path",
+        "inside the triggerer",
+        "retention",
+    ):
+        assert mechanism in detail
+
+
+def test_a_worker_produced_success_is_a_platform_event_and_its_owner_is_not_an_actor(airflow):
+    result = _audited_run(airflow, EXECUTED_TI, events=[SUCCESS_EVENT, RUNNING_EVENT])
+    seen = _attribution(result, "prepare_disbursement_file")
+
+    assert seen["attribution"] == "platform_execution_event"
+    assert seen["event"] == "success"
+    assert seen["event_owner"] == "airflow"
+    assert seen["recorded_principal"] is None
+    assert seen["recorded_principal_kind"] == "dag_task_owner"
+    assert seen["interface"] == "platform"
+    assert seen["new_state"] == "success"
+    assert seen["new_state_source"] == "event_name"
+    assert seen["event_map_index"] == -1
+    assert seen["event_try_number"] == 1
+    assert seen["matches_recorded_attempt"] is True
+    assert "U4" in seen["unknowns"]
+    assert [row["event"] for row in seen["events"]] == ["success", "running"]
+    assert _findings(result) == []
+
+
+def test_a_dag_authors_owner_string_never_becomes_a_recorded_principal(airflow):
+    """hollis_enrolment_sync's execution rows carry owner 'registrar-it', which
+    is default_args={"owner": "registrar-it"} at files/dags/hollis_enrolment_sync.py:235.
+
+    It reads exactly like a team of humans and is a string an attacker who can
+    edit a Dag chooses freely.
+    """
+    rows = [{**SUCCESS_EVENT, "owner": "registrar-it", "owner_display_name": "registrar-it"}]
+
+    result = _audited_run(airflow, EXECUTED_TI, events=rows)
+    seen = _attribution(result, "prepare_disbursement_file")
+
+    assert seen["event_owner"] == "registrar-it"
+    assert seen["recorded_principal"] is None
+    assert seen["recorded_principal_kind"] == "dag_task_owner"
+    assert "U4" in seen["unknowns"]
+    assert "registrar-it" not in result["summary"]
+
+
+def test_the_scheduler_empty_operator_path_lands_in_the_same_state_as_the_bulk_forgery(airflow):
+    """gate0_empty_noop: the EmptyOperator task has no row while its siblings do,
+    because models/dagrun.py:2286-2300 is a bulk UPDATE that writes no Log row.
+
+    Identical to the bulk forgery, which is correct and has to be stated: this
+    state does not separate them.
+    """
+    result = _audited_run(airflow, EXECUTED_TI, EMPTY_OPERATOR_TI, events=[SUCCESS_EVENT, RUNNING_EVENT])
+
+    assert _attribution(result, "noop")["attribution"] == "no_event_found"
+    assert _findings(result) == []
+    assert "successes_without_worker_fields" in result["run_health"]["clean_blockers"]
+
+
+def test_a_triggerer_completion_is_no_event_found_and_is_never_a_mitigation(airflow):
+    """It emits no execution-API row either, so its absence separates nothing —
+    and it must not be budgeted as a mitigation anywhere."""
+    result = _audited_run(airflow, TRIGGERER_COMPLETED_TI_LIVE, events=[])
+    seen = _attribution(result, "wait_for_settlement_window")
+
+    assert seen["attribution"] == "no_event_found"
+    assert "U12" in seen["unknowns"]
+    # The conjunction excluded it on its own legs; the event history neither
+    # rescued it nor flagged it.
+    assert _findings(result) == []
+    assert "no_event_found" not in result["run_health"]["clean_blockers"]
+
+
+def test_a_task_group_patch_is_relayed_and_demoted_like_every_other_rest_row(airflow):
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "patch_task_group_instances"}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["event"] == "patch_task_group_instances"
+    assert seen["interface"] == "rest_api"
+    assert seen["recorded_principal_kind"] == "authenticated_api_principal"
+    assert "U3" in seen["unknowns"]
+
+
+@pytest.mark.parametrize("event", ["cli_dag_test", "cli_task_clear", "cli_something_new"])
+def test_a_cli_owner_is_an_operating_system_user_and_never_an_api_principal(airflow, event):
+    """`airflow dags test --mark-success-pattern` records owner 'root'. Folding it
+    under the API-principal state would make an OS username read as one."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": event, "owner": "root", "owner_display_name": "root"}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    # Demoted like every other row that no map_index column corroborates, but the
+    # owner-kind distinction survives the demotion: U5, never U3, and no
+    # `recorded_principal`, because an OS user name is not an API principal.
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "uncorroborated_association"
+    assert seen["targeting_is_request_settable"] is False
+    assert seen["interface"] == "cli"
+    assert seen["recorded_principal_kind"] == "os_user_from_cli"
+    assert seen["recorded_principal"] is None
+    assert "U5" in seen["unknowns"]
+    assert "U3" not in seen["unknowns"]
+    # U7 is a REST-row caveat; a `cli_*` row is not one.
+    assert "U7" not in seen["unknowns"]
+
+
+def test_a_cleared_and_rerun_instance_reports_the_honest_success_as_its_headline(airflow):
+    """gate0_forge_chain / gate0_forge_002: forged, then cleared and rerun.
+
+    The headline is the genuine rerun; the forged attempt stays visible in
+    history rather than being the answer.
+    """
+    rerun_running = _event(
+        event_log_id=906,
+        when="2026-08-07T07:07:18.068696Z",
+        task_id="remit_payment_batch",
+        map_index=-1,
+        try_number=1,
+        event="running",
+        owner="airflow",
+        extra='{"host_name": "b256b32ddda1"}',
+    )
+    rerun_success = {
+        **rerun_running,
+        "event_log_id": 907,
+        "when": "2026-08-07T07:07:18.376504Z",
+        "event": "success",
+    }
+    old_patch = {**PATCH_EVENT, "event_log_id": 883, "when": "2026-08-07T06:52:11.953851Z"}
+    rows = [rerun_success, rerun_running, CLEAR_EVENT, old_patch]
+    rerun_ti = {**EXECUTED_TI, "task_id": "remit_payment_batch", "try_number": 1}
+
+    result = _audited_run(airflow, rerun_ti, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["attribution"] == "platform_execution_event"
+    assert seen["event"] == "success"
+    assert seen["when"] == "2026-08-07T07:07:18.376504Z"
+    assert seen["matches_recorded_attempt"] is True
+    assert seen["events_recorded"] == 4
+    # Corroborated associations rank first, then newest-first inside each rank;
+    # the tail past EVENT_HISTORY_PER_INSTANCE is counted, not dropped silently.
+    assert [row["event"] for row in seen["events"]] == ["success", "running"]
+    assert seen["events_omitted_for_instance"] == 2
+    assert _findings(result) == []
+
+    # The clear names its target only in `extra`, and that is the only shape
+    # accepted — visible once the corroborated rows are out of its way.
+    only_clear = _attribution(_audited_run(airflow, rerun_ti, events=[CLEAR_EVENT]), "remit_payment_batch")
+    assert only_clear["associated_via"] == "extra.task_ids"
+
+
+def test_a_run_scoped_clear_only_attaches_through_a_list_of_task_id_strings(airflow):
+    """Any other shape in `extra` is ignored rather than guessed at."""
+    bad = [
+        {**CLEAR_EVENT, "event_log_id": 1, "extra": '{"task_ids": "remit_payment_batch"}'},
+        {**CLEAR_EVENT, "event_log_id": 2, "extra": '{"task_ids": [{"task_id": "remit_payment_batch"}]}'},
+        {**CLEAR_EVENT, "event_log_id": 3, "extra": '["remit_payment_batch"]'},
+        {**CLEAR_EVENT, "event_log_id": 4, "extra": "not json at all"},
+    ]
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=bad), "remit_payment_batch")
+
+    assert seen["attribution"] == "no_event_found"
+    # Nothing is dropped: they are all still reported as run-scoped rows.
+    assert len(_audited_run(airflow, FORGED_TI, events=bad)["event_history"]["run_scoped_events"]) == 4
+
+
+def test_more_state_changes_than_the_per_instance_cap_are_counted_not_hidden(airflow):
+    rows = [
+        {**PATCH_EVENT, "event_log_id": 100 + index, "when": f"2026-08-07T07:5{index}:00.000000Z"}
+        for index in range(8)
+    ]
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["events_recorded"] == 8
+    assert len(seen["events"]) == server.EVENT_HISTORY_PER_INSTANCE
+    assert seen["events_omitted_for_instance"] == 8 - server.EVENT_HISTORY_PER_INSTANCE
+    # The headline always describes events[0], so the cap cannot change it.
+    assert seen["event_log_id"] == seen["events"][0]["event_log_id"] == 100
+
+
+def test_a_run_whose_rows_aged_out_is_indistinguishable_from_never_written_and_says_so(airflow):
+    """`log` is cleanable by `airflow db clean`, so an empty history is not a
+    measurement of absence — and it is not a blocker either, because it is the
+    ordinary state for an EmptyOperator success."""
+    result = _audited_run(airflow, EXECUTED_TI, events=[])
+
+    assert result["event_history"]["status"] == "checked"
+    assert result["event_history"]["total_entries"] == 0
+    seen = _attribution(result, "prepare_disbursement_file")
+    assert seen["attribution"] == "no_event_found"
+    assert "U2" in seen["unknowns"]
+    assert "airflow db clean" in server._UNKNOWNS["U2"]
+    assert result["run_health"]["clean_blockers"] == []
+    assert result["summary"].startswith("No problems found")
+
+
+@pytest.mark.parametrize(
+    ("audit_scope", "status", "error", "attribution", "unknown", "blocker"),
+    [
+        (
+            "denied",
+            "not_permitted",
+            "the caller is not authorized to read this Dag's audit log",
+            "event_history_unavailable",
+            "U9",
+            "event_history_unavailable",
+        ),
+        # An argument that never arrived is not a permission that was refused.
+        (
+            "",
+            "not_scoped",
+            "no audit scope was supplied, so the audit log was not read",
+            "event_history_not_scoped",
+            "U14",
+            "event_history_not_scoped",
+        ),
+    ]
+    + [
+        (
+            junk,
+            "not_permitted",
+            "the caller is not authorized to read this Dag's audit log",
+            "event_history_unavailable",
+            "U9",
+            "event_history_unavailable",
+        )
+        for junk in ("GRANTED", "granted ", "yes", "granted\n", "True", "1")
+    ],
+    ids=["denied", "empty", "case", "space", "junk", "newline", "bool", "one"],
+)
+def test_the_event_history_read_fails_closed_on_anything_but_a_granted_scope(
+    airflow, audit_scope, status, error, attribution, unknown, blocker
+):
+    """A permission gap can only ever produce less information, never more —
+    and every value a model could invent buys ZERO /eventLogs calls."""
+    result = _green_run(airflow, EXECUTED_TI, FORGED_TI, audit_scope=audit_scope)
+
+    assert _event_calls(airflow) == []
+    assert result["event_history"]["status"] == status
+    assert result["event_history"]["error"] == error
+    assert _attribution(result, "remit_payment_batch")["attribution"] == attribution
+    assert unknown in _attribution(result, "remit_payment_batch")["unknowns"]
+    assert blocker in result["run_health"]["clean_blockers"]
+    # The dispatch conjunction does not depend on the audit log, so it is intact.
+    assert len(_findings(result)) == 1
+
+
+def test_an_unauthorized_caller_still_gets_the_whole_rest_of_the_diagnosis(airflow):
+    airflow.tasks = [{"task_id": "extract", "downstream_task_ids": []}]
+
+    result = _green_run(airflow, EXECUTED_TI, FORGED_TI, audit_scope="denied")
+
+    assert result["task_instances"]
+    assert result["source"] == SOURCE
+    assert result["tasks"]["order"] == ["extract"]
+    assert result["run_health"]["successes_scanned"] == 2
+    assert result["run_history"]["returned"] == 1
+
+
+def test_a_truncated_scan_never_reports_absence_as_no_event_found(airflow):
+    """Absence inside a truncated window is not absence; merging the two would
+    let a cap manufacture a finding."""
+    _with_own_history(airflow)
+    airflow.event_logs = [SUCCESS_EVENT, RUNNING_EVENT]
+    airflow.event_logs_total = 900
+
+    result = _green_run(airflow, EXECUTED_TI, FORGED_TI, audit_scope="granted")
+
+    assert result["event_history"]["status"] == "partial"
+    assert result["event_history"]["events_omitted"] == 898
+    assert result["event_history"]["oldest_scanned_when"] == RUNNING_EVENT["when"]
+    seen = _attribution(result, "remit_payment_batch")
+    assert seen["attribution"] == "event_history_truncated"
+    assert seen["unknowns"] == ["U8"]
+    assert "event_history_truncated" in result["run_health"]["clean_blockers"]
+    # The instance that DID match keeps a correct headline: the scan is newest-first.
+    assert _attribution(result, "prepare_disbursement_file")["attribution"] == "platform_execution_event"
+
+
+def test_the_event_scan_follows_pages_up_to_its_ceiling_and_no_further(airflow, monkeypatch):
+    monkeypatch.setattr(server, "EVENT_SCAN_PAGE", 2)
+    monkeypatch.setattr(server, "EVENT_SCAN_LIMIT", 4)
+    airflow.event_log_pages = [
+        [_event(event_log_id=index * 2), _event(event_log_id=index * 2 + 1)] for index in range(5)
+    ]
+
+    result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
+
+    assert len(_event_calls(airflow)) == 2
+    assert [params["offset"] for params in _event_calls(airflow)] == [0, 2]
+    assert result["event_history"]["events_scanned"] == 4
+    assert result["event_history"]["total_entries"] == 10
+    assert result["event_history"]["events_omitted"] == 6
+    assert result["event_history"]["status"] == "partial"
+
+
+def test_the_event_scan_stops_after_a_bounded_number_of_pages(airflow, monkeypatch):
+    """F15: a route that answers a 100-row page with one row, forever, and keeps
+    saying there are 10000, spun the loop once per row. The iteration count is
+    bounded by the tool's own constants now, not by the server's arithmetic."""
+    monkeypatch.setattr(server, "EVENT_SCAN_PAGE", 100)
+    monkeypatch.setattr(server, "EVENT_SCAN_LIMIT", 300)
+    airflow.event_log_pages = [[_event(event_log_id=index)] for index in range(500)]
+    airflow.event_logs_total = 10_000
+
+    result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
+
+    assert len(_event_calls(airflow)) == 3
+    assert result["event_history"]["status"] == "partial"
+
+
+def test_a_secret_extra_key_is_named_and_never_relayed(airflow):
+    """F9: Airflow's masker matches key NAMES, so anything the requester chose to
+    call something else came through whole. A `trigger_dag_run` row carries the
+    run conf and the run note; a `cli_*` row carries the whole argv."""
+    _with_own_history(airflow)
+    secrets = {
+        "method": "PATCH",
+        "national_id": "123-45-6789",
+        "conf": {"presigned": "https://s3/x?X-Amz-Signature=deadbeefcafe"},
+        "note": "call the CFO on +1-555-0100",
+        "full_command": "['airflow', 'dags', 'test', '--conn-uri', 'postgres://u:p@h/db']",
+    }
+    rows = [{**PATCH_EVENT, "extra": json.dumps(secrets)}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["extra"] == {"method": "PATCH"}
+    assert seen["extra_keys"] == ["conf", "full_command", "national_id", "note"]
+    whole = json.dumps(result)
+    for secret in ("123-45-6789", "X-Amz-Signature", "deadbeefcafe", "+1-555-0100", "postgres://"):
+        assert secret not in whole
+
+
+def test_an_empty_page_ends_the_event_scan_whatever_the_total_says(airflow):
+    """A total that never comes down would otherwise loop to the ceiling."""
+    airflow.event_logs = [SUCCESS_EVENT]
+    airflow.event_logs_total = 10_000
+
+    result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
+
+    assert len(_event_calls(airflow)) == 2
+    assert result["event_history"]["events_scanned"] == 1
+
+
+def test_a_mapped_instance_is_matched_on_task_id_and_map_index_together(airflow):
+    mapped = {**EXECUTED_TI, "task_id": "fan", "map_index": 3}
+    sibling = {**EXECUTED_TI, "task_id": "fan", "map_index": 4}
+    rows = [
+        {**SUCCESS_EVENT, "event_log_id": 20, "task_id": "fan", "map_index": 3, "try_number": 1},
+        {**SUCCESS_EVENT, "event_log_id": 21, "task_id": "fan", "map_index": 4, "try_number": 9},
+    ]
+
+    result = _audited_run(airflow, mapped, sibling, events=rows)
+
+    third = _attribution(result, "fan", 3)
+    assert third["event_log_id"] == 20
+    assert third["associated_via"] == "row.task_id+map_index"
+    assert third["pins_map_index"] is True
+    assert third["pins_try_number"] is True
+    assert third["matches_recorded_attempt"] is True
+    fourth = _attribution(result, "fan", 4)
+    assert fourth["event_log_id"] == 21
+    assert fourth["matches_recorded_attempt"] is False
+
+
+def test_an_audited_row_with_a_null_map_index_attaches_to_every_mapped_instance(airflow):
+    """Verified live on event_log_id 1026: audited rows carry neither."""
+    forged = [{**FORGED_TI, "task_id": "fan", "map_index": index} for index in range(3)]
+    airflow.tries_by_task = {("fan", index): [dict(forged[index])] for index in range(3)}
+
+    result = _audited_run(airflow, *forged, events=[{**PATCH_EVENT, "task_id": "fan"}])
+
+    for index in range(3):
+        seen = _attribution(result, "fan", index)
+        assert seen["attribution"] == "other_recorded_event"
+        assert seen["associated_via"] == "row.task_id"
+        assert seen["pins_map_index"] is False
+        assert "U7" in seen["unknowns"]
+
+
+def test_a_map_index_in_extra_narrows_the_association_but_never_pins_the_attempt(airflow):
+    """CRITICAL-2: `map_index` is NOT in `fields_skip_logging`
+    (decorators.py:169-178), so `?map_index=3` on a rejected request lands in
+    `extra` verbatim. It may still narrow which instance the row is shown
+    against, but it must never count as a pin - a pin suppressed U7, which is
+    exactly the caveat a request-supplied value needs."""
+    forged = [{**FORGED_TI, "task_id": "fan", "map_index": index} for index in range(2)]
+    airflow.tries_by_task = {("fan", index): [dict(forged[index])] for index in range(2)}
+    rows = [
+        {
+            **PATCH_EVENT,
+            "task_id": "fan",
+            "extra": '{"new_state": "success", "method": "PATCH", "map_index": "1"}',
+        }
+    ]
+
+    result = _audited_run(airflow, *forged, events=rows)
+
+    # Nothing is lost for the instance it does not pin: the row still attaches by
+    # task_id, and says so by pinning neither.
+    unpinned = _attribution(result, "fan", 0)
+    assert unpinned["associated_via"] == "row.task_id"
+    assert unpinned["pins_map_index"] is False
+    pinned = _attribution(result, "fan", 1)
+    assert pinned["associated_via"] == "extra.map_index"
+    assert pinned["pins_map_index"] is False
+    assert pinned["pins_try_number"] is False
+    assert pinned["corroborated_association"] is False
+    # The whole point: U7 survives a request-supplied map_index.
+    assert "U7" in pinned["unknowns"]
+    assert "U7" in unpinned["unknowns"]
+
+
+@pytest.mark.parametrize("value", ["", "notanint", None, True, 2.5, [1]], ids=lambda v: repr(v)[:12])
+def test_an_unparsable_extra_map_index_never_upgrades_the_association(airflow, value):
+    forged = {**FORGED_TI, "task_id": "fan", "map_index": 1}
+    airflow.tries_by_task = {("fan", 1): [dict(forged)]}
+    rows = [{**PATCH_EVENT, "task_id": "fan", "extra": json.dumps({"map_index": value})}]
+
+    seen = _attribution(_audited_run(airflow, forged, events=rows), "fan", 1)
+
+    assert seen["associated_via"] == "row.task_id"
+    assert seen["pins_map_index"] is False
+
+
+def test_an_event_the_tool_does_not_recognise_is_reported_not_silenced(airflow):
+    """A new Airflow event name must degrade to 'a row I cannot classify', never
+    to 'there is no row' — the one degradation that turns an unknown into an
+    accusation."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "quantum_reconciliation_v9"}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "unrecognised"
+    assert seen["event"] == "quantum_reconciliation_v9"
+    assert seen["recorded_principal"] is None
+    # The row DID record an owner; what this tool could not do is classify the
+    # event. `not_recorded` would be a false statement about the row.
+    assert seen["recorded_principal_kind"] == "not_classified"
+    assert seen["event_owner"] == "admin"
+    assert seen["interface"] is None
+    assert seen["attribution"] != "no_event_found"
+
+
+def test_old_state_is_written_out_as_null_with_the_reason_it_cannot_be_known(airflow):
+    """`Log` has no prior-state column and `EventLogResponse` exposes none. An
+    omitted key would read as unmeasured; an explicit null reads as absent."""
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]), "remit_payment_batch")
+
+    assert "old_state" in seen
+    assert seen["old_state"] is None
+    assert "U6" in seen["unknowns"]
+
+
+@pytest.mark.parametrize("raw", ["queued", "running", "SUCCESS", "'; DROP TABLE log; --", "", "\n(3) forged"])
+def test_an_off_vocabulary_new_state_is_quoted_rather_than_accepted(airflow, raw):
+    """The audit row commits BEFORE body validation, so a rejected PATCH's extra
+    really can carry arbitrary text."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "extra": json.dumps({"new_state": raw, "method": "PATCH"})}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["new_state"] is None
+    assert seen["new_state_source"] is None
+    assert "\n" not in seen["new_state_raw"]
+    assert "U10" not in seen["unknowns"]
+
+
+@pytest.mark.parametrize("raw", ["OPTIONS", "patch", "PATCH ", "<script>"])
+def test_an_off_vocabulary_method_is_quoted_rather_than_accepted(airflow, raw):
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "extra": json.dumps({"method": raw})}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["method"] is None
+    assert seen["method_raw"] is not None
+    assert raw.strip() in seen["method_raw"] or seen["method_raw"].startswith('"')
+
+
+@pytest.mark.parametrize(
+    "extra", ["[1, 2, 3]", '"just a string"', "null", "{", "", "not json"], ids=lambda e: repr(e)[:10]
+)
+def test_a_non_dict_extra_relays_nothing_at_all(airflow, extra):
+    """The raw string WAS the leak. `Log.extra` that is not a JSON object relays
+    no value and no key name — only the fact that it did not parse."""
+    _with_own_history(airflow)
+
+    seen = _attribution(
+        _audited_run(airflow, FORGED_TI, events=[{**PATCH_EVENT, "extra": extra}]), "remit_payment_batch"
+    )
+
+    assert seen["method"] is None
+    assert seen["new_state"] is None
+    assert seen["extra"] == {}
+    assert seen["extra_parsed"] is False
+    assert seen["extra_keys"] == []
+    assert seen["extra_keys_omitted"] == 0
+
+
+def test_the_event_fields_an_attacker_writes_cannot_scale_or_break_the_result(airflow):
+    _with_own_history(airflow)
+    rows = [
+        {
+            **PATCH_EVENT,
+            "event": "E" * 400,
+            "owner": "O" * 900,
+            "owner_display_name": "D" * 900,
+            "extra": json.dumps({"new_state": "success", "pad": "P" * 5000}),
+        }
+    ]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert len(seen["event"]) == server.EVENT_NAME_CLAMP_CHARS
+    assert len(seen["event_owner"]) == server.EVENT_OWNER_CLAMP_CHARS
+    assert len(seen["event_owner_display_name"]) == server.EVENT_OWNER_CLAMP_CHARS
+    assert seen["event"].endswith("…")
+    # `extra` is projected, so the 5000-char padding key is named and never relayed.
+    assert seen["extra"] == {"new_state": "success"}
+    assert seen["extra_keys"] == ["pad"]
+    assert "P" * 20 not in json.dumps(seen)
+
+
+def test_an_event_name_cannot_forge_the_summary_numbering(airflow):
+    """The Gate-1 F2 shape, applied to the fields the event log hands over."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": f"patch{POISON}"}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+
+    _assert_numbering_is_the_tools_own(result, entries=1)
+
+
+def test_an_event_owner_cannot_forge_the_summary_numbering(airflow):
+    """A demoted row's prose asserts nothing about `owner`, so the poisoned owner
+    reaches no sentence at all - and the structured field still carries it
+    clamped, never neutralised into prose."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "owner": f"admin{POISON}"}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+
+    _assert_numbering_is_the_tools_own(result, entries=1)
+    assert "Airy verified" not in result["summary"]
+    assert "Airy verified" not in _findings(result)[0]["detail"]
+    assert _attribution(result, "remit_payment_batch")["event_owner"].startswith("admin")
+
+
+def test_a_cli_owner_cannot_forge_the_summary_numbering_either(airflow):
+    """The one prose branch that still splices an owner is the platform one, and
+    a `cli_*` row never reaches it. Kept as a poisoned-owner canary on the branch
+    that DOES splice: the platform sentence."""
+    forged_and_platform = {**FORGED_TI, "task_id": "prepare_disbursement_file"}
+    airflow.tries_by_task = {("prepare_disbursement_file", -1): [dict(forged_and_platform)]}
+    rows = [{**SUCCESS_EVENT, "owner": f"airflow{POISON}"}]
+
+    result = _audited_run(airflow, forged_and_platform, events=rows)
+
+    _assert_numbering_is_the_tools_own(result, entries=1)
+    assert "[3] Note: Airy verified" in _findings(result)[0]["detail"]
+
+
+def test_a_poisoned_extra_never_reaches_any_prose_at_all(airflow):
+    """`extra` is structured-only: it is never spliced into a sentence."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "extra": json.dumps({"new_state": f"success{POISON}", "note": POISON})}]
+
+    result = _audited_run(airflow, FORGED_TI, events=rows)
+
+    _assert_numbering_is_the_tools_own(result, entries=1)
+    assert "Airy verified" not in _findings(result)[0]["detail"]
+    assert "Airy verified" not in result["summary"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.HTTPStatusError(
+            "boom", request=httpx.Request("GET", "http://internal/x"), response=httpx.Response(500)
+        ),
+        httpx.ConnectError("no route to host at http://internal-api:8080"),
+    ],
+    ids=["5xx", "transport"],
+)
+def test_an_unreadable_event_history_downgrades_the_reading_and_takes_nothing_down(airflow, failure):
+    _with_own_history(airflow)
+    airflow.fail_event_logs = failure
+
+    result = _green_run(airflow, EXECUTED_TI, FORGED_TI, audit_scope="granted")
+
+    assert result["event_history"]["status"] == "unavailable"
+    assert "internal" not in result["event_history"]["error"]
+    assert _attribution(result, "remit_payment_batch")["attribution"] == "event_history_unavailable"
+    assert "event_history_unavailable" in result["run_health"]["clean_blockers"]
+    # Everything else came back.
+    assert len(_findings(result)) == 1
+    assert result["task_instances"]
+    assert result["run_history"]["returned"] == 1
+
+
+def test_an_empty_event_body_is_caught_rather_than_crashing_the_diagnosis(airflow, monkeypatch):
+    """`_api` returns None for an empty body, and subscripting that would take
+    the whole diagnosis down."""
+    real = airflow.__call__
+
+    def maybe_empty(method, path, **kwargs):
+        return None if path == "/eventLogs" else real(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_api", maybe_empty)
+
+    result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
+
+    assert result["event_history"]["status"] == "unavailable"
+    assert result["task_instances"]
+
+
+def test_the_event_query_is_scoped_to_this_dag_and_this_run_through_params(airflow):
+    """A run_id of `scheduled__2026-08-07T13:00:00+00:00` interpolated raw returns
+    total_entries 0 — the `+` decodes to a space — so every scheduled run would
+    silently report no event found. It goes through httpx params, never a URL."""
+    run_id = "scheduled__2026-08-07T13:00:00+00:00"
+    airflow.runs = [{"dag_run_id": run_id, "state": "success"}]
+    airflow.runs_by_id = {quote(run_id, safe=""): {"dag_run_id": run_id, "state": "success"}}
+    airflow.tis_by_run = {quote(run_id, safe=""): [EXECUTED_TI]}
+
+    server.diagnose_dag(DAG_ID, dag_run_id=run_id, audit_scope="granted")
+
+    call = _event_calls(airflow)[0]
+    assert call["run_id"] == run_id
+    assert call["dag_id"] == DAG_ID
+    assert call["order_by"] == "-when"
+    # The ids are in the parameters, never in the path — httpx encodes them, and a
+    # crafted run_id cannot smuggle extra query parameters that widen the scope.
+    assert [path for _, path in airflow.calls if path.startswith("/eventLogs")] == ["/eventLogs"]
+
+
+def test_a_row_for_another_dag_is_dropped_and_counted(airflow):
+    """The query is already dag_id-scoped, so this can only be a server-side
+    filter regression — which must not leak through."""
+    rows = [{**SUCCESS_EVENT, "dag_id": "some_other_dag"}, SUCCESS_EVENT]
+
+    result = _audited_run(airflow, EXECUTED_TI, events=rows)
+
+    assert result["event_history"]["rows_rejected"] == 1
+    assert result["event_history"]["events_scanned"] == 1
+
+
+def test_run_scoped_events_are_capped_and_the_remainder_counted(airflow):
+    rows = [{**CLEAR_EVENT, "event_log_id": index} for index in range(14)]
+
+    history = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+
+    assert len(history["run_scoped_events"]) == server.RUN_SCOPED_EVENT_LIMIT
+    assert history["run_scoped_events_omitted"] == 4
+    assert history["run_scoped_events"][0]["recorded_principal"] == "admin"
+
+
+def test_instances_outside_the_detailed_projection_are_counted_not_guessed_at(airflow, monkeypatch):
+    monkeypatch.setattr(server, "TASK_INSTANCE_DETAIL_LIMIT", 1)
+    crowd = [_executed(f"t{index}") for index in range(4)]
+
+    result = _audited_run(airflow, *crowd, events=[SUCCESS_EVENT])
+
+    assert result["event_history"]["instances_without_attribution"] == 3
+    assert result["task_instance_detail_reduced"] == 3
+    reduced = [ti for ti in result["task_instances"] if "last_state_change" not in ti]
+    assert len(reduced) == 3
+
+
+# ---------------------------------------------------------------------------
+# An audit row's targeting fields are chosen by the request BODY
+# ---------------------------------------------------------------------------
+
+# Captured verbatim from the live deployment: g2fa_attribution_probe /
+# g2fa_probe_001, event_log_ids 1871 and 1872. Both are REJECTED `patch_dag_run`
+# requests - `state` is not a state - yet each planted a row whose task_id column
+# was taken from its own body. 1872 names the Dag and the run in its body too.
+PROBE_ROW_1871 = _event(
+    event_log_id=1871,
+    when="2026-08-07T17:12:31.267420Z",
+    dag_id=DAG_ID,
+    task_id="remit_payment_batch",
+    event="patch_dag_run",
+    owner="admin",
+    owner_display_name="admin",
+    extra='{"state": "zzz_not_a_state", "task_id": "remit_payment_batch", "method": "PATCH"}',
+)
+PROBE_ROW_1872 = {
+    **PROBE_ROW_1871,
+    "event_log_id": 1872,
+    "when": "2026-08-07T17:14:23.415092Z",
+    "task_id": "prepare_disbursement_file",
+    "extra": (
+        '{"state": "zzz", "dag_id": "sales_summary", "run_id": "manual__1", '
+        '"task_id": "prepare_disbursement_file", "method": "PATCH"}'
+    ),
+}
+
+
+def test_a_row_whose_body_chose_its_target_never_becomes_an_audited_headline(airflow):
+    """The F1 probe. The logging dependency merges the request BODY over the path
+    parameters and reads dag_id/run_id/task_id out of the merged dict
+    (decorators.py:196-203,213-217), and commits before the handler
+    (:236-239) - ahead of the authorization dependency
+    (task_instances.py:1187-1190). So a 422 plants a row naming any task."""
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, FORGED_TI, events=[PROBE_ROW_1871])
+    seen = _attribution(result, "remit_payment_batch")
+
+    assert not seen["attribution"].startswith("audited_")
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["targeting_is_request_settable"] is True
+    # Reported in full, never silenced: it is still the row this instance has.
+    assert seen["event"] == "patch_dag_run"
+    assert seen["event_owner"] == "admin"
+    assert "U13" in seen["unknowns"]
+    census = result["run_health"]["state_change_attribution"]
+    assert "audited_other_state_action" not in census["by_attribution"]
+    assert "audited_single_instance_patch" not in census["by_attribution"]
+
+
+def test_the_probe_rows_never_displace_the_platform_events_from_the_census(airflow):
+    """Both probe rows are NEWER than the platform's own execution events, so
+    newest-first alone handed them the headline for both tasks."""
+    executed = _executed("prepare_disbursement_file")
+    other = _executed("remit_payment_batch")
+    rows = [PROBE_ROW_1872, PROBE_ROW_1871, SUCCESS_EVENT, RUNNING_EVENT]
+    rows += [
+        {**SUCCESS_EVENT, "event_log_id": 30, "task_id": "remit_payment_batch"},
+        {**RUNNING_EVENT, "event_log_id": 31, "task_id": "remit_payment_batch"},
+    ]
+
+    result = _audited_run(airflow, executed, other, events=rows)
+
+    for task_id in ("prepare_disbursement_file", "remit_payment_batch"):
+        seen = _attribution(result, task_id)
+        assert seen["attribution"] == "platform_execution_event"
+        assert seen["associated_via"] == "row.task_id+map_index"
+        assert seen["corroborated_association"] is True
+    census = result["run_health"]["state_change_attribution"]
+    assert census["by_attribution"] == {"platform_execution_event": 2}
+    assert census["corroborated"] == {"platform_execution_event": 2}
+    assert census["row_claimed"] == {}
+    assert census["instances_attributed_by_unpinned_row"] == 0
+
+
+def test_a_corroborated_association_outranks_a_newer_row_claimed_one(airflow):
+    """Ranking, not recency: a row that pins map_index on its own column beats a
+    newer row that only claims a task_id."""
+    executed = _executed("prepare_disbursement_file")
+    newer_claim = {**PATCH_EVENT, "event_log_id": 99, "when": "2099-01-01T00:00:00.000000Z"}
+    newer_claim = {**newer_claim, "task_id": "prepare_disbursement_file", "extra": "{}"}
+
+    seen = _attribution(
+        _audited_run(airflow, executed, events=[newer_claim, SUCCESS_EVENT]), "prepare_disbursement_file"
+    )
+
+    assert seen["attribution"] == "platform_execution_event"
+    assert seen["event_log_id"] == SUCCESS_EVENT["event_log_id"]
+    assert seen["corroborated_association"] is True
+    # The claim is still there, one place down.
+    assert [row["event_log_id"] for row in seen["events"]] == [SUCCESS_EVENT["event_log_id"], 99]
+
+
+# FATAL-1. `decorators.py:169-178` sets fields_skip_logging to exactly
+# {csrf_token, _csrf_token, is_paused, dag_id, task_id, dag_run_id, run_id,
+# logical_date}, and :180-184 builds `extra` from the query and path parameters
+# with those keys REMOVED - while :196-203 still reads them into `params` and
+# :213-217 writes Log.task_id/dag_id/run_id from it. So the evidence that the
+# targeting columns were request-supplied can NEVER appear in `extra`, and a
+# demotion keyed on `extra` is structurally blind to the query-string variant.
+# `PATCH /dags/{dag_id}/dagRuns/{dag_run_id}/taskGroupInstances/{group_id}`
+# (task_instances.py:997-1005) has no task_id in its path and logs before
+# authorization: `?task_id=<victim>` with NO body is the whole attack.
+QUERY_FORGED_GROUP_PATCH = _event(
+    event_log_id=2001,
+    when="2026-08-07T18:02:11.100000Z",
+    task_id="remit_payment_batch",
+    event="patch_task_group_instances",
+    owner="admin",
+    owner_display_name="admin",
+    # No body at all, and the stripped keys are absent by construction: exactly
+    # what the query-string variant leaves behind.
+    extra='{"group_id": "settlement", "method": "PATCH"}',
+)
+QUERY_FORGED_CLEAR = _event(
+    event_log_id=2002,
+    when="2026-08-07T18:03:44.200000Z",
+    task_id="remit_payment_batch",
+    event="post_clear_task_instances",
+    owner="admin",
+    owner_display_name="admin",
+    extra='{"method": "POST"}',
+)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [QUERY_FORGED_GROUP_PATCH, QUERY_FORGED_CLEAR],
+    ids=["task_group_patch_query_task_id", "clear_query_run_id"],
+)
+def test_a_query_string_forgery_with_no_body_is_demoted_on_its_interface(airflow, row):
+    """The row `extra` cannot give away. Nothing here is a body key, so any
+    demotion keyed on `extra` passes it through as an audited headline."""
+    _with_own_history(airflow)
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=[row]), "remit_payment_batch")
+
+    assert not seen["attribution"].startswith("audited_")
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["targeting_is_request_settable"] is True
+    # None of the stripped key names is in `extra` - that is the point.
+    assert not {"task_id", "dag_id", "run_id", "dag_run_id"} & set(seen["extra"])
+    assert seen["extra_keys"] == [] or "task_id" not in seen["extra_keys"]
+    assert "U13" in seen["unknowns"]
+    assert "U7" in seen["unknowns"]
+
+
+def test_the_body_forged_probe_row_still_never_outranks_a_platform_event(airflow):
+    """(iii) The g2fa_probe_001 shape, unchanged: a platform row that pins its
+    own map_index still takes the headline off it."""
+    executed = _executed("remit_payment_batch")
+    rows = [PROBE_ROW_1871, {**SUCCESS_EVENT, "event_log_id": 40, "task_id": "remit_payment_batch"}]
+
+    seen = _attribution(_audited_run(airflow, executed, events=rows), "remit_payment_batch")
+
+    assert seen["attribution"] == "platform_execution_event"
+    assert seen["associated_via"] == "row.task_id+map_index"
+    assert seen["corroborated_association"] is True
+    assert seen["events"][1]["event_log_id"] == 1871
+    assert seen["events"][1]["targeting_is_request_settable"] is True
+
+
+def test_a_run_scoped_clear_named_only_in_extra_is_request_settable_too(airflow):
+    """CRITICAL-3: the association is `extra.task_ids`, which no key list covers.
+    It is a rest_api row, so the interface answers it without one."""
+    _with_own_history(airflow)
+    rows = [{**CLEAR_EVENT, "extra": '{"task_ids": ["remit_payment_batch"], "method": "POST"}'}]
+
+    seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    assert seen["associated_via"] == "extra.task_ids"
+    assert seen["attribution"] == "other_recorded_event"
+    assert seen["classification"] == "request_settable_targeting_fields"
+    assert seen["targeting_is_request_settable"] is True
+
+
+def test_no_rest_row_can_ever_reach_an_audited_state(airflow):
+    """`audited_*` is reachable only from `row.task_id+map_index`, which a REST
+    audit row structurally cannot reach: decorators.py:209-218 never passes
+    map_index to Log(...) and models/log.py:108-109 sets it only from kwargs."""
+    _with_own_history(airflow)
+    rest_events = ["patch_task_instance", *sorted(server._AUDITED_TI_STATE_ACTIONS)]
+
+    for event in rest_events:
+        rows = [{**PATCH_EVENT, "event": event}]
+        seen = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+        assert seen["interface"] == "rest_api", event
+        assert not seen["attribution"].startswith("audited_"), event
+        assert seen["targeting_is_request_settable"] is True, event
+        assert "U7" in seen["unknowns"], event
+
+
+def test_a_well_formed_audited_row_still_carries_the_forgeability_caveat(airflow):
+    """Every REST row is forgeable in the same way, so every one of them says so
+    - the well-formed ones above all, because nothing on them gave it away."""
+    _with_own_history(airflow)
+
+    patch = _attribution(_audited_run(airflow, FORGED_TI, events=[PATCH_EVENT]), "remit_payment_batch")
+    clear_rows = [{**CLEAR_EVENT, "extra": '{"task_ids": ["remit_payment_batch"], "method": "POST"}'}]
+    clear = _attribution(_audited_run(airflow, FORGED_TI, events=clear_rows), "remit_payment_batch")
+
+    assert patch["classification"] == "request_settable_targeting_fields"
+    assert clear["classification"] == "request_settable_targeting_fields"
+    for seen in (patch, clear):
+        assert "U13" in seen["unknowns"]
+    assert "committed BEFORE the handler runs" in server._UNKNOWNS["U13"]
+    assert "1187-1190" in server._UNKNOWNS["U13"]
+    # The strip is the REASON `extra` can never carry the proof, so U13 cites it
+    # alongside the merge it used to cite alone.
+    assert "169-178" in server._UNKNOWNS["U13"]
+    assert "fields_skip_logging" in server._UNKNOWNS["U13"]
+    assert "180-184" in server._UNKNOWNS["U13"]
+    assert "196-203" in server._UNKNOWNS["U13"]
+
+
+def test_an_unclassified_event_claims_nothing_at_all_about_its_owner(airflow):
+    """F4/F3: one prose branch served both platform and unclassified events, so
+    a row recording an authenticated principal was asserted to be 'the task's
+    owner attribute from the Dag file and not an actor'."""
+    _with_own_history(airflow)
+    rows = [{**PATCH_EVENT, "event": "quantum_reconciliation_v9"}]
+
+    detail = _findings(_audited_run(airflow, FORGED_TI, events=rows))[0]["detail"]
+
+    assert "does not classify as a state change" in detail
+    assert "owner attribute from the Dag file" not in detail
+    assert "not an actor" not in detail
+
+
+def test_one_row_never_reports_two_different_principal_kinds(airflow):
+    """MAJOR-5: the headline took the raw third element of `_classify_event`
+    while `_compact_event` and the context rows went through
+    `_recorded_principal_kind`. On an ownerless row that read `not_classified` at
+    the headline - asserting a principal WAS recorded - and `not_recorded` in the
+    context rows of the same object."""
+    forged = {**FORGED_TI, "task_id": "fan", "map_index": -1}
+    airflow.tries_by_task = {("fan", -1): [dict(forged)]}
+    ownerless = {
+        **PATCH_EVENT,
+        "task_id": "fan",
+        "event": "quantum_reconciliation_v9",
+        "owner": None,
+        "owner_display_name": None,
+    }
+    rows = [ownerless, {**ownerless, "event_log_id": 1027, "when": "2026-08-07T07:57:24.000000Z"}]
+
+    seen = _attribution(_audited_run(airflow, forged, events=rows), "fan")
+
+    assert seen["recorded_principal_kind"] == "not_recorded"
+    assert [row["recorded_principal_kind"] for row in seen["events"]] == ["not_recorded", "not_recorded"]
+    assert seen["recorded_principal"] is None
+
+
+def test_a_platform_event_still_says_its_owner_is_the_dag_files_owner(airflow):
+    """The sentence the split kept — it is true for a platform row."""
+    forged_and_platform = {**FORGED_TI, "task_id": "prepare_disbursement_file"}
+    airflow.tries_by_task = {("prepare_disbursement_file", -1): [dict(forged_and_platform)]}
+
+    detail = _findings(_audited_run(airflow, forged_and_platform, events=[SUCCESS_EVENT]))[0]["detail"]
+
+    assert "owner attribute from the Dag file and not an actor" in detail
+
+
+def test_one_unpinned_row_is_not_counted_as_a_state_change_per_mapped_instance(airflow):
+    """F11: a `patch_task_instance` row with a null map_index attaches to every
+    instance of a mapped task, which read as N state changes off one row."""
+    fanout = [{**EXECUTED_TI, "task_id": "fan", "map_index": index} for index in range(4)]
+    rows = [{**PATCH_EVENT, "task_id": "fan", "extra": '{"method": "PATCH"}'}]
+
+    census = _audited_run(airflow, *fanout, events=rows)["run_health"]["state_change_attribution"]
+
+    assert census["by_attribution"] == {"other_recorded_event": 4}
+    assert census["row_claimed"] == {"other_recorded_event": 4}
+    assert census["corroborated"] == {}
+    assert census["instances_attributed_by_unpinned_row"] == 4
+    # Four instances, ONE row.
+    assert census["distinct_event_log_ids"] == 1
+
+
+def test_a_clear_with_an_include_flag_says_it_named_only_its_seed_task(airflow):
+    """F13: `include_downstream` sweeps in instances the row names nowhere, so
+    their `no_event_found` cannot read as full coverage."""
+    swept = _executed("notify_treasury_complete")
+
+    result = _audited_run(airflow, EXECUTED_TI, swept, events=[CLEAR_EVENT])
+
+    assert result["event_history"]["clear_with_include_flags"] is True
+    downstream = _attribution(result, "notify_treasury_complete")
+    assert downstream["attribution"] == "no_event_found"
+    assert "U15" in downstream["unknowns"]
+    assert "include_downstream" in server._UNKNOWNS["U15"]
+
+
+def test_an_absent_row_never_claims_the_scan_covered_this_run_completely(airflow):
+    """F8: `cli_*` rows carry a null run_id, so a run-scoped query cannot reach
+    one — `cli_dag_test` above all, the route the forgery unknown names."""
+    seen = _attribution(_audited_run(airflow, EXECUTED_TI, events=[]), "prepare_disbursement_file")
+
+    assert seen["attribution"] == "no_event_found"
+    assert "covered this run completely" not in seen["attribution_detail"]
+    assert "cli_dag_test" in seen["attribution_detail"]
+    assert "null run_id" in seen["attribution_detail"]
+
+
+def test_the_attribution_census_counts_every_detailed_instance(airflow):
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, EXECUTED_TI, FORGED_TI, events=[SUCCESS_EVENT, PATCH_EVENT, RUNNING_EVENT])
+
+    assert result["run_health"]["state_change_attribution"] == {
+        "by_attribution": {"other_recorded_event": 1, "platform_execution_event": 1},
+        # The platform row's own map_index column agrees with its instance; the
+        # PATCH row pins nothing and only claims a task_id.
+        "corroborated": {"platform_execution_event": 1},
+        "row_claimed": {"other_recorded_event": 1},
+        "instances_attributed_by_unpinned_row": 1,
+        "distinct_event_log_ids": 2,
+    }
+
+
+def test_the_finding_and_the_projected_row_carry_the_same_attribution_object(airflow):
+    """The prose and the structured row cannot drift apart, because they are one."""
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, FORGED_TI, events=[PATCH_EVENT])
+
+    assert _findings(result)[0]["last_state_change"] == _attribution(result, "remit_payment_batch")
+    assert _findings(result)[0]["attribution"] == "other_recorded_event"
+    assert _findings(result)[0]["attribution_detail"] == server._ATTRIBUTION_DETAIL["other_recorded_event"]
+
+
+def test_the_attribution_sentence_composes_into_the_finding_and_the_summary(airflow):
+    _with_own_history(airflow)
+
+    result = _audited_run(airflow, FORGED_TI, events=[PATCH_EVENT])
+    detail = _findings(result)[0]["detail"]
+
+    assert not detail.endswith(".")
+    assert detail.endswith("What wrote this state is not established by this diagnosis")
+    label = "Success with no worker-dispatch fields for the recorded attempt"
+    assert f"(1) {label}: {detail}." in result["summary"]
+
+
+def test_the_event_history_never_changes_which_instances_are_flagged(airflow):
+    """Strictly additive: a positive row proves an attempt and not an effect, and
+    an absent row proves nothing — so neither may add or remove a finding."""
+    _with_own_history(airflow)
+
+    without = _green_run(airflow, EXECUTED_TI, FORGED_TI, MARK_SUCCESS_TI)
+    with_rows = _audited_run(
+        airflow, EXECUTED_TI, FORGED_TI, MARK_SUCCESS_TI, events=[PATCH_EVENT, SUCCESS_EVENT]
+    )
+
+    def flagged(result):
+        return sorted((f["task_id"], f["map_index"]) for f in _findings(result))
+
+    assert flagged(without) == flagged(with_rows)
+
+
+def test_the_event_history_ships_its_own_limits_as_data(airflow):
+    history = _audited_run(airflow, EXECUTED_TI, events=[SUCCESS_EVENT])["event_history"]
+
+    assert history["limits"] == [
+        server._L1,
+        server._L2,
+        server._L3,
+        server._L4,
+        server._L5,
+        server._L6,
+        server._L7,
+    ]
+    assert "airflow db clean" in server._L4
+    assert "null `dag_id`" in server._L3
+    # `cli_*` rows carry a null run_id, so a run-scoped query cannot reach one.
+    assert "cli_dag_test" in server._L5
+    assert "null" in server._L5
+    assert history["query"] == "GET /api/v2/eventLogs?dag_id=<dag>&run_id=<run> (order_by=-when)"
+
+
+# ---------------------------------------------------------------------------
+# run_history: the runs this diagnosis already paid for, and the same task across them
+# ---------------------------------------------------------------------------
+
+
+def test_run_history_reports_the_window_and_marks_the_diagnosed_run(airflow):
+    airflow.runs = [
+        {"dag_run_id": "manual__2", "state": "success", "run_after": "2026-08-07T08:00:00Z"},
+        {"dag_run_id": "manual__1", "state": "failed", "run_after": "2026-08-07T07:00:00Z"},
+    ]
+    airflow.runs_total = 12
+    airflow.task_instances = [EXECUTED_TI]
+
+    history = server.diagnose_dag(DAG_ID)["run_history"]
+
+    assert history["returned"] == 2
+    assert history["total_entries"] == 12
+    assert history["runs_omitted"] == 10
+    assert history["window"] == "the most recent 2 run(s) of this Dag by run_after, newest first"
+    assert [run["is_diagnosed_run"] for run in history["runs"]] == [False, True]
+    assert history["limits"] == [server._R1, server._R2]
+
+
+def test_run_history_reads_the_run_list_the_diagnosis_already_fetched(airflow):
+    """One call, not two: the resolution scan and the field are the same list."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.task_instances = [EXECUTED_TI]
+
+    server.diagnose_dag(DAG_ID)
+
+    assert [path for _, path in airflow.calls].count(f"/dags/{DAG_ID}/dagRuns") == 1
+
+
+def test_run_history_is_emitted_for_an_exact_run_too(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "success"}}
+    airflow.tis_by_run = {"manual__1": [EXECUTED_TI]}
+
+    result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1")
+
+    assert result["run_history"]["runs"][0]["is_diagnosed_run"] is True
+
+
+def test_run_history_costs_nothing_extra_when_the_diagnosis_found_nothing(airflow):
+    result = _green_run(airflow, EXECUTED_TI)
+
+    assert result["run_history"]["task_comparison"]["task_ids_compared"] == []
+    assert result["run_history"]["task_comparison"]["tasks"] == {}
+    assert not [path for _, path in airflow.calls if path.endswith("/dagRuns/~/taskInstances")]
+
+
+def test_run_history_compares_the_task_this_diagnosis_flagged(airflow):
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [
+        {**FORGED_TI, "dag_run_id": "manual__1"},
+        {**EXECUTED_TI, "task_id": "remit_payment_batch", "dag_run_id": "manual__0"},
+    ]
+    airflow.runs = [
+        {"dag_run_id": "manual__1", "state": "success", "run_after": "2026-08-07T08:00:00Z"},
+        {"dag_run_id": "manual__0", "state": "success", "run_after": "2026-08-07T07:00:00Z"},
+    ]
+    airflow.task_instances = [FORGED_TI]
+
+    comparison = server.diagnose_dag(DAG_ID)["run_history"]["task_comparison"]
+
+    assert comparison["task_ids_compared"] == ["remit_payment_batch"]
+    rows = comparison["tasks"]["remit_payment_batch"]
+    assert [row["dag_run_id"] for row in rows] == ["manual__1", "manual__0"]
+    assert rows[0]["hostname"] == ""
+    assert rows[1]["hostname"] == "b256b32ddda1"
+    assert comparison["runs_not_covered"] == []
+
+
+def test_run_history_clips_the_comparison_to_the_window_and_says_what_it_missed(airflow):
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [{**FORGED_TI, "dag_run_id": "manual__1"}]
+    airflow.runs = [
+        {"dag_run_id": "manual__1", "state": "success", "run_after": "2026-08-07T08:00:00Z"},
+        {"dag_run_id": "manual__0", "state": "success", "run_after": "2026-08-07T07:00:00Z"},
+    ]
+    airflow.task_instances = [FORGED_TI]
+
+    comparison = server.diagnose_dag(DAG_ID)["run_history"]["task_comparison"]
+
+    assert comparison["runs_not_covered"] == ["manual__0"]
+    # The window's oldest run bounds the query rather than the whole history.
+    params = [p for (_, path), p in zip(airflow.calls, airflow.params) if path.endswith("/~/taskInstances")]
+    assert params[0]["run_after_gte"] == "2026-08-07T07:00:00Z"
+    assert params[0]["order_by"] == "-run_after"
+
+
+def test_the_comparison_says_how_many_rows_it_did_not_get_per_task_id(airflow):
+    """F12: `total_entries` was never read, so a task with more history than the
+    page held was reported as if the page were all of it."""
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [{**FORGED_TI, "dag_run_id": "manual__1"}]
+    airflow.cross_run_total = 47
+
+    comparison = _green_run(airflow, FORGED_TI)["run_history"]["task_comparison"]
+
+    assert comparison["rows_omitted"] == {"remit_payment_batch": 46}
+
+
+def test_the_comparison_reports_no_omission_when_the_page_held_it_all(airflow):
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [{**FORGED_TI, "dag_run_id": "manual__1"}]
+
+    comparison = _green_run(airflow, FORGED_TI)["run_history"]["task_comparison"]
+
+    assert comparison["rows_omitted"] == {"remit_payment_batch": 0}
+
+
+def test_the_top_level_dag_version_carries_the_same_caveat_as_the_run_rows(airflow):
+    """F14/C4: the top-level display is the one a model reads out, so it cannot
+    be the one without the caveat."""
+    result = _green_run(airflow, EXECUTED_TI)
+
+    assert result["dag_version_limits"] == [server._R1]
+    assert result["dag_version_limits"] == [
+        limit for limit in result["run_history"]["limits"] if limit == server._R1
+    ]
+
+
+def test_run_history_caps_how_many_task_ids_it_compares(airflow, monkeypatch):
+    monkeypatch.setattr(server, "TASK_COMPARISON_LIMIT", 2)
+    forged = [{**FORGED_TI, "task_id": f"forged_{index}"} for index in range(5)]
+    airflow.tries_by_task = {(ti["task_id"], -1): [dict(ti)] for ti in forged}
+
+    comparison = _green_run(airflow, *forged)["run_history"]["task_comparison"]
+
+    assert len(comparison["task_ids_compared"]) == 2
+    assert comparison["task_ids_omitted"] == 3
+
+
+def test_run_history_compares_failed_instances_when_nothing_was_flagged(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.task_instances = [{**EXECUTED_TI, "task_id": "broke", "state": "failed"}]
+    airflow.log = "ValueError: boom"
+
+    comparison = server.diagnose_dag(DAG_ID)["run_history"]["task_comparison"]
+
+    assert comparison["task_ids_compared"] == ["broke"]
+
+
+def test_an_unreadable_run_history_blocks_clean_and_takes_nothing_down(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "success"}}
+    airflow.tis_by_run = {"manual__1": [EXECUTED_TI]}
+
+    def fail_listing(method, path, **kwargs):
+        if path == f"/dags/{DAG_ID}/dagRuns":
+            raise httpx.ConnectError("boom at http://internal-api:8080")
+        return FakeAirflow.__call__(airflow, method, path, **kwargs)
+
+    server._api = fail_listing
+    try:
+        result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1", audit_scope="granted")
+    finally:
+        server._api = airflow
+
+    assert result["run_history"]["error"] == "ConnectError"
+    assert result["run_history"]["runs"] == []
+    assert "run_history_unavailable" in result["run_health"]["clean_blockers"]
+    assert result["task_instances"]
+
+
+def test_a_failing_comparison_does_not_take_the_run_list_with_it(airflow):
+    _with_own_history(airflow)
+    airflow.fail_cross_run = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("GET", "http://internal/x"), response=httpx.Response(503)
+    )
+
+    history = _green_run(airflow, FORGED_TI)["run_history"]
+
+    assert history["error"] is None
+    assert history["runs"]
+    assert history["task_comparison"]["tasks"] == {}
+    assert history["task_comparison"]["error"] == "HTTP 503"
+
+
+def test_a_run_list_failure_never_reads_as_this_dag_has_never_run(airflow, monkeypatch):
+    """Turning a transport failure into 'never run' would be a false statement
+    about the Dag rather than a downgrade."""
+
+    def fail_listing(method, path, **kwargs):
+        if path == f"/dags/{DAG_ID}/dagRuns":
+            raise httpx.ConnectError("boom")
+        return airflow(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_api", fail_listing)
+
+    with pytest.raises(httpx.ConnectError):
+        server.diagnose_dag(DAG_ID)

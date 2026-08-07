@@ -1220,6 +1220,74 @@ def test_authorize_tool_call_pins_source_tools_to_the_authorized_bytes(auth_mana
     assert args["source_digest"] == "d1g35t"
 
 
+@pytest.mark.parametrize(
+    "supplied",
+    ["granted", "GRANTED", "granted ", "denied", "", "yes", "true", "1", "granted\n", None, True, 0],
+    ids=lambda v: repr(v)[:10],
+)
+def test_authorize_tool_call_clobbers_any_audit_scope_the_model_invented(auth_manager, supplied):
+    """
+    `audit_scope` is decided by the auth manager and NEVER by the caller.
+
+    It gates a privileged read in the sidecar, so a model that writes "granted"
+    into its own tool call must not thereby grant itself the audit log.
+    """
+    _grant(auth_manager, DIAGNOSE_ACCESS)
+    args = {"dag_id": "sales_summary", "audit_scope": supplied}
+
+    assert plugin._authorize_tool_call(FakeUser(), "diagnose_dag", args) is None
+
+    assert args["audit_scope"] == "denied"
+
+
+def test_authorize_tool_call_grants_the_audit_scope_only_on_a_real_audit_log_permission(auth_manager):
+    """
+    AUDIT_LOG is a first-class per-Dag entity (core_api/security.py:493-496).
+
+    Checked separately, so a user without it keeps the rest of diagnose_dag.
+    """
+    _grant(auth_manager, [*DIAGNOSE_ACCESS, ("GET", "AUDIT_LOG")])
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "diagnose_dag", args) is None
+
+    assert args["audit_scope"] == "granted"
+
+
+def test_the_audit_log_permission_is_optional_and_never_gates_the_tool(auth_manager):
+    """
+    It widens the tool, it does not gate it.
+
+    Appending it to the mandatory tuple would cost every non-audit user the
+    whole of diagnose_dag — which is why it is evaluated separately.
+    """
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    assert plugin._tool_optional_access_requirements("diagnose_dag") == (("GET", Entity.AUDIT_LOG),)
+    assert ("GET", Entity.AUDIT_LOG) not in plugin._tool_access_requirements("diagnose_dag", {})
+    # Every other tool asks for nothing optional, so nothing else is widened.
+    assert all(
+        plugin._tool_optional_access_requirements(name) == ()
+        for name in plugin.TOOL_POLICY
+        if name != "diagnose_dag"
+    )
+
+
+def test_the_audit_scope_must_clear_every_dag_in_a_shared_source_file(monkeypatch, auth_manager):
+    """The source comes back whole, so the audit read is held to the whole file."""
+    monkeypatch.setattr(plugin, "_dag_ids_sharing_file", lambda dag_id: ["sales_summary", "twin"])
+    auth_manager.allowed = {
+        *{(method, entity, "sales_summary", "data_platform") for method, entity in DIAGNOSE_ACCESS},
+        ("GET", "AUDIT_LOG", "sales_summary", "data_platform"),
+        ("GET", None, "twin", "data_platform"),
+    }
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "diagnose_dag", args) is None
+
+    assert args["audit_scope"] == "denied"
+
+
 def test_plan_revert_is_a_read_side_plan_tool():
     """It mirrors plan_dag_code_changes: reads source, issues a token, never writes."""
     assert plugin.TOOL_POLICY["plan_revert_dag_code"] == {"reads_source": True}
@@ -1611,8 +1679,15 @@ async def test_dag_auth_toolset_runs_an_authorized_call(auth_manager):
     result = await gated.call_tool("diagnose_dag", {"dag_id": "sales_summary"}, None, None)
 
     assert result == "diagnosed"
-    # The pinned version reaches the tool along with the arguments.
-    assert inner.ran == [("diagnose_dag", {"dag_id": "sales_summary", "source_digest": "d1g35t"})]
+    # The pinned version reaches the tool along with the arguments, and so does
+    # the audit scope: DIAGNOSE_ACCESS carries no AUDIT_LOG grant, so the
+    # privileged read is refused while the rest of the tool still runs.
+    assert inner.ran == [
+        (
+            "diagnose_dag",
+            {"dag_id": "sales_summary", "source_digest": "d1g35t", "audit_scope": "denied"},
+        )
+    ]
 
 
 @pytest.mark.parametrize("can_write", [True, False])

@@ -48,7 +48,7 @@ import re
 import secrets
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
@@ -108,6 +108,34 @@ OPERATOR_CLAMP_CHARS = 120
 # at all so the count is checkable; capped because the population is chosen by
 # whoever wrote the states being read.
 COVERAGE_NAME_LIMIT = 5
+# ``GET /eventLogs`` clamps ``limit`` to 100 (verified live: limit=1000 returned
+# 100 rows of 1378), so asking for more does not help and the pages are followed.
+EVENT_SCAN_PAGE = 100
+# At most three HTTP calls per diagnosis whatever the Dag's size. The scan is
+# ordered ``-when``, so what a truncation drops is always the OLDEST rows and a
+# per-instance "latest event" stays correct under it — only ABSENCE becomes
+# unreliable, which is what the ``partial`` status exists to say.
+EVENT_SCAN_LIMIT = int(os.environ.get("AIRY_MCP_EVENT_SCAN_LIMIT", "300"))
+# One instance's event list. The headline attribution always describes events[0],
+# so this cap can never change the answer — only how much context comes with it.
+# It is copied into every detailed row AND into the finding that embeds the same
+# attribution object, so it is the multiplier on the largest repeated structure
+# in the result and is kept as small as the reading allows.
+EVENT_HISTORY_PER_INSTANCE = 2
+RUN_SCOPED_EVENT_LIMIT = 10
+RUN_HISTORY_LIMIT = int(os.environ.get("AIRY_MCP_RUN_HISTORY_LIMIT", "10"))
+TASK_COMPARISON_LIMIT = int(os.environ.get("AIRY_MCP_TASK_COMPARISON_LIMIT", "5"))
+# ``Log.owner`` and ``Log.owner_display_name`` are String(500) and ``Log.extra``
+# is unbounded Text, and ``extra`` is copied once per detailed instance — so
+# without these the size of the result is chosen by whoever wrote the rows.
+EVENT_OWNER_CLAMP_CHARS = 120
+# One RELAYED ``extra`` value: an HTTP verb, a task-instance state, a map_index
+# or a task id. Anything past this is off-vocabulary junk that is reported
+# through ``_quoted`` at 60 characters anyway.
+EVENT_EXTRA_CLAMP_CHARS = 120
+# ``Log.event`` is String(60); clamped anyway, the same reflex as
+# ``_clamped_operator``.
+EVENT_NAME_CLAMP_CHARS = 120
 
 mcp: FastMCP = FastMCP("airy-selfheal")
 
@@ -829,11 +857,992 @@ def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str
     return {"status": "checked", "rows": rows, "attempts_recorded": total}
 
 
+# ---------------------------------------------------------------------------
+# What the event log can and cannot establish.
+#
+# Every one of these ships in the DATA, not only in prose: a small model relays
+# a field it was handed far more reliably than a caveat it has to reconstruct,
+# and the caveats here are the whole point of the reading.
+# ---------------------------------------------------------------------------
+
+_U1 = (
+    "A recorded audit row proves a request was received and logged, and nothing more. The row is "
+    "written by a request dependency that commits before the handler runs "
+    "(api_fastapi/logging/decorators.py:236-239) and before the authorization dependency, so it "
+    "does not prove the request was accepted, that it was authorized, or that it wrote this state."
+)
+_U2 = (
+    "No recorded event is not evidence of a direct database write. The bulk task-instance PATCH "
+    "route changes state and records nothing "
+    "(api_fastapi/core_api/routes/public/task_instances.py:1165-1169 carries no action_logging), "
+    "and the log table is deleted by `airflow db clean` (utils/db_cleanup.py:189), so a row may "
+    "have existed and been removed by retention."
+)
+_U3 = (
+    "`owner` on an audited row is the authenticated principal name the API recorded for the "
+    "request. It is not evidence that a human acted, and the row carries no source address, user "
+    "agent, token identity, session or client name."
+)
+_U4 = (
+    "`owner` on a platform execution event is the task's `owner` attribute from the Dag file, not "
+    "an authenticated principal."
+)
+_U5 = (
+    "`owner` on a `cli_*` event is the operating-system user inside the container that ran the "
+    "command, not an authenticated principal."
+)
+_U6 = (
+    "No recorded event carries the state this task instance was in before the change. The event "
+    "log has no column for a prior state."
+)
+_U7 = (
+    "The audited row records neither `map_index` nor `try_number`, so it does not establish which "
+    "attempt or which mapped instance it targeted. No REST audit row ever can: the logging "
+    "dependency never passes `map_index` to `Log(...)` (api_fastapi/logging/decorators.py:209-218) "
+    "and `models/log.py:108-109` sets it only when it is present in the kwargs."
+)
+_U8 = (
+    "The event history was cut off at the scan cap, so an older event for this task instance may "
+    "exist and is not shown."
+)
+_U9 = "The event history could not be read, so nothing about a recorded event is established either way."
+_U10 = "`new_state` in `extra` is the state the request asked for, not the state that was written."
+_U11 = (
+    "Which route wrote this state is not established. A single-instance PATCH, a task-group PATCH, "
+    "a bulk PATCH, a direct database write, an in-process `TaskInstance.set_state` from a plugin "
+    "or listener, and `airflow dags test --mark-success-pattern` are all consistent with what is "
+    "recorded here."
+)
+_U12 = (
+    "A task instance that completes entirely inside the triggerer records no execution event "
+    "either, so the absence of one does not separate that case."
+)
+_U13 = (
+    "The `dag_id`, `run_id` and `task_id` columns of an audited row are NOT trustworthy targeting, "
+    "and no row can carry the proof either way. The logging dependency builds its parameter dict "
+    "from the query and path parameters and then merges the request BODY over it "
+    "(api_fastapi/logging/decorators.py:196-203), and reads the three ids out of that merged dict "
+    "(:213-217) - so a query parameter or a body key wins over the path. The row is committed "
+    "BEFORE the handler runs (:236-239), and "
+    "api_fastapi/core_api/routes/public/task_instances.py:1187-1190 lists `Depends(action_logging())` "
+    "BEFORE `Depends(requires_access_dag(...))`, so a request REJECTED with 422 or 403 still leaves "
+    "a row naming whatever Dag, run and task the request chose. `extra` cannot expose that: "
+    ":169-178 sets `fields_skip_logging` to exactly {csrf_token, _csrf_token, is_paused, dag_id, "
+    "task_id, dag_run_id, run_id, logical_date} and :180-184 builds `extra` from the query and path "
+    "parameters with those keys REMOVED - so a request that supplied `task_id` in the query string "
+    "plants the column and leaves `extra` clean. `patch_task_group_instances` "
+    "(task_instances.py:997-1005) has no `task_id` in its path and logs before authorization, so "
+    "`?task_id=<victim>` with no body at all is enough. Presence of a row is not evidence that "
+    "anything was received against THIS task instance."
+)
+_U14 = (
+    "The event history was not read because the call carried no audit scope, so nothing about a "
+    "recorded event is established either way."
+)
+_U15 = (
+    "A recorded clear carried an `include_upstream`/`include_downstream`/`include_future`/"
+    "`include_past` flag. Such a clear names only its seed task ids in `extra.task_ids`, and the "
+    "further instances it swept in are named nowhere - so an instance with no row of its own may "
+    "still have been cleared by it."
+)
+
+# Every caveat ships as a CODE plus one legend at the top of ``event_history``.
+# The prose is constant and this tool wrote it; repeating six paragraphs on each
+# of 200 detailed rows was ~197 KB of the result and bought nothing.
+_UNKNOWNS: dict[str, str] = {
+    "U1": _U1,
+    "U2": _U2,
+    "U3": _U3,
+    "U4": _U4,
+    "U5": _U5,
+    "U6": _U6,
+    "U7": _U7,
+    "U8": _U8,
+    "U9": _U9,
+    "U10": _U10,
+    "U11": _U11,
+    "U12": _U12,
+    "U13": _U13,
+    "U14": _U14,
+    "U15": _U15,
+}
+
+_L1 = (
+    f"At most {EVENT_SCAN_LIMIT} event rows are read, newest first by `when`; anything older than "
+    f"that window was not looked at."
+)
+_L2 = (
+    "The query is scoped to this Dag and this run, so it cannot see a row recorded against any "
+    "other Dag or any other run."
+)
+_L3 = (
+    "Rows with a null `dag_id` are unreachable by a dag_id-scoped query and need a separate "
+    "fleet-wide audit-log permission, so this reading never covers them."
+)
+_L4 = (
+    "The `log` table is cleanable by `airflow db clean` (utils/db_cleanup.py:189, included when "
+    "`--tables` is omitted), so an empty history can also mean retention removed the rows."
+)
+_L5 = (
+    "`cli_*` rows are written with NO `run_id` at all - the CLI action logger inserts only "
+    "event, owner, extra, task_id, dag_id and logical_date (utils/cli_action_loggers.py:133-146, "
+    "off the metrics built at utils/cli.py:210-224) - so `run_id` is null on every one of them and "
+    "a run-scoped query structurally cannot return any. That includes `cli_dag_test`, the "
+    "`airflow dags test --mark-success-pattern` route named in the unknowns above: a CLI-driven "
+    "state change is invisible to this reading whether or not it happened."
+)
+_L6 = (
+    "`extra` is projected to the four keys this tool reads (`method`, `new_state`, `task_ids`, "
+    "`map_index`) and only for the HEADLINE row of each task instance; every other key is named in "
+    "`extra_keys` and withheld, and the context rows under `events` carry no `extra` at all. "
+    "Airflow masks `extra` by key NAME only, so relaying it whole passed through anything the "
+    "requester chose to call something else."
+)
+_L7 = (
+    "The attribution payload is bounded at runtime, not only by the per-field clamps: the "
+    "serialized `last_state_change` objects are measured and, past the ceiling reported in "
+    "`attribution_payload_limit`, context rows and then `extra` projections are dropped from the "
+    "oldest instances first. Any row that lost content says so with `size_reduced`, and the count "
+    "is in `attribution_reduced_for_size`."
+)
+
+_R1 = (
+    "`dag_version` records the version stamped on the run's task instances, not the version that "
+    "executed them. On a bundle with no `bundle_version` the scheduler rewrites it forward "
+    "(jobs/scheduler_job_runner.py:3047-3057, models/dagbag.py:210-216) and it can name a version "
+    "the run never ran."
+)
+_R2 = (
+    "`triggering_user_name` is the authenticated principal recorded for triggering the run. It "
+    "says nothing about who changed any task instance's state."
+)
+
+# States a platform component writes into ``Log.event``.
+# execution_api/routes/task_instances.py:234 (event=RUNNING.value) and :491
+# (event=updated_state.value); models/taskinstance.py:193,198,1430,1877;
+# jobs/scheduler_job_runner.py:1558,3121,3138,3716.
+_PLATFORM_STATE_EVENTS = frozenset(
+    {
+        "queued",
+        "running",
+        "success",
+        "failed",
+        "skipped",
+        "up_for_retry",
+        "up_for_reschedule",
+        "restarting",
+        "deferred",
+        "removed",
+        "upstream_failed",
+        "scheduled",
+        "fail task",
+        "skip task",
+        "state mismatch",
+        "stuck in queued tries exceeded",
+        "heartbeat timeout",
+        "task stuck in queued reschedule",
+    }
+)
+# The subset of those whose event NAME is itself the state that was written.
+_TI_STATE_VALUES = frozenset(
+    {
+        "queued",
+        "running",
+        "success",
+        "failed",
+        "skipped",
+        "up_for_retry",
+        "up_for_reschedule",
+        "restarting",
+        "deferred",
+        "removed",
+        "upstream_failed",
+        "scheduled",
+    }
+)
+# Audited REST actions that can change a task instance's state.
+_AUDITED_TI_STATE_ACTIONS = frozenset(
+    {
+        "patch_task_instance",
+        "patch_task_group_instances",
+        "post_clear_task_instances",
+        "clear_dag_run",
+        "patch_dag_run",
+        "delete_task_instance",
+    }
+)
+# ``cli_*`` is matched by prefix as well; these two are named because they are
+# the ones that change a task instance's state.
+_CLI_STATE_ACTIONS = frozenset({"cli_dag_test", "cli_task_clear"})
+_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+# datamodels/task_instances.py:261-274 — the only states the PATCH body accepts.
+_PATCH_NEW_STATES = frozenset({"success", "failed", "skipped"})
+
+_ATTR_AUDITED_PATCH = "audited_single_instance_patch"
+_ATTR_AUDITED_OTHER = "audited_other_state_action"
+_ATTR_PLATFORM = "platform_execution_event"
+_ATTR_OTHER = "other_recorded_event"
+_ATTR_NONE = "no_event_found"
+_ATTR_TRUNCATED = "event_history_truncated"
+_ATTR_UNAVAILABLE = "event_history_unavailable"
+# An argument that was never supplied is not a permission that was refused.
+_ATTR_NOT_SCOPED = "event_history_not_scoped"
+_ATTR_UNKNOWN = "unknown"
+
+_ATTRIBUTION_DETAIL = {
+    _ATTR_AUDITED_PATCH: (
+        "The event log holds a row recording that a single-task-instance PATCH request naming this "
+        "task in this run was RECEIVED AND LOGGED. It records the principal name the request "
+        "authenticated as, the time, the HTTP verb, and the state the request asked for. The row is "
+        "committed before the request is validated and before it is authorized, so it does not "
+        "establish that the request was accepted, that it was authorized, that it wrote the state "
+        "now on the row, or that a person acted."
+    ),
+    _ATTR_AUDITED_OTHER: (
+        "The event log holds a row for a different recorded action that can change this task "
+        "instance's state - a task-group PATCH, a clear, a Dag-run PATCH, a task-instance delete, "
+        "or a `cli_*` command. It establishes that such a request was received and logged, not that "
+        "it was accepted, authorized, or that it wrote this state."
+    ),
+    _ATTR_PLATFORM: (
+        "The event log holds a row the platform wrote for a state this task instance reached - the "
+        "worker's execution-API report, or a scheduler-written state event. The recorded event "
+        "does not distinguish which of those two wrote it, and `owner` on such a row is the task's "
+        "`owner` attribute from the Dag file, not an actor."
+    ),
+    _ATTR_OTHER: (
+        "A row exists for this task instance but it does not record a state change, or its event "
+        "name is not one this tool recognises. The row is reported in full; no state transition is "
+        "claimed from it."
+    ),
+    _ATTR_NONE: (
+        "The scan covered every row this run-scoped query can reach and holds none for this task "
+        "instance. That is NOT the same as covering this run completely, and it is not evidence of "
+        "a direct database write: it is equally consistent with the bulk PATCH route (which changes "
+        "state and records nothing), a direct database UPDATE, an in-process TaskInstance.set_state "
+        "from a plugin or listener, the scheduler's EmptyOperator fast path, a task instance that "
+        "completed inside the triggerer, a clear that swept this instance in through an include_* "
+        "flag while naming only its seed task, event-log retention having deleted the row, and any "
+        "`cli_*` command - `cli_dag_test` included - whose row carries a null run_id and is "
+        "therefore unreachable by a run-scoped query at all."
+    ),
+    _ATTR_TRUNCATED: (
+        "The event scan hit its cap before it could cover this run completely, and no row for this "
+        "task instance appeared inside the scanned window. An older row may exist. Nothing is "
+        "established."
+    ),
+    _ATTR_UNAVAILABLE: (
+        "The event history was not read: the caller was not authorized for audit-log access on this "
+        "Dag, or the query failed. Nothing about a recorded event is established either way - "
+        "neither presence nor absence."
+    ),
+    _ATTR_NOT_SCOPED: (
+        "The event history was not read because the call carried no audit scope at all - no "
+        "permission was refused and none was asked for. Nothing about a recorded event is "
+        "established either way - neither presence nor absence."
+    ),
+    _ATTR_UNKNOWN: (
+        "The event history was not consulted for this task instance at all - it fell outside the "
+        "detailed projection - or classification could not be decided."
+    ),
+}
+
+# The one sentence each state contributes to a dispatch finding's prose. Never
+# built from ``extra``, which is structured-only, and never phrased as an actor.
+_ATTRIBUTION_SENTENCE = {
+    _ATTR_AUDITED_PATCH: (
+        "The event log records that a single task-instance state-change request naming this task in "
+        "this run was RECEIVED AND LOGGED"
+    ),
+    _ATTR_AUDITED_OTHER: (
+        "The event log records that a state-changing request naming this task in this run was "
+        "RECEIVED AND LOGGED"
+    ),
+    _ATTR_PLATFORM: (
+        "The newest event-log row for this task instance is one the platform wrote for a state it reached"
+    ),
+    _ATTR_OTHER: (
+        "The newest event-log row for this task instance is one this diagnosis does not classify "
+        "as a state change"
+    ),
+    _ATTR_NONE: (
+        "The event log holds no row this run-scoped query can reach for this task instance, which "
+        "is not evidence of a direct database write - a bulk state change, the scheduler's "
+        "EmptyOperator path, a completion inside the triggerer, a `cli_*` command (whose row "
+        "carries a null run_id and is unreachable here) and event-log retention all leave no row"
+    ),
+    _ATTR_TRUNCATED: (
+        "The event scan was cut off before it covered this run, and no row for this task instance "
+        "was inside the scanned window, so nothing about a recorded event is established"
+    ),
+    _ATTR_UNAVAILABLE: (
+        "The event history was not read for this run, so nothing about a recorded event is "
+        "established either way"
+    ),
+    _ATTR_NOT_SCOPED: (
+        "The event history was not read for this run because the call carried no audit scope, so "
+        "nothing about a recorded event is established either way"
+    ),
+    _ATTR_UNKNOWN: "The event history was not consulted for this task instance",
+}
+
+_AUDIT_NOT_PERMITTED = "the caller is not authorized to read this Dag's audit log"
+_AUDIT_NOT_SCOPED = "no audit scope was supplied, so the audit log was not read"
+_EVENT_QUERY = "GET /api/v2/eventLogs?dag_id=<dag>&run_id=<run> (order_by=-when)"
+
+
+def _clamped_event_text(value: Any, limit: int) -> tuple[Any, bool]:
+    """A value out of the event log, cut to a size this tool chooses."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[: limit - 1] + "…", True
+    return value, False
+
+
+def _classify_event(name: Any) -> tuple[str, str | None, str]:
+    """``(attribution state, interface, recorded_principal_kind)`` for one event name.
+
+    An event name in none of the sets is ``other_recorded_event`` and is still
+    listed in full: a future Airflow event name must degrade to "a row I cannot
+    classify", never to "there is no row".
+
+    The fall-through kind is ``not_classified``, never ``not_recorded``: rows
+    this tool does not recognise DO record a principal (``trigger_dag_run``
+    carries owner "admin" live), and calling that "not recorded" is a false
+    statement about the row rather than an honest one about the classifier.
+    """
+    if not isinstance(name, str):
+        return _ATTR_OTHER, None, "not_classified"
+    if name == "patch_task_instance":
+        return _ATTR_AUDITED_PATCH, "rest_api", "authenticated_api_principal"
+    if name.startswith("cli_") or name in _CLI_STATE_ACTIONS:
+        return _ATTR_AUDITED_OTHER, "cli", "os_user_from_cli"
+    if name in _AUDITED_TI_STATE_ACTIONS:
+        return _ATTR_AUDITED_OTHER, "rest_api", "authenticated_api_principal"
+    if name in _PLATFORM_STATE_EVENTS:
+        return _ATTR_PLATFORM, "platform", "dag_task_owner"
+    return _ATTR_OTHER, None, "not_classified"
+
+
+def _recorded_principal_kind(name: Any, owner: Any) -> str:
+    """``not_recorded`` only when the row genuinely carries no owner."""
+    _, _, kind = _classify_event(name)
+    if kind == "not_classified" and owner is None:
+        return "not_recorded"
+    return kind
+
+
+def _parsed_extra(raw: Any) -> dict[str, Any]:
+    """``Log.extra`` as a dict, or an empty one.
+
+    ``json.loads`` inside a try, never ``eval``; a non-dict result is ignored and
+    only the raw string is reported.
+    """
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# The only ``extra`` keys the attribution state machine reads, and therefore the
+# only ones relayed. Everything else is withheld BY NAME, because Airflow's
+# masker matches key names only: a national id under ``national_id`` and a
+# presigned URL's ``X-Amz-Signature`` pass through it untouched, and a
+# ``trigger_dag_run`` row carries the whole run conf and the run note verbatim.
+_EXTRA_RELAYED_KEYS = ("method", "new_state", "task_ids", "map_index")
+_EXTRA_INCLUDE_KEYS = ("include_upstream", "include_downstream", "include_future", "include_past")
+# ``extra`` is unbounded Text written by whoever made the request, so both the
+# breadth of what is relayed and the breadth of what is merely NAMED are capped.
+EXTRA_LIST_LIMIT = 20
+EXTRA_KEY_LIMIT = 20
+# A withheld key is NAMED, not relayed, so the name needs only to be recognisable.
+EXTRA_KEY_CLAMP_CHARS = 40
+# The per-field clamps bound one row; they do not bound the RESULT, because the
+# number of rows carrying them is TASK_INSTANCE_DETAIL_LIMIT. Every clamp at its
+# maximum on every detailed instance - a relayed ``task_ids`` list, twenty
+# withheld key names at their own clamp, both owner fields, and two context rows
+# each - measured ~997 KB of attribution alone. This is the ceiling on the
+# serialized attribution payload, enforced at runtime rather than argued for.
+#
+# It is set ABOVE the floor that reduction cannot go under: TASK_INSTANCE_DETAIL_LIMIT
+# rows of this tool's own constant prose plus the clamped identifiers measures
+# ~325 KB, and a ceiling below that would be one the tool could only report
+# missing. ``attribution_payload_over_limit`` says so if it ever is.
+ATTRIBUTION_PAYLOAD_LIMIT_CHARS = int(os.environ.get("AIRY_MCP_ATTRIBUTION_PAYLOAD_LIMIT", "400000"))
+
+
+def _bounded_extra_value(value: Any, depth: int = 1) -> tuple[Any, bool]:
+    """One relayed ``extra`` value, cut to a size this tool chooses."""
+    if isinstance(value, str):
+        return _clamped_event_text(value, EVENT_EXTRA_CLAMP_CHARS)
+    if isinstance(value, bool) or isinstance(value, (int, float)) or value is None:
+        return value, False
+    if isinstance(value, list) and depth > 0:
+        kept: list[Any] = []
+        truncated = len(value) > EXTRA_LIST_LIMIT
+        for item in value[:EXTRA_LIST_LIMIT]:
+            bounded, cut = _bounded_extra_value(item, depth - 1)
+            kept.append(bounded)
+            truncated = truncated or cut
+        return kept, truncated
+    # A dict, a deeper list, or anything else: named, never relayed.
+    return None, True
+
+
+# ``extra`` is unbounded Text, and the association check runs it once per (row,
+# task instance) pair — 300 rows against 200 instances is 60000 parses of a
+# string whose size the requester chose. Parsed once, memoised on the row, and
+# never emitted: the rows are dropped from the payload before it is returned.
+_PARSED_EXTRA_KEY = "__airy_parsed_extra"
+
+
+def _parsed_extra_of(row: dict[str, Any]) -> dict[str, Any]:
+    """``_parsed_extra`` for one event-log row, parsed at most once.
+
+    Reads the copy ``_event_history`` made; it never WRITES the key, because the
+    row it is handed is not this function's to mutate.
+    """
+    cached = row.get(_PARSED_EXTRA_KEY)
+    return cached if cached is not None else _parsed_extra(row.get("extra"))
+
+
+def _is_json_object(raw: Any) -> bool:
+    """Whether ``Log.extra`` was a JSON object at all — reported, never guessed at."""
+    if not isinstance(raw, str):
+        return False
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (ValueError, TypeError):
+        return False
+
+
+def _projected_extra(row: dict[str, Any]) -> dict[str, Any]:
+    """``Log.extra`` reduced to the four keys read, plus the names of what was withheld."""
+    raw = row.get("extra")
+    parsed = _parsed_extra_of(row)
+    projected: dict[str, Any] = {}
+    truncated = False
+    for key in _EXTRA_RELAYED_KEYS:
+        if key in parsed:
+            value, cut = _bounded_extra_value(parsed[key])
+            projected[key] = value
+            truncated = truncated or cut
+    withheld = sorted(
+        _clamped_event_text(key, EXTRA_KEY_CLAMP_CHARS)[0]
+        for key in parsed
+        if key not in _EXTRA_RELAYED_KEYS and isinstance(key, str)
+    )
+    return {
+        "extra": projected,
+        # ``Log.extra`` that is not a JSON object relays nothing at all: the raw
+        # string was the leak, not the parse. The second parse is reached only
+        # when the first produced nothing, so it is never paid twice on a
+        # well-formed row.
+        "extra_parsed": bool(parsed) or _is_json_object(raw),
+        "extra_keys": withheld[:EXTRA_KEY_LIMIT],
+        "extra_keys_omitted": max(len(withheld) - EXTRA_KEY_LIMIT, 0),
+        "extra_truncated": truncated,
+    }
+
+
+def _compact_event(row: dict[str, Any]) -> dict[str, Any]:
+    """One event-log row, clamped, classified, and never spliced into prose."""
+    _, interface, _ = _classify_event(row.get("event"))
+    owner, _ = _clamped_event_text(row.get("owner"), EVENT_OWNER_CLAMP_CHARS)
+    principal_kind = _recorded_principal_kind(row.get("event"), row.get("owner"))
+    event, _ = _clamped_event_text(row.get("event"), EVENT_NAME_CLAMP_CHARS)
+    display, _ = _clamped_event_text(row.get("owner_display_name"), EVENT_OWNER_CLAMP_CHARS)
+    return {
+        "event_log_id": row.get("event_log_id"),
+        "when": row.get("when"),
+        "event": event,
+        "event_owner": owner,
+        "event_owner_display_name": display,
+        "recorded_principal": owner if principal_kind == "authenticated_api_principal" else None,
+        "recorded_principal_kind": principal_kind,
+        "interface": interface,
+        **_projected_extra(row),
+    }
+
+
+def _event_association(row: dict[str, Any], ti: dict[str, Any]) -> str | None:
+    """How this row attaches to this task instance, or ``None`` for not at all."""
+    extra = _parsed_extra_of(row)
+    task_id, map_index = _ti_key(ti)
+    row_task_id = row.get("task_id")
+    if row_task_id is None:
+        # A run-scoped row (a clear, a Dag-run PATCH) names its targets in
+        # ``extra`` and nowhere else. Only that one shape is ever accepted.
+        targets = extra.get("task_ids")
+        if isinstance(targets, list) and any(t == task_id for t in targets if isinstance(t, str)):
+            return "extra.task_ids"
+        return None
+    if row_task_id != task_id:
+        return None
+    row_map_index = row.get("map_index")
+    if row_map_index is not None:
+        return "row.task_id+map_index" if row_map_index == map_index else None
+    # The by-map-index PATCH route puts map_index in the path, so ``extra`` can
+    # carry it as a string. Accepted only when it parses to this instance's.
+    raw_index = extra.get("map_index")
+    if isinstance(raw_index, (int, str)) and not isinstance(raw_index, bool):
+        try:
+            if int(raw_index) == map_index:
+                return "extra.map_index"
+        except (TypeError, ValueError):
+            pass
+    return "row.task_id"
+
+
+def _classification(state: str, request_settable: bool, demoted_audited: bool) -> str | None:
+    """Why an ``other_recorded_event`` is one — the three reasons are not the same."""
+    if state != _ATTR_OTHER:
+        return None
+    if request_settable:
+        return "request_settable_targeting_fields"
+    if demoted_audited:
+        return "uncorroborated_association"
+    return "unrecognised"
+
+
+def _bare_attribution(state: str, unknowns: list[str]) -> dict[str, Any]:
+    """An attribution with no row behind it. Nulls are written out, never dropped."""
+    return {
+        "attribution": state,
+        "attribution_detail": _ATTRIBUTION_DETAIL[state],
+        "event": None,
+        "when": None,
+        "event_log_id": None,
+        "event_owner": None,
+        "event_owner_display_name": None,
+        "recorded_principal": None,
+        "recorded_principal_kind": "not_recorded",
+        "interface": None,
+        "method": None,
+        "method_raw": None,
+        "new_state": None,
+        "new_state_raw": None,
+        "new_state_source": None,
+        "old_state": None,
+        "event_map_index": None,
+        "event_try_number": None,
+        "pins_map_index": False,
+        "pins_try_number": False,
+        "matches_recorded_attempt": None,
+        "associated_via": None,
+        "classification": None,
+        "extra": {},
+        "extra_parsed": False,
+        "extra_keys": [],
+        "extra_keys_omitted": 0,
+        "extra_truncated": False,
+        "targeting_is_request_settable": False,
+        "corroborated_association": False,
+        "size_reduced": False,
+        "events_recorded": 0,
+        "events_omitted_for_instance": 0,
+        "events": [],
+        "unknowns": unknowns,
+    }
+
+
+def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, Any]:
+    """What the event log recorded last for one task instance — and what it cannot say.
+
+    Strictly additive reporting. It never adds a dispatch finding, never removes
+    one, and never enters ``_is_never_dispatched_attempt``: a positive
+    ``patch_task_instance`` row proves an attempt and not an effect, and an
+    absent row proves nothing at all.
+    """
+    status = history["status"]
+    if status == "not_scoped":
+        return _bare_attribution(_ATTR_NOT_SCOPED, ["U14"])
+    if status in ("unavailable", "not_permitted"):
+        return _bare_attribution(_ATTR_UNAVAILABLE, ["U9"])
+    matched = [(row, via) for row in history["rows"] if (via := _event_association(row, ti))]
+    if not matched:
+        if status == "partial":
+            return _bare_attribution(_ATTR_TRUNCATED, ["U8"])
+        absent = ["U2", "U11", "U12", "U13"]
+        if history.get("clear_with_include_flags"):
+            absent.append("U15")
+        return _bare_attribution(_ATTR_NONE, absent)
+
+    # Ordered ``-when``, so a match is newest-first within its rank. The RANK
+    # comes first: an association corroborated by the row's own map_index column
+    # outranks one the row merely claims by task_id, so a row-claimed association
+    # cannot displace a corroborated platform event as the headline. Without this
+    # a forged audit row - newer by construction, since it is planted after the
+    # fact - took the headline off the platform's own execution events.
+    matched.sort(key=lambda pair: 0 if pair[1] == "row.task_id+map_index" else 1)
+    row, via = matched[0]
+    compact = _compact_event(row)
+    raw_state, interface, _ = _classify_event(row.get("event"))
+    # The headline and the context rows must not report two different principal
+    # kinds for the same row: both go through ``_recorded_principal_kind``.
+    principal_kind = _recorded_principal_kind(row.get("event"), row.get("owner"))
+    extra = _parsed_extra_of(row)
+
+    # Keyed on the INTERFACE, never on ``extra``. Every REST audit row's
+    # dag_id/run_id/task_id columns are request-settable - a query parameter or a
+    # body key merged over the path (decorators.py:196-203, :213-217) - and
+    # ``extra`` is structurally incapable of showing it, because :169-178 strips
+    # exactly those key names out of ``extra`` at :180-184. So a demotion keyed
+    # on ``extra`` is blind to the query-string variant, and every rest_api row
+    # is DEMOTED out of the audited states: it is reported in full, and it is not
+    # counted as a state-change claim about this task instance.
+    #
+    # ACCEPTED COST: legitimate ``post_clear_task_instances`` rows are demoted
+    # too. ``decorators.py:217`` is ``params.get("run_id") or
+    # params.get("dag_run_id")`` over the body-merged dict, so nothing on the row
+    # separates a genuine clear from a plant. Carving ``dag_run_id`` back out
+    # would restore the exact vector; under-claiming on a real clear is the
+    # correct direction to fail.
+    targeting_is_request_settable = interface == "rest_api"
+    demoted_audited = raw_state in (_ATTR_AUDITED_PATCH, _ATTR_AUDITED_OTHER) and (
+        # An audited state survives ONLY on an association the row's own
+        # map_index column corroborates, which a REST audit row structurally
+        # cannot reach (decorators.py:209-218 never passes map_index).
+        targeting_is_request_settable or via != "row.task_id+map_index"
+    )
+    state = _ATTR_OTHER if demoted_audited else raw_state
+
+    # ``extra.map_index`` is a value the requester wrote and ``map_index`` is NOT
+    # in ``fields_skip_logging``, so a ``?map_index=3`` on a rejected request
+    # lands there verbatim. Only the row's own column may pin an attempt.
+    pins_map_index = via == "row.task_id+map_index"
+    pins_try_number = pins_map_index and row.get("try_number") is not None
+    matches_attempt = row.get("try_number") == ti.get("try_number") if pins_try_number else None
+
+    raw_method = extra.get("method")
+    method = raw_method if isinstance(raw_method, str) and raw_method in _HTTP_METHODS else None
+    method_raw = _quoted(raw_method, 60) if raw_method is not None and method is None else None
+
+    raw_new_state = extra.get("new_state")
+    new_state = new_state_raw = new_state_source = None
+    if isinstance(raw_new_state, str) and raw_new_state in _PATCH_NEW_STATES:
+        new_state, new_state_source = raw_new_state, "extra.new_state"
+    elif raw_new_state is not None:
+        # The audit row is written by a dependency that commits BEFORE body
+        # validation, so a rejected PATCH's extra really can carry arbitrary text.
+        new_state_raw = _quoted(raw_new_state, 60)
+    elif state == _ATTR_PLATFORM and row.get("event") in _TI_STATE_VALUES:
+        new_state, new_state_source = row["event"], "event_name"
+
+    unknowns: list[str] = []
+    if state == _ATTR_AUDITED_PATCH:
+        unknowns = ["U1", "U3", "U11", "U13"]
+    elif state == _ATTR_AUDITED_OTHER:
+        unknowns = ["U1", "U5" if principal_kind == "os_user_from_cli" else "U3", "U11", "U13"]
+    elif state == _ATTR_PLATFORM:
+        unknowns = ["U4"]
+    elif demoted_audited:
+        # A demoted row is still an audited row. It keeps every caveat the
+        # audited states carry - including the one naming what its `owner` field
+        # is - and gains U13, the reason it was demoted.
+        unknowns = ["U1", "U5" if principal_kind == "os_user_from_cli" else "U3", "U11", "U13"]
+    else:
+        unknowns = ["U11"]
+    if new_state_source == "extra.new_state":
+        unknowns.append("U10")
+    # Every rest_api row, without exception: no REST audit row can carry
+    # map_index or try_number at all, so none of them establishes which attempt
+    # or which mapped instance it named.
+    if interface == "rest_api":
+        unknowns.append("U7")
+    if any(bool(extra.get(key)) for key in _EXTRA_INCLUDE_KEYS):
+        unknowns.append("U15")
+    # ``old_state`` is hard-null for every state that has a row, so the reason it
+    # is null travels with it rather than being left for the reader to supply.
+    unknowns.append("U6")
+
+    # Context rows, deliberately slimmer than the headline. ``extra`` is
+    # projected only for the headline because the headline is the only row the
+    # state machine reads — and one projection per context row was the largest
+    # repeated structure in the whole result (``_L6`` says so in the data).
+    events = [
+        {
+            "event_log_id": other.get("event_log_id"),
+            "when": other.get("when"),
+            "event": _clamped_event_text(other.get("event"), EVENT_NAME_CLAMP_CHARS)[0],
+            "event_owner": _clamped_event_text(other.get("owner"), EVENT_OWNER_CLAMP_CHARS)[0],
+            "recorded_principal_kind": _recorded_principal_kind(other.get("event"), other.get("owner")),
+            "interface": _classify_event(other.get("event"))[1],
+            "targeting_is_request_settable": _classify_event(other.get("event"))[1] == "rest_api",
+            "event_map_index": other.get("map_index"),
+            "event_try_number": other.get("try_number"),
+            "associated_via": other_via,
+        }
+        for other, other_via in matched[:EVENT_HISTORY_PER_INSTANCE]
+    ]
+    return {
+        "attribution": state,
+        "attribution_detail": _ATTRIBUTION_DETAIL[state],
+        "event": compact["event"],
+        "when": compact["when"],
+        "event_log_id": compact["event_log_id"],
+        "event_owner": compact["event_owner"],
+        "event_owner_display_name": compact["event_owner_display_name"],
+        "recorded_principal": compact["recorded_principal"],
+        "recorded_principal_kind": principal_kind,
+        "interface": compact["interface"],
+        "method": method,
+        "method_raw": method_raw,
+        "new_state": new_state,
+        "new_state_raw": new_state_raw,
+        "new_state_source": new_state_source,
+        # NOT RECOVERABLE from anywhere: ``Log`` (models/log.py:36-72) has no
+        # prior-state column and ``EventLogResponse`` exposes none. The execution
+        # API computes ``previous_state`` but puts it only in a 409 detail. An
+        # omitted key would read as unmeasured; an explicit null reads as absent.
+        "old_state": None,
+        "event_map_index": row.get("map_index"),
+        "event_try_number": row.get("try_number"),
+        "pins_map_index": pins_map_index,
+        "pins_try_number": pins_try_number,
+        "matches_recorded_attempt": matches_attempt,
+        "associated_via": via,
+        "classification": _classification(state, targeting_is_request_settable, demoted_audited),
+        "extra": compact["extra"],
+        "extra_parsed": compact["extra_parsed"],
+        "extra_keys": compact["extra_keys"],
+        "extra_keys_omitted": compact["extra_keys_omitted"],
+        "extra_truncated": compact["extra_truncated"],
+        "targeting_is_request_settable": targeting_is_request_settable,
+        # The row's own map_index column agrees with this instance. Anything else
+        # is a claim the row makes about itself.
+        "corroborated_association": via == "row.task_id+map_index",
+        # Set by ``_enforce_attribution_ceiling`` when the runtime ceiling had to
+        # take bulk off this object.
+        "size_reduced": False,
+        "events_recorded": len(matched),
+        "events_omitted_for_instance": max(len(matched) - EVENT_HISTORY_PER_INSTANCE, 0),
+        "events": events,
+        "unknowns": unknowns,
+    }
+
+
+def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]:
+    """Every event-log row for one run, or why there are none to read.
+
+    Never raises, exactly like ``_attempt_history``: an unreadable history
+    downgrades what the diagnosis can conclude and must not take the diagnosis
+    down with it. ``TypeError`` is in the net because ``_api`` returns ``None``
+    for an empty body.
+
+    FAILS CLOSED. The read happens only when the caller's permissions said so;
+    every other value — "denied", "", a missing argument, a plugin too old to
+    inject one — performs zero HTTP calls. A permission gap can therefore only
+    ever produce less information, never more.
+
+    An EMPTY scope is reported as ``not_scoped``, not as ``not_permitted``: no
+    argument arrived, so no permission was refused, and saying one was is a false
+    statement about the caller.
+    """
+    payload: dict[str, Any] = {
+        "status": "not_permitted",
+        "events_scanned": 0,
+        "total_entries": 0,
+        "events_omitted": 0,
+        "oldest_scanned_when": None,
+        "rows_rejected": 0,
+        "instances_without_attribution": 0,
+        "attribution_payload_bytes": 0,
+        "attribution_payload_limit": ATTRIBUTION_PAYLOAD_LIMIT_CHARS,
+        "attribution_reduced_for_size": 0,
+        "attribution_payload_over_limit": False,
+        "clear_with_include_flags": False,
+        "run_scoped_events": [],
+        "run_scoped_events_omitted": 0,
+        "error": _AUDIT_NOT_PERMITTED,
+        "query": _EVENT_QUERY,
+        "limits": [_L1, _L2, _L3, _L4, _L5, _L6, _L7],
+        "unknowns_legend": _UNKNOWNS,
+        "rows": [],
+    }
+    if audit_scope == "":
+        payload["status"] = "not_scoped"
+        payload["error"] = _AUDIT_NOT_SCOPED
+        return payload
+    if audit_scope != "granted":
+        return payload
+    fetched: list[dict[str, Any]] = []
+    total = 0
+    # Bounded by construction rather than by the server's arithmetic: the break
+    # below already ends the scan, and this makes an ``offset`` the API ignores
+    # or a total that never comes down cost a fixed number of calls, not a spin.
+    max_pages = max(1, -(-EVENT_SCAN_LIMIT // max(EVENT_SCAN_PAGE, 1)))
+    try:
+        for _ in range(max_pages):
+            resp = _api(
+                "GET",
+                "/eventLogs",
+                # Through ``params=``, never interpolated: a run_id carries
+                # ``+00:00``, whose ``+`` decodes to a space when it is written
+                # into the URL raw — which returned 0 rows for a run that has 27.
+                # It also stops a crafted run_id smuggling extra query parameters
+                # that would widen the scope past this Dag.
+                params={
+                    "dag_id": dag_id,
+                    "run_id": run_id,
+                    "order_by": "-when",
+                    "limit": EVENT_SCAN_PAGE,
+                    "offset": len(fetched),
+                },
+            )
+            page = resp["event_logs"]
+            total = resp.get("total_entries", len(page))
+            fetched += page
+            # An empty page ends it whatever the count says.
+            if not page or len(fetched) >= min(total, EVENT_SCAN_LIMIT):
+                break
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        payload["status"] = "unavailable"
+        payload["error"] = _explain_error(e)
+        return payload
+
+    # Defence in depth: the query is already dag_id-scoped, so a row for another
+    # Dag can only be a server-side filter regression. Dropped and counted.
+    # Copied rather than mutated, and the parse happens exactly once per row.
+    kept = [
+        {**row, _PARSED_EXTRA_KEY: _parsed_extra(row.get("extra"))}
+        for row in fetched
+        if isinstance(row, dict) and row.get("dag_id") == dag_id
+    ]
+    run_scoped = [row for row in kept if row.get("task_id") is None]
+    # A clear with an include_* flag names only its seed task ids, so the further
+    # instances it swept in are named nowhere. Carried on the history rather than
+    # on a row, because the instances that need the caveat are exactly the ones
+    # with no row of their own.
+    swept = any(any(bool(_parsed_extra_of(row).get(key)) for key in _EXTRA_INCLUDE_KEYS) for row in kept)
+    payload.update(
+        {
+            "status": "checked" if len(fetched) >= total else "partial",
+            "events_scanned": len(kept),
+            "total_entries": total,
+            "events_omitted": max(total - len(fetched), 0),
+            "oldest_scanned_when": kept[-1].get("when") if kept else None,
+            "rows_rejected": len(fetched) - len(kept),
+            "clear_with_include_flags": swept,
+            "run_scoped_events": [_compact_event(row) for row in run_scoped[:RUN_SCOPED_EVENT_LIMIT]],
+            "run_scoped_events_omitted": max(len(run_scoped) - RUN_SCOPED_EVENT_LIMIT, 0),
+            "error": None,
+            "rows": kept,
+        }
+    )
+    return payload
+
+
+def _attribution_bytes(attribution: dict[str, Any]) -> int:
+    """The serialized size of one attribution object, measured not estimated."""
+    return len(json.dumps(attribution, default=str))
+
+
+def _enforce_attribution_ceiling(history: dict[str, Any], task_instances: list[dict[str, Any]]) -> None:
+    """Bound the serialized attribution payload, and say so when it bites.
+
+    The per-field clamps bound a row; nothing bounded the SUM, and the levers a
+    caller controls (a relayed ``extra.task_ids`` list, withheld key names at
+    ``EXTRA_KEY_CLAMP_CHARS``, both owner fields, the context rows) multiply by
+    the number of detailed instances. Measured worst case was ~997 KB.
+
+    Reduction is in place, so the object the projection carries and the object a
+    finding carries stay the same object and cannot disagree. It never touches
+    ``attribution``, ``classification`` or ``unknowns``: the claims are what the
+    reading is for, and the bulk is what it can afford to lose. Oldest instances
+    first, so the head of the list keeps its detail.
+    """
+    carriers = [
+        attribution for ti in task_instances if isinstance(attribution := ti.get("last_state_change"), dict)
+    ]
+    total = sum(_attribution_bytes(attribution) for attribution in carriers)
+    reduced: set[int] = set()
+    # Two passes, cheapest content first: the context rows are a convenience,
+    # while ``extra`` is the only projected content that came from the caller.
+    for strip in (_strip_context_rows, _strip_extra_projection):
+        for attribution in reversed(carriers):
+            if total <= ATTRIBUTION_PAYLOAD_LIMIT_CHARS:
+                break
+            before = _attribution_bytes(attribution)
+            if not strip(attribution):
+                continue
+            attribution["size_reduced"] = True
+            reduced.add(id(attribution))
+            total -= before - _attribution_bytes(attribution)
+    history["attribution_payload_bytes"] = total
+    history["attribution_payload_limit"] = ATTRIBUTION_PAYLOAD_LIMIT_CHARS
+    history["attribution_reduced_for_size"] = len(reduced)
+    # Reduction takes bulk, never claims, so there is a floor it cannot go under.
+    # A ceiling that was missed is reported as missed rather than asserted away.
+    history["attribution_payload_over_limit"] = total > ATTRIBUTION_PAYLOAD_LIMIT_CHARS
+
+
+def _strip_context_rows(attribution: dict[str, Any]) -> bool:
+    """Drop the per-instance context rows, counting them as omitted."""
+    if not attribution.get("events"):
+        return False
+    attribution["events_omitted_for_instance"] = attribution.get("events_recorded", 0)
+    attribution["events"] = []
+    return True
+
+
+def _strip_extra_projection(attribution: dict[str, Any]) -> bool:
+    """Drop the relayed ``extra`` and the withheld key names, counting them."""
+    if not attribution.get("extra") and not attribution.get("extra_keys"):
+        return False
+    attribution["extra_keys_omitted"] = attribution.get("extra_keys_omitted", 0) + len(
+        attribution.get("extra_keys") or []
+    )
+    attribution["extra"] = {}
+    attribution["extra_keys"] = []
+    attribution["extra_truncated"] = True
+    return True
+
+
+def _prune_unknowns_legend(history: dict[str, Any], *carriers: list[dict[str, Any]]) -> None:
+    """Keep only the caveats this result actually cites.
+
+    The legend is what replaced repeating six constant paragraphs on every
+    detailed row; shipping all fifteen of them on a diagnosis that cites one is
+    the same waste in a smaller costume.
+    """
+    used = {
+        code
+        for carrier in carriers
+        for item in carrier
+        for code in (item.get("last_state_change") or {}).get("unknowns", [])
+    }
+    history["unknowns_legend"] = {
+        code: text for code, text in _UNKNOWNS.items() if code in used and code in _UNKNOWNS
+    }
+
+
+def _attribution_reader(history: dict[str, Any]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """One attribution per instance, computed once and shared.
+
+    The projection and the findings read the same object, so the row the caller
+    sees and the row the prose was built from cannot drift apart.
+    """
+    cache: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def read(ti: dict[str, Any]) -> dict[str, Any]:
+        key = _ti_key(ti)
+        if key not in cache:
+            cache[key] = _last_state_change(ti, history)
+        return cache[key]
+
+    return read
+
+
 _DISPATCH_FINDING_KIND = "success_without_attempt_dispatch_fields"
 _DISPATCH_TRUNCATED_KIND = "dispatch_findings_folded"
 
 
-def _dispatch_finding(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, Any] | None:
+def _dispatch_finding(
+    ti: dict[str, Any], history: dict[str, Any], attribution: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     """A success whose recorded attempt carries none of the fields a dispatch writes.
 
     Two independent ways in. The live row can say it on its own — none of the
@@ -930,10 +1939,43 @@ def _dispatch_finding(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, 
             f"so whether an earlier attempt executed is not established."
         )
 
+    attribution = attribution or _bare_attribution(_ATTR_UNKNOWN, [])
+    # Exactly one sentence, chosen by attribution state and built only from
+    # values this tool wrote or ``_quoted``/``_fenced`` neutralised. ``extra`` is
+    # never spliced into it — it is structured-only.
+    attribution_text = _ATTRIBUTION_SENTENCE[attribution["attribution"]]
+    if attribution["attribution"] in (_ATTR_AUDITED_PATCH, _ATTR_AUDITED_OTHER):
+        principal = (
+            "the operating-system user name" if attribution["interface"] == "cli" else "the principal name"
+        )
+        attribution_text += (
+            f", event {_quoted(attribution['event'])} at {_quoted(attribution['when'])}, recorded "
+            f"against {principal} {_quoted(attribution['event_owner'])}; the row is written before "
+            f"the request is handled, so it does not establish that this request wrote this state, "
+            f"and it does not establish that a person acted"
+        )
+    elif attribution["attribution"] == _ATTR_PLATFORM:
+        attribution_text += (
+            f", event {_quoted(attribution['event'])} at {_quoted(attribution['when'])}, whose "
+            f"owner field {_quoted(attribution['event_owner'])} is the task's owner attribute from "
+            f"the Dag file and not an actor"
+        )
+    elif attribution["attribution"] == _ATTR_OTHER:
+        # NOTHING is claimed about ``owner`` here. This branch is the one where
+        # the event was NOT classified, so the row may well be an audited one
+        # whose owner IS an authenticated principal - and the platform sentence
+        # would have converted that principal into "not an actor".
+        attribution_text += f", event {_quoted(attribution['event'])} at {_quoted(attribution['when'])}"
+
     finding: dict[str, Any] = {
         "kind": _DISPATCH_FINDING_KIND,
         "detail": " ".join(
-            [core, history_text, "What wrote this state is not established by this diagnosis"]
+            [
+                core,
+                history_text,
+                f"{attribution_text}.",
+                "What wrote this state is not established by this diagnosis",
+            ]
         ),
         "task_id": ti["task_id"],
         "map_index": ti.get("map_index", -1),
@@ -944,7 +1986,9 @@ def _dispatch_finding(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, 
         "operator": _clamped_operator(ti.get("operator")),
         "current_attempt_dispatched": False,
         "attempt_history": status,
-        "attribution": "not established",
+        "attribution": attribution["attribution"],
+        "attribution_detail": attribution["attribution_detail"],
+        "last_state_change": attribution,
     }
     if attempts_recorded is not None:
         finding["attempts_recorded"] = attempts_recorded
@@ -956,7 +2000,10 @@ def _dispatch_finding(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, 
 
 
 def _check_dispatch_evidence(
-    dag_id: str, run_path: str, tis: list[dict[str, Any]]
+    dag_id: str,
+    run_path: str,
+    tis: list[dict[str, Any]],
+    attribution_of: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, int], list[str]], dict[str, Any]]:
     """Read every scanned success for signs its recorded attempt was dispatched.
 
@@ -1022,7 +2069,11 @@ def _check_dispatch_evidence(
     unprobed = {"status": "not_checked", "rows": [], "error": _HISTORY_NOT_CHECKED}
     checks = []
     for ti in successes:
-        finding = _dispatch_finding(ti, probed.get(_ti_key(ti), unprobed))
+        finding = _dispatch_finding(
+            ti,
+            probed.get(_ti_key(ti), unprobed),
+            attribution_of(ti) if attribution_of else None,
+        )
         if finding:
             checks.append(finding)
     suppressed = max(len(checks) - DISPATCH_FINDING_LIMIT, 0)
@@ -1068,7 +2119,8 @@ def _project_task_instances(
     tis: list[dict[str, Any]],
     flagged: set[tuple[str, int]],
     incomplete: dict[tuple[str, int], list[str]],
-) -> tuple[list[dict[str, Any]], int]:
+    attribution_of: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     """Every scanned instance, in full where it matters and reduced where it does not.
 
     Nulls are always written out: a dropped key and a null value are the same
@@ -1090,6 +2142,12 @@ def _project_task_instances(
     detailed = set(ordered[:TASK_INSTANCE_DETAIL_LIMIT])
 
     projected = []
+    census: dict[str, int] = {}
+    corroborated: dict[str, int] = {}
+    row_claimed: dict[str, int] = {}
+    unpinned = 0
+    event_log_ids: set[Any] = set()
+    seen: set[tuple[str, int]] = set()
     for ti in tis:
         key = _ti_key(ti)
         if key not in detailed:
@@ -1107,8 +2165,45 @@ def _project_task_instances(
         entry["operator"] = _clamped_operator(entry["operator"])
         if key in incomplete:
             entry["dispatch_evidence_incomplete"] = incomplete[key]
+        if attribution_of is not None:
+            attribution = attribution_of(ti)
+            entry["last_state_change"] = attribution
+            if key not in seen:
+                state = attribution["attribution"]
+                census[state] = census.get(state, 0) + 1
+                if attribution["event_log_id"] is not None:
+                    if attribution["corroborated_association"]:
+                        corroborated[state] = corroborated.get(state, 0) + 1
+                    else:
+                        row_claimed[state] = row_claimed.get(state, 0) + 1
+                        unpinned += 1
+                    event_log_ids.add(attribution["event_log_id"])
+        seen.add(key)
         projected.append(entry)
-    return projected, len(tis) - len(detailed)
+    attribution_census = {
+        "by_attribution": dict(sorted(census.items())),
+        # Corroborated means the ROW's own map_index column agrees with the
+        # instance. Row-claimed means the row named a task_id (or listed one in
+        # its body) and nothing else — which a rejected request can do for any
+        # task in any Dag.
+        "corroborated": dict(sorted(corroborated.items())),
+        "row_claimed": dict(sorted(row_claimed.items())),
+        "instances_attributed_by_unpinned_row": unpinned,
+        # One row that pins no map_index attaches to every instance of a mapped
+        # task, so the per-instance counts above are NOT a count of state
+        # changes. This says how many rows they actually stand on.
+        "distinct_event_log_ids": len(event_log_ids),
+    }
+    return projected, len(tis) - len(detailed), attribution_census
+
+
+_NO_CENSUS: dict[str, Any] = {
+    "by_attribution": {},
+    "corroborated": {},
+    "row_claimed": {},
+    "instances_attributed_by_unpinned_row": 0,
+    "distinct_event_log_ids": 0,
+}
 
 
 def _run_health(
@@ -1118,6 +2213,9 @@ def _run_health(
     checks: list[dict[str, Any]],
     omitted: int,
     coverage: dict[str, Any],
+    attribution_census: dict[str, Any] | None = None,
+    event_history: dict[str, Any] | None = None,
+    run_history: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The one place that decides whether this run may be called clean.
 
@@ -1154,6 +2252,21 @@ def _run_health(
         blockers.append("dispatch_findings_suppressed")
     if coverage.get("static_checks_suppressed"):
         blockers.append("static_checks_suppressed")
+    # An unread event history is the absence of a measurement, not a measurement
+    # of absence — and the strong sentence must not be earned off one. A
+    # ``no_event_found`` is deliberately NOT a blocker: it is the ordinary state
+    # for an EmptyOperator success and for any run whose rows aged out, and
+    # ``successes_without_worker_fields`` already covers that population.
+    if event_history and event_history["status"] in ("unavailable", "not_permitted"):
+        blockers.append("event_history_unavailable")
+    # An argument that never arrived is not a permission that was refused, and
+    # the reason the strong sentence is withheld has to say which it was.
+    if event_history and event_history["status"] == "not_scoped":
+        blockers.append("event_history_not_scoped")
+    if event_history and event_history["status"] == "partial":
+        blockers.append("event_history_truncated")
+    if run_history and run_history.get("error"):
+        blockers.append("run_history_unavailable")
     # A run with nothing in it would otherwise earn the strongest sentence there
     # is, on the strength of having looked at nothing.
     if not tis:
@@ -1173,9 +2286,181 @@ def _run_health(
         "dispatch_findings_suppressed": coverage["dispatch_findings_suppressed"],
         "static_checks_suppressed": coverage.get("static_checks_suppressed", 0),
         "task_instances_omitted": omitted,
+        "state_change_attribution": attribution_census if attribution_census is not None else _NO_CENSUS,
         "clean": not blockers,
         "clean_blockers": blockers,
     }
+
+
+_RUN_HISTORY_KEYS = (
+    "dag_run_id",
+    "state",
+    "run_type",
+    "logical_date",
+    "queued_at",
+    "start_date",
+    "end_date",
+    "duration",
+    "triggered_by",
+    "triggering_user_name",
+)
+
+_TASK_COMPARISON_KEYS = (
+    "dag_run_id",
+    "map_index",
+    "state",
+    "try_number",
+    "duration",
+    "hostname",
+    "pid",
+    "queued_when",
+    "scheduled_when",
+    "start_date",
+    "end_date",
+)
+
+_TASK_COMPARISON_SELECTION = (
+    "task instances this diagnosis flagged, then failed or retrying ones, newest-first, capped at "
+    f"{TASK_COMPARISON_LIMIT} task ids"
+)
+
+
+def _comparison_task_ids(checks: list[dict[str, Any]], tis: list[dict[str, Any]]) -> list[str]:
+    """Which tasks are worth looking at across runs — chosen by the diagnosis, not the caller.
+
+    Empty when the diagnosis found nothing and nothing failed, which is what
+    keeps the comparison at zero HTTP calls in the common case.
+    """
+    ordered: list[str] = []
+    for check in checks:
+        if check["kind"] == _DISPATCH_FINDING_KIND and check["task_id"] not in ordered:
+            ordered.append(check["task_id"])
+    for ti in tis:
+        if ti.get("state") in ("failed", "up_for_retry") and ti["task_id"] not in ordered:
+            ordered.append(ti["task_id"])
+    return ordered
+
+
+def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str]) -> dict[str, Any]:
+    """The same task's rows across the runs in the window.
+
+    One call per compared task id, and none at all when there is nothing to
+    compare. The fleet-scoped batch route is deliberately not used: it is
+    ``dag_id`` ``Literal["~"]`` AND carries ``Depends(action_logging())``, so it
+    reads outside the per-Dag boundary the plugin enforces and writes an audit
+    row into the very table this tool reads as evidence.
+    """
+    compared = task_ids[:TASK_COMPARISON_LIMIT]
+    result: dict[str, Any] = {
+        "selection": _TASK_COMPARISON_SELECTION,
+        "task_ids_compared": compared,
+        "task_ids_omitted": max(len(task_ids) - len(compared), 0),
+        "runs_not_covered": [],
+        "tasks": {},
+        # Per task id, how many rows the route said it held beyond the page that
+        # came back. Never read before, so a task with more history than
+        # RUN_HISTORY_LIMIT rows was silently reported as if the page were all
+        # of it.
+        "rows_omitted": {},
+        "error": None,
+    }
+    if not compared or not runs:
+        return result
+    window = {run["dag_run_id"] for run in runs}
+    oldest = runs[-1].get("run_after")
+    tasks: dict[str, list[dict[str, Any]]] = {}
+    omitted: dict[str, int] = {}
+    covered: set[str] = set()
+    try:
+        for task_id in compared:
+            params: dict[str, Any] = {
+                "task_id": task_id,
+                "order_by": "-run_after",
+                "limit": RUN_HISTORY_LIMIT,
+            }
+            if oldest:
+                params["run_after_gte"] = oldest
+            resp = _api("GET", _dag_url(dag_id, "/dagRuns/~/taskInstances"), params=params)
+            returned = resp["task_instances"]
+            omitted[task_id] = max(resp.get("total_entries", len(returned)) - len(returned), 0)
+            rows = []
+            for row in returned:
+                if row.get("dag_run_id") not in window:
+                    continue
+                covered.add(row["dag_run_id"])
+                entry = {name: row.get(name) for name in _TASK_COMPARISON_KEYS}
+                entry["operator"] = _clamped_operator(row.get("operator"))
+                rows.append(entry)
+            tasks[task_id] = rows
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        result["error"] = _explain_error(e)
+        return result
+    result["tasks"] = tasks
+    result["rows_omitted"] = omitted
+    result["runs_not_covered"] = [run["dag_run_id"] for run in runs if run["dag_run_id"] not in covered]
+    return result
+
+
+def _run_history(
+    dag_id: str,
+    diagnosed_run_id: str | None,
+    runs: list[dict[str, Any]],
+    total: int,
+    error: str | None,
+    task_ids: list[str],
+) -> dict[str, Any]:
+    """The Dag's recent runs, and the diagnosed run's place among them.
+
+    A field rather than a tool: every question it answers is a question about the
+    run already under diagnosis, and the comparison set is chosen BY the
+    diagnosis rather than guessed at by a caller.
+    """
+    window = runs[:RUN_HISTORY_LIMIT]
+    listed = []
+    for run in window:
+        entry = {name: run.get(name) for name in _RUN_HISTORY_KEYS}
+        entry["dag_version"] = _run_version(run)
+        entry["is_diagnosed_run"] = run.get("dag_run_id") == diagnosed_run_id
+        listed.append(entry)
+    return {
+        "returned": len(listed),
+        "total_entries": total,
+        "runs_omitted": max(total - len(listed), 0),
+        "window": (
+            f"the most recent {len(listed)} run(s) of this Dag by run_after, newest first"
+            if listed
+            else "this Dag has no runs"
+        ),
+        "runs": listed,
+        "task_comparison": (
+            _task_comparison(dag_id, window, task_ids)
+            if error is None
+            else {
+                "selection": _TASK_COMPARISON_SELECTION,
+                "task_ids_compared": [],
+                "task_ids_omitted": 0,
+                "runs_not_covered": [],
+                "tasks": {},
+                "rows_omitted": {},
+                "error": error,
+            }
+        ),
+        "limits": [_R1, _R2],
+        "error": error,
+    }
+
+
+def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
+    """The newest runs of this Dag. Raises — the callers differ on what a failure means.
+
+    On the run-resolving path a failure must not be turned into "this Dag has
+    never run"; on the exact-run path it only costs the history field.
+    """
+    resp = _api(
+        "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": RUN_HISTORY_LIMIT}
+    )
+    runs = resp["dag_runs"]
+    return runs, resp.get("total_entries", len(runs))
 
 
 _CHECK_LABELS = {
@@ -1346,7 +2631,9 @@ def _build_diagnosis_summary(
     return f"{head} {' '.join(numbered)}{tail}{_coverage_clauses(health)}"
 
 
-def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = None) -> dict[str, Any]:
+def diagnose_dag(
+    dag_id: str, dag_run_id: str = "", source_digest: str | None = None, audit_scope: str = ""
+) -> dict[str, Any]:
     """
     Find out what is wrong with a run of this Dag.
 
@@ -1361,7 +2648,15 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     only the first. A green run is not automatically a healthy one: report what
     ``summary`` says, not what the run state says.
 
-    ``source_digest`` is set by the caller's permissions, not by you.
+    Also returns ``event_history`` — what the Dag's audit log recorded for this
+    run — with a ``last_state_change`` on every detailed task instance naming
+    what was recorded, when, against which principal NAME, through which
+    recorded interface, and, in ``unknowns``, what that does not establish. A
+    recorded row proves an action was ATTEMPTED, never that it wrote the state;
+    NO recorded row is not evidence of a direct database write. And
+    ``run_history`` — the Dag's recent runs and the same task's rows across them.
+
+    ``source_digest`` and ``audit_scope`` are set by the caller's permissions, not by you.
     """
     stale_note = ""
     diagnosed_is_latest: bool | None = None
@@ -1370,11 +2665,19 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
         run, error = _resolve_run(dag_id, dag_run_id)
         if run is None:
             return {"dag_id": dag_id, "dag_run_id": dag_run_id, "error": error}
-    else:
+        runs_error = None
         try:
-            runs = _api("GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": 5})[
-                "dag_runs"
-            ]
+            recent_runs, runs_total = _recent_runs(dag_id)
+        except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+            recent_runs, runs_total, runs_error = [], 0, _explain_error(e)
+    else:
+        runs_error = None
+        try:
+            # Fetched at the run-history depth and resolved off the first five,
+            # so the run list this diagnosis already needed is the one the field
+            # reports rather than a second call for the same rows.
+            recent_runs, runs_total = _recent_runs(dag_id)
+            runs = recent_runs[:5]
         except httpx.HTTPStatusError as e:
             message = _explain_unknown_dag(dag_id, e)
             if message is None:
@@ -1385,6 +2688,9 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
                 "dag_id": dag_id,
                 "diagnosis": "this Dag has never run",
                 "summary": "This Dag has never run, so there is no run to diagnose.",
+                # Emitted on this path above all: it is exactly where a model
+                # with no run list in front of it invents a run id.
+                "run_history": _run_history(dag_id, None, [], runs_total, runs_error, []),
             }
         run = next((r for r in runs if r["state"] == "failed"), runs[0])
         newest = runs[0]
@@ -1416,12 +2722,29 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     run_path = f"/dagRuns/{quote(run['dag_run_id'], safe='')}"
 
     tis, omitted = _run_task_instances(dag_id, run_path)
-    dispatch_checks, incomplete_evidence, coverage = _check_dispatch_evidence(dag_id, run_path, tis)
-    task_instances, detail_reduced = _project_task_instances(
+    event_history = _event_history(dag_id, run["dag_run_id"], audit_scope)
+    attribution_of = _attribution_reader(event_history)
+    dispatch_checks, incomplete_evidence, coverage = _check_dispatch_evidence(
+        dag_id, run_path, tis, attribution_of
+    )
+    task_instances, detail_reduced, attribution_census = _project_task_instances(
         tis,
         # The folded-findings entry names no instance, so it is not one.
         {(check["task_id"], check["map_index"]) for check in dispatch_checks if "task_id" in check},
         incomplete_evidence,
+        attribution_of,
+    )
+    event_history.pop("rows", None)
+    event_history["instances_without_attribution"] = detail_reduced
+    _enforce_attribution_ceiling(event_history, task_instances)
+    _prune_unknowns_legend(event_history, task_instances, dispatch_checks)
+    run_history = _run_history(
+        dag_id,
+        run["dag_run_id"],
+        recent_runs,
+        runs_total,
+        runs_error,
+        _comparison_task_ids(dispatch_checks, tis),
     )
 
     result: dict[str, Any] = {
@@ -1429,7 +2752,12 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
         "dag_run_id": run["dag_run_id"],
         "run_state": run["state"],
         "dag_version": _run_version(run),
+        # The same caveat the run-history rows carry. The top-level display is
+        # the one a model reads out, so it cannot be the one without it.
+        "dag_version_limits": [_R1],
         "task_instances": task_instances,
+        "event_history": event_history,
+        "run_history": run_history,
     }
     if detail_reduced:
         result["task_instance_detail_reduced"] = detail_reduced
@@ -1485,7 +2813,9 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     # diagnosis is for.
     failed = [ti for ti in tis if ti.get("state") in ("failed", "up_for_retry")]
     if not failed:
-        result["run_health"] = _run_health(run, tis, [], checks, omitted, coverage)
+        result["run_health"] = _run_health(
+            run, tis, [], checks, omitted, coverage, attribution_census, event_history, run_history
+        )
         result["diagnosis"] = f"latest run is {run['state']}; no failed task instances"
         result["summary"] = _build_diagnosis_summary(
             run["dag_run_id"], run["state"], [], checks, 0, result["run_health"]
@@ -1530,7 +2860,9 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     logs_omitted = len(failed) - len(failures)
     if logs_omitted:
         result["logs_omitted"] = logs_omitted
-    result["run_health"] = _run_health(run, tis, failures, checks, omitted, coverage)
+    result["run_health"] = _run_health(
+        run, tis, failures, checks, omitted, coverage, attribution_census, event_history, run_history
+    )
     result["summary"] = _build_diagnosis_summary(
         run["dag_run_id"], run["state"], failures, checks, logs_omitted, result["run_health"]
     )
