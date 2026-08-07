@@ -79,6 +79,35 @@ DIAGNOSIS_LOG_BUDGET_CHARS = 12000
 # followed, up to a ceiling, and whatever is still missing is reported.
 TASK_INSTANCE_PAGE = 100
 TASK_INSTANCE_SCAN_LIMIT = 500
+# The 13-field per-instance projection is what makes a dispatch-evidence reading
+# possible at all, but a 500-instance fan-out of it is ~60 KB of context. Beyond
+# this many instances the rest fall back to the 4-field projection, and the count
+# that fell back is reported rather than silently dropped.
+TASK_INSTANCE_DETAIL_LIMIT = 200
+# ``/tries`` is one HTTP call per task instance, so it is spent only on the
+# successes that a live-row reading cannot settle on its own.
+TRIES_PROBE_LIMIT = int(os.environ.get("AIRY_MCP_TRIES_PROBE_LIMIT", "20"))
+# One dispatch finding is a paragraph of prose, and how many there are is chosen
+# by whoever wrote the states being read: 500 flagged successes is 500 paragraphs
+# in one tool result. Past this many the rest are folded into a single aggregate
+# entry, and the fold is reported as its own ``clean_blocker`` so it is never
+# silent.
+DISPATCH_FINDING_LIMIT = int(os.environ.get("AIRY_MCP_DISPATCH_FINDING_LIMIT", "25"))
+# The same ceiling for the same reason on the source-side checks: how many unknown
+# XCom references a file holds is the Dag author's choice, and 5000 of them was
+# three quarters of a megabyte of ``checks`` on its own.
+STATIC_CHECK_LIMIT = int(os.environ.get("AIRY_MCP_STATIC_CHECK_LIMIT", "25"))
+# The summary is the prose the model echoes verbatim, so it needs the ceiling the
+# log path already has — for the same reason and in the same units.
+DIAGNOSIS_SUMMARY_BUDGET_CHARS = 12000
+# ``TaskInstance.operator`` is a free String(1000) the Dag author picks, and it is
+# copied once per detailed row AND once per finding, so a 1000-char operator over
+# 500 flagged rows put the size of the result in the author's hands.
+OPERATOR_CLAMP_CHARS = 120
+# How many instances the coverage prose names before it stops naming them. Named
+# at all so the count is checkable; capped because the population is chosen by
+# whoever wrote the states being read.
+COVERAGE_NAME_LIMIT = 5
 
 mcp: FastMCP = FastMCP("airy-selfheal")
 
@@ -133,7 +162,11 @@ def _explain_error(e: Exception) -> str:
     ``str()`` of an ``httpx.HTTPStatusError`` names the internal URL it hit, so
     it must never reach a relayable string; the response body's ``detail`` is
     the API's own words for what went wrong, and the status code is the fallback.
+    A transport error is the same hazard by another route — ``httpx`` builds its
+    message from the URL it could not reach — so only the class name is relayed.
     """
+    if isinstance(e, httpx.RequestError):
+        return e.__class__.__name__
     if not isinstance(e, httpx.HTTPStatusError):
         return str(e) or e.__class__.__name__
     detail = None
@@ -441,8 +474,13 @@ def _declared_task_ids(source: str) -> set[str]:
     return {m.group("task_id") for m in _TASK_ID_RE.finditer(source)}
 
 
-def _static_checks(source: str, task_ids: set[str]) -> list[dict[str, str]]:
+_STATIC_CHECKS_FOLDED_KIND = "static_checks_folded"
+
+
+def _static_checks(source: str, task_ids: set[str]) -> tuple[list[dict[str, str]], int]:
     """Problems visible in the source and graph alone, before anything runs.
+
+    Returns the checks and how many were folded away rather than listed.
 
     Only for a file that defines this Dag and nothing else. A source file can
     hold several Dags, and then every reference to a *co-located* Dag's task
@@ -452,32 +490,58 @@ def _static_checks(source: str, task_ids: set[str]) -> list[dict[str, str]]:
     this Dag does not have, and more than one Dag being constructed. Either is
     enough to stop guessing, and the second catches a co-located Dag built
     entirely from TaskFlow tasks, which declares no task id at all.
+
+    Both the count of entries and the bytes inside each one are the Dag author's
+    to choose, so both are bounded: the ids are quoted one by one rather than
+    rendered as a Python list, and the tail past the limit is folded.
     """
-    checks = []
-    strangers = _declared_task_ids(source) - task_ids
+    strangers = sorted(_declared_task_ids(source) - task_ids)
     if strangers or len(_DAG_DEF_RE.findall(source)) > 1:
-        return [
-            {
-                "kind": "source_graph_disagreement",
-                "detail": (
-                    "the file defines more than this Dag"
-                    + (f" — it also declares task_id(s) {sorted(strangers)}" if strangers else "")
-                    + ", so reference checks are skipped: this Dag's graph cannot say whether "
-                    "another Dag's task ids are valid"
-                ),
-            }
-        ]
-    for ref in sorted(_referenced_task_ids(source) - task_ids):
-        checks.append(
-            {
-                "kind": "unknown_xcom_task_id",
-                "detail": (
-                    f"an XCom pull references task_ids={ref!r}, which is not a task in this Dag, "
-                    f"so the pull returns None"
-                ),
-            }
+        named = ", ".join(_quoted(name) for name in strangers[:STATIC_CHECK_LIMIT])
+        unnamed = max(len(strangers) - STATIC_CHECK_LIMIT, 0)
+        return (
+            [
+                {
+                    "kind": "source_graph_disagreement",
+                    "detail": (
+                        "the file defines more than this Dag"
+                        + (f" — it also declares task_id(s) {named}" if named else "")
+                        + (f" and {unnamed} more" if unnamed else "")
+                        + ", so reference checks are skipped: this Dag's graph cannot say whether "
+                        "another Dag's task ids are valid"
+                    ),
+                }
+            ],
+            0,
         )
-    return checks
+    unknown = sorted(_referenced_task_ids(source) - task_ids)
+    checks: list[dict[str, str]] = [
+        {
+            "kind": "unknown_xcom_task_id",
+            "detail": (
+                f"an XCom pull references task_ids={_fenced(ref)}, which is not a task in this Dag, "
+                f"so the pull returns None"
+            ),
+        }
+        for ref in unknown[:STATIC_CHECK_LIMIT]
+    ]
+    suppressed = max(len(unknown) - STATIC_CHECK_LIMIT, 0)
+    if suppressed:
+        # First, not last, for the same reason the dispatch fold is first: the
+        # summary has its own budget, and the entry that speaks for all the
+        # others must not be the one it drops.
+        checks = [
+            {
+                "kind": _STATIC_CHECKS_FOLDED_KIND,
+                "detail": (
+                    f"{len(unknown)} XCom pull(s) in this Dag's source reference a task_id that is "
+                    f"not a task in this Dag; {len(checks)} are named individually below and the "
+                    f"other {suppressed} are not, so this diagnosis does not name them"
+                ),
+            },
+            *checks,
+        ]
+    return checks, suppressed
 
 
 def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -513,11 +577,14 @@ def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
         if filename in names or any(
             filename.endswith(f"/{name}") or name.endswith(f"/{filename}") for name in names
         ):
-            trace = (entry.get("stack_trace") or "").strip()
+            # A stack trace is text a Dag author owns end to end: it is quoted
+            # and clamped like any other value this tool did not write. The tail
+            # is what is kept, because the exception is at the end of it.
+            trace = _quoted((entry.get("stack_trace") or "").strip()[-400:], 420)
             checks.append(
                 {
                     "kind": "import_error",
-                    "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace[-400:]}",
+                    "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace}",
                 }
             )
     total = resp.get("total_entries", len(errors))
@@ -534,49 +601,749 @@ def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
     return checks
 
 
+# The fields the conjunction reads. A key that is ABSENT from the response is
+# never read as null: absence of the key is a different fact from a null value,
+# and inferring one from the other would manufacture the finding out of nothing
+# but a shape change. ``duration``/``start_date``/``end_date`` are here because
+# the conjunction reads them, NOT because either is evidence on its own — see
+# ``_is_never_dispatched_attempt``.
+_DISPATCH_EVIDENCE_KEYS = (
+    "hostname",
+    "pid",
+    "queued_when",
+    "scheduled_when",
+    "try_number",
+    "duration",
+    "start_date",
+    "end_date",
+)
+
+_TASK_INSTANCE_DETAIL_KEYS = (
+    "task_id",
+    "map_index",
+    "state",
+    "try_number",
+    "max_tries",
+    "start_date",
+    "end_date",
+    "duration",
+    "hostname",
+    "pid",
+    "queued_when",
+    "scheduled_when",
+    "operator",
+)
+
+# Said the same way whether the budget ran out or the precondition never picked
+# the instance: both are "this was not looked at", and neither is a measurement.
+_HISTORY_NOT_CHECKED = "attempt history was not checked for this task instance"
+_HISTORY_EMPTY = "attempt history returned no attempts"
+_HISTORY_PARTIAL = "the attempt history came back truncated"
+
+
+def _ti_key(ti: dict[str, Any]) -> tuple[str, int]:
+    return ti["task_id"], ti.get("map_index", -1)
+
+
+def _ti_where(ti: dict[str, Any]) -> str:
+    task_id, map_index = _ti_key(ti)
+    return f"{task_id}[{map_index}]" if map_index >= 0 else task_id
+
+
+# Anything spliced into prose that a Dag author or a task's own output can choose
+# has to be neutralised first. ``operator`` is ``TaskInstance.operator`` — a free
+# String(1000) with no key validation behind it — and a log tail is whatever the
+# task printed. Either can carry newlines, or a ``(3)`` that reads as one more
+# entry in the summary's numbered list.
+#  ``+`` is in the safe set because a run_id carries one (``manual__\u2026+00:00``) and
+# a fence makes Markdown inert anyway; the strip is against breaking *out* of it.
+_PROSE_UNSAFE = re.compile(r"[^\w+./:@\[\]-]")
+_FORGEABLE_NUMBERING = re.compile(r"\((\d+)\)")
+# json.dumps escapes the C0 controls; these three are the line breaks it leaves.
+_PROSE_LINE_BREAKS = re.compile("[\u0085\u2028\u2029]")
+
+
+def _quoted(value: Any, limit: int = 120) -> str:
+    """A value from outside this tool, clamped and escaped for a prose sentence.
+
+    JSON-quoting takes the newlines out, ``(3)`` is rewritten because it would
+    otherwise read as one more entry in the summary's numbered list, and the
+    clamp stops a single field from filling the whole result.
+
+    Numbers and ``None`` are rendered as themselves rather than quoted: a null
+    ``pid`` written as the string ``"None"`` says the opposite of "pid is null",
+    which is what the rest of this tool's prose says about the same column.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = json.dumps(_PROSE_LINE_BREAKS.sub(" ", str(value)), ensure_ascii=False)
+    text = _FORGEABLE_NUMBERING.sub(r"[\1]", text)
+    return text if len(text) <= limit else text[: limit - 4] + '..."'
+
+
+def _fenced(text: Any, limit: int = 80) -> str:
+    """An identifier spliced into prose: code-fenced, and stripped to identifier bytes.
+
+    A bare ``task_id`` renders as Markdown emphasis wherever underscores pair up,
+    and a backtick or a newline inside one would break straight back out of the
+    fence, so everything that is not identifier-shaped is replaced. Used for
+    run ids too: Airflow's own validators are ``$``-anchored and Python's ``$``
+    matches before a trailing newline, so a run_id ending in one is accepted.
+    """
+    return f"`{_PROSE_UNSAFE.sub('?', str(text))[:limit]}`"
+
+
+def _clamped_operator(value: Any) -> Any:
+    """``TaskInstance.operator`` cut to a size the Dag author does not choose."""
+    if isinstance(value, str) and len(value) > OPERATOR_CLAMP_CHARS:
+        return value[: OPERATOR_CLAMP_CHARS - 1] + "\u2026"
+    return value
+
+
+def _is_never_dispatched_attempt(ti: dict[str, Any]) -> bool:
+    """Whether this attempt carries none of the fields dispatching one writes.
+
+    Eight legs, every one necessary and none sufficient alone.
+
+    hostname, pid, queued_when and scheduled_when are the four fields a dispatch
+    writes, and they carry the argument. ``try_number`` is the weakest leg and is
+    never read as evidence on its own — a mapped instance derived from an
+    up_for_reschedule sensor is created with ``try_number`` still at 0 and really
+    runs (``models/dagrun.py:2206-2207,2229-2236``, ``models/taskmap.py:223,265``)
+    — but for one family it is the ONLY leg doing the excluding, and that is
+    worth stating plainly rather than hedging.
+
+    That family is the scheduler's EmptyOperator fast path. It is selected at
+    ``models/dagrun.py:2198-2210`` and completed at
+    ``models/dagrun.py:2229-2236``, which always writes ``try_number + 1``, so
+    every instance it produces is at try_number >= 1. Everything else about it is
+    the forged shape: hostname empty, pid null, queued_when null, scheduled_when
+    null, duration 0.0. Its start_date and end_date do come from two separate
+    ``utcnow()`` calls (``models/dagrun.py:2295-2296``) and are observed ~2us
+    apart, but two clock reads landing on different values is a timing accident,
+    not a guarantee, so that leg is not what may be relied on here. try_number is
+    the one structural exclusion for this family — categorical for it, and only
+    for it, which is why the conjunction reads it in full and never reads it
+    alone.
+
+    ``duration`` and ``start_date == end_date`` are legs and *only* legs — never
+    read as evidence on their own, because a genuinely executed EmptyOperator
+    writes 0.0 and equal timestamps too. What they exclude is the
+    triggerer-completion path: a ``start_from_trigger`` operator that reaches
+    up_for_reschedule at try_number 0 is deferred at ``models/dagrun.py:2204``,
+    BEFORE the update at ``models/dagrun.py:2243-2248`` writes scheduled_dttm or
+    increments try_number, and ``models/trigger.py:725`` finishes it with
+    ``set_state``, which writes neither hostname nor pid. That instance really
+    ran, and what separates it from a state written onto a row that never
+    started is structural rather than a timing coincidence: it already has a
+    start_date, so ``set_state`` keeps it and computes a real duration against a
+    later end_date (``models/taskinstance.py:1013-1021``), whereas a row with no
+    start_date takes both timestamps from one ``current_time`` and lands on a
+    duration of 0.0.
+
+    The log endpoint stays out of it: the route synthesises "no logs" from
+    ``try_number`` before it ever consults a handler (``log_reader.py:94,118``).
+    """
+    if ti.get("state") != "success" or "state" not in ti:
+        return False
+    if not all(key in ti for key in _DISPATCH_EVIDENCE_KEYS):
+        return False
+    started, ended = ti["start_date"], ti["end_date"]
+    return (
+        not ti["hostname"]
+        and ti["pid"] is None
+        and ti["queued_when"] is None
+        and ti["scheduled_when"] is None
+        and ti["try_number"] == 0
+        and ti["duration"] is not None
+        and not ti["duration"]
+        and started is not None
+        and ended is not None
+        and started == ended
+    )
+
+
+def _tries_probe_tier(ti: dict[str, Any]) -> str | None:
+    """Which attempt-history probe this success earns, or ``None`` for no call.
+
+    Tier A confirms a live-row reading and answers "did an *earlier* attempt
+    execute?". Tier B is the case no live-row reading can settle: clearing an
+    instance resets only its state and max_tries, so a success written over a
+    cleared row is field-for-field identical to an honest one. What the clear
+    does leave behind is arithmetic — it rewrites ``max_tries`` to at least
+    ``try_number`` — so ``try_number > max_tries`` proves the row has not been
+    cleared since its last attempt and needs no HTTP call at all. On the common
+    retries=0 Dag that excludes every success, which is what keeps the probe
+    free in the case that does not need it.
+
+    The residual window this leaves is narrow and worth naming: between a clear
+    and the re-schedule that follows it, ``try_number <= max_tries`` holds and
+    the archived attempt has not been duplicated yet, so a success written into
+    exactly that window is read by neither disjunct. Once the row is
+    re-scheduled the window shuts from both sides — the increment puts
+    ``try_number`` past ``max_tries``, and if it does not, the duplicate
+    ``try_number`` in ``/tries`` is there to be seen.
+    """
+    if not all(key in ti for key in ("state", "try_number", "max_tries")):
+        return None
+    if ti["state"] != "success":
+        return None
+    if _is_never_dispatched_attempt(ti):
+        return "A"
+    try_number, max_tries = ti["try_number"], ti["max_tries"]
+    if isinstance(try_number, int) and isinstance(max_tries, int):
+        if try_number >= 1 and max_tries >= try_number:
+            return "B"
+    return None
+
+
+def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str, Any]:
+    """Every recorded attempt of one task instance, or why they could not be read.
+
+    Never raises: an unreadable history downgrades what the diagnosis can
+    conclude, and must not take the whole diagnosis down with it. ``TypeError``
+    is in the net because ``_api`` returns ``None`` for an empty body, and
+    subscripting that would otherwise take the whole diagnosis down. The
+    unmapped route accepts ``map_index`` as a query parameter, so one URL serves
+    mapped and unmapped instances, and it is not paginated.
+    """
+    path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/tries")
+    try:
+        resp = _api("GET", path, params={"map_index": ti.get("map_index", -1)})
+        rows = resp["task_instances"]
+        total = resp.get("total_entries", len(rows))
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        return {"status": "unavailable", "rows": [], "error": _explain_error(e)}
+    if not rows:
+        # Never read as "there were no earlier attempts" — it is the absence of
+        # an answer, not an answer of absence.
+        return {"status": "empty", "rows": [], "error": _HISTORY_EMPTY}
+    if total > len(rows):
+        # Presence-based conclusions survive a truncated list; absence-based
+        # ones do not.
+        return {"status": "partial", "rows": rows, "attempts_recorded": total, "error": _HISTORY_PARTIAL}
+    return {"status": "checked", "rows": rows, "attempts_recorded": total}
+
+
+_DISPATCH_FINDING_KIND = "success_without_attempt_dispatch_fields"
+_DISPATCH_TRUNCATED_KIND = "dispatch_findings_folded"
+
+
+def _dispatch_finding(ti: dict[str, Any], history: dict[str, Any]) -> dict[str, Any] | None:
+    """A success whose recorded attempt carries none of the fields a dispatch writes.
+
+    Two independent ways in. The live row can say it on its own — none of the
+    fields a dispatch writes are set. Or the attempt history can say it: a
+    try_number that appears twice means the attempt was archived and never
+    re-dispatched, because archiving an attempt is always followed by a
+    try_number increment before anything runs again. The up_for_reschedule path
+    never archives at all, so a rescheduled sensor cannot produce that duplicate.
+
+    States what the fields say and stops there. What wrote the state is not
+    visible from here and is not guessed at.
+
+    Note for anything built on top of this: an execution-API event-history leg is
+    NOT a substitute for the ``duration``/``start_date == end_date`` legs in
+    ``_is_never_dispatched_attempt``. A task instance completed inside the
+    triggerer emits no execution-API row either, so an event-history reading
+    would flag it exactly as the six-leg conjunction did.
+    """
+    status = history["status"]
+    rows = history.get("rows") or []
+    try_number = ti.get("try_number")
+    never_dispatched = _is_never_dispatched_attempt(ti)
+    archived_not_redispatched = (
+        ti.get("state") == "success"
+        and "try_number" in ti
+        and status in ("checked", "partial")
+        and sum(1 for row in rows if row.get("try_number") == try_number) >= 2
+    )
+    if not (never_dispatched or archived_not_redispatched):
+        return None
+
+    # The live row is in ``rows`` exactly once (the route drops only up_for_retry
+    # rows, which state == 'success' already excludes), so subtracting it is
+    # exact rather than an estimate.
+    executing_rows = [row for row in rows if row.get("hostname") or row.get("pid") is not None]
+    live_has_execution = bool(ti.get("hostname")) or ti.get("pid") is not None
+    executed_earlier = (len(executing_rows) - (1 if live_has_execution else 0)) >= 1
+    # "A different attempt" is a claim about try_number, so it is read off
+    # try_number. The archived-not-redispatched disjunct fires on a DUPLICATE
+    # try_number, and ``record_ti`` dedupes by try_number
+    # (models/taskinstancehistory.py:196-206), so those two rows are one attempt
+    # and its archive — saying "a different attempt" there would be false in
+    # exactly the case that produced the finding.
+    other_attempt_executed = any(row.get("try_number") != try_number for row in executing_rows)
+    if status == "checked":
+        earlier_attempt_executed: bool | None = executed_earlier
+    elif status == "partial" and executed_earlier:
+        earlier_attempt_executed = True
+    else:
+        earlier_attempt_executed = None
+
+    where = _fenced(_ti_where(ti))
+    attempts_recorded = history.get("attempts_recorded")
+    if never_dispatched:
+        core = (
+            f"{where} is recorded state=success at try_number 0, and this attempt carries none of "
+            f"the fields a dispatched attempt writes: hostname is empty, pid is null, queued_when "
+            f"is null and scheduled_when is null, with duration 0 and start_date equal to end_date. "
+            f"Only hostname and pid are written by a worker, and a task instance that completes "
+            f"entirely inside the triggerer writes none of these fields either."
+        )
+        if archived_not_redispatched:
+            core += f" Its attempt history also already holds a separate record for try_number {try_number}."
+    else:
+        core = (
+            f"{where} is recorded state=success at try_number {try_number}, and its attempt history "
+            f"already holds a separate record for try_number {try_number}, so the execution fields "
+            f"on the live row (hostname {_quoted(ti.get('hostname'))}, pid {_quoted(ti.get('pid'))}, "
+            f"start_date {_quoted(ti.get('start_date'))}) were recorded before that history entry "
+            f"was made and do not describe a dispatch that happened after it."
+        )
+    if earlier_attempt_executed is True:
+        recorded = attempts_recorded if attempts_recorded is not None else len(rows)
+        further = max(recorded - 1, 0)
+        history_text = (
+            f"Its attempt history holds {further} further record(s) for this task instance in this "
+            f"run, at least one carrying execution fields."
+        )
+        if other_attempt_executed:
+            history_text += (
+                " At least one of those is at a different try_number, so this task instance did "
+                "execute earlier in this run - on a different attempt than the one recorded success."
+            )
+    elif earlier_attempt_executed is False:
+        history_text = (
+            f"Its attempt history records {attempts_recorded} attempt(s) and none of them carries "
+            f"execution fields."
+        )
+    else:
+        # The reachable content here is the API's own 404 detail, which is a
+        # string this tool did not write — quoted like any other.
+        history_text = (
+            f"Its attempt history could not be read ({_quoted(history.get('error') or status, 240)}), "
+            f"so whether an earlier attempt executed is not established."
+        )
+
+    finding: dict[str, Any] = {
+        "kind": _DISPATCH_FINDING_KIND,
+        "detail": " ".join(
+            [core, history_text, "What wrote this state is not established by this diagnosis"]
+        ),
+        "task_id": ti["task_id"],
+        "map_index": ti.get("map_index", -1),
+        # Structured, never spliced into the prose: it is a free-form String(1000)
+        # the Dag author chooses, and the summary is prose the model reads out.
+        # Clamped even so — one copy per finding is 500 copies in a 500-finding
+        # run, which is the result's size in the author's hands.
+        "operator": _clamped_operator(ti.get("operator")),
+        "current_attempt_dispatched": False,
+        "attempt_history": status,
+        "attribution": "not established",
+    }
+    if attempts_recorded is not None:
+        finding["attempts_recorded"] = attempts_recorded
+    if status != "not_checked":
+        finding["earlier_attempt_executed"] = earlier_attempt_executed
+    if history.get("error"):
+        finding["tries_error"] = history["error"]
+    return finding
+
+
+def _check_dispatch_evidence(
+    dag_id: str, run_path: str, tis: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[tuple[str, int], list[str]], dict[str, Any]]:
+    """Read every scanned success for signs its recorded attempt was dispatched.
+
+    Returns the findings, the successes whose response did not carry the fields
+    to decide with, and the coverage numbers. The findings are evaluated for
+    every success rather than only for probed ones, so a response that keeps the
+    probe from being selected still cannot hide a live-row-visible finding.
+    """
+    successes = sorted((ti for ti in tis if ti.get("state") == "success"), key=_ti_key)
+    incomplete: dict[tuple[str, int], list[str]] = {}
+    for ti in successes:
+        missing = [key for key in _DISPATCH_EVIDENCE_KEYS if key not in ti]
+        # max_tries is deliberately NOT a leg of the conjunction, but the
+        # clear-detection arithmetic in ``_tries_probe_tier`` cannot run without
+        # it. Without this, a success whose max_tries never arrived was pooled
+        # with the ones that needed no probe — "couldn't tell" counted as
+        # "didn't need to", and the strong sentence earned off it.
+        if "max_tries" not in ti:
+            missing.append("max_tries")
+        elif ti["max_tries"] is None:
+            missing.append("max_tries (null)")
+        if missing:
+            incomplete[_ti_key(ti)] = missing
+    # Only hostname and pid are written by a worker: scheduled_when is the
+    # scheduler's (dagrun.py:2247) and queued_when is the executor hand-off
+    # (scheduler_job_runner.py:1044-1045). A success carrying neither worker
+    # field satisfies no disjunct here, so it is counted rather than passed over
+    # in silence — INCLUDING the case with no dispatch field of any kind, which
+    # is the scheduler's EmptyOperator fast path and the single largest real
+    # population of it (dagrun.py:2286-2300).
+    worker_fieldless: list[str] = []
+    no_dispatch_field = 0
+    for ti in successes:
+        if not all(key in ti for key in ("hostname", "pid", "queued_when", "scheduled_when")):
+            continue
+        if ti["hostname"] or ti["pid"] is not None:
+            continue
+        worker_fieldless.append(_ti_where(ti))
+        if ti["queued_when"] is None and ti["scheduled_when"] is None:
+            no_dispatch_field += 1
+
+    tiers: dict[str, list[dict[str, Any]]] = {"A": [], "B": []}
+    for ti in successes:
+        tier = _tries_probe_tier(ti)
+        if tier:
+            tiers[tier].append(ti)
+    # Tier A first: those are the instances the live row already flags, so the
+    # budget must never be spent elsewhere before them.
+    probed: dict[tuple[str, int], dict[str, Any]] = {}
+    checked = unchecked = 0
+    for position, ti in enumerate(tiers["A"] + tiers["B"]):
+        history = (
+            _attempt_history(dag_id, run_path, ti)
+            if position < TRIES_PROBE_LIMIT
+            else {"status": "not_checked", "rows": [], "error": _HISTORY_NOT_CHECKED}
+        )
+        probed[_ti_key(ti)] = history
+        if history["status"] == "checked":
+            checked += 1
+        else:
+            unchecked += 1
+
+    unprobed = {"status": "not_checked", "rows": [], "error": _HISTORY_NOT_CHECKED}
+    checks = []
+    for ti in successes:
+        finding = _dispatch_finding(ti, probed.get(_ti_key(ti), unprobed))
+        if finding:
+            checks.append(finding)
+    suppressed = max(len(checks) - DISPATCH_FINDING_LIMIT, 0)
+    if suppressed:
+        listed = checks[:DISPATCH_FINDING_LIMIT]
+        # First, not last: the summary has its own character budget, and the one
+        # entry that speaks for all the others must not be the one it drops.
+        checks = [
+            {
+                "kind": _DISPATCH_TRUNCATED_KIND,
+                "detail": (
+                    f"{len(listed) + suppressed} successful task instance(s) in this run carry no "
+                    f"dispatch fields for the attempt recorded success; {len(listed)} are described "
+                    f"individually below and the other {suppressed} are not, so this diagnosis does "
+                    f"not name them"
+                ),
+            },
+            *listed,
+        ]
+    coverage: dict[str, Any] = {
+        "successes_scanned": len(successes),
+        "successes_with_incomplete_evidence": len(incomplete),
+        "attempt_history_checked": checked,
+        "attempt_history_unchecked": unchecked,
+        # Numerator and denominator over the same set: every success is in
+        # exactly one of checked / unchecked / no-probe-needed / evidence
+        # incomplete. "No probe needed" is a claim the row's own fields settle
+        # it, so a row whose fields did not all arrive cannot be in that bucket.
+        "successes_without_history_check": len(successes) - checked,
+        "successes_no_probe_needed": sum(
+            1 for ti in successes if _ti_key(ti) not in incomplete and _tries_probe_tier(ti) is None
+        ),
+        "successes_without_worker_fields": len(worker_fieldless),
+        "successes_with_no_dispatch_field": no_dispatch_field,
+        "successes_without_worker_fields_named": worker_fieldless[:COVERAGE_NAME_LIMIT],
+        "dispatch_findings_suppressed": suppressed,
+        "static_checks_suppressed": 0,
+    }
+    return checks, incomplete, coverage
+
+
+def _project_task_instances(
+    tis: list[dict[str, Any]],
+    flagged: set[tuple[str, int]],
+    incomplete: dict[tuple[str, int], list[str]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Every scanned instance, in full where it matters and reduced where it does not.
+
+    Nulls are always written out: a dropped key and a null value are the same
+    bytes to a reader, and the whole reading turns on which of the two it is.
+
+    The rows that matter are ranked rather than exempted. Exempting them put the
+    size of the result in the hands of whoever wrote the states being read — a
+    run full of flagged successes was a run full of 13-field rows, however low
+    the limit was set — so the ranking decides the order and the limit still
+    decides the count.
+    """
+    ordered: list[tuple[str, int]] = []
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for ti in tis:
+        by_key.setdefault(_ti_key(ti), ti)
+    unrun = {key for key, ti in by_key.items() if ti.get("state") in ("failed", "up_for_retry")}
+    for group in (flagged & set(by_key), unrun - flagged, set(by_key) - unrun - flagged):
+        ordered.extend(sorted(group))
+    detailed = set(ordered[:TASK_INSTANCE_DETAIL_LIMIT])
+
+    projected = []
+    for ti in tis:
+        key = _ti_key(ti)
+        if key not in detailed:
+            projected.append(
+                {
+                    "task_id": ti["task_id"],
+                    "state": ti.get("state"),
+                    "try_number": ti.get("try_number"),
+                    "map_index": ti.get("map_index", -1),
+                }
+            )
+            continue
+        entry = {name: ti.get(name) for name in _TASK_INSTANCE_DETAIL_KEYS}
+        entry["map_index"] = ti.get("map_index", -1)
+        entry["operator"] = _clamped_operator(entry["operator"])
+        if key in incomplete:
+            entry["dispatch_evidence_incomplete"] = incomplete[key]
+        projected.append(entry)
+    return projected, len(tis) - len(detailed)
+
+
+def _run_health(
+    run: dict[str, Any],
+    tis: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    checks: list[dict[str, Any]],
+    omitted: int,
+    coverage: dict[str, Any],
+) -> dict[str, Any]:
+    """The one place that decides whether this run may be called clean.
+
+    Computed once and handed to both the summary and the caller, so the sentence
+    the model reads out and the structured findings cannot disagree: every reason
+    the strong sentence is withheld is named in ``clean_blockers``.
+    """
+    census: dict[str, int] = {}
+    for ti in tis:
+        state = ti.get("state") or "none"
+        census[state] = census.get(state, 0) + 1
+    non_success = sum(count for state, count in census.items() if state != "success")
+
+    blockers = []
+    if run.get("state") != "success":
+        blockers.append("run_not_success")
+    if failures:
+        blockers.append("failed_task_instances")
+    if checks:
+        blockers.append("checks_present")
+    if non_success:
+        blockers.append("non_success_task_instances")
+    if omitted:
+        blockers.append("task_instances_omitted")
+    if coverage["successes_with_incomplete_evidence"]:
+        blockers.append("dispatch_evidence_incomplete")
+    if coverage["attempt_history_unchecked"]:
+        blockers.append("attempt_history_unchecked")
+    # The strong sentence claims something about worker dispatch; a success with
+    # neither worker-written field is exactly the case it has not tested.
+    if coverage["successes_without_worker_fields"]:
+        blockers.append("successes_without_worker_fields")
+    if coverage["dispatch_findings_suppressed"]:
+        blockers.append("dispatch_findings_suppressed")
+    if coverage.get("static_checks_suppressed"):
+        blockers.append("static_checks_suppressed")
+    # A run with nothing in it would otherwise earn the strongest sentence there
+    # is, on the strength of having looked at nothing.
+    if not tis:
+        blockers.append("empty_run")
+    return {
+        "state": run.get("state"),
+        "task_instance_states": dict(sorted(census.items())),
+        "successes_scanned": coverage["successes_scanned"],
+        "successes_with_incomplete_evidence": coverage["successes_with_incomplete_evidence"],
+        "attempt_history_checked": coverage["attempt_history_checked"],
+        "attempt_history_unchecked": coverage["attempt_history_unchecked"],
+        "successes_without_history_check": coverage["successes_without_history_check"],
+        "successes_no_probe_needed": coverage["successes_no_probe_needed"],
+        "successes_without_worker_fields": coverage["successes_without_worker_fields"],
+        "successes_with_no_dispatch_field": coverage.get("successes_with_no_dispatch_field", 0),
+        "successes_without_worker_fields_named": coverage.get("successes_without_worker_fields_named", []),
+        "dispatch_findings_suppressed": coverage["dispatch_findings_suppressed"],
+        "static_checks_suppressed": coverage.get("static_checks_suppressed", 0),
+        "task_instances_omitted": omitted,
+        "clean": not blockers,
+        "clean_blockers": blockers,
+    }
+
+
 _CHECK_LABELS = {
     "unknown_xcom_task_id": "Latent blocker",
     "import_error": "Import error",
     "import_errors_truncated": "Note",
     "source_graph_disagreement": "Note",
+    # Names what was observed — the absence of the fields — and not what wrote
+    # the state or whether anything ran.
+    _DISPATCH_FINDING_KIND: "Success with no worker-dispatch fields for the recorded attempt",
+    _DISPATCH_TRUNCATED_KIND: "Note",
+    _STATIC_CHECKS_FOLDED_KIND: "Note",
 }
+
+# The entries that stand for other entries rather than being one themselves, so
+# the headline can count problems instead of paragraphs.
+_FOLD_KINDS = (_DISPATCH_TRUNCATED_KIND, _STATIC_CHECKS_FOLDED_KIND)
 
 
 def _summarize_failure(failure: dict[str, Any]) -> str:
-    where = failure["task_id"]
-    if failure.get("map_index", -1) >= 0:
-        where += f"[{failure['map_index']}]"
-    line = _extract_error_line(failure.get("log_tail") or "") or "no log available"
+    where = _fenced(_ti_where(failure))
+    # The log line is whatever the task printed, so it is quoted and clamped like
+    # any other value this tool did not write.
+    # ``_extract_error_line`` already clips at 400 on a word boundary; the limit
+    # here only has to leave room for the quotes and the escapes it adds.
+    line = _quoted(_extract_error_line(failure.get("log_tail") or "") or "no log available", 440)
     if failure.get("still_retrying"):
         return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log)."
     return f"Confirmed failure: {where} failed with {line} (see log)."
+
+
+def _census_clause(health: dict[str, Any]) -> str:
+    """What did not succeed, when nothing failed outright.
+
+    A run whose state is ``success`` can still hold skipped, upstream_failed or
+    removed instances, and "nothing failed" is not the same claim as "everything
+    ran".
+    """
+    others = {state: count for state, count in health["task_instance_states"].items() if state != "success"}
+    if not others:
+        return ""
+    listed = ", ".join(f"{count} {state}" for state, count in sorted(others.items()))
+    return f" {sum(others.values())} task instance(s) did not succeed: {listed}."
+
+
+def _coverage_clauses(health: dict[str, Any]) -> str:
+    """What this diagnosis did not get to look at, stated rather than implied."""
+    clauses = []
+    if health["task_instances_omitted"]:
+        clauses.append(
+            f" {health['task_instances_omitted']} more task instance(s) in this run were not "
+            f"scanned, so this diagnosis does not cover them."
+        )
+    if health["successes_with_incomplete_evidence"]:
+        clauses.append(
+            f" {health['successes_with_incomplete_evidence']} successful task instance(s) did not "
+            f"report the fields needed to tell whether they were dispatched, or whether the row had "
+            f"been cleared since its last attempt."
+        )
+    # Stated over the set it ranges over: a success that earned no probe used to
+    # appear in neither the checked nor the unchecked count, and a coverage
+    # number that leaves instances out reads as coverage they never had.
+    if health["successes_scanned"]:
+        clauses.append(
+            f" Attempt history was read for {health['attempt_history_checked']} of "
+            f"{health['successes_scanned']} successful task instance(s)."
+        )
+        if health["successes_no_probe_needed"]:
+            clauses.append(
+                f" {health['successes_no_probe_needed']} of those needed no attempt-history read: "
+                f"the live row already carries dispatch fields, or try_number is past max_tries, "
+                f"which rules out a clear since the last attempt."
+            )
+        if health["attempt_history_unchecked"]:
+            clauses.append(
+                f" {health['attempt_history_unchecked']} were selected for an attempt-history read "
+                f"that did not come back."
+            )
+    if health["successes_without_worker_fields"]:
+        total = health["successes_without_worker_fields"]
+        bare = health["successes_with_no_dispatch_field"]
+        named = health["successes_without_worker_fields_named"]
+        unnamed = total - len(named)
+        clauses.append(
+            f" {total} successful task instance(s) carry no worker-written field (hostname empty, "
+            f"pid null), so this diagnosis does not establish that a worker ran them: "
+            f"{total - bare} with a scheduler or executor field set (queued_when or "
+            f"scheduled_when), and {bare} with no dispatch field recorded at all."
+            + (f" Named: {', '.join(_fenced(where) for where in named)}." if named else "")
+            + (f" {unnamed} further such instance(s) are not named here." if unnamed else "")
+        )
+    if health["dispatch_findings_suppressed"]:
+        clauses.append(
+            f" {health['dispatch_findings_suppressed']} further finding(s) of that kind were folded "
+            f"into one entry rather than listed."
+        )
+    if health["static_checks_suppressed"]:
+        clauses.append(
+            f" {health['static_checks_suppressed']} further source-reference check(s) were folded "
+            f"into one entry rather than listed."
+        )
+    return "".join(clauses)
 
 
 def _build_diagnosis_summary(
     run_id: str,
     run_state: str,
     failures: list[dict[str, Any]],
-    checks: list[dict[str, str]],
+    checks: list[dict[str, Any]],
     logs_omitted: int,
+    health: dict[str, Any],
 ) -> str:
     """One deterministic digest the model can echo, enumerating every finding.
 
     Built server-side because a small model reliably repeats a numbered list it
     was handed, and just as reliably drops one finding out of two it has to
     assemble from separate fields.
+
+    The strong "No problems found" sentence is gated on ``health['clean']`` and
+    on nothing else, and every finding it would have to contradict is an entry
+    in the same ``checks`` list this enumerates — so there is no second
+    computation for it to drift from.
     """
     items = [_summarize_failure(failure) for failure in failures]
     items += [f"{_CHECK_LABELS.get(check['kind'], 'Check')}: {check['detail']}." for check in checks]
     if not items:
-        return f"No problems found: run {run_id} is {run_state} and no task instances failed."
-    numbered = " ".join(f"({position}) {text}" for position, text in enumerate(items, 1))
-    head = f"{len(items)} problem{'s' if len(items) != 1 else ''} found."
+        if health["clean"]:
+            # Says what the conjunction actually tested. ``clean`` withholds this
+            # sentence unless every success reported all the fields AND carries a
+            # worker-written one, so that — and not "no forgery" — is the claim.
+            return (
+                f"No problems found: run {_fenced(run_id)} is {run_state}; all "
+                f"{health['successes_scanned']} task instances succeeded, and every one of them "
+                f"carries a worker-written dispatch field (hostname or pid) on the attempt recorded "
+                f"successful.{_coverage_clauses(health)}"
+            )
+        return (
+            f"No failures found: run {_fenced(run_id)} is {run_state}."
+            f"{_census_clause(health)}{_coverage_clauses(health)}"
+        )
+    # The same ceiling the log path has, for the same reason: how many findings
+    # there are is not this tool's choice, and one tool result should not be
+    # 190k tokens of prose. The first entry always survives, so a run whose
+    # findings were folded still says so.
+    numbered: list[str] = []
+    budget = DIAGNOSIS_SUMMARY_BUDGET_CHARS
+    for position, text in enumerate(items, 1):
+        entry = f"({position}) {text}"
+        if numbered and len(entry) > budget:
+            break
+        numbered.append(entry)
+        budget -= len(entry) + 1
+    unlisted = len(items) - len(numbered)
+    # A fold entry stands for the findings it replaced, so counting it as one
+    # problem reported 26 for a run holding 500. The headline counts problems;
+    # the numbering counts entries, and the fold entry says which is which.
+    folded_away = health["dispatch_findings_suppressed"] + health["static_checks_suppressed"]
+    fold_entries = sum(1 for check in checks if check["kind"] in _FOLD_KINDS)
+    problems = len(items) - fold_entries + folded_away
+    head = f"{problems} problem{'s' if problems != 1 else ''} found."
     tail = (
         f" The logs of {logs_omitted} more failed task instance(s) were omitted for size."
         if logs_omitted
         else ""
     )
-    return f"{head} {numbered}{tail}"
+    if unlisted:
+        tail += f" {unlisted} further finding(s) were left out of this summary for size."
+    return f"{head} {' '.join(numbered)}{tail}{_coverage_clauses(health)}"
 
 
 def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = None) -> dict[str, Any]:
@@ -584,12 +1351,15 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     Find out what is wrong with a run of this Dag.
 
     ``dag_run_id`` names an exact run; left empty, the first failed of the last
-    5 runs is diagnosed (else the newest). Returns every task instance and its
-    state, the log tail of **every** failed or retrying one, the task graph,
-    the full Dag source, deterministic checks that spot broken task references
-    and import errors before they ever run, and a ``summary`` that enumerates
+    5 runs is diagnosed (else the newest). Returns every task instance with the
+    fields that show whether its recorded attempt was dispatched, the log tail
+    of **every** failed or retrying one, the task graph, the full Dag source,
+    deterministic checks that spot broken task references, import errors and
+    successes carrying no dispatch evidence, a ``run_health`` that names every
+    reason the run cannot be called clean, and a ``summary`` that enumerates
     every finding. Relay the ``summary`` completely — every numbered item, not
-    only the first.
+    only the first. A green run is not automatically a healthy one: report what
+    ``summary`` says, not what the run state says.
 
     ``source_digest`` is set by the caller's permissions, not by you.
     """
@@ -625,38 +1395,44 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
         # in the summary itself: a small model echoes the summary, not a flag.
         if not diagnosed_is_latest:
             newest_run_info = {"dag_run_id": newest["dag_run_id"], "state": newest["state"]}
+            # A run_id is caller-chosen text: Airflow's validators are
+            # ``$``-anchored and Python's ``$`` matches before a trailing
+            # newline, so one ending in ``\n`` is accepted by the API and would
+            # otherwise break this note across lines.
             if newest["state"] in ("queued", "running"):
                 stale_note = (
-                    f"Note: the newest run {newest['dag_run_id']} is still {newest['state']} — this "
-                    f"diagnosis is of the earlier run {run['dag_run_id']}, not of the run in progress."
+                    f"Note: the newest run {_fenced(newest['dag_run_id'])} is still "
+                    f"{newest['state']} — this diagnosis is of the earlier run "
+                    f"{_fenced(run['dag_run_id'])}, not of the run in progress."
                 )
             else:
                 # A newest run that already finished (e.g. succeeded) must not be
                 # spoken for by an older failure either.
                 stale_note = (
-                    f"Note: the newest run {newest['dag_run_id']} finished with state "
+                    f"Note: the newest run {_fenced(newest['dag_run_id'])} finished with state "
                     f"{newest['state']} — this diagnosis is of the EARLIER run "
-                    f"{run['dag_run_id']}, not of that newest run."
+                    f"{_fenced(run['dag_run_id'])}, not of that newest run."
                 )
     run_path = f"/dagRuns/{quote(run['dag_run_id'], safe='')}"
 
     tis, omitted = _run_task_instances(dag_id, run_path)
+    dispatch_checks, incomplete_evidence, coverage = _check_dispatch_evidence(dag_id, run_path, tis)
+    task_instances, detail_reduced = _project_task_instances(
+        tis,
+        # The folded-findings entry names no instance, so it is not one.
+        {(check["task_id"], check["map_index"]) for check in dispatch_checks if "task_id" in check},
+        incomplete_evidence,
+    )
 
     result: dict[str, Any] = {
         "dag_id": dag_id,
         "dag_run_id": run["dag_run_id"],
         "run_state": run["state"],
         "dag_version": _run_version(run),
-        "task_instances": [
-            {
-                "task_id": ti["task_id"],
-                "state": ti.get("state"),
-                "try_number": ti.get("try_number"),
-                "map_index": ti.get("map_index", -1),
-            }
-            for ti in tis
-        ],
+        "task_instances": task_instances,
     }
+    if detail_reduced:
+        result["task_instance_detail_reduced"] = detail_reduced
     if diagnosed_is_latest is not None:
         result["diagnosed_run_is_latest"] = diagnosed_is_latest
     if newest_run_info:
@@ -696,10 +1472,12 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     source = result.get("source")
     static_checks: list[dict[str, str]] | None = None
     if tasks and isinstance(source, str) and not source.startswith("unavailable:"):
-        static_checks = _static_checks(source, {task["task_id"] for task in tasks})
+        static_checks, coverage["static_checks_suppressed"] = _static_checks(
+            source, {task["task_id"] for task in tasks}
+        )
     import_checks = _find_import_errors(dag)
-    checks = (static_checks or []) + import_checks
-    if static_checks is not None or import_checks:
+    checks: list[dict[str, Any]] = (static_checks or []) + import_checks + dispatch_checks
+    if static_checks is not None or checks:
         result["checks"] = checks
 
     # up_for_retry counts: the task already failed at least once, and waiting
@@ -707,8 +1485,11 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     # diagnosis is for.
     failed = [ti for ti in tis if ti.get("state") in ("failed", "up_for_retry")]
     if not failed:
+        result["run_health"] = _run_health(run, tis, [], checks, omitted, coverage)
         result["diagnosis"] = f"latest run is {run['state']}; no failed task instances"
-        result["summary"] = _build_diagnosis_summary(run["dag_run_id"], run["state"], [], checks, 0)
+        result["summary"] = _build_diagnosis_summary(
+            run["dag_run_id"], run["state"], [], checks, 0, result["run_health"]
+        )
         if stale_note:
             result["summary"] = f"{stale_note} {result['summary']}"
         return result
@@ -749,8 +1530,9 @@ def diagnose_dag(dag_id: str, dag_run_id: str = "", source_digest: str | None = 
     logs_omitted = len(failed) - len(failures)
     if logs_omitted:
         result["logs_omitted"] = logs_omitted
+    result["run_health"] = _run_health(run, tis, failures, checks, omitted, coverage)
     result["summary"] = _build_diagnosis_summary(
-        run["dag_run_id"], run["state"], failures, checks, logs_omitted
+        run["dag_run_id"], run["state"], failures, checks, logs_omitted, result["run_health"]
     )
     if stale_note:
         result["summary"] = f"{stale_note} {result['summary']}"
@@ -960,9 +1742,8 @@ def _find_unaddressed_findings(dag_id: str, patched: str) -> list[dict[str, str]
         task_ids = {task["task_id"] for task in _tasks(dag_id)}
     except (httpx.HTTPStatusError, KeyError):
         return []
-    return [
-        check for check in _static_checks(patched, task_ids) if check["kind"] != "source_graph_disagreement"
-    ]
+    checks, _ = _static_checks(patched, task_ids)
+    return [check for check in checks if check["kind"] != "source_graph_disagreement"]
 
 
 def _build_asset_note(dag_id: str) -> str:
