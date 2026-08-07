@@ -22,6 +22,7 @@
 
 - [Airy self-healing MCP (summit demo)](#airy-self-healing-mcp-summit-demo)
   - [Setup (Breeze)](#setup-breeze)
+  - [Showcase: incident_triage and incident_digest](#showcase-incident_triage-and-incident_digest)
   - [Demo run-book](#demo-run-book)
   - [Deliberate shortcuts](#deliberate-shortcuts)
   - [Tests](#tests)
@@ -38,53 +39,87 @@ is actually approving.
 
 | Tool | What it does |
 |---|---|
-| `diagnose_dag(dag_id)` | latest failed run → **every** task instance and state, the log tail of **every** failed one, the task graph in topological order, the full Dag source, and static `checks` (an XCom `task_ids` that matches no task, source/graph disagreement) |
-| `plan_dag_code_changes(dag_id, changes)` | read-only: applies every `{old, new}` in memory, compiles, returns the combined diff plus the graph impact — a change that orphans a task's edges or leaves a live reference behind is `blocking` and gets **no** token. Removals are found against the live graph, so deleting a TaskFlow task (or just its `@task` decorator) counts, even though it declares no `task_id` |
-| `apply_dag_code_changes(dag_id, changes, plan_token)` | writes all the planned edits as one file write, one backup, one reparse, one new Dag version |
-| `revert_dag_code(dag_id)` | restores the **original** file, discarding every fix (rehearse the demo from the chat) |
-| `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas and conf changes; names the differing Dag versions but does **not** diff them, since an older version may hold a co-located Dag the caller was never authorized against |
-| `find_failure_clusters(hours, dag_ids)` | recent failed task instances grouped by normalised error signature; `dag_ids` is set by the caller's permissions, not by the model |
+| `diagnose_dag(dag_id, dag_run_id="")` | one run — the exact `dag_run_id` if given, else the first failed of the last 5 (else the newest) → **every** task instance and state, the log tail of **every** failed *or retrying* one (`up_for_retry` counts, marked `still_retrying`), the task graph in topological order, the full Dag source, static `checks` (an XCom `task_ids` that matches no task, source/graph disagreement, and **import errors** for the Dag's file — the failure mode that never produces a failed run), and a deterministic `summary` that enumerates every failure and every check as a numbered list. The summary is built server-side, never by the model: a small model reliably repeats a numbered list it was handed, and just as reliably drops one finding out of two it has to assemble itself |
+| `plan_dag_code_changes(dag_id, changes)` | read-only: applies every `{old, new}` in memory, compiles, returns the combined diff plus the graph impact — a change that orphans a task's edges or leaves a live reference behind is `blocking` and gets **no** token. Removals are found against the live graph, so deleting a TaskFlow task (or just its `@task` decorator) counts, even though it declares no `task_id`. A patch that touches assets, inlets/outlets or the schedule also carries an `asset_note` naming this Dag's own produced/consumed assets (never other Dags' ids — only `get_blast_radius` is authorized for those) |
+| `apply_dag_code_changes(dag_id, changes, plan_token, asset_note="")` | writes all the planned edits as one file write, one backup, one reparse, one new Dag version. A plan that carried an `asset_note` must have it repeated verbatim here — the tool refuses without it, so the approval card always shows what the change can knock over |
+| `plan_revert_dag_code(dag_id)` | read-only: previews a revert as the diff between the backup and the current file, plus a relayable `summary` and a single-use `plan_token` (kind `revert`). No backup → no token, just a relayable "nothing to revert" |
+| `revert_dag_code(dag_id, plan_token, diff)` | restores the **original** file, discarding every fix (rehearse the demo from the chat). Requires the token from `plan_revert_dag_code` *and* the same `diff` repeated in the arguments, so the confirmation card shows exactly what reverting discards; at execution it re-verifies that the backup is still there and the current bytes still hash to what the plan was made from — drift aborts |
+| `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas and conf changes; takes exact run ids or `latest`/`previous` ("compare the last two runs" is `previous` vs `latest`). A mapped task is aggregated to one row per task — instance count plus the *longest* instance's duration, not whichever `map_index` the API listed last. Names the differing Dag versions but does **not** diff them, since an older version may hold a co-located Dag the caller was never authorized against |
+| `find_failure_clusters(hours, dag_ids)` | recent failed task instances grouped by normalised error signature; `dag_ids` is set by the caller's permissions, not by the model. Log fetches pass each instance's `map_index`, so a mapped failure is signed by its own log rather than the unmapped instance's; `failures_omitted` reports how many failures the window held beyond the page that was scanned, so "3 clusters" never quietly means "of the 50 I looked at" |
 | `plan_backfill(dag_id, from, to)` | dry-run preview — read-only; returns every planned run and the `plan_token` that authorizes creating them |
 | `run_backfill(dag_id, from, to, plan_token, planned_runs)` | creates the backfill, only for a plan the user reviewed and that still produces the same runs, capped at `AIRY_MCP_MAX_BACKFILL_RUNS` (50) |
 | `get_blast_radius(dag_id)` | assets this Dag produces/consumes and the Dags up- and downstream of them |
 | `plan_task_instance_clear(dag_id, task_id/position, dag_run_id)` | read-only: resolves `latest` to an exact run and a position to a task id (refused where a branch means the graph does not fix the order), dry-runs the clear, and returns the exact instances it would affect. Takes the downstream with it by default, as Airflow's own clear dialog does — `include_downstream=False` holds it to the one task |
-| `apply_task_instance_clear(dag_id, dag_run_id, task_ids, plan_token)` | re-runs the **existing** instances in their own run: repeats the dry run *and* the task-set check, aborts if either moved, and never creates a Dag run |
-| `rerun_dag(dag_id, unpause=False, unpause_token="")` | triggers a **new** run; a paused Dag first returns a warning and a token, and only a second call carrying it may unpause |
+| `apply_task_instance_clear(dag_id, dag_run_id, task_ids, plan_token)` | re-runs the **existing** instances in their own run: repeats the dry run *and* the task-set check, aborts if either moved, and never creates a Dag run. After the clear it compares what actually cleared against the plan: `cleared_matches_plan`, and on drift a `cleared_delta` (`missing`/`extra`) plus a warning — truthful reporting of an outcome that moved, not a rollback; the clear itself did happen |
+| `rerun_dag(dag_id, conf=None, note="", unpause=False, unpause_token="")` | triggers a **new** run. `conf` is validated against the Dag's own `params` schema (from `GET /dags/{dag_id}/details`): unknown keys are refused with the full list of valid params, types and defaults; enum and type violations are refused; a Dag without params accepts only an empty conf — and validation runs *before* the unpause flow, so a bad conf never burns an `unpause_token`. `note` is attached to the created run (default "Triggered via Airy"). A paused Dag first returns a warning and a token, and only a second call carrying it may unpause |
 
-This goes past AIP-91 phase 1 (read-only) on purpose — it is the "what if the
-assistant could close the loop" end state, not a proposal for phase 1.
+Two conventions run through the whole surface. Any tool's first GET translates
+a 403/404 into `Dag 'x' does not exist or you cannot see it` — deliberately the
+same words for both, so an unauthorized caller cannot use the error to confirm
+an id exists. And results carry a pre-digested `summary` wherever a small model
+must relay a finding completely.
+
+This deliberately goes past both of the AIPs it borrows its framing from.
+**AIP-91** (Draft, not yet voted) phase 1 is **GET-only**: per-user
+authorization via a JWT pass-through proxy, with writes explicitly rejected.
+**AIP-101** (Draft) is the embedded UI assistant that rides entirely on AIP-91
+and never exceeds the signed-in user's permissions. Everything write-capable
+here is beyond both — an experiment in the "what if the assistant could close
+the loop" end state, not a proposal for either — and the UI says so: the
+drawer carries an **Experimental** badge.
 
 ## Setup (Breeze)
 
 ```bash
-# 1. the demo Dag
+# 1. the demo Dags: sales_summary plus the incident showcase pair (both
+#    incident files must land in the write jail so Airy can patch the poison
+#    record — AIRY_MCP_DAGS_DIR defaults to /files/dags)
 cp dev/airy_mcp/demo_dag.py files/dags/sales_summary.py
+cp dev/airy_mcp/incident_triage_dag.py dev/airy_mcp/incident_digest_dag.py files/dags/
 
 # 2. the plugin (files/plugins is what Breeze actually loads)
-cd plugins/airflow-chatbot-plugin && pnpm install && pnpm build
-mkdir -p www/dist && cp dist/* www/dist/ && cd -
-cp plugins/airflow-chatbot-plugin/airflow_chatbot_plugin.py files/plugins/
-cp -r plugins/airflow-chatbot-plugin/www files/plugins/
+cd plugins/airflow-chatbot-plugin && pnpm install && pnpm deploy:breeze && cd -
 
 # 3. demo timing — add to files/airflow-breeze-config/environment_variables.env
 #    so a fix lands in seconds instead of ~30s (see "Timing" below):
 #      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL=0
 #      AIRFLOW__DAG_PROCESSOR__MIN_FILE_PROCESS_INTERVAL=0
+
+# 4. the showcase Dags' LLM connection — same env file. Required whenever
+#    OPENAI_API_KEY is set (the Breeze demo env sets it): the engine gate
+#    routes to @task.llm when *either* the connection or the key exists, but
+#    @task.llm itself resolves the pydanticai_default connection, so key
+#    without connection fails at connection lookup. The password may be
+#    omitted — the hook then falls back to OPENAI_API_KEY.
+#      AIRFLOW_CONN_PYDANTICAI_DEFAULT='{"conn_type": "pydanticai", "password": "<key>", "extra": {"model": "openai:gpt-4o-mini"}}'
 ```
 
 The image already ships `fastmcp-slim[client]` at the version in `uv.lock` (it
 comes with pydantic-ai's MCP extra), so the sidecar only needs the **server**
-half. The launchers run `pip install 'fastmcp-slim[server]'` if
-`import fastmcp.server` fails — deliberately with no version specifier, so pip
-adds the extra's dependencies and leaves the installed version alone.
+half. `files/airflow-breeze-config/init.sh` installs it when
+`ENABLE_AIRY_MCP=true`, and the launchers run `pip install
+'fastmcp-slim[server]'` if `import fastmcp.server` fails — deliberately with no
+version specifier, so pip adds the extra's dependencies and leaves the
+installed version alone.
 
-Do **not** `pip install fastmcp` instead: the meta-package resolves to the latest
-release and drags `mcp` (1.28.1 → 1.29.0) and `uvicorn` (0.51 → 0.52) off
-Airflow's pins. Verified: `fastmcp-slim[server]` keeps `fastmcp-slim`, `mcp`,
-`uvicorn`, `httpx`, `pydantic` and `starlette` exactly where `uv.lock` has them.
+Do **not** `pip install fastmcp` instead — in `init.sh` or anywhere else: the
+meta-package resolves to the latest release and drags `mcp` (1.28.1 → 1.29.0)
+and `uvicorn` (0.51 → 0.52) off Airflow's pins. Verified: `fastmcp-slim[server]`
+keeps `fastmcp-slim`, `mcp`, `uvicorn`, `httpx`, `pydantic` and `starlette`
+exactly where `uv.lock` has them.
 
 The sidecar binds **127.0.0.1** by default: the transport is unauthenticated and
 `apply_dag_code_changes` writes Python that Airflow then executes. Do not expose it.
+
+### Headless start
+
+`breeze start-airflow` drives a terminal multiplexer, and the default
+(`mprocs`) panics under a pty that reports no size — exactly what a headless
+shell (an agent, CI, `nohup`) hands it. Give the pty a size and use tmux:
+
+```bash
+script -qec "stty rows 50 cols 200; breeze start-airflow --backend postgres --terminal-multiplexer tmux" /dev/null
+```
 
 ### Timing
 
@@ -103,9 +138,88 @@ would otherwise take down the whole chat rather than just its own tools.
 (Verified against pydantic-ai 2.13.0; a sidecar that is listening but broken
 still errors.)
 
+### Operational controls
+
+All read at request time from Airflow Variables — no restart needed:
+
+- **`airy_read_only`** — global kill-switch: `true` withholds every write tool
+  from every user, and the prompt then says an admin disabled writes rather
+  than blaming the user's permissions. Fail-closed: a Variable store that
+  cannot be read counts as "on". Enforced server-side in the toolset gate, not
+  just in the prompt — including when `/confirm` resumes an already-approved
+  write, so flipping the switch mid-approval makes the resume fail rather than
+  execute.
+- **`airy_disabled_tools`** — comma-separated tool names withheld entirely.
+  Unknown names match nothing; disabling an `apply_*` does not disable its
+  `plan_*`, or vice versa. Fail-closed: when the list cannot be read, every
+  write tool is withheld.
+- **`airy_model`** — the model name, default `gpt-4o-mini` (the demo key is
+  restricted to exactly that model; set this Variable when using a stronger
+  key).
+- **`airy_mcp_url`** — comma-separated MCP endpoints. **The write-capable
+  sidecar must be the *last* entry** (the default puts `:8001` last): nothing
+  in MCP names which server carries which tool without connecting to it, so
+  the plugin identifies the write sidecar by position. Any override of this
+  Variable must keep that convention.
+
+`GET /chatbot/health` reports `read_only` (the kill-switch) and
+`write_tools_available` (write sidecar reachable and the MCP extra
+importable). They are orthogonal — the drawer's read-only badge combines them
+and words the two causes differently. SSE `error` frames carry a
+machine-readable `code` (`llm_auth | rate_limited | mcp_unreachable |
+cancelled | internal`) and a `retryable` flag; the raw exception text stays in
+the server log. A `{"type": "ping"}` frame goes out after ~15 s of frame
+silence so proxies do not sever a stream that is quietly waiting on a long
+tool call.
+
+## Showcase: incident_triage and incident_digest
+
+`incident_triage` is the richer showcase next to `sales_summary` — the
+three-task sales Dag stays as-is because its one-screen shape is what makes
+the code-fix loop legible. The incident pair exercises everything else:
+
+- **Params validated at trigger time** — `window_hours` (integer 1–168),
+  `severity_threshold` (enum over low/medium/high/critical), `skip_invalid`
+  (boolean, default `False`). This gives `rerun_dag`'s conf validation a real
+  schema to refuse against.
+- **Deterministic fixture ingest** — incidents are built inline, seeded by the
+  calendar date of the logical date (no network, no external files); the same
+  date always produces the same batch.
+- **Dynamic task mapping** — classification expands over the normalized
+  incidents.
+- **Schema-validated `@task.llm` with a deterministic offline fallback** — a
+  gate task routes to `@task.llm` (connection `pydanticai_default`,
+  `output_type` a pydantic model whose severity is a `Literal`) when the
+  connection or `OPENAI_API_KEY` exists, else to a rule-based classifier
+  producing the *same* schema; every assessment is re-validated with
+  `model_validate` before it touches control flow. The executive summary has
+  the same llm/offline split.
+- **Severity routing into task groups** — a branch sends the batch to the
+  `page` group when any incident meets the threshold, else to the `digest`
+  group.
+- **An Asset-linked consumer** — `publish_report` renders a markdown report
+  with `outlets=[Asset("incident_report")]` and attaches it to the asset
+  event's extra; `incident_digest` is scheduled on that asset and logs the
+  report in full. That makes `get_blast_radius` demoable for the first time:
+  `incident_triage` → `incident_report` → `incident_digest`.
+
+**The staged failure.** One fixture record, `INC-0999`, always carries the
+malformed timestamp `2026-02-30T99:99:99+00:00` (the `POISON_TIMESTAMP`
+constant — exactly one occurrence in the file, so the string-replace patch
+applies cleanly). With the default `skip_invalid=False` the `normalize` task
+fails loudly, and its error names the record and both recoveries:
+
+1. **Re-trigger with conf** — `rerun_dag` with `{"skip_invalid": true}`; Airy
+   turns the natural-language ask into typed conf that the params schema
+   validates.
+2. **Fix the feed and clear** — `plan`/`apply_dag_code_changes` replacing the
+   poison literal with a parseable timestamp, then
+   `plan`/`apply_task_instance_clear` on `normalize`.
+
 ## Demo run-book
 
-The Dag carries **two** bugs. Only one of them has failed anything yet —
+The `sales_summary` Dag carries **two** bugs. Only one of them has failed
+anything yet —
 `report` never runs while `summarize` is failing — and finding just that one is
 the failure mode this demo is built to avoid. One diagnosis reports both.
 
@@ -153,8 +267,48 @@ that already succeeded keeps the XCom value the re-run exists to replace. So
 clearing `summarize` on its own would leave `report` exactly as broken as it was.
 That is not silent — the plan lists every instance before the card is shown.
 
-Reset between rehearsals: ask Airy to *"revert sales_summary"* (or
-`mv files/dags/sales_summary.py.airy-bak files/dags/sales_summary.py`).
+Reset between rehearsals: ask Airy to *"revert sales_summary"* — now a planned
+flow, so `plan_revert_dag_code` shows the diff before `revert_dag_code` is
+approved — or use the file-level reset below.
+
+### Incident triage beats
+
+1. Trigger `incident_triage` with defaults → `normalize` fails within seconds;
+   its log names `INC-0999`, the malformed value, and both recoveries.
+2. **"What's wrong with incident_triage?"** → `diagnose_dag` → the `summary`
+   carries the confirmed failure straight from the log.
+3. **Recovery A** — *"re-run it, but skip the invalid records"* → `rerun_dag`
+   with conf `{"skip_invalid": true}`. For a refusal beat first, ask for
+   `severity_threshold: "urgent"` or `window_hours: "yesterday"` — both are
+   refused with the full catalog of valid params, types and defaults.
+4. **Recovery B** (rehearse from a fresh failure, not after A) — *"fix the
+   feed"* → `plan_dag_code_changes` replacing the poison timestamp (it occurs
+   exactly once), then `plan`/`apply_task_instance_clear` on `normalize`. The
+   repaired record parses but falls outside the default 24 h window, so the
+   run succeeds with one record visible in the report's "dropped" line.
+5. A successful run's `publish_report` emits the `incident_report` asset event
+   → an `incident_digest` run starts within seconds and logs the full markdown
+   report.
+6. **"What breaks if incident_triage breaks?"** → `get_blast_radius` →
+   `incident_report` and `incident_digest`.
+
+### Deterministic reset
+
+Between rehearsals, put the sources back and drop the backups Airy's patches
+leave behind:
+
+```bash
+cp dev/airy_mcp/demo_dag.py files/dags/sales_summary.py
+rm -f files/dags/sales_summary.py.airy-bak
+# same pattern if incident_triage was patched:
+cp dev/airy_mcp/incident_triage_dag.py files/dags/incident_triage_dag.py
+rm -f files/dags/incident_triage_dag.py.airy-bak
+```
+
+Clear the conversation from the drawer (the clear button arms on the first
+click and clears on the second). Dag-run history survives all of this — it
+lives in the metadata DB — so a truly blank slate is `breeze down` and a fresh
+start.
 
 ## Deliberate shortcuts
 
@@ -303,7 +457,7 @@ Declared up front, all of them cheap to replace:
    warning was issued and the plan was shown, not that a human read either — the
    confirmation card is what covers that.
 
-3. **Refreshing the page around the chat.** A write that lands changes what the
+6. **Refreshing the page around the chat.** A write that lands changes what the
    Dag view behind the drawer is showing, and that view will not notice: core
    queries have a five-minute stale time, window-focus refetch is off, and the
    Grid only polls while a run is active — so a terminal run cleared from the
@@ -325,25 +479,49 @@ Declared up front, all of them cheap to replace:
    first-class plugin API for cache invalidation, rather than a custom event two
    bundles have to agree on.
 
+### Known residual limitations
+
+Found in review and accepted for the demo, distinct from the settled
+shortcuts above:
+
+- `GET /assets` reads one 100-row page, so `get_blast_radius` and the
+  `asset_note` can understate a fleet-sized asset catalog (import errors now
+  carry an explicit truncation note; assets do not yet). Blast radius is one
+  hop, not transitive.
+- Plan tokens have no session owner, so planning the same Dag from two
+  conversations inside the 15-minute TTL discards the older conversation's
+  token (its apply then refuses safely, and the guard's refusal text stays
+  neutral about who planned first).
+- The backend validates `rerun_dag` conf only when it is a dict; a non-dict
+  conf reaches the sidecar, whose own input schema is the backstop.
+- `gpt-4o-mini` (the demo key's only model) occasionally plans a partial fix;
+  the plan result's `unaddressed_findings` field and the prompt rules push it
+  to re-plan, and the demo script's explicit phrasing avoids the detour. The
+  `airy_model` Variable upgrades behavior wholesale on a better key.
+- The frontend vitest suite has once failed en masse on a cold cache and
+  passed on every rerun; if a smoke check fails wholesale, run it twice.
+
 ## Tests
 
 ```bash
-uv run --project airflow-core pytest dev/airy_mcp/test_server.py -q
+uv run --project airflow-core pytest dev/airy_mcp/test_server.py -q           # 205 tests
+uv run --project airflow-core pytest dev/airy_mcp/test_incident_triage.py -q  # 48 tests
 ```
 
 The plugin and UI suites:
 
 ```bash
-cd plugins/airflow-chatbot-plugin && uv run --project ../../airflow-core pytest test_chat_stream.py -q
-cd plugins/airflow-chatbot-plugin && pnpm exec vitest run
+cd plugins/airflow-chatbot-plugin && uv run --project ../../airflow-core pytest test_chat_stream.py -q  # 211 tests
+cd plugins/airflow-chatbot-plugin && pnpm exec vitest run                                               # 265 tests
 cd airflow-core/src/airflow/ui && pnpm exec vitest run src/queries/useResourceChanged.test.ts
 ```
 
-`testpaths = ["tests"]` in the root `pyproject.toml` means **nothing collects the
-MCP suite automatically** — no CI job runs it, and it is invisible unless someone
-types the path. Anyone editing `server.py` has to run it by hand. Moving the file
-to `dev/airy_mcp/tests/` (with a `conftest.py` for the import) is the first thing
-to do if any of this is adopted.
+`testpaths = ["tests"]` in the root `pyproject.toml` means **nothing collects
+these suites automatically** — no CI job runs them, and they are invisible
+unless someone types the path. Anyone editing `server.py` or the showcase Dags
+has to run them by hand. Moving the files to `dev/airy_mcp/tests/` (with a
+`conftest.py` for the import) is the first thing to do if any of this is
+adopted.
 
 ## The Dag-processor question, and the long-term answer
 
