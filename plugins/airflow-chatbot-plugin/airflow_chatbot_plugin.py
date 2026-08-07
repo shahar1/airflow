@@ -330,7 +330,9 @@ _READ_ONLY_PROMPT = """\
 
 **Read-only access.**  This session has no write tools: you can diagnose and
 explain, but applying fixes, re-running or backfilling requires Dag-edit
-permission the user does not have.  If asked to change anything, say so.
+permission the user does not have.  You cannot even plan a change.  If asked
+to change anything, lead with that — never promise to apply, proceed with or
+follow up on a write, and never ask the user to confirm one.
 """
 
 _ADMIN_READ_ONLY_PROMPT = """\
@@ -338,8 +340,11 @@ _ADMIN_READ_ONLY_PROMPT = """\
 **Read-only mode.**  An administrator has switched Airy to read-only for
 everyone, so this session has no write tools regardless of the user's own
 permissions: you can diagnose and explain, but nothing can be applied through
-Airy until an admin re-enables writes.  If asked to change anything, say an
-admin disabled writes — do not present it as a permission the user lacks.
+Airy until an admin re-enables writes.  You cannot even plan a change.  If
+asked to change anything, lead with the fact that an admin disabled writes —
+do not present it as a permission the user lacks, never promise to apply,
+proceed with or follow up on a write, and never ask the user to confirm one.
+Describing the fix in prose is welcome; claiming you will make it is not.
 """
 
 _WRITE_UNAVAILABLE_PROMPT = """\
@@ -1160,8 +1165,11 @@ def _gate_toolsets(toolsets: list[Any], can_write: bool, user: Any = None) -> li
     # place. pydantic-ai refuses to attach two toolsets sharing a name, which
     # turns that confusion into a startup error rather than a silent swap — so
     # the fix for a collision is to rename ours, never to prefix past it.
+    # A plan whose apply can never run is a dead end that reads as progress: the
+    # model plans, promises to "proceed", and never mentions that writes are off.
+    withheld = disabled if can_write else disabled | PLAN_TOOLS
     known = [
-        ts.filtered(lambda ctx, tool_def: tool_def.name in TOOL_POLICY and tool_def.name not in disabled)
+        ts.filtered(lambda ctx, tool_def: tool_def.name in TOOL_POLICY and tool_def.name not in withheld)
         for ts in toolsets
     ]
     # Each write tool on its own merits: holding "clear a task instance" is not

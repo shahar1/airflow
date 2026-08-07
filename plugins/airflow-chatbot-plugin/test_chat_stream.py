@@ -948,6 +948,40 @@ def test_gate_toolsets_filters_write_tools_for_viewers():
     assert inner.filter_func(None, SimpleNamespace(name="diagnose_dag")) is True
 
 
+def _offers(toolset, name) -> bool:
+    """Whether a tool survives every filter layer the gate stacked."""
+    node, tool_def = toolset, SimpleNamespace(name=name)
+    while hasattr(node, "wrapped"):
+        if hasattr(node, "filter_func") and not node.filter_func(None, tool_def):
+            return False
+        node = node.wrapped
+    return True
+
+
+def test_gate_toolsets_withholds_plan_tools_when_writes_are_off():
+    """
+    A plan whose apply can never run reads as progress.
+
+    The model plans, promises to proceed, and never mentions writes are off.
+    """
+    from pydantic_ai.toolsets import FunctionToolset
+
+    (gated,) = plugin._gate_toolsets([FunctionToolset()], can_write=False)
+
+    for name in plugin.PLAN_TOOLS:
+        assert _offers(gated, name) is False
+    assert _offers(gated, "diagnose_dag") is True
+
+
+def test_gate_toolsets_keeps_plan_tools_for_editors():
+    from pydantic_ai.toolsets import FunctionToolset
+
+    (gated,) = plugin._gate_toolsets([FunctionToolset()], can_write=True)
+
+    for name in plugin.PLAN_TOOLS:
+        assert _offers(gated, name) is True
+
+
 def test_gate_toolsets_pauses_write_tools_for_editors():
     from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 
