@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import airflow_chatbot_plugin as plugin
@@ -44,6 +45,20 @@ from starlette.testclient import TestClient
 # BaseExceptionGroup is a builtin only from 3.11; airflow-core still supports 3.10.
 _EXC_GROUP = getattr(builtins, "BaseExceptionGroup", None)
 needs_exception_groups = pytest.mark.skipif(_EXC_GROUP is None, reason="needs Python 3.11+")
+
+
+# Captured before the autouse fixture below shadows them, for the tests that
+# exercise the real Variable-backed readers.
+_real_writes_disabled_globally = plugin._writes_disabled_globally
+_real_disabled_tool_names = plugin._disabled_tool_names
+
+
+@pytest.fixture(autouse=True)
+def airy_config(monkeypatch):
+    """Neutralize the Variable-backed switches — they fail closed without a DB."""
+    monkeypatch.setattr(plugin, "_writes_disabled_globally", lambda: False)
+    monkeypatch.setattr(plugin, "_disabled_tool_names", lambda: frozenset())
+    monkeypatch.setattr(plugin, "_mcp_probe_cache", {})
 
 
 def tool_call_event(name="diagnose_dag", args=None, call_id="c1"):
@@ -182,6 +197,22 @@ def test_event_payload_refuses_to_call_any_no_op_write_a_success(content):
     assert plugin._event_payload(event)["failed"] is True
 
 
+def test_event_payload_refuses_to_call_a_conf_refusal_a_success():
+    """An invalid conf is refused before the sidecar ever runs — no run was triggered."""
+    refusal = (
+        f"{plugin._INVALID_CONF}'urgent' is not one of ['low', 'medium', 'high'] — conf key "
+        f"'severity_threshold' violates the params schema of Dag 'sales_summary'."
+    )
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="rerun_dag", content=refusal, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is True
+    assert payload["denied"] is False
+
+
 @pytest.mark.parametrize(
     ("tool", "content"),
     [
@@ -196,6 +227,26 @@ def test_event_payload_leaves_a_real_result_alone(tool, content):
     event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
 
     assert plugin._event_payload(event)["failed"] is False
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_failed"),
+    [
+        ({"planned": False, "error": "already planned"}, True),
+        ('{"planned": false, "error": "already planned"}', True),
+        ({"planned": True, "plan_token": "t1"}, False),
+    ],
+)
+def test_event_payload_marks_a_refused_plan_as_failed(content, expected_failed):
+    # A refused plan with a green check reads as success while the model
+    # narrates failure — the row must carry the refusal.
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="plan_dag_code_changes", content=content, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is expected_failed
 
 
 def test_event_payload_marks_a_failed_tool_call():
@@ -274,6 +325,51 @@ def test_to_message_history_of_a_fresh_conversation(history):
     assert plugin._to_message_history(history) == []
 
 
+def _turns(count, size=1):
+    history = []
+    for i in range(count):
+        history.append({"role": "user", "content": f"q{i}".ljust(size, "x")})
+        history.append({"role": "assistant", "content": f"a{i}".ljust(size, "x")})
+    return history
+
+
+def test_capped_history_keeps_only_the_newest_twenty_pairs():
+    history = _turns(30)
+
+    kept = plugin._capped_history(history)
+
+    assert len(kept) == plugin._HISTORY_MAX_PAIRS * 2
+    # Newest retained, oldest dropped.
+    assert kept[-1] == history[-1]
+    assert kept[0] == history[20]
+
+
+def test_capped_history_enforces_the_character_budget_newest_first():
+    history = _turns(4, size=10_000)  # 80k chars across 8 messages
+
+    kept = plugin._capped_history(history)
+
+    assert sum(len(m["content"]) for m in kept) <= plugin._HISTORY_MAX_CHARS
+    assert kept[-1] == history[-1]
+    # The oldest messages are the ones sacrificed.
+    assert history[0] not in kept
+
+
+def test_capped_history_clips_a_single_oversize_newest_message():
+    history = [{"role": "user", "content": "y" * 50_000}]
+
+    kept = plugin._capped_history(history)
+
+    assert len(kept) == 1
+    assert len(kept[0]["content"]) == plugin._HISTORY_MAX_CHARS
+
+
+def test_to_message_history_applies_the_server_side_cap():
+    history = plugin._to_message_history(_turns(30))
+
+    assert len(history) == plugin._HISTORY_MAX_PAIRS * 2
+
+
 @needs_exception_groups
 def test_root_cause_unwraps_nested_task_group_errors():
     inner = ValueError("the real problem")
@@ -284,6 +380,56 @@ def test_root_cause_unwraps_nested_task_group_errors():
 def test_root_cause_passes_a_plain_exception_through():
     err = RuntimeError("boom")
     assert plugin._root_cause(err) is err
+
+
+@pytest.mark.parametrize(
+    ("exc", "code", "retryable"),
+    [
+        (ConnectionError("sidecar down"), "mcp_unreachable", True),
+        (TimeoutError("slow"), "mcp_unreachable", True),
+        # openai/httpx exceptions are matched by class name, not import.
+        (type("AuthenticationError", (Exception,), {})("bad key"), "llm_auth", False),
+        (type("PermissionDeniedError", (Exception,), {})("no access"), "llm_auth", False),
+        (type("RateLimitError", (Exception,), {})("429"), "rate_limited", True),
+        (type("ConnectError", (Exception,), {})("refused"), "mcp_unreachable", True),
+        (type("APIConnectionError", (Exception,), {})("reset"), "mcp_unreachable", True),
+        (asyncio.CancelledError(), "cancelled", True),
+        (RuntimeError("anything else"), "internal", False),
+    ],
+    ids=[
+        "connection",
+        "timeout",
+        "auth",
+        "permission",
+        "rate-limit",
+        "httpx-connect",
+        "api-connect",
+        "cancelled",
+        "internal",
+    ],
+)
+def test_error_frame_categorizes_known_failures(exc, code, retryable):
+    frame = plugin._error_frame(exc)
+
+    assert frame["type"] == "error"
+    assert frame["code"] == code
+    assert frame["retryable"] is retryable
+
+
+def test_error_frame_keeps_raw_exception_text_out_of_the_browser():
+    # str(e) can carry internal sidecar URLs and provider detail; the frame
+    # carries only the taxonomy's relayable sentence.
+    frame = plugin._error_frame(RuntimeError("http://10.0.0.5:8001 leaked secret"))
+
+    assert "10.0.0.5" not in frame["message"]
+    assert "secret" not in frame["message"]
+
+
+@needs_exception_groups
+def test_error_frame_classifies_the_root_cause_inside_an_exception_group():
+    wrapped = _EXC_GROUP("tg", [ConnectionError("gone")])
+
+    assert plugin._error_frame(wrapped)["code"] == "mcp_unreachable"
 
 
 @pytest.mark.asyncio
@@ -299,10 +445,10 @@ async def test_stream_agent_explains_a_missing_api_key(monkeypatch):
 
 @needs_exception_groups
 @pytest.mark.asyncio
-async def test_stream_agent_surfaces_the_root_cause_of_a_failure(monkeypatch):
+async def test_stream_agent_classifies_the_root_cause_of_a_failure(monkeypatch):
     class ExplodingAgent:
         def run_stream_events(self, *args, **kwargs):
-            raise _EXC_GROUP("tg", [ConnectionError("mcp sidecar is gone")])
+            raise _EXC_GROUP("tg", [ConnectionError("http://internal-sidecar:8001 is gone")])
 
     monkeypatch.setattr(
         plugin, "_build_agent", lambda page_url=None, can_write=False, user=None: (ExplodingAgent(), None)
@@ -310,7 +456,13 @@ async def test_stream_agent_surfaces_the_root_cause_of_a_failure(monkeypatch):
 
     payloads = [p async for p in plugin._stream_agent("hi")]
 
-    assert payloads == [{"type": "error", "message": "mcp sidecar is gone"}]
+    assert len(payloads) == 1
+    frame = payloads[0]
+    assert frame["type"] == "error"
+    assert frame["code"] == "mcp_unreachable"
+    assert frame["retryable"] is True
+    # The raw exception text (internal URLs, provider detail) stays server-side.
+    assert "internal-sidecar" not in frame["message"]
 
 
 def test_render_system_prompt_appends_the_page_line():
@@ -342,6 +494,205 @@ def test_render_system_prompt_bounds_hostile_input():
     page_line = rendered.rsplit("Current page: ", 1)[1]
     assert "\n" not in page_line.rstrip("\n")
     assert len(page_line) <= 501
+
+
+def test_system_prompt_defends_against_tool_output_injection():
+    assert "data" in plugin._SYSTEM_PROMPT
+    assert "do not comply" in plugin._SYSTEM_PROMPT
+    assert "prompt-injection" in plugin._SYSTEM_PROMPT
+
+
+def test_system_prompt_demands_every_finding_be_reported():
+    assert "EVERY entry" in plugin._SYSTEM_PROMPT
+    for field in ("`summary`", "`checks`", "`failures`"):
+        assert field in plugin._SYSTEM_PROMPT
+
+
+def test_system_prompt_separates_fact_from_inference():
+    assert "Fact versus inference" in plugin._SYSTEM_PROMPT
+    assert "never present a guess" in plugin._SYSTEM_PROMPT
+
+
+def test_system_prompt_teaches_relative_entity_links():
+    assert "[sales_summary](/dags/sales_summary)" in plugin._SYSTEM_PROMPT
+    assert "/dags/sales_summary/runs/manual__1/tasks/summarize" in plugin._SYSTEM_PROMPT
+
+
+def test_prompts_write_dag_not_all_caps_in_prose():
+    # Model replies mirror the prompt's spelling; the project convention is "Dag".
+    prose = (
+        plugin._SYSTEM_PROMPT
+        + plugin._WRITE_PROMPT
+        + plugin._READ_ONLY_PROMPT
+        + plugin._ADMIN_READ_ONLY_PROMPT
+        + plugin._WRITE_UNAVAILABLE_PROMPT
+        + plugin._FOLLOWUP_PROMPT
+    )
+    assert "DAG" not in prose
+
+
+def test_write_prompt_covers_the_new_write_flows():
+    writable = plugin._render_system_prompt(None, can_write=True)
+
+    assert "plan_revert_dag_code" in writable
+    assert "asset_note" in writable
+    # rerun conf: natural language becomes validated conf keys.
+    assert "`params` schema" in writable
+
+
+def test_write_prompt_accounts_for_every_finding_and_verbatim_logs():
+    writable = plugin._render_system_prompt(None, can_write=True)
+
+    # A plan that leaves findings unaddressed must say so, not drop them.
+    assert "unaddressed_findings" in writable
+    # Fenced log excerpts come straight from log_tail — the fact-vs-inference
+    # rule is worthless if the "fact" was retyped from memory.
+    assert "verbatim" in writable
+    assert "`log_tail`" in writable
+
+
+def test_write_prompt_pins_verification_to_the_triggered_run():
+    """Diagnosing an older run and reporting it as the re-run's outcome, observed live."""
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "name the exact `dag_run_id` you inspected" in normalized
+    assert "is NOT the outcome of that action" in normalized
+    assert "say it has not finished and offer to check again" in normalized
+    assert "never report an older run's failure as the result" in normalized
+    # next_step is the sidecar telling the model what to do with a result.
+    assert "`next_step`" in normalized
+    assert "never silently drop it" in normalized
+
+
+def test_render_system_prompt_explains_an_admin_kill_switch():
+    rendered = plugin._render_system_prompt(None, can_write=False, read_only_reason="admin")
+
+    assert "admin disabled writes" in rendered
+    assert "do not present it as a permission the user lacks" in rendered
+    assert "apply_dag_code_changes" not in rendered
+    # The permission wording must not leak into the admin variant.
+    assert "permission the user does not have" not in rendered
+
+
+def test_render_system_prompt_explains_an_unreachable_write_service():
+    rendered = plugin._render_system_prompt(None, can_write=False, read_only_reason="capability")
+
+    assert "availability problem, not a permission problem" in rendered
+    assert "permission the user does not have" not in rendered
+
+
+def test_render_system_prompt_defaults_to_the_permission_wording():
+    rendered = plugin._render_system_prompt(None, can_write=False, read_only_reason="permission")
+
+    assert "Read-only access" in rendered
+
+
+def _capture_prompt_choice(monkeypatch, seen):
+    def capture(page_url, can_write=False, read_only_reason=None):
+        seen.update(can_write=can_write, reason=read_only_reason)
+        return "prompt"
+
+    monkeypatch.setattr(plugin, "_get_llm_api_key", lambda: "sk-x")
+    monkeypatch.setattr(plugin, "_render_system_prompt", capture)
+    monkeypatch.setattr(plugin, "_gate_toolsets", lambda toolsets, can_write, user=None: [])
+    # The MCP extra need not be installed to decide capability from reachability.
+    monkeypatch.setattr(plugin, "_build_mcp_toolsets", lambda urls: [SimpleNamespace()] if urls else [])
+
+
+@pytest.mark.parametrize(
+    ("reachable", "expected"),
+    [
+        # Write sidecar (last URL) up: RBAC verdict stands.
+        (["http://ro:8000/mcp", "http://rw:8001/mcp"], {"can_write": True, "reason": None}),
+        # Write sidecar down: a capability gap, not a permission one.
+        (["http://ro:8000/mcp"], {"can_write": False, "reason": "capability"}),
+        ([], {"can_write": False, "reason": "capability"}),
+    ],
+    ids=["write-up", "write-down", "all-down"],
+)
+def test_build_agent_requires_the_write_sidecar_for_writes(monkeypatch, reachable, expected):
+    seen = {}
+    _capture_prompt_choice(monkeypatch, seen)
+    monkeypatch.setattr(plugin, "_get_mcp_urls", lambda: ["http://ro:8000/mcp", "http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_reachable_mcp_urls", lambda urls: reachable)
+
+    agent, problem = plugin._build_agent("/x", can_write=True, user=None)
+
+    assert problem is None
+    assert seen == expected
+
+
+def test_build_agent_downgrades_everyone_when_the_kill_switch_is_on(monkeypatch):
+    seen = {}
+    _capture_prompt_choice(monkeypatch, seen)
+    monkeypatch.setattr(plugin, "_get_mcp_urls", lambda: ["http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_reachable_mcp_urls", lambda urls: ["http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_writes_disabled_globally", lambda: True)
+
+    agent, problem = plugin._build_agent("/x", can_write=True, user=None)
+
+    assert problem is None
+    assert seen == {"can_write": False, "reason": "admin"}
+
+
+def test_build_agent_keeps_import_failure_details_out_of_the_browser(monkeypatch):
+    """The raw ImportError can carry internal paths; only install instructions go out."""
+    monkeypatch.setattr(plugin, "_get_llm_api_key", lambda: "sk-x")
+    # None in sys.modules makes `from pydantic_ai import Agent` raise ImportError.
+    monkeypatch.setitem(sys.modules, "pydantic_ai", None)
+
+    agent, problem = plugin._build_agent("/x")
+
+    assert agent is None
+    assert "pip install" in problem
+    # The interpreter's message for this failure mode — must stay server-side.
+    assert "halted" not in problem
+    assert "sys.modules" not in problem
+
+
+def test_build_agent_keeps_the_permission_wording_for_viewers(monkeypatch):
+    seen = {}
+    _capture_prompt_choice(monkeypatch, seen)
+    monkeypatch.setattr(plugin, "_get_mcp_urls", lambda: ["http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_reachable_mcp_urls", lambda urls: ["http://rw:8001/mcp"])
+
+    agent, problem = plugin._build_agent("/x", can_write=False, user=None)
+
+    assert problem is None
+    assert seen == {"can_write": False, "reason": "permission"}
+
+
+def test_reachable_mcp_urls_caches_probes_for_a_short_ttl(monkeypatch):
+    """Two dead sidecars must not cost every concurrent chat turn ~4s of probing."""
+    calls = []
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_create_connection(addr, timeout):
+        calls.append(addr)
+        return FakeConn()
+
+    monkeypatch.setattr(plugin.socket, "create_connection", fake_create_connection)
+    urls = ["http://localhost:8001/mcp"]
+
+    first = plugin._reachable_mcp_urls(urls)
+    second = plugin._reachable_mcp_urls(urls)
+
+    assert first == second == urls
+    assert len(calls) == 1
+
+    # An expired entry probes again.
+    key = tuple(urls)
+    stamp, cached = plugin._mcp_probe_cache[key]
+    plugin._mcp_probe_cache[key] = (stamp - plugin._MCP_PROBE_TTL_S - 1, cached)
+    plugin._reachable_mcp_urls(urls)
+
+    assert len(calls) == 2
 
 
 class FakeUser:
@@ -414,7 +765,59 @@ def test_chat_endpoint_reports_a_mid_stream_failure_then_terminates(client, monk
         ]
 
     assert [f["type"] for f in frames] == ["text", "error", "done"]
-    assert frames[1]["message"] == "stream died"
+    assert frames[1]["code"] == "internal"
+    assert frames[1]["retryable"] is False
+    assert "stream died" not in frames[1]["message"]
+
+
+def _frames_of(chunks):
+    return [json.loads(chunk.removeprefix("data:").strip()) for chunk in chunks]
+
+
+@pytest.mark.asyncio
+async def test_sse_response_pings_through_frame_silence(monkeypatch):
+    """A proxy that sees an idle stream severs it mid-tool-call; pings keep it alive."""
+    monkeypatch.setattr(plugin, "_PING_INTERVAL_S", 0.02)
+
+    async def slow_tool():
+        await asyncio.sleep(0.1)
+        yield {"type": "text", "delta": "done thinking"}
+
+    response = plugin._sse_response(slow_tool())
+    frames = _frames_of([chunk async for chunk in response.body_iterator])
+
+    types = [f["type"] for f in frames]
+    assert "ping" in types
+    # Pings pad the silence; the real frames still arrive in order.
+    assert [t for t in types if t != "ping"] == ["text", "done"]
+
+
+@pytest.mark.asyncio
+async def test_sse_response_does_not_ping_a_lively_stream():
+    async def quick():
+        yield {"type": "text", "delta": "hi"}
+
+    response = plugin._sse_response(quick())
+    frames = _frames_of([chunk async for chunk in response.body_iterator])
+
+    assert [f["type"] for f in frames] == ["text", "done"]
+
+
+@pytest.mark.asyncio
+async def test_sse_response_still_pings_before_a_mid_stream_failure(monkeypatch):
+    monkeypatch.setattr(plugin, "_PING_INTERVAL_S", 0.02)
+
+    async def slow_explosion():
+        await asyncio.sleep(0.1)
+        raise RuntimeError("died late")
+        yield  # pragma: no cover
+
+    response = plugin._sse_response(slow_explosion())
+    frames = _frames_of([chunk async for chunk in response.body_iterator])
+
+    types = [f["type"] for f in frames]
+    assert "ping" in types
+    assert [t for t in types if t != "ping"] == ["error", "done"]
 
 
 def test_injected_script_is_versioned_by_the_built_bundle(monkeypatch, tmp_path):
@@ -464,9 +867,47 @@ def test_chat_endpoint_rejects_an_empty_message(client):
     assert client.post("/chat", json={"message": "   "}).status_code == 400
 
 
+def _stub_health_inputs(monkeypatch, *, reachable):
+    monkeypatch.setattr(plugin, "_get_llm_api_key", lambda: "sk-x")
+    monkeypatch.setattr(plugin, "_get_mcp_urls", lambda: ["http://ro:8000/mcp", "http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_reachable_mcp_urls", lambda urls: reachable)
+    monkeypatch.setattr(plugin, "_mcp_toolset_importable", lambda: True)
+
+
+def test_health_reports_the_read_only_kill_switch(client, monkeypatch):
+    _stub_health_inputs(monkeypatch, reachable=["http://ro:8000/mcp", "http://rw:8001/mcp"])
+    monkeypatch.setattr(plugin, "_writes_disabled_globally", lambda: True)
+
+    body = client.get("/health").json()
+
+    assert body["read_only"] is True
+    # The kill-switch is a policy, not an outage: the write sidecar still works.
+    assert body["write_tools_available"] is True
+
+
+@pytest.mark.parametrize(
+    ("reachable", "available"),
+    [
+        (["http://ro:8000/mcp", "http://rw:8001/mcp"], True),
+        # The write sidecar is by convention the LAST configured URL; the
+        # read-only one alone cannot execute anything.
+        (["http://ro:8000/mcp"], False),
+        ([], False),
+    ],
+    ids=["both-up", "write-down", "all-down"],
+)
+def test_health_reports_whether_write_tools_can_execute(client, monkeypatch, reachable, available):
+    _stub_health_inputs(monkeypatch, reachable=reachable)
+
+    body = client.get("/health").json()
+
+    assert body["read_only"] is False
+    assert body["write_tools_available"] is available
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
-    [("post", "/chat"), ("get", "/health"), ("get", "/bundle"), ("get", "/")],
+    [("post", "/chat"), ("get", "/health"), ("get", "/")],
 )
 def test_routes_reject_unauthenticated_requests(method, path):
     client = TestClient(plugin._create_chatbot_api()["app"])
@@ -518,6 +959,106 @@ def test_gate_toolsets_pauses_write_tools_for_editors():
     for name in plugin.WRITE_TOOLS:
         assert inner.approval_required_func(None, SimpleNamespace(name=name), {}) is True
     assert inner.approval_required_func(None, SimpleNamespace(name="diagnose_dag"), {}) is False
+
+
+def test_gate_toolsets_enforces_the_kill_switch_over_the_callers_verdict(monkeypatch):
+    """airy_read_only is enforced server-side, not only through the prompt."""
+    from pydantic_ai.toolsets import FilteredToolset, FunctionToolset
+
+    monkeypatch.setattr(plugin, "_writes_disabled_globally", lambda: True)
+
+    (gated,) = plugin._gate_toolsets([FunctionToolset()], can_write=True)
+    inner = gated.wrapped
+
+    # The editor branch would be ApprovalRequiredToolset; the kill-switch
+    # forces the viewer branch, which filters writes out entirely.
+    assert isinstance(inner, FilteredToolset)
+    for name in plugin.WRITE_TOOLS:
+        assert inner.filter_func(None, SimpleNamespace(name=name)) is False
+
+
+def test_gate_toolsets_removes_disabled_tools_before_gating(monkeypatch):
+    from pydantic_ai.toolsets import FunctionToolset
+
+    monkeypatch.setattr(
+        plugin, "_disabled_tool_names", lambda: frozenset({"apply_dag_code_changes", "diagnose_dag"})
+    )
+
+    (gated,) = plugin._gate_toolsets([FunctionToolset()], can_write=True)
+    known = gated.wrapped.wrapped.wrapped  # approval → offered → known
+
+    assert known.filter_func(None, SimpleNamespace(name="apply_dag_code_changes")) is False
+    assert known.filter_func(None, SimpleNamespace(name="diagnose_dag")) is False
+    # Disabling an apply does not disable its plan.
+    assert known.filter_func(None, SimpleNamespace(name="plan_dag_code_changes")) is True
+
+
+def test_gate_toolsets_ignores_unknown_disabled_names(monkeypatch):
+    from pydantic_ai.toolsets import FunctionToolset
+
+    monkeypatch.setattr(plugin, "_disabled_tool_names", lambda: frozenset({"no_such_tool"}))
+
+    (gated,) = plugin._gate_toolsets([FunctionToolset()], can_write=True)
+    known = gated.wrapped.wrapped.wrapped
+
+    for name in plugin.TOOL_POLICY:
+        assert known.filter_func(None, SimpleNamespace(name=name)) is True
+
+
+def _variable_get(mapping, error=None):
+    def get(key, default_var=None, **kw):
+        if error is not None:
+            raise error
+        return mapping.get(key, default_var)
+
+    return staticmethod(get)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("True", True),
+        ("1", True),
+        ("false", False),
+        ("0", False),
+        ("", False),
+        # Fail closed: a value nobody recognizes must not silently enable writes.
+        ("maybe", True),
+    ],
+)
+def test_writes_disabled_globally_parses_the_kill_switch(monkeypatch, value, expected):
+    from airflow.models.variable import Variable
+
+    monkeypatch.setattr(Variable, "get", _variable_get({"airy_read_only": value}))
+
+    assert _real_writes_disabled_globally() is expected
+
+
+def test_writes_disabled_globally_fails_closed_on_a_broken_variable_store(monkeypatch):
+    from airflow.models.variable import Variable
+
+    monkeypatch.setattr(Variable, "get", _variable_get({}, error=RuntimeError("db down")))
+
+    assert _real_writes_disabled_globally() is True
+
+
+def test_disabled_tool_names_parses_the_comma_separated_list(monkeypatch):
+    from airflow.models.variable import Variable
+
+    monkeypatch.setattr(
+        Variable, "get", _variable_get({"airy_disabled_tools": " rerun_dag, run_backfill ,,unknown "})
+    )
+
+    assert _real_disabled_tool_names() == frozenset({"rerun_dag", "run_backfill", "unknown"})
+
+
+def test_disabled_tool_names_fails_closed_to_no_write_tools(monkeypatch):
+    from airflow.models.variable import Variable
+
+    monkeypatch.setattr(Variable, "get", _variable_get({}, error=RuntimeError("db down")))
+
+    assert _real_disabled_tool_names() == frozenset(plugin.WRITE_TOOLS)
 
 
 class FakeAuthManager:
@@ -603,12 +1144,14 @@ FIX_ACCESS = [("PUT", None), ("GET", None), ("GET", "CODE"), ("GET", "VERSION")]
         ("diagnose_dag", [p for p in DIAGNOSE_ACCESS if p != ("GET", "CODE")], "GET on CODE"),
         # Editing the Dag object is not permission to read its source.
         ("apply_dag_code_changes", [("PUT", None), ("GET", None)], "GET on CODE"),
+        # The revert plan is held to the same read side as the code-change plan.
+        ("plan_revert_dag_code", [("GET", None), ("GET", "TASK")], "GET on CODE"),
         # Triggering a run is POST on RUN, not edit on the Dag.
         ("rerun_dag", [("PUT", None), ("GET", None)], "POST on RUN"),
         # Airflow gates even the backfill preview on POST.
         ("plan_backfill", [("GET", "RUN")], "POST on RUN"),
     ],
-    ids=["logs", "source", "code-read", "run-create", "backfill-preview"],
+    ids=["logs", "source", "code-read", "revert-plan", "run-create", "backfill-preview"],
 )
 def test_authorize_tool_call_demands_each_underlying_permission(auth_manager, tool, granted, missing):
     _grant(auth_manager, granted)
@@ -640,6 +1183,24 @@ def test_authorize_tool_call_pins_source_tools_to_the_authorized_bytes(auth_mana
     args = {"dag_id": "sales_summary"}
 
     assert plugin._authorize_tool_call(FakeUser(), "diagnose_dag", args) is None
+    assert args["source_digest"] == "d1g35t"
+
+
+def test_plan_revert_is_a_read_side_plan_tool():
+    """It mirrors plan_dag_code_changes: reads source, issues a token, never writes."""
+    assert plugin.TOOL_POLICY["plan_revert_dag_code"] == {"reads_source": True}
+    assert "plan_revert_dag_code" in plugin.PLAN_TOOLS
+    assert "plan_revert_dag_code" not in plugin.WRITE_TOOLS
+    assert plugin._tool_access_requirements("plan_revert_dag_code", {}) == (
+        plugin._tool_access_requirements("plan_dag_code_changes", {})
+    )
+
+
+def test_authorize_tool_call_pins_the_revert_plan_to_the_authorized_bytes(auth_manager):
+    _grant(auth_manager, DIAGNOSE_ACCESS)
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "plan_revert_dag_code", args) is None
     assert args["source_digest"] == "d1g35t"
 
 
@@ -787,6 +1348,18 @@ def test_the_policy_is_the_only_source_of_write_tools():
     assert all(plugin.TOOL_POLICY[name]["writes"] for name in plugin.WRITE_TOOLS)
 
 
+def test_every_write_tool_is_classified_for_plan_tokens():
+    """Token-required is derived by exemption, so a future write tool must be classified."""
+    assert {
+        "apply_dag_code_changes",
+        "apply_task_instance_clear",
+        "revert_dag_code",
+        "run_backfill",
+    } == plugin.TOKEN_REQUIRED_WRITES
+    assert {"rerun_dag"} == plugin.TOKENLESS_WRITES
+    assert plugin.TOKENLESS_WRITES | plugin.TOKEN_REQUIRED_WRITES == plugin.WRITE_TOOLS
+
+
 FLEET_ACCESS = [("GET", "TASK_INSTANCE"), ("GET", "TASK_LOGS")]
 
 
@@ -845,6 +1418,132 @@ def test_an_unscopable_fleet_tool_is_refused_even_for_a_full_reader(fleet):
 def test_a_non_dict_argument_payload_is_refused(auth_manager):
     """Narrowing works by rewriting args in place; it must not silently no-op."""
     assert "cannot check" in plugin._authorize_tool_call(FakeUser(), "find_failure_clusters", "{}")
+
+
+RERUN_ACCESS = [("GET", None), ("POST", "RUN")]
+
+
+@pytest.fixture
+def rerun_granted(auth_manager):
+    _grant(auth_manager, RERUN_ACCESS)
+    return auth_manager
+
+
+def _demo_params():
+    """Build the params a serialized Dag hands back — real server-side validator objects."""
+    from airflow.serialization.definitions.param import SerializedParam, SerializedParamsDict
+
+    return SerializedParamsDict(
+        {
+            "severity_threshold": SerializedParam(
+                default="medium", type="string", enum=["low", "medium", "high"]
+            ),
+            "retries": SerializedParam(type="integer"),
+            "note": SerializedParam(default=None, type=["null", "string"]),
+            "tag": SerializedParam(default="x"),
+        }
+    )
+
+
+def test_an_unknown_conf_key_is_refused_with_the_params_catalog(rerun_granted, monkeypatch):
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: _demo_params())
+
+    refusal = plugin._authorize_tool_call(
+        FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": {"severity": "high"}}
+    )
+
+    assert not refusal.startswith(plugin._ACCESS_DENIED)
+    assert "'severity'" in refusal
+    # The catalog — types, enum values, defaults — lets the model correct the
+    # call without another round trip.
+    assert "type string" in refusal
+    assert "one of 'low', 'medium', 'high'" in refusal
+    assert "default 'medium'" in refusal
+    assert "type integer" in refusal
+    assert "no default" in refusal
+    assert "type null or string" in refusal
+    assert "- tag (default 'x')" in refusal
+
+
+@pytest.mark.parametrize(
+    ("conf", "key", "bad_value", "allowed"),
+    [
+        ({"severity_threshold": "urgent"}, "'severity_threshold'", "'urgent'", "'low', 'medium', 'high'"),
+        ({"retries": "three"}, "'retries'", "'three'", "integer"),
+    ],
+    ids=["enum", "type"],
+)
+def test_a_conf_value_the_params_schema_rejects_is_refused(
+    rerun_granted, monkeypatch, conf, key, bad_value, allowed
+):
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: _demo_params())
+
+    refusal = plugin._authorize_tool_call(FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": conf})
+
+    assert not refusal.startswith(plugin._ACCESS_DENIED)
+    assert key in refusal
+    assert bad_value in refusal
+    assert allowed in refusal
+
+
+def test_a_valid_conf_reaches_the_tool_untouched(rerun_granted, monkeypatch):
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: _demo_params())
+    args = {"dag_id": "sales_summary", "conf": {"severity_threshold": "high", "retries": 2}}
+
+    assert plugin._authorize_tool_call(FakeUser(), "rerun_dag", args) is None
+    assert args == {"dag_id": "sales_summary", "conf": {"severity_threshold": "high", "retries": 2}}
+
+
+def test_conf_for_a_dag_without_params_is_refused(rerun_granted, monkeypatch):
+    from airflow.serialization.definitions.param import SerializedParamsDict
+
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: SerializedParamsDict())
+
+    refusal = plugin._authorize_tool_call(
+        FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": {"anything": 1}}
+    )
+
+    assert "takes no conf" in refusal
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"dag_id": "sales_summary"},
+        {"dag_id": "sales_summary", "conf": {}},
+        {"dag_id": "sales_summary", "conf": None},
+    ],
+    ids=["absent", "empty", "null"],
+)
+def test_an_empty_or_absent_conf_is_not_validated(rerun_granted, monkeypatch, args):
+    monkeypatch.setattr(
+        plugin, "_get_serialized_params", lambda dag_id: pytest.fail("no conf, no serialized-Dag read")
+    )
+
+    assert plugin._authorize_tool_call(FakeUser(), "rerun_dag", args) is None
+
+
+def test_conf_of_a_never_serialized_dag_is_refused(rerun_granted, monkeypatch):
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: None)
+
+    refusal = plugin._authorize_tool_call(
+        FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": {"severity_threshold": "low"}}
+    )
+
+    assert "cannot be validated" in refusal
+
+
+def test_conf_validation_runs_only_after_authorization(auth_manager, monkeypatch):
+    """The refusal catalogs the Dag's params; an unauthorized user must not see them."""
+    monkeypatch.setattr(
+        plugin, "_get_serialized_params", lambda dag_id: pytest.fail("params read before authorization")
+    )
+
+    denial = plugin._authorize_tool_call(
+        FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": {"severity_threshold": "urgent"}}
+    )
+
+    assert denial.startswith(plugin._ACCESS_DENIED)
 
 
 class RecordingToolset:
@@ -1278,6 +1977,26 @@ async def test_a_plan_the_model_only_narrated_is_corrected_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_narrated_revert_plan_is_corrected_too(monkeypatch):
+    """plan_revert_dag_code issues a token like any other plan tool."""
+    agent = ScriptedAgent(
+        [
+            [
+                plan_result_event(tool="plan_revert_dag_code"),
+                text_delta_event("Reverting now..."),
+                run_result_event(),
+            ],
+            [text_delta_event("Proposing the revert.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("undo it", user_id="alice")]
+
+    assert "did not propose it" in agent.prompts[1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("events", "label"),
     [
@@ -1343,6 +2062,122 @@ async def test_a_write_proposed_without_its_token_is_corrected(monkeypatch, pend
     [p async for p in plugin._stream_agent("fix it", user_id="alice")]
 
     assert "without the plan_token" in agent.prompts[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool",
+    ["apply_dag_code_changes", "apply_task_instance_clear", "revert_dag_code", "run_backfill"],
+)
+async def test_a_tokenless_token_required_write_is_corrected_even_without_a_plan(
+    monkeypatch, pending_store, tool
+):
+    """Not just the apply pair: revert_dag_code and run_backfill hard-require a plan_token too."""
+    tokenless = [ToolCallPart(tool_name=tool, args={"dag_id": "d"}, tool_call_id="c9")]
+    agent = ScriptedAgent(
+        [
+            [
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=tokenless)
+                ),
+                run_result_event(),
+            ],
+            [text_delta_event("Planning first, then proposing.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert len(agent.prompts) == 2
+    assert "without the plan_token" in agent.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_token_echoed_from_an_earlier_turn_is_corrected(monkeypatch, pending_store):
+    """Truthy is not issued: a prior turn's token in the args is still a doomed card."""
+    stale = [
+        ToolCallPart(
+            tool_name="apply_dag_code_changes",
+            args={"dag_id": "d", "plan_token": "st4le"},
+            tool_call_id="c9",
+        )
+    ]
+    agent = ScriptedAgent(
+        [
+            [
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=stale)
+                ),
+                run_result_event(),
+            ],
+            [text_delta_event("Planning first, then proposing.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert len(agent.prompts) == 2
+    assert "without the plan_token" in agent.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_a_write_carrying_a_token_this_run_did_not_issue_is_corrected(monkeypatch, pending_store):
+    """A plan ran, but the proposal carries some other token — the tool will refuse it."""
+    mismatched = [
+        ToolCallPart(
+            tool_name="apply_dag_code_changes",
+            args={"dag_id": "d", "plan_token": "st4le"},
+            tool_call_id="c9",
+        )
+    ]
+    agent = ScriptedAgent(
+        [
+            [
+                plan_result_event(),
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=mismatched)
+                ),
+                run_result_event(),
+            ],
+            [text_delta_event("Re-proposing with the fresh token.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("fix it", user_id="alice")]
+
+    assert len(agent.prompts) == 2
+    assert "without the plan_token" in agent.prompts[1]
+
+
+def test_the_correction_tells_the_model_to_plan_first_when_no_plan_ran():
+    """Without this branch the correction invites a hallucinated token."""
+    assert "call the matching plan tool first" in plugin._UNPROPOSED_PLAN_CORRECTION
+    assert "a token from an earlier turn is already spent" in plugin._UNPROPOSED_PLAN_CORRECTION
+
+
+@pytest.mark.asyncio
+async def test_a_tokenless_rerun_is_not_corrected(monkeypatch, pending_store):
+    """rerun_dag is tokenless by design; the correction covers every other write."""
+    approvals = [ToolCallPart(tool_name="rerun_dag", args={"dag_id": "d"}, tool_call_id="c9")]
+    agent = ScriptedAgent(
+        [
+            [
+                SimpleNamespace(
+                    event_kind="deferred_tool_requests", requests=SimpleNamespace(approvals=approvals)
+                ),
+                run_result_event(),
+            ]
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    payloads = [p async for p in plugin._stream_agent("run it", user_id="alice")]
+
+    assert agent.prompts == ["run it"]
+    assert payloads[-1]["type"] == "confirm_required"
 
 
 @pytest.mark.asyncio
