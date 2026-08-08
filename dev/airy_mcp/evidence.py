@@ -1081,6 +1081,13 @@ def _attribution_bytes(attribution: dict[str, Any]) -> int:
 def _enforce_attribution_ceiling(history: dict[str, Any], task_instances: list[dict[str, Any]]) -> None:
     """Bound the serialized attribution payload, and say so when it bites.
 
+    The numbers land on the EVENT HISTORY and not on the diagnosis, which looks
+    at first like the shape D14 forbids and is not: every ``last_state_change``
+    they measure is this same read's projection onto one instance, built by
+    ``_event_history`` out of the rows it read. D14 bars one read's completeness
+    being written onto a DIFFERENT read's payload; this is the same read
+    accounting for the size of its own projection.
+
     The per-field clamps bound a row; nothing bounded the SUM, and the levers a
     caller controls (a relayed ``extra.task_ids`` list, withheld key names at
     ``EXTRA_KEY_CLAMP_CHARS``, both owner fields, the context rows) multiply by

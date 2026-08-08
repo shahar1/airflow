@@ -9319,7 +9319,6 @@ _READS_WITHOUT_A_UNIVERSE = {
         2,
         "the failure scan is wrapped in a Reading at the call site, and the per-failure log is a body",
     ),
-    ("diagnosis", "get_blast_radius"): (1, "the asset catalog is wrapped in a Reading at the call site"),
     ("recovery", "apply_task_instance_clear"): (
         2,
         "the pre-write preview and the single mutating write; the preview becomes a Reading in the gate",
@@ -11637,3 +11636,70 @@ def test_the_plans_own_enumeration_guard_says_what_it_could_not_enumerate(cleare
 
     assert plan["planned"] is False
     assert "cannot enumerate what this clear would touch" in plan["error"]
+
+
+def test_the_types_own_unsettled_sentence_reaches_the_payload(airflow):
+    """``Verdict.detail()`` and ``Verdict.route`` were dead in production while
+    twelve call sites wrote the same sentence again, and two of those copies had
+    already drifted apart. One computation, consumed."""
+    _sweep_world(airflow)
+    airflow.run_tis_total = 900
+
+    result = server.compare_dag_runs(DAG_ID, "manual__1", "manual__2")
+
+    rows = {entry["task_id"]: entry for entry in result["task_durations"]}
+    note = rows["summarize"]["run_a_worker_field_note"]
+    assert rows["summarize"]["run_a_worker_field"] is None
+    assert (
+        note
+        == reading.Verdict(
+            reading.Outcome.UNKNOWN,
+            route=reading._TASK_INSTANCES_ROUTE,
+            why=note.split(" — ")[0],
+        ).detail()
+    )
+    assert reading._TASK_INSTANCES_ROUTE in note
+
+
+def test_a_conjunction_over_no_verdicts_settles_nothing():
+    """A positive constructible out of nothing is asymmetric with every other
+    answer here, where a claim about the world is earned by a whole read."""
+    assert reading.all_of(route="R").is_unknown()
+    assert reading.all_of(route="R").as_field() is None
+
+
+def test_the_blast_radius_reads_the_catalog_through_the_boundary(airflow):
+    """It reimplemented ``read_asset_catalog`` inline with different error
+    handling — no KeyError arm, and ``resp["assets"]`` raising TypeError on an
+    empty body — so the two drifted on the one thing they exist to agree about."""
+    _sweep_world(airflow)
+    airflow.fail_import_errors = None
+
+    real = transport._api
+
+    def empty_body(method, path, **kwargs):
+        if path == "/assets":
+            return None
+        return real(method, path, **kwargs)
+
+    transport._api = empty_body
+    try:
+        result = server.get_blast_radius(DAG_ID)
+    finally:
+        transport._api = real
+
+    assert "error" in result
+    assert "could not be read" in result["error"]
+
+
+def test_a_non_empty_blast_radius_over_a_short_catalog_is_caveated_too(airflow):
+    """A NON-empty enumeration over a truncated catalog is just as short of an
+    edge as an empty one, and it shipped with no caveat at all."""
+    _sweep_world(airflow)
+    airflow.assets_total = 900
+
+    result = server.get_blast_radius(DAG_ID)
+
+    assert result["produces_assets"] == ["daily_sales"]
+    assert result["asset_catalog_read_whole"] is False
+    assert "is not closed" in result["scope"]

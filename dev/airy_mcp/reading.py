@@ -442,7 +442,12 @@ class Verdict:
         return self.outcome is Outcome.UNKNOWN
 
     def detail(self) -> str:
-        """The sentence an unestablished answer carries, naming the read that fell short."""
+        """The sentence an unestablished answer carries, naming the read that fell short.
+
+        The one computation of it. Twelve call sites hand-wrote the same
+        sentence a second time and two of them had already drifted apart, which
+        is what a second computation of one sentence is for.
+        """
         if self.outcome is not Outcome.UNKNOWN:
             return ""
         route = self.route or "the read behind it"
@@ -484,7 +489,13 @@ def all_of(*verdicts: Verdict, route: str = "") -> Verdict:
     Returns one of the inputs rather than building a new negative: a definite
     counterexample settles the conjunction whatever the rest are, and one
     unsettled member leaves the whole thing unsettled.
+
+    A conjunction over NO verdicts is unsettled, not true: a positive
+    constructible out of nothing is asymmetric with every other answer here,
+    where a claim about the world has to be earned by a read that was whole.
     """
+    if not verdicts:
+        return Verdict(Outcome.UNKNOWN, route=route, why="no verdict was asked, so nothing was settled")
     for verdict in verdicts:
         if verdict.is_absent():
             return verdict
@@ -1030,13 +1041,13 @@ def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bo
     if run_versions:
         # One verdict per version the run recorded: "still listed" is a presence
         # and survives truncation, "no longer listed" is an absence and does not.
-        def listed(version: Any) -> Callable[[Mapping[str, Any]], bool]:
+        def is_version(version: Any) -> Callable[[Mapping[str, Any]], bool]:
             return lambda row: row.get("version_number") == version
 
         verdicts = {
             version: find(
                 versions,
-                listed(version),
+                is_version(version),
                 f"version {version} was not among the Dag versions this reading listed",
             )
             for version in run_versions
@@ -1292,7 +1303,11 @@ def read_asset_catalog() -> Reading:
     try:
         resp = transport._api("GET", "/assets", params={"limit": ASSET_CATALOG_LIMIT})
         resp["assets"]
-    except (httpx.HTTPStatusError, KeyError) as e:
+    # The full net, as the attempt-history read uses. ``_api`` returns None for
+    # an empty body and subscripting that is a TypeError, and a connection that
+    # will not open is a RequestError: neither was caught, so an unreadable
+    # catalog took the whole tool down instead of coming back as a failed read.
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         return failed_read(ASSET_CATALOG_ROUTE, _explain_error(e))
     return read_of(resp, "assets", ASSET_CATALOG_ROUTE)
 

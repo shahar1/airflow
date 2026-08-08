@@ -1093,16 +1093,15 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         # not whichever map_index the API listed last.
         per_task: dict[str, dict[str, Any]] = {}
         for ti in scan.rows:
-            info = per_task.setdefault(ti["task_id"], {"count": 0, "duration": None, "rows": []})
+            info = per_task.setdefault(ti["task_id"], {"count": 0, "duration": None})
             info["count"] += 1
-            info["rows"].append(ti)
             duration = ti.get("duration")
             if duration is not None and (info["duration"] is None or duration > info["duration"]):
                 info["duration"] = duration
         instances[label] = per_task
 
     task_durations = []
-    empty: dict[str, Any] = {"count": 0, "duration": None, "rows": []}
+    empty: dict[str, Any] = {"count": 0, "duration": None}
     for task_id in sorted(set(instances["run_a"]) | set(instances["run_b"])):
         info_a = instances["run_a"].get(task_id, empty)
         info_b = instances["run_b"].get(task_id, empty)
@@ -1113,6 +1112,9 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         # most stable task in the Dag. The flag is therefore asked of the run's
         # READING — a worker-bearing instance sitting past the scan ceiling used
         # to come back as a measured false.
+        worker_fields = {
+            label: _worker_field_verdict(readings[label], task_id) for label in ("run_a", "run_b")
+        }
         entry = {
             "task_id": task_id,
             "run_a": a,
@@ -1121,9 +1123,16 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
             # Named for what was observed - a worker-written field on the row -
             # and not for what ran: this says nothing about who or what wrote
             # the state.
-            "run_a_worker_field": _worker_field_verdict(readings["run_a"], task_id).as_field(),
-            "run_b_worker_field": _worker_field_verdict(readings["run_b"], task_id).as_field(),
+            "run_a_worker_field": worker_fields["run_a"].as_field(),
+            "run_b_worker_field": worker_fields["run_b"].as_field(),
         }
+        # The type's OWN sentence for an unsettled answer, not a thirteenth
+        # hand-written copy of it. ``Verdict.detail()`` and ``Verdict.route``
+        # were dead in production while twelve call sites wrote the sentence
+        # again, and two of those copies had already drifted apart.
+        for label, verdict in worker_fields.items():
+            if verdict.is_unknown():
+                entry[f"{label}_worker_field_note"] = verdict.detail()
         if max(info_a["count"], info_b["count"]) > 1:
             # A count over a truncated scan is the ceiling presented as the
             # fan-out. Null says the fan-out was not read, which is what happened.
@@ -1322,20 +1331,19 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
     the Dags scheduled on or reading those assets — plus the upstream side,
     the assets this Dag depends on and who produces them.
     """
-    try:
-        resp = transport._api("GET", "/assets", params={"limit": reading.ASSET_CATALOG_LIMIT})
-        resp["assets"]
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code in (403, 404):
-            return {
-                "dag_id": dag_id,
-                "error": (
-                    f"the asset catalog could not be read (HTTP {e.response.status_code}), "
-                    f"so the blast radius of {dag_id} is unknown"
-                ),
-            }
-        raise
-    catalog = reading.read_of(resp, "assets", reading.ASSET_CATALOG_ROUTE)
+    # The boundary's own read, not a second copy of it. This site used to inline
+    # the same call with different error handling — no KeyError arm, and an
+    # empty body raising TypeError on ``resp["assets"]`` — so the two drifted on
+    # the one thing they exist to agree about.
+    catalog = reading.read_asset_catalog()
+    if catalog.read_failed:
+        return {
+            "dag_id": dag_id,
+            "error": (
+                f"the asset catalog could not be read ({catalog.error}), "
+                f"so the blast radius of {dag_id} is unknown"
+            ),
+        }
 
     edges = _compute_asset_edges(dag_id, catalog)
     return {
@@ -1358,7 +1366,12 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
         + (
             ""
             if catalog.complete
+            # Said over EVERY list, not only the null ones. A non-empty
+            # enumeration drawn from a truncated catalog is just as short of an
+            # edge as an empty one, and it shipped with no caveat at all —
+            # ``_build_asset_note`` gets this right over the same data.
             else f" The catalog was NOT read whole ({catalog.reason}), so a null list above means "
-            f"this reading cannot say whether an edge exists."
+            f"this reading cannot say whether an edge exists, and a list that DOES name Dags or "
+            f"assets is not closed: an edge this Dag has may be missing from it."
         ),
     }
