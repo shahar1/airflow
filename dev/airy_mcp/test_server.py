@@ -10056,3 +10056,52 @@ def test_the_code_write_re_asks_the_task_graph_it_planned_against(airflow, tmp_p
     assert result["mutation_applied"] is False
     assert "NOT applied" in result["error"]
     assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def _completeness_comparisons():
+    """Every place in the tree that compares a count against a claimed total.
+
+    The census that started this: nine sites in four mutually incompatible
+    forms, of which one was correct. The target is one site and one form, and
+    the scan is what keeps it there when the tenth is written.
+    """
+    found = []
+    for module in _MODULES:
+        for node in ast.walk(_module_source(module)):
+            if not isinstance(node, ast.Compare):
+                continue
+            text = ast.unparse(node)
+            counted = "len(" in text or ".kept" in text or "_delivered" in text
+            claimed = any(word in text for word in ("total", "_claimed", "universe", "recorded", "omitted"))
+            if (
+                counted
+                and claimed
+                and any(isinstance(op, (ast.GtE, ast.Gt, ast.LtE, ast.Lt)) for op in node.ops)
+            ):
+                found.append((module, text))
+    return found
+
+
+# The same arithmetic, doing a different job: these decide when a PAGINATION
+# LOOP stops and what to record as its exhaustion evidence. They feed a Reading
+# rather than standing in for one, and neither of them answers "may an absence
+# be concluded here" — the property does that, once, for all of them.
+_PAGINATION_TERMINATIONS = {
+    ("reading", "len(tis) >= min(total, TASK_INSTANCE_SCAN_LIMIT)"),
+    ("reading", "len(tis) >= total"),
+    ("evidence", "len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT)"),
+    ("evidence", "len(fetched) >= total"),
+}
+
+_THE_ONE_DERIVATION = ("reading", "self.kept >= self.universe")
+
+
+def test_completeness_is_derived_in_exactly_one_place():
+    """N1. The root cause of all four rounds was nine sites and four forms."""
+    sites = set(_completeness_comparisons())
+
+    assert _THE_ONE_DERIVATION in sites
+    unaccounted = sites - _PAGINATION_TERMINATIONS - {_THE_ONE_DERIVATION}
+    assert unaccounted == set(), f"a second completeness derivation appeared: {sorted(unaccounted)}"
+    # A declared exception may not outlive the loop it excused.
+    assert sites >= _PAGINATION_TERMINATIONS
