@@ -8936,6 +8936,23 @@ def test_a_matching_attempt_outside_the_retained_slice_refuses_rather_than_denyi
     assert cleared_run.cleared == []
 
 
+def test_a_preview_that_reports_no_attempt_at_all_cannot_say_the_attempt_has_not_moved(cleared_run):
+    """R9. ``.get(...)`` answered None for a field the preview omitted AND for a
+    field it sent as null, so ``plan["attempts"]`` was ``{where: None}`` and the
+    rule compared None against None and passed — a whole new attempt landing
+    between the plan and the click went undetected."""
+    for ti in cleared_run.tis_by_run["manual__1"]:
+        ti.pop("try_number", None)
+        ti.pop("state", None) if ti["task_id"] == "summarize" else None
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert "did not report state or try_number" in result["error"]
+    assert cleared_run.cleared == []
+
+
 def test_an_unreadable_attempt_history_refuses_the_write(cleared_run):
     plan = _gate_plan(cleared_run)
     cleared_run.fail_tries = httpx.ConnectError("connection refused")
@@ -10301,7 +10318,11 @@ _COVERAGE_DISCLOSURES = {
     "instances_omitted": ("$.instances_omitted",),
     "surviving_runs_unread": ("$.surviving_runs_unread",),
     "logs_read_as_a_tail": ("$.logs_read_as_a_tail",),
-    "log_tail_truncated": ("$.failures[].log_tail_truncated", "$.log_tail_truncated"),
+    "log_tail_truncated": (
+        "$.failures[].log_tail_truncated",
+        "$.log_tail_truncated",
+        "$.instances[].log_tail_truncated",
+    ),
     "task_instances_omitted": (
         "$.run_a.task_instances_omitted",
         "$.run_b.task_instances_omitted",
@@ -10962,6 +10983,48 @@ def _verdict_rebuilders():
             if any(keyword.arg == "outcome" for keyword in node.keywords):
                 found.append((module, owner, ast.unparse(node)))
     return sorted(found)
+
+
+def test_a_selection_over_a_scan_that_stopped_at_its_ceiling_is_not_exhaustive():
+    """R9. ``selection_of`` dropped ``_pages``/``_exhausted`` to their defaults,
+    so a selection over a scan that STOPPED AT ITS OWN CEILING came back
+    exhausted — erasing the evidence ``complete`` had just been taught to
+    consult, and letting ``none_match`` answer a confident negative over it."""
+    ceiling = reading.Reading(
+        rows=({"task_id": "a"},), route="GET /x", _delivered=1, _claimed=1, _pages=3, _exhausted=False
+    )
+
+    picked = reading.selection_of(ceiling, [{"task_id": "a"}])
+
+    assert picked.complete is False
+    assert "stopped at its own ceiling" in picked.reason
+    assert reading.none_match(picked, lambda row: row["task_id"] == "b", "why").is_unknown()
+
+
+def test_a_selection_over_a_scan_that_reached_the_end_is_still_exhaustive():
+    """The repair may not cost the negative: a whole scan still answers."""
+    whole = reading.Reading(rows=({"task_id": "a"},), route="GET /x", _delivered=1, _claimed=1)
+
+    picked = reading.selection_of(whole, [{"task_id": "a"}])
+
+    assert picked.complete is True
+    assert reading.none_match(picked, lambda row: row["task_id"] == "b", "why").is_present()
+
+
+def test_a_reading_ordered_by_time_does_not_order_iso_strings_lexically():
+    """R9. The API mixes ``+00:00`` with ``Z`` and varies the fractional digits,
+    so a lexical sort agrees with time only by accident — and a clamp after one
+    drops the newest record while reporting itself ordered by time."""
+    rows = [
+        {"key": "old", "timestamp": "2026-08-07T22:30:29.862440+00:00"},
+        {"key": "newest", "timestamp": "2026-08-07T23:00:00Z"},
+    ]
+    source = reading.Reading(rows=tuple(rows), route="GET /x", _delivered=2, _claimed=2)
+
+    newest_first = source.reordered(lambda row: str(row.get("timestamp") or ""), reverse=True)
+
+    assert [row["key"] for row in newest_first.rows] == ["newest", "old"]
+    assert newest_first.clamp(1).rows[0]["key"] == "newest"
 
 
 def test_no_verdict_is_rebuilt_with_a_different_outcome():
@@ -11925,7 +11988,41 @@ def test_the_failure_scan_never_claims_the_window_holds_no_failure_it_did_not_re
 
     assert short["failures_omitted"] == 1
     assert "No clusters means no FAILED task instance in the window" not in short["scope"]
-    assert "not whole" in short["scope"]
+    assert "short of the window" in short["scope"]
+    assert "1 failed task instance(s) in the window were not scanned" in short["scope"]
+    # Each shortfall named only when it happened: no log was unreadable here.
+    assert "could not be read" not in short["scope"]
+
+
+def test_an_unreadable_log_over_a_whole_scan_does_not_report_a_shortfall_that_did_not_happen(airflow):
+    """R9. The sentence led with "this scan was not whole" and then stated the
+    scan's own omission count whatever it was, so a WHOLE scan with one
+    unreadable log announced "0 failed task instance(s) were not scanned AND 1
+    log could not be read" — a false reason beside a true one."""
+    _sweep_world(airflow)
+    airflow.fail_log = httpx.ConnectError("boom")
+
+    result = server.find_failure_clusters(hours=24, dag_ids=[DAG_ID])
+
+    assert result["failures_omitted"] == 0
+    assert result["failures_unreadable"]
+    assert "0 failed task instance(s)" not in result["scope"]
+    assert "log(s) could not be read" in result["scope"]
+
+
+def test_a_log_read_as_a_tail_says_what_it_costs_the_clustering(airflow, monkeypatch):
+    """``logs_read_as_a_tail`` had no prose anywhere, though a clipped log can
+    split one failure into two clusters."""
+    monkeypatch.setattr(reading, "LOG_TAIL_LINES", 1)
+    monkeypatch.setattr(reading, "LOG_TAIL_CHARS", 20)
+    _sweep_world(airflow)
+    airflow.log = "line one\nline two\nValueError: boom"
+
+    result = server.find_failure_clusters(hours=24, dag_ids=[DAG_ID])
+
+    assert result["logs_read_as_a_tail"]
+    assert "read as a TAIL only" in result["scope"]
+    assert "one failure can appear as two clusters" in result["scope"]
 
 
 # ---------------------------------------------------------------------------

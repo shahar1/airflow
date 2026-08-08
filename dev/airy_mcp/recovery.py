@@ -160,12 +160,21 @@ def _clear_body(
 _CLEAR_PREVIEW_ROUTE = "POST /dags/<dag>/clearTaskInstances (dry_run=true)"
 
 
+# What a preview row says when it did not carry the field at all. ``.get(...)``
+# answered ``None`` for a field the route omitted AND for a field it sent as
+# null, so a preview that carries neither state nor try_number produced
+# ``plan["attempts"] = {where: None}`` — and the rule that refuses when an
+# attempt has moved compared None against None and passed. A whole new attempt
+# landing between the plan and the click went undetected.
+_FIELD_NOT_SENT = "<not sent by the preview>"
+
+
 def _affected_row(ti: Any) -> dict[str, Any]:
     return {
         "task_id": ti["task_id"],
         "map_index": ti.get("map_index", -1),
-        "state": ti.get("state"),
-        "try_number": ti.get("try_number"),
+        "state": ti.get("state", _FIELD_NOT_SENT),
+        "try_number": ti.get("try_number", _FIELD_NOT_SENT),
     }
 
 
@@ -965,6 +974,16 @@ def plan_task_instance_clear(
 
 _NOTHING_CLEARED = "Nothing was cleared — this was checked before the write was sent."
 
+# The staleness refusal's own next step. It used to reuse the truncation one,
+# which tells the caller to "name the read that could not be shown complete" —
+# and on this path every read WAS complete. The world moved under the approval;
+# nothing was unreadable.
+_DO_NOT_MAKE_IT_STALE_AGAIN = (
+    "Tell the user nothing was cleared and name what changed under the approval they gave. Do not "
+    "re-issue this call to get past it: re-plan against the world as it is now, show them the new "
+    "plan, and let them approve that."
+)
+
 # What a refusal must not do: send the caller round again to get past the guard.
 _DO_NOT_BYPASS = (
     "Tell the user nothing was cleared and name the read that could not be shown complete. Do not "
@@ -1018,7 +1037,7 @@ def _expired_evidence(dag_id: str, dag_run_id: str, why: str, **fields: Any) -> 
             f"read at plan time, so it no longer describes what would be written. "
             f"{_NOTHING_CLEARED}"
         ),
-        "next_step": _DO_NOT_BYPASS,
+        "next_step": _DO_NOT_MAKE_IT_STALE_AGAIN,
     }
 
 
@@ -1140,8 +1159,8 @@ def _rule_target_not_in_flight(ctx: _GateContext) -> dict[str, Any] | None:
 
 
 def _rule_target_attempt_not_moved(ctx: _GateContext) -> dict[str, Any] | None:
-    live_states = {_ti_where(ti): ti.get("state") for ti in ctx.now}
-    live_attempts = {_ti_where(ti): ti.get("try_number") for ti in ctx.now}
+    live_states = {_ti_where(ti): ti.get("state", _FIELD_NOT_SENT) for ti in ctx.now}
+    live_attempts = {_ti_where(ti): ti.get("try_number", _FIELD_NOT_SENT) for ti in ctx.now}
     planned_states = ctx.plan.get("states") or {}
     planned_attempts = ctx.plan.get("attempts") or {}
     moved = sorted(
@@ -1150,6 +1169,24 @@ def _rule_target_attempt_not_moved(ctx: _GateContext) -> dict[str, Any] | None:
         if (where in planned_states and live_states[where] != planned_states[where])
         or (where in planned_attempts and live_attempts[where] != planned_attempts[where])
     )
+    # A field the preview never sent cannot be compared, so this rule cannot
+    # say the attempt has not moved. Answering "unchanged" over two absences is
+    # the rule reporting a pass it never performed.
+    unreadable = sorted(
+        where
+        for where in live_states
+        if _FIELD_NOT_SENT in (live_states[where], live_attempts[where])
+        or _FIELD_NOT_SENT in (planned_states.get(where), planned_attempts.get(where))
+    )
+    if unreadable:
+        return _expired_evidence(
+            ctx.dag_id,
+            ctx.dag_run_id,
+            f"the clear preview did not report state or try_number for {unreadable}, so whether "
+            f"the attempt this approval was given for is still the attempt on the row is NOT "
+            f"established",
+            instances_that_moved=unreadable,
+        )
     if not moved:
         return None
     return _expired_evidence(
@@ -2208,6 +2245,9 @@ def _verify_instance(
         "unestablished_checks": unestablished,
         "checks": checks,
         "log_tail": log.get("tail"),
+        # Same rule as the diagnosis's top-level tail: the caveat travels with
+        # the text, or the text reads as the whole log.
+        "log_tail_truncated": bool(log.get("tail_truncated")),
         "end_date": ended,
     }
     if short_reads:

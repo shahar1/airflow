@@ -53,6 +53,7 @@ from primitives import (
     _carries_execution_fields,
     _clamped_operator,
     _later_than,
+    _parse_moment,
     _quoted,
     _ti_where,
 )
@@ -145,6 +146,21 @@ _HISTORY_CLAMPED = (
 # of the only type that carries rows, so a consumer that holds rows cannot hold
 # a second number to compare them against.
 # ---------------------------------------------------------------------------
+
+
+def _comparable(key: Callable[[Mapping[str, Any]], Any]) -> Callable[[Mapping[str, Any]], Any]:
+    """A sort key that orders timestamps by TIME, and everything else as given."""
+
+    def ordered(row: Mapping[str, Any]) -> Any:
+        value = key(row)
+        if isinstance(value, str):
+            moment = _parse_moment(value)
+            if moment is not None:
+                return (0, moment.timestamp(), "")
+            return (1, 0.0, value)
+        return value
+
+    return ordered
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,8 +291,14 @@ class Reading:
         A clamp keeps a prefix, so which rows a clamp keeps is decided by the
         order the route chose — and ``/xcomEntries`` orders alphabetically while
         every question asked of it here is chronological.
+
+        The key is normalised through the same comparison the rest of this server
+        uses for timestamps. Sorting ISO strings lexically agrees with time only
+        while every string has the same shape, and the API mixes ``+00:00`` with
+        ``Z`` and varies the fractional digits — so a clamp after a lexical sort
+        can drop the newest record while reporting itself ordered by time.
         """
-        return replace(self, rows=tuple(sorted(self.rows, key=key, reverse=reverse)))
+        return replace(self, rows=tuple(sorted(self.rows, key=_comparable(key), reverse=reverse)))
 
     def filter(self, keep: Callable[[Mapping[str, Any]], bool]) -> Reading:
         """A discard is a method too — dropped rows reduce kept, exactly like a clamp."""
@@ -384,6 +406,8 @@ def matches_of(
     claimed: Any,
     route: str,
     limit: int | None = None,
+    pages: int = 1,
+    exhausted: bool = True,
 ) -> Reading:
     """The rows that answered a question, over a scan that may not have covered everything.
 
@@ -405,6 +429,8 @@ def matches_of(
         route=route,
         _delivered=len(matched),
         _claimed=len(matched) + unexamined,
+        _pages=pages,
+        _exhausted=exhausted,
         note=(
             f"only the first {scanned} of {scanned + unexamined} row(s) were scanned, so any of the "
             f"{unexamined} that were not could have matched"
@@ -423,7 +449,18 @@ def selection_of(source: Reading, rows: list[dict[str, Any]] | tuple[dict[str, A
     """
     if source.read_failed:
         return failed_read(source.route, source.error or "")
-    return matches_of(list(rows), scanned=source.kept, claimed=source.universe, route=source.route)
+    # The pagination evidence travels too. It was dropped to the defaults, so a
+    # selection over a scan that had STOPPED AT ITS OWN CEILING came back
+    # exhausted — erasing the very evidence ``complete`` had just been taught to
+    # consult, and letting ``none_match`` answer PRESENT over it.
+    return matches_of(
+        list(rows),
+        scanned=source.kept,
+        claimed=source.universe,
+        route=source.route,
+        pages=source._pages,
+        exhausted=source._exhausted,
+    )
 
 
 def failed_read(route: str, error: str) -> Reading:

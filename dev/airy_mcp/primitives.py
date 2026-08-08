@@ -358,16 +358,27 @@ def _check(name: str, passed: bool | None, detail: str) -> dict[str, Any]:
     return {"check": name, "passed": passed, "detail": detail}
 
 
-def _later_than(when: Any, reference: str) -> bool | None:
-    """Whether an API timestamp is after a reference one, or ``None`` if unanswerable."""
-    if not reference or not isinstance(when, str) or not when:
+def _parse_moment(when: Any) -> datetime | None:
+    """One API timestamp as a moment, or ``None`` when it is not one.
+
+    THE place a timestamp string becomes comparable, so that ordering rows by
+    time and asking whether one is later than another cannot disagree. The API
+    mixes ``+00:00`` with ``Z`` and varies the fractional digits, so a lexical
+    comparison agrees with this one only by accident.
+    """
+    if not isinstance(when, str) or not when:
         return None
     try:
-        left = datetime.fromisoformat(when.replace("Z", "+00:00"))
-        right = datetime.fromisoformat(reference.replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(when.replace("Z", "+00:00"))
     except ValueError:
         return None
-    if left.tzinfo is None or right.tzinfo is None:
+    return moment if moment.tzinfo is not None else None
+
+
+def _later_than(when: Any, reference: str) -> bool | None:
+    """Whether an API timestamp is after a reference one, or ``None`` if unanswerable."""
+    left, right = _parse_moment(when), _parse_moment(reference)
+    if left is None or right is None:
         return None
     return left > right
 

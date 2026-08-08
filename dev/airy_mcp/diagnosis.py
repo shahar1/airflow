@@ -1058,6 +1058,10 @@ def diagnose_dag(
     # Kept for the single-failure case every prompt and card already speaks.
     result["failed_task_id"] = failures[0]["task_id"]
     result["log_tail"] = failures[0]["log_tail"]
+    # The caveat travels WITH the tail wherever the tail does. Copied without it,
+    # a top-level ``log_tail`` read as the log, and every absence in it as an
+    # absence in the log.
+    result["log_tail_truncated"] = failures[0].get("log_tail_truncated", False)
     return result
 
 
@@ -1355,14 +1359,45 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
         "success whose task never ran is invisible here; diagnose_dag finds those."
         if scan.complete and not unreadable
         else (
-            f"task instances recorded state=failed only, AND this scan was not whole: "
-            f"{failures_omitted} failed task instance(s) in the window were not scanned"
-            + (f" and {len(unreadable)} log(s) could not be read" if unreadable else "")
+            "task instances recorded state=failed only, and this list is short of the window: "
+            # Each shortfall named ONLY when it happened. The sentence used to
+            # lead with "this scan was not whole" and then state the scan's own
+            # omission count whatever it was, so a whole scan with one
+            # unreadable log announced "0 failed task instance(s) were not
+            # scanned AND 1 log could not be read" — a false reason beside a
+            # true one.
+            + ", ".join(
+                clause
+                for clause in (
+                    (
+                        f"{failures_omitted} failed task instance(s) in the window were not scanned"
+                        if not scan.complete
+                        else ""
+                    ),
+                    (
+                        f"{len(unreadable)} log(s) could not be read, so the failures they belong to "
+                        f"are not clustered by their error"
+                        if unreadable
+                        else ""
+                    ),
+                )
+                if clause
+            )
             + ". An empty or short cluster list therefore says nothing about the failures this "
             "scan did not reach. A run recorded success whose task never ran is invisible here "
             "whatever the coverage; diagnose_dag finds those."
         )
     )
+    if clipped_logs:
+        # A clipped log can split ONE failure into two clusters, because the
+        # signature is drawn from the tail and the tail is not the log. The
+        # count had no prose anywhere and the reader had no way to know what it
+        # meant for the grouping.
+        scope += (
+            f" {clipped_logs} log(s) were read as a TAIL only, so their error signature is "
+            f"the last error in what was read: one failure can appear as two clusters, and two as "
+            f"one."
+        )
     result = {
         "window_hours": hours,
         "failures_scanned": clustered,
