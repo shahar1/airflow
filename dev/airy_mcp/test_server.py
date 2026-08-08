@@ -72,7 +72,11 @@ class FakeAirflow:
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
         self.tasks: list[dict] = []
+        # What /tasks says it has, when that is not what it handed over.
+        self.tasks_total: int | None = None
         self.cleared: list[dict] = []
+        # What clearTaskInstances says its preview covers, likewise.
+        self.clear_total: int | None = None
         self.fail_clear: Exception | None = None
         # Every version the Dag still lists, newest first. ``None`` means "just
         # the current one", which is what every pre-Gate-4 test assumed.
@@ -162,7 +166,8 @@ class FakeAirflow:
         if path == f"/dags/{DAG_ID}/details":
             return {"dag_id": DAG_ID, "params": self.dag_params}
         if path == f"/dags/{DAG_ID}/tasks":
-            return {"tasks": self.tasks, "total_entries": len(self.tasks)}
+            total = len(self.tasks) if self.tasks_total is None else self.tasks_total
+            return {"tasks": self.tasks, "total_entries": total}
         if path == f"/dags/{DAG_ID}/clearTaskInstances":
             return self._clear(kwargs["json"])
         if path == "/backfills/dry_run":
@@ -337,7 +342,8 @@ class FakeAirflow:
             self.cleared.append(body)
             for ti in matches:
                 ti["state"] = None
-        return {"task_instances": matches, "total_entries": len(matches)}
+        total = len(matches) if self.clear_total is None else self.clear_total
+        return {"task_instances": matches, "total_entries": total}
 
     def _downstream_of(self, names: set) -> set:
         """Everything reachable from those tasks, as `include_downstream` means."""
@@ -7801,7 +7807,8 @@ def test_a_probe_that_cannot_answer_leaves_the_closure_possibly_expandable(group
     assert "'grp.inner'" in warning
 
 
-def test_an_apply_under_an_unanswered_probe_never_claims_it_created_none(group_zero_run):
+def test_an_apply_under_an_unanswered_probe_refuses_instead_of_writing(group_zero_run):
+    """An unanswered probe leaves the closure unread, and the closure authorises the write."""
     group_zero_run.fail_list_mapped = httpx.RequestError("connection reset")
 
     plan = _group_plan()
@@ -7814,10 +7821,12 @@ def test_an_apply_under_an_unanswered_probe_never_claims_it_created_none(group_z
         reviewed_instances=_reviewed(plan),
     )
 
-    assert result["cleared"] is True
-    assert result["mapped_tasks_settled"] is False
-    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
-    assert result["expansion_unprobed_tasks"] == ["grp.inner", "seed", "transmit"]
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert result["incomplete_read"]["read"] == "expandability probe over the cleared closure"
+    assert "['grp.inner', 'seed', 'transmit']" in result["incomplete_read"]["detail"]
+    assert server._NOTHING_CLEARED in result["error"]
+    assert group_zero_run.cleared == []
 
 
 def test_a_404_that_does_not_say_not_mapped_settles_nothing(group_zero_run):
@@ -8417,8 +8426,8 @@ def test_an_unknown_outcome_records_the_approved_set_because_the_write_may_have_
     assert server._approved_set_record(DAG_ID, "manual__1")["approved"] == [("report", -1)]
 
 
-def test_partial_probe_coverage_unsettles_the_claim_without_refusing_the_clear(cleared_run, monkeypatch):
-    """One closure task answers, another declines: an unanswered probe is not an addition."""
+def test_partial_probe_coverage_refuses_the_clear(cleared_run, monkeypatch):
+    """One closure task answers, another declines: part of a closure is not a closure."""
     plan = server.plan_task_instance_clear(
         DAG_ID, task_id="summarize", only_failed=False, include_downstream=True
     )
@@ -8438,11 +8447,10 @@ def test_partial_probe_coverage_unsettles_the_claim_without_refusing_the_clear(c
         reviewed_instances=_reviewed(plan),
     )
 
-    assert result["cleared"] is True
-    assert result["mapped_tasks_settled"] is False
-    assert result["expansion_unprobed_tasks"] == ["report"]
-    assert "['report']" in result["mapped_tasks_unsettled_warning"]
-    assert "MAY CREATE" in result["mapped_tasks_unsettled_warning"]
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert "['report']" in result["incomplete_read"]["detail"]
+    assert cleared_run.cleared == []
 
 
 def test_a_probe_that_answers_for_every_closure_task_still_settles_it(cleared_run, monkeypatch):
@@ -8502,3 +8510,337 @@ def test_the_missing_approval_record_enumerates_nothing_rather_than_an_empty_lis
     assert record["approved"] == server._APPROVED_SET_NOT_ESTABLISHED
     assert record["added_since_approval"] == server._APPROVED_SET_NOT_ESTABLISHED
     assert record["absent_since_approval"] == server._APPROVED_SET_NOT_ESTABLISHED
+
+
+# ---------------------------------------------------------------------------
+# Containment: no write on a read that cannot be shown complete.
+#
+# The gate runs once, immediately before the POST, and it is the only thing
+# between the approval and the mutation. So every test here asserts the mutation
+# COUNT — ``fake.cleared`` only grows on a non-dry-run clear — and never the
+# wording of the answer: a refusal that still wrote is not a refusal.
+# ---------------------------------------------------------------------------
+
+
+def _gate_plan(fake):
+    """The closure the gate guards: the seed and everything downstream of it."""
+    return server.plan_task_instance_clear(DAG_ID, task_id="summarize", only_failed=False)
+
+
+def _gate_apply(plan, **kwargs):
+    return server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+        **kwargs,
+    )
+
+
+def _truncate_preview(fake, monkeypatch, total):
+    """Let the preview account for more instances than it hands over, at apply time only."""
+    real = fake._clear
+
+    def only_on_the_second_preview(body):
+        result = real(body)
+        if body["dry_run"] and fake.calls.count(("POST", f"/dags/{DAG_ID}/clearTaskInstances")) > 1:
+            return {**result, "total_entries": total}
+        return result
+
+    monkeypatch.setattr(fake, "_clear", only_on_the_second_preview)
+
+
+@pytest.mark.parametrize(
+    ("claimed", "written"),
+    [(1, True), (2, True), (3, False)],
+    ids=["source-total-under-delivered", "source-total-equals-delivered", "source-total-over-delivered"],
+)
+def test_the_preview_is_measured_against_the_largest_universe_anyone_claims(
+    cleared_run, monkeypatch, claimed, written
+):
+    """Two rows delivered, none discarded. Only a source accounting for MORE than it sent is truncated.
+
+    A total BELOW what was handed over is a bad count, not an unread record: every
+    row the route sent is in hand. The universe is therefore the larger of the two,
+    which is the derivation ``_attempt_reading`` already makes.
+    """
+    plan = _gate_plan(cleared_run)
+    _truncate_preview(cleared_run, monkeypatch, claimed)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is written
+    assert len(cleared_run.cleared) == (1 if written else 0)
+    if not written:
+        assert result["incomplete_read"]["read"] == "clear preview"
+        assert f"2 instance(s) were read of {claimed if claimed > 2 else 2}" in result["error"]
+
+
+def test_a_truncated_preview_says_nothing_about_the_instances_it_did_not_read(cleared_run, monkeypatch):
+    plan = _gate_plan(cleared_run)
+    _truncate_preview(cleared_run, monkeypatch, 9)
+
+    result = _gate_apply(plan)
+
+    assert result["mutation_applied"] is False
+    assert server._NOTHING_CLEARED in result["error"]
+    assert "not established here, in either direction" in result["error"]
+    # The refusal names the read, and never sends the caller round again.
+    assert "clearTaskInstances" in result["incomplete_read"]["route"]
+    assert "Do not re-issue this call to get past it" in result["next_step"]
+    assert cleared_run.cleared == []
+
+
+def test_a_run_this_tool_cannot_read_whole_refuses_the_write(cleared_run, monkeypatch):
+    plan = _gate_plan(cleared_run)
+    real = server._run_task_instances
+    monkeypatch.setattr(
+        server, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 7)
+    )
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert "7 not seen" in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
+    """/tasks decides whether re-queuing changes the task set; half of it cannot."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tasks_total = 5
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert "lists more tasks than this tool read (3 of 5)" in result["error"]
+    assert cleared_run.cleared == []
+
+
+@pytest.mark.parametrize(
+    ("delivered", "claimed", "written"),
+    [
+        (10, None, True),
+        (11, None, False),
+        (10, 10, True),
+        (10, 11, False),
+        (15, 3, False),
+    ],
+    ids=[
+        "exact-limit",
+        "limit-plus-one",
+        "exact-limit-source-agrees",
+        "source-accounts-for-one-more",
+        "source-claims-complete-while-rows-are-discarded",
+    ],
+)
+def test_the_target_attempt_history_must_be_read_whole_before_the_write(
+    cleared_run, delivered, claimed, written
+):
+    """RECOVERY_ATTEMPT_LIMIT is 10, and a clamp is this tool's own truncation."""
+    cleared_run.tries_by_task[("summarize", -1)] = _attempts(delivered)
+    cleared_run.tries_total = claimed
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is written
+    assert len(cleared_run.cleared) == (1 if written else 0)
+    if not written:
+        assert result["incomplete_read"]["read"] == "attempt history of summarize"
+        assert "/tries" in result["incomplete_read"]["route"]
+
+
+def test_a_matching_attempt_outside_the_retained_slice_refuses_rather_than_denying_it(cleared_run):
+    """The record the clamp drops is the one the safety reading would have found."""
+    cleared_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=12)
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert "10 attempt(s) read of 12" in result["incomplete_read"]["detail"]
+    assert cleared_run.cleared == []
+
+
+def test_an_unreadable_attempt_history_refuses_the_write(cleared_run):
+    plan = _gate_plan(cleared_run)
+    cleared_run.fail_tries = httpx.ConnectError("connection refused")
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert "came back unavailable" in result["incomplete_read"]["detail"]
+    assert cleared_run.cleared == []
+
+
+def test_a_tries_page_that_carries_no_rows_while_accounting_for_some_refuses_the_write(cleared_run):
+    """ "Empty" and "truncated to nothing" are the same word from the route and not the same read."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tries_by_task[("summarize", -1)] = []
+    cleared_run.tries_total = 5
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert "0 attempt(s) read of 5" in result["incomplete_read"]["detail"]
+    assert cleared_run.cleared == []
+
+
+def test_an_attempt_history_that_is_genuinely_empty_still_permits_the_clear(cleared_run):
+    """A complete read with a real absence is not an incomplete read."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tries_by_task[("summarize", -1)] = []
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert result["mutation_applied"] is True
+    assert len(cleared_run.cleared) == 1
+
+
+def test_a_complete_history_holding_no_earlier_dispatched_attempt_still_permits_the_clear(cleared_run):
+    """The whole point of the guard is completeness, not what a complete read found."""
+    cleared_run.tries_by_task[("summarize", -1)] = _attempts(3)
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert result["mapped_tasks_settled"] is True
+    assert len(cleared_run.cleared) == 1
+
+
+@pytest.mark.parametrize("state", ["running", "queued", "scheduled"])
+def test_an_instance_in_flight_at_the_moment_of_the_write_is_refused(cleared_run, state):
+    """Airflow refuses only ``running``; queued and scheduled would clear through and re-dispatch."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tis_by_run["manual__1"][2]["state"] = state
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert result["in_flight_instances"] == ["report"]
+    assert server._NOTHING_CLEARED in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_a_state_that_moved_between_plan_and_apply_is_refused(cleared_run):
+    """The identity set still matches; the evidence card the approval rests on does not."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tis_by_run["manual__1"][2]["state"] = "skipped"
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["instances_that_moved"] == ["report"]
+    assert "('failed', 1)" in result["error"]
+    assert "('skipped', 1)" in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_an_attempt_that_landed_between_plan_and_apply_is_refused(cleared_run):
+    """try_number is what ``_identities`` throws away, and it is how a new attempt shows."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tis_by_run["manual__1"][2]["try_number"] = 2
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["instances_that_moved"] == ["report"]
+    assert cleared_run.cleared == []
+
+
+def test_a_task_that_became_expandable_between_plan_and_apply_writes_nothing(cleared_run):
+    plan = _gate_plan(cleared_run)
+    cleared_run.needs_expansion = {"report"}
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["newly_expandable_tasks"] == ["report"]
+    assert server._NOTHING_CLEARED in result["error"]
+    assert cleared_run.cleared == []
+
+
+def _no_tries(fake):
+    fake.fail_tries = httpx.ConnectError("connection refused")
+
+
+def _no_probe(fake):
+    fake.fail_list_mapped = httpx.RequestError("connection reset")
+
+
+def _clamped_tries(fake):
+    fake.tries_by_task[("summarize", -1)] = _attempts(12)
+
+
+def _short_task_list(fake):
+    fake.tasks_total = 9
+
+
+def _in_flight(fake):
+    fake.tis_by_run["manual__1"][2]["state"] = "queued"
+
+
+def _moved_state(fake):
+    fake.tis_by_run["manual__1"][2]["state"] = "skipped"
+
+
+def _expandable(fake):
+    fake.needs_expansion = {"report"}
+
+
+def _drifted_task_set(fake):
+    fake.tasks = DEMO_TASKS + [{"task_id": "publish", "downstream_task_ids": []}]
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    [
+        _no_tries,
+        _no_probe,
+        _clamped_tries,
+        _short_task_list,
+        _in_flight,
+        _moved_state,
+        _expandable,
+        _drifted_task_set,
+    ],
+    ids=[
+        "unreadable-tries",
+        "unanswered-probe",
+        "clamped-tries",
+        "short-task-list",
+        "in-flight",
+        "moved-state",
+        "newly-expandable",
+        "drifted-task-set",
+    ],
+)
+def test_no_refusal_path_reaches_the_write(cleared_run, break_it):
+    """Asserted on the mutation count, because prose is not what makes a refusal one."""
+    plan = _gate_plan(cleared_run)
+    break_it(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert cleared_run.cleared == []
+    assert result["cleared"] is False
+    assert result.get("mutation_applied") is False
+    assert server._approved_set_record(DAG_ID, "manual__1") is None
+
+
+def test_every_read_the_gate_rests_on_is_taken_after_the_approval_is_spent(cleared_run):
+    """A refusal must not leave the plan re-usable — one approval buys one attempt."""
+    plan = _gate_plan(cleared_run)
+    cleared_run.tasks_total = 9
+
+    assert _gate_apply(plan)["cleared"] is False
+    # The same token again is not "the read was incomplete"; the approval is gone.
+    assert "no reviewed plan" in _gate_apply(plan)["error"]
+    assert cleared_run.cleared == []

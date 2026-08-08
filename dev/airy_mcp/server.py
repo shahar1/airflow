@@ -382,14 +382,22 @@ def _run_task_instances(dag_id: str, run_path: str) -> tuple[list[dict[str, Any]
     return tis, max(total - len(tis), 0)
 
 
-def _tasks(dag_id: str) -> list[dict[str, Any]]:
-    """The current tasks and their edges.
+def _tasks_reading(dag_id: str) -> tuple[list[dict[str, Any]], int]:
+    """The current tasks and their edges, with the count the route accounted for.
 
     ``/tasks`` is the only *public* route that carries ``downstream_task_ids``;
     the richer structure view lives under ``/ui`` and is not part of the API this
-    server is allowed to speak.
+    server is allowed to speak. The total comes back so a caller that reasons
+    about the task set being COMPLETE can say whether it read all of it.
     """
-    return _api("GET", _dag_url(dag_id, "/tasks"))["tasks"]
+    resp = _api("GET", _dag_url(dag_id, "/tasks"))
+    rows = resp["tasks"]
+    return rows, resp.get("total_entries", len(rows))
+
+
+def _tasks(dag_id: str) -> list[dict[str, Any]]:
+    """The current tasks and their edges."""
+    return _tasks_reading(dag_id)[0]
 
 
 def _display_order(tasks: list[dict[str, Any]]) -> tuple[list[str], set[int]]:
@@ -849,8 +857,11 @@ def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str
         return {"status": "unavailable", "rows": [], "error": _explain_error(e)}
     if not rows:
         # Never read as "there were no earlier attempts" — it is the absence of
-        # an answer, not an answer of absence.
-        return {"status": "empty", "rows": [], "error": _HISTORY_EMPTY}
+        # an answer, not an answer of absence. ``attempts_recorded`` still comes
+        # back, because a page that carries no rows while accounting for some is
+        # a truncated read wearing the same word, and a caller deciding whether
+        # it read the whole history has to be able to tell the two apart.
+        return {"status": "empty", "rows": [], "attempts_recorded": total, "error": _HISTORY_EMPTY}
     if total > len(rows):
         # Presence-based conclusions survive a truncated list; absence-based
         # ones do not.
@@ -4231,8 +4242,15 @@ def _version_drift(dag_id: str, dag_run_id: str) -> tuple[dict[str, list[str]] |
             f"run {dag_run_id} has more task instances than this tool will read "
             f"({omitted} not seen), so it cannot tell whether clearing would change the task set"
         )
+    tasks, tasks_total = _tasks_reading(dag_id)
+    if len(tasks) < tasks_total:
+        return None, (
+            f"the latest version of {dag_id} lists more tasks than this tool read "
+            f"({len(tasks)} of {tasks_total}), so it cannot tell whether clearing would change "
+            f"the task set"
+        )
     current = {ti["task_id"] for ti in run_tis}
-    latest = {task["task_id"] for task in _tasks(dag_id)}
+    latest = {task["task_id"] for task in tasks}
     if current == latest:
         return None, None
     return {"added": sorted(latest - current), "removed": sorted(current - latest)}, None
@@ -5090,6 +5108,10 @@ def plan_task_instance_clear(
             "reviewed_instances": reviewed_instances,
             "affected": _identities(affected),
             "attempts": {_ti_where(ti): ti.get("try_number") for ti in affected},
+            # The evidence card the approval rests on, kept in the fields
+            # ``_identities`` throws away. An identity set that still matches
+            # says nothing about an attempt that landed in between.
+            "states": {_ti_where(ti): ti.get("state") for ti in affected},
             # Carried, not recomputed: the apply must make no network call
             # between the write and the answer it returns, because a read that
             # raises there turns a clear that landed into a reported failure.
@@ -5099,6 +5121,281 @@ def plan_task_instance_clear(
         },
     )
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Containment: what has to be shown READ WHOLE before the clear is written.
+#
+# Every read this write rests on is bounded — by the route's paging, by
+# RECOVERY_ATTEMPT_LIMIT, by TASK_INSTANCE_SCAN_LIMIT — and a bounded read used
+# as if it were the whole universe turns a record nobody looked at into a record
+# that is not there. So the question asked here is not "does the evidence say
+# yes". It is "was the evidence read whole, at the moment immediately before the
+# write". One rule, one place, evaluated immediately before the POST: a read
+# that cannot show it was complete refuses the write, and the refusal names the
+# READ rather than the conclusion it could not reach.
+#
+# This gate will refuse clears that would have been fine. That is the trade it
+# exists to make: the cost of refusing a good clear is a re-plan, and the cost of
+# writing on a partial read is a mutation nobody reviewed.
+# ---------------------------------------------------------------------------
+
+_NOTHING_CLEARED = "Nothing was cleared — this was checked before the write was sent."
+
+# What a refusal must not do: send the caller round again to get past the guard.
+_DO_NOT_BYPASS = (
+    "Tell the user nothing was cleared and name the read that could not be shown complete. Do not "
+    "re-issue this call to get past it: re-plan, and if the read is still incomplete the clear "
+    "stays unsent."
+)
+
+_NO_EXPANSION: dict[str, Any] = {"tasks": [], "settled": False, "unprobed": []}
+
+
+def _read_is_complete(kept: int, delivered: int, claimed: Any) -> bool:
+    """Whether a list read holds every record anything involved accounts for.
+
+    Three numbers, because three different things truncate a list: the route's
+    own paging (``claimed`` above ``delivered``), this tool's clamps (``kept``
+    below ``delivered``), and a source whose count is simply lower than what it
+    handed over. Completeness is what was KEPT measured against the largest
+    universe anyone claimed — the derivation ``_attempt_reading`` already makes.
+    A read that discarded rows is truncated whatever the source said its total
+    was, and a source that accounts for more than it sent is truncated whatever
+    this tool did with the rows.
+    """
+    universe = max(delivered, claimed) if isinstance(claimed, int) else delivered
+    return kept >= universe
+
+
+def _incomplete_read(dag_id: str, dag_run_id: str, read: str, route: str, why: str) -> dict[str, Any]:
+    """The refusal for a decision-bearing read that could not be shown complete.
+
+    Pre-mutation by construction: the gate runs before the POST, so "nothing was
+    cleared" is a fact about this call and not an inference from a response. It
+    says which read fell short and how far, and it says nothing whatever about
+    what the records it did not read contain.
+    """
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_id": dag_id,
+        "dag_run_id": dag_run_id,
+        "incomplete_read": {"read": read, "route": route, "detail": why},
+        "error": (
+            f"this clear was NOT sent: the {read} could not be shown to be complete at the moment "
+            f"before the write ({why}). A decision taken over part of a list is a decision about "
+            f"the part that was read, and this one would have authorised a write. "
+            f"{_NOTHING_CLEARED} What the unread records hold is not established here, in either "
+            f"direction."
+        ),
+        "next_step": _DO_NOT_BYPASS,
+    }
+
+
+def _expired_evidence(dag_id: str, dag_run_id: str, why: str, **fields: Any) -> dict[str, Any]:
+    """The refusal for a read that was complete when taken and is no longer current.
+
+    Staleness is the same defect as truncation wearing a different coat: the
+    approval names a universe, and by the time of the write that universe has
+    moved. Also pre-mutation, so it carries the same "not applied" shape.
+    """
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_id": dag_id,
+        "dag_run_id": dag_run_id,
+        **fields,
+        "error": (
+            f"this clear was NOT sent: {why}. The approval the user gave named the state as it was "
+            f"read at plan time, so it no longer describes what would be written. "
+            f"{_NOTHING_CLEARED}"
+        ),
+        "next_step": _DO_NOT_BYPASS,
+    }
+
+
+def _containment_gate(
+    dag_id: str,
+    dag_run_id: str,
+    run_path: str,
+    plan: dict[str, Any],
+    preview: Any,
+    now: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Every decision-bearing read behind this write, re-asked and proven whole.
+
+    Returns ``(refusal, expansion)``. A refusal is returned when any read the
+    authorization, the target set, the closure, the idempotency or the safety of
+    this write depends on is truncated, clamped, unreadable, stale or internally
+    inconsistent. ``expansion`` is handed back so the caller does not re-ask the
+    probe after the write — a network call there turns a clear that landed into a
+    reported failure.
+    """
+    # R1 — the target set. The preview IS the set that gets written, so a preview
+    # that accounted for more instances than it handed over describes a write
+    # this call cannot enumerate.
+    body = preview if isinstance(preview, dict) else {}
+    delivered = len(body.get("task_instances") or [])
+    claimed = body.get("total_entries")
+    if not _read_is_complete(len(now), delivered, claimed):
+        universe = max(delivered, claimed) if isinstance(claimed, int) else delivered
+        return (
+            _incomplete_read(
+                dag_id,
+                dag_run_id,
+                "clear preview",
+                "POST /dags/<dag>/clearTaskInstances (dry_run=true)",
+                f"{len(now)} instance(s) were read of {universe} the route accounted for",
+            ),
+            _NO_EXPANSION,
+        )
+
+    # R1 — and the same set the user reviewed, by identity.
+    if _identities(now) != plan["affected"]:
+        return (
+            {
+                "cleared": False,
+                "mutation_applied": False,
+                "dag_run_id": dag_run_id,
+                "affected": now,
+                "error": (
+                    f"what this clear would affect changed since the user reviewed it "
+                    f"({len(plan['affected'])} instance(s) then, {len(now)} now); re-plan and show them"
+                ),
+            },
+            _NO_EXPANSION,
+        )
+
+    # R2 — the fields ``_identities`` throws away. An identity set that still
+    # matches proves nothing about an attempt that landed in between, and the
+    # plan's own in-flight refusal was never re-asked before the write.
+    live_states = {_ti_where(ti): ti.get("state") for ti in now}
+    live_attempts = {_ti_where(ti): ti.get("try_number") for ti in now}
+    in_flight = sorted(where for where, state in live_states.items() if state in _IN_FLIGHT_TARGET_STATES)
+    if in_flight:
+        return (
+            _expired_evidence(
+                dag_id,
+                dag_run_id,
+                f"{in_flight} is on its way to a worker or already has one "
+                f"({sorted({str(live_states[where]) for where in in_flight})}). Airflow itself "
+                f"refuses a clear only for {_quoted(_REFUSED_BY_THE_API_STATE)} "
+                f"(models/taskinstance.py:387), so a queued or scheduled instance would clear "
+                f"through and be dispatched twice",
+                in_flight_instances=in_flight,
+            ),
+            _NO_EXPANSION,
+        )
+    planned_states = plan.get("states") or {}
+    planned_attempts = plan.get("attempts") or {}
+    moved = sorted(
+        where
+        for where in live_states
+        if (where in planned_states and live_states[where] != planned_states[where])
+        or (where in planned_attempts and live_attempts[where] != planned_attempts[where])
+    )
+    if moved:
+        return (
+            _expired_evidence(
+                dag_id,
+                dag_run_id,
+                f"{moved} moved since the plan was shown — state or try_number is not what was read "
+                f"then (planned "
+                f"{ {where: (planned_states.get(where), planned_attempts.get(where)) for where in moved} }, "
+                f"now { {where: (live_states[where], live_attempts[where]) for where in moved} })",
+                instances_that_moved=moved,
+            ),
+            _NO_EXPANSION,
+        )
+
+    # R3 / R4 — the run's instance list and the Dag's task list, both of which
+    # decide whether re-queuing this run changes its task set. ``_version_drift``
+    # reports its own incompleteness for each; the decision is taken here.
+    drift, drift_error = _version_drift(dag_id, dag_run_id)
+    if drift or drift_error:
+        return (
+            {
+                "cleared": False,
+                "mutation_applied": False,
+                "dag_run_id": dag_run_id,
+                "migration": drift,
+                "error": drift_error
+                or (
+                    f"the Dag's tasks changed since the user reviewed this clear ({drift}), so "
+                    f"re-queuing the run would now add or drop instances they never saw; re-plan "
+                    f"and show them"
+                ),
+            },
+            _NO_EXPANSION,
+        )
+
+    # R5 / R6 — the closure. ``_version_drift`` compares task-id SETS, so it is
+    # blind to a task that became expandable under the same id: the fan-out
+    # changes and the id does not. The plan's answer is therefore not carried
+    # into the write; it is asked again here, against the live Dag.
+    expansion = _mapped_in_closure(dag_id, run_path, now)
+    gained = sorted(set(expansion["tasks"]) - set(plan.get("mapped_tasks") or []))
+    if gained:
+        return (
+            {
+                "cleared": False,
+                "mutation_applied": False,
+                "dag_run_id": dag_run_id,
+                "newly_expandable_tasks": gained,
+                "error": (
+                    f"the task(s) {gained} became expandable since the user reviewed this clear, so "
+                    f"their instances are now recomputed from upstream output when the run is "
+                    f"re-queued and this clear MAY CREATE instances the reviewed plan did not "
+                    f"enumerate; re-plan and show them. {_NOTHING_CLEARED}"
+                ),
+                "next_step": _DO_NOT_BYPASS,
+            },
+            _NO_EXPANSION,
+        )
+    if not expansion["settled"]:
+        # A probe that declines leaves the closure unread, and the closure is
+        # what says whether this write can create instances nobody reviewed. It
+        # used to unsettle a claim in the result; it now refuses the write.
+        return (
+            _incomplete_read(
+                dag_id,
+                dag_run_id,
+                "expandability probe over the cleared closure",
+                "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/listMapped",
+                f"the probe did not answer for {expansion['unprobed']}, so whether this clear's "
+                f"instance set is closed was not established",
+            ),
+            _NO_EXPANSION,
+        )
+
+    # R7 — the attempt history behind the safety reading the approval rests on:
+    # whether an earlier attempt of the target already reached the outside world,
+    # which is what makes this clear a possible duplicate of half an operation.
+    target = _plan_target(plan)
+    marker = (plan.get("task_ids") or [None])[0]
+    wanted = marker[1] if isinstance(marker, (list, tuple)) and len(marker) > 1 else -1
+    for ti in now:
+        if ti["task_id"] != target or ti.get("map_index", -1) != wanted:
+            continue
+        history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
+        recorded = history.get("attempts_recorded")
+        kept = len(history["rows"])
+        if history["status"] == "checked" or (history["status"] == "empty" and not recorded):
+            break
+        return (
+            _incomplete_read(
+                dag_id,
+                dag_run_id,
+                f"attempt history of {_ti_where(ti)}",
+                "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/tries",
+                f"the reading came back {history['status']} — {kept} attempt(s) read of "
+                f"{recorded if isinstance(recorded, int) else 'an unknown number'} "
+                f"({_quoted(history.get('error'), 200)})",
+            ),
+            _NO_EXPANSION,
+        )
+    return None, expansion
 
 
 def _clear_outcome_unknown(
@@ -5244,60 +5541,21 @@ def apply_task_instance_clear(
     # The preview and the clear are two calls, so state can move between them:
     # a task that started running since would otherwise be killed by an approval
     # given for a failed one.
-    now = _affected(_api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body))
-    if _identities(now) != plan["affected"]:
-        return {
-            "cleared": False,
-            "mutation_applied": False,
-            "dag_run_id": dag_run_id,
-            "affected": now,
-            "error": (
-                f"what this clear would affect changed since the user reviewed it "
-                f"({len(plan['affected'])} instance(s) then, {len(now)} now); re-plan and show them"
-            ),
-        }
-    # Every write precondition is re-established here, immediately before the
-    # POST, so the window where the Dag could change under the approval is as
-    # narrow as REST calls allow. It cannot be closed from out here — the same is
-    # true of the backfill preview — but nothing decided at plan time is carried
-    # into the write unre-checked. A refusal on this path is PRE-mutation: the
-    # POST has not been sent, so "not applied" is a fact, not an inference.
-    drift, drift_error = _version_drift(dag_id, dag_run_id)
-    if drift or drift_error:
-        return {
-            "cleared": False,
-            "mutation_applied": False,
-            "dag_run_id": dag_run_id,
-            "migration": drift,
-            "error": drift_error
-            or (
-                f"the Dag's tasks changed since the user reviewed this clear ({drift}), so re-queuing "
-                f"the run would now add or drop instances they never saw; re-plan and show them"
-            ),
-        }
-    # ``_version_drift`` compares task-id SETS, so it is blind to a task that
-    # became expandable under the same id — the fan-out changes, the id does not.
-    # The plan's answer is therefore not carried into the result; it is asked
-    # again here, against the live Dag, and a task the plan enumerated as
-    # unmapped that now probes expandable is a blast radius the user never
-    # reviewed. A probe that DECLINES is not an addition and does not refuse:
-    # it lands in expansion_unprobed_tasks and unsettles the claim instead.
-    expansion = _mapped_in_closure(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}", now)
-    gained = sorted(set(expansion["tasks"]) - set(plan.get("mapped_tasks") or []))
-    if gained:
-        return {
-            "cleared": False,
-            "mutation_applied": False,
-            "dag_run_id": dag_run_id,
-            "newly_expandable_tasks": gained,
-            "error": (
-                f"the task(s) {gained} became expandable since the user reviewed this clear, so "
-                f"their instances are now recomputed from upstream output when the run is "
-                f"re-queued and this clear MAY CREATE instances the reviewed plan did not "
-                f"enumerate; re-plan and show them. Nothing was cleared — this was checked before "
-                f"the write was sent."
-            ),
-        }
+    preview = _api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
+    now = _affected(preview)
+    # Every write precondition is re-established HERE, in one place, immediately
+    # before the POST, so the window where the world could move under the
+    # approval is as narrow as REST calls allow. It cannot be closed from out
+    # here — the same is true of the backfill preview — but nothing decided at
+    # plan time is carried into the write unre-checked, and no read the decision
+    # rests on is used without first showing it was read whole. A refusal on this
+    # path is PRE-mutation: the POST has not been sent, so "not applied" is a
+    # fact, not an inference.
+    contained, expansion = _containment_gate(
+        dag_id, dag_run_id, f"/dagRuns/{quote(dag_run_id, safe='')}", plan, preview, now
+    )
+    if contained is not None:
+        return contained
     try:
         cleared = _affected(
             _api("POST", _dag_url(dag_id, "/clearTaskInstances"), json={**body, "dry_run": False})
