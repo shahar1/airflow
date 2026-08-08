@@ -1075,6 +1075,11 @@ def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bo
     known = [row.get("version_number") for row in versions.rows]
     context["latest_version"] = known[0] if known else None
     context["versions_status"] = "checked" if versions.complete else "partial"
+    if not versions.complete:
+        # The READ, named. A status word carries no identity: "partial" beside
+        # a version list says a read fell short without saying which one, and a
+        # reader cannot tie it to anything.
+        context["versions_not_read_whole"] = versions.describe()
     if run_versions:
         # One verdict per version the run recorded: "still listed" is a presence
         # and survives truncation, "no longer listed" is an absence and does not.

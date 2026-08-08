@@ -385,6 +385,10 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
             "attempts_omitted": max(whole.kept - len(rows), 0),
             "earlier_attempt_carries_execution_fields": earlier_executed,
             "error": reading.attempt_error(whole),
+            # The READ, named, whenever it fell short. ``status: "partial"``
+            # says a read did, without saying which — and a card carrying three
+            # readings gave the reader no way to tell them apart.
+            **({} if whole.complete else {"not_read_whole": whole.describe()}),
         },
         "live_row_carries_execution_fields": live_executed,
         "log_for_recorded_attempt": _tagged_log(_attempt_log(dag_id, run_path, ti, ti.get("try_number"))),
@@ -767,7 +771,8 @@ def plan_task_instance_clear(
             "planned": False,
             "error": (
                 f"run {resolved_run_id} has more task instances than this tool will read "
-                f"({run_scan.omitted} not seen), so it cannot enumerate what this clear would touch"
+                f"({run_scan.omitted} not seen on {run_scan.route}), so it cannot enumerate what "
+                f"this clear would touch"
             ),
         }
     if target_state in _IN_FLIGHT_TARGET_STATES:

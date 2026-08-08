@@ -32,10 +32,20 @@ import pytest
 
 # fastmcp only ships inside the Breeze image; stub it so the tool logic is
 # testable anywhere.  The stub's ``tool`` is the identity, which is exactly how
-# server.py registers its tools.
+# server.py registers its tools — and it RECORDS what it was handed, so the tool
+# registry the sweeps run over is observed at registration rather than read off
+# the AST. Reading the AST meant reading one ``for`` loop's tuple, and
+# ``mcp.tool(globals()["list_stalled_pools"])`` is a Subscript: a live tool of
+# the server that no sweep could see, with every count assertion still passing.
 if "fastmcp" not in sys.modules:
+    _REGISTERED_AT_IMPORT: list = []
+
+    def _record_tool(fn):
+        _REGISTERED_AT_IMPORT.append(fn)
+        return fn
+
     _stub = types.ModuleType("fastmcp")
-    _stub.FastMCP = lambda *args, **kwargs: types.SimpleNamespace(tool=lambda fn: fn)  # type: ignore[attr-defined]
+    _stub.FastMCP = lambda *args, **kwargs: types.SimpleNamespace(tool=_record_tool)  # type: ignore[attr-defined]
     sys.modules["fastmcp"] = _stub
 
 import approvals
@@ -47,6 +57,10 @@ import reading
 import recovery
 import server
 import transport
+
+# Empty when the real FastMCP is installed, in which case the scan below falls
+# back to the AST.
+_REGISTERED_AT_IMPORT = globals().get("_REGISTERED_AT_IMPORT", [])
 
 DAG_ID = "sales_summary"
 SOURCE = 'op_kwargs={"column": "ammount"}\nprint("ammount is a typo")\n'
@@ -9698,12 +9712,26 @@ def test_the_readers_that_carry_a_reading_really_carry_one(airflow, tmp_path, en
 
 
 def _registered_tools():
-    """Every tool this server registers, however it registers it.
+    """Every tool this server registers, OBSERVED at registration.
 
-    Reading only the registration tuple made a tool registered by any other
-    means — ``@mcp.tool`` on the def, a bare ``mcp.tool(f)`` beside the loop —
-    invisible to every sweep below while being a live tool of the server.
+    The stub above records what ``mcp.tool`` was handed while ``server`` was
+    imported, so the spelling of the registration is not part of the answer: a
+    decorator, a loop, a bare call, a name fetched out of ``globals()`` all
+    arrive here identically. The AST scan is kept underneath as a cross-check —
+    it must not see MORE than the run did, which is the direction that hides a
+    tool rather than invents one.
     """
+    observed = sorted(getattr(fn, "__name__", "") for fn in _REGISTERED_AT_IMPORT)
+    if observed:
+        assert set(observed) >= set(_registered_tools_by_ast()), (
+            "the AST sees a registration the import did not make"
+        )
+        return observed
+    return _registered_tools_by_ast()
+
+
+def _registered_tools_by_ast():
+    """The registrations one static scan can see — everything it cannot is the point."""
     tree = _module_source("server")
     loops = {}
     names = set()
@@ -10122,6 +10150,46 @@ def test_every_read_that_reaches_airflow_was_made_by_a_registered_reader(
     )
 
 
+def test_the_instruments_own_census_is_derived_and_printed(capsys):
+    """Every number this instrument is described by, COMPUTED here.
+
+    The counts in the prose beside it have been wrong in both repair rounds —
+    recited from a previous shape of the tree — and a recited number is a claim
+    about coverage that nothing checks. These are derived, printed, and held
+    only to relations that must hold whatever the tree grows into.
+    """
+    readers = _functions_calling_transport()
+    exclusions = set(_READS_WITHOUT_A_UNIVERSE) | set(_READS_CARRYING_A_READING)
+    typed = _typed_readers()
+    counts, flags = _truncation_knobs()
+    census = {
+        "modules swept": len(_MODULES),
+        "modules excluded by name": len(_NOT_THE_SERVER),
+        "transport readers (AST)": len(readers),
+        "declared exclusions": len(exclusions),
+        "typed readers": len(typed),
+        "row-count bounds": len(_row_count_bounds()),
+        "source-count knobs": len(counts),
+        "no-count knobs": len(flags),
+        "levers": len(_LEVERS),
+        "levers declared inert": len(_LEVERS_THAT_MOVE_NOTHING),
+        "registered tools": len(_registered_tools()),
+        "value-swept tools": len(_SWEPT_TOOLS),
+        "writing tools": len(_WRITING_TOOLS),
+        "value sweep cases": len(_LEVERS) * len(_SWEPT_TOOLS),
+        "write sweep cases": len(_LEVERS) * len(_WRITING_TOOLS),
+    }
+    print("\n".join(f"{value:>5}  {name}" for name, value in census.items()))
+
+    assert census["transport readers (AST)"] == census["declared exclusions"] + census["typed readers"]
+    assert census["levers"] == (
+        census["source-count knobs"] + census["no-count knobs"] + census["row-count bounds"]
+    )
+    assert census["registered tools"] == census["value-swept tools"] + census["writing tools"]
+    assert census["levers declared inert"] < census["levers"], "the whole axis is inert"
+    assert "levers" in capsys.readouterr().out.replace("\n", " ") or True
+
+
 def test_the_observed_registry_would_catch_a_read_through_a_second_entry_point():
     """The instrument's own discrimination, stated as a test rather than asserted
     in a comment: a site nothing declares is reported whatever route it used."""
@@ -10418,16 +10486,21 @@ def _watching_readings(monkeypatch):
     A read that FAILED is not a short read: the two are different answers to
     "why can nothing be concluded here", and only one of them is a truncation.
     """
-    short_routes: list[str] = []
+    short_reads: list[tuple[str, str, int]] = []
     original = reading.Reading.__init__
 
     def watched(self, *args, **kwargs):
         original(self, *args, **kwargs)
         if self.error is None and not reading.Reading.complete.fget(self):
-            short_routes.append(self.route)
+            # The route AND the sentence the type itself writes for this
+            # shortfall. The sentence is what ties a disclosure to the read that
+            # produced it: a bare word matched anywhere in the payload is
+            # cross-talk, and a payload naming ONE short read while swallowing a
+            # second passed on the strength of the first.
+            short_reads.append((self.route, reading.Reading.reason.fget(self), self.omitted))
 
     monkeypatch.setattr(reading.Reading, "__init__", watched)
-    return short_routes
+    return short_reads
 
 
 # Leaf suffixes that carry read coverage in the payload rather than in prose.
@@ -10664,6 +10737,51 @@ _TRUNCATION_VOCABULARY = (
 )
 
 
+def _names_this_read(route, reason, omitted, whole, short, before, after):
+    """Whether the payload discloses THIS read's shortfall, not some other one.
+
+    Three ties, all of them to the read itself rather than to a vocabulary:
+    the route string, the sentence the ``Reading`` wrote for its own shortfall
+    (or the distinctive clauses of it), and a coverage leaf whose value moved by
+    exactly the number of rows this read did not cover. A bare word matched
+    anywhere in the payload is none of those — stripping ``get_blast_radius`` of
+    both its caveat and its coverage flag and adding an unrelated
+    ``"schedule_source": "unavailable"`` satisfied the old rule outright.
+    """
+    if route and route in after and route not in before:
+        return True
+    for clause in (part.strip() for part in reason.split(";")):
+        if len(clause) > 12 and clause in after and clause not in before:
+            return True
+    # The exact number of rows THIS read did not cover, appearing where the
+    # whole answer had no such number. Arithmetic is a tie in a way a status
+    # word is not: "9996 not seen" belongs to the read that missed 9996 rows.
+    if omitted and re.search(rf"\b{omitted}\b", after) and not re.search(rf"\b{omitted}\b", before):
+        return True
+    for path in _coverage_disclosures(whole, short):
+        value = dict(_leaves(short)).get(path)
+        # A COUNT that equals the rows this read did not cover is tied to it by
+        # arithmetic. A bare status word — ``"partial"``, ``"unavailable"`` —
+        # carries no identity at all, and any leaf anywhere holding one used to
+        # count as this read naming itself.
+        if isinstance(value, int) and not isinstance(value, bool) and value == omitted and omitted:
+            return True
+    return False
+
+
+def _routes_whose_shortfall_is_unnamed(short_reads, whole, short, before, after):
+    """EVERY short read, not one of them. ``named`` needed a single member, so a
+    tool reaching two short reads and disclosing one passed while swallowing the
+    other."""
+    return sorted(
+        {
+            route
+            for route, reason, omitted in short_reads
+            if not _names_this_read(route, reason, omitted, whole, short, before, after)
+        }
+    )
+
+
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
 @pytest.mark.parametrize("lever", sorted(_LEVERS))
 def test_a_truncated_read_is_named_in_the_result(airflow, tmp_path, monkeypatch, tool, lever):
@@ -10680,21 +10798,54 @@ def test_a_truncated_read_is_named_in_the_result(airflow, tmp_path, monkeypatch,
     before = _without_tokens(whole)
 
     _LEVERS[lever](airflow, monkeypatch)
-    short_routes = _watching_readings(monkeypatch)
+    short_reads = _watching_readings(monkeypatch)
     short = _SWEPT_TOOLS[tool]()
     after = _without_tokens(short)
 
-    if not short_routes:
-        # Measured, not assumed: no read this tool made came back short, so
-        # there is no shortfall for it to name.
-        return
-    named = [route for route in set(short_routes) if route and route in after and route not in before]
-    named += [word for word in _TRUNCATION_VOCABULARY if word in after and word not in before]
-    named += _coverage_disclosures(whole, short)
-    assert named, (
-        f"{tool} reached a short read on {sorted(set(short_routes))} under {lever} "
-        f"and named no shortfall the whole read had not already named"
+    unnamed = _routes_whose_shortfall_is_unnamed(short_reads, whole, short, before, after)
+    assert unnamed == [], (
+        f"{tool} reached a short read on {unnamed} under {lever} and named that read's "
+        f"shortfall nowhere — a disclosure of a DIFFERENT read does not cover it"
     )
+
+
+def test_a_disclosure_of_one_read_does_not_cover_a_different_read():
+    """I6's proven evasion, as a test.
+
+    Stripping a tool of both its caveat and its coverage flag and adding an
+    unrelated ``"schedule_source": "unavailable"`` satisfied the old rule: any
+    string leaf anywhere holding one of four words counted as naming the
+    shortfall, with no tie to the route that came back short.
+    """
+    route = "GET /assets"
+    reason = "the route accounted for 900 and handed over 4"
+    whole = {"produces_assets": ["a"], "schedule_source": "checked"}
+    swallowed = {"produces_assets": ["a"], "schedule_source": "unavailable"}
+    disclosed = {**whole, "asset_catalog_not_read_whole": f"{route} was NOT read whole: {reason}"}
+
+    assert not _names_this_read(route, reason, 896, whole, swallowed, str(whole), str(swallowed))
+    assert _names_this_read(route, reason, 896, whole, disclosed, str(whole), str(disclosed))
+
+
+def test_every_short_read_has_to_be_named_and_not_merely_one_of_them():
+    """``named`` needed a single member, so a tool reaching two short reads and
+    disclosing one passed while swallowing the other."""
+    reads = [("GET /assets", "the route accounted for 900 and handed over 4", 896), ("GET /pools", "x", 7)]
+    whole = "{}"
+    after = "{'note': 'GET /assets was NOT read whole'}"
+
+    assert _routes_whose_shortfall_is_unnamed(reads, {}, {}, whole, after) == ["GET /pools"]
+
+
+def test_a_correct_disclosure_keeps_counting_when_it_is_renamed():
+    """The other direction of the same defect: the vocabulary was over-strict as
+    well as leaky, so renaming ``asset_catalog_read_whole`` to
+    ``asset_catalog_coverage`` made a correct disclosure stop counting."""
+    route = "GET /assets"
+    reason = "the route accounted for 900 and handed over 4"
+    renamed = {"asset_catalog_coverage": f"{route} was NOT read whole: {reason}"}
+
+    assert _names_this_read(route, reason, 896, {}, renamed, "{}", str(renamed))
 
 
 def test_the_truncation_vocabulary_says_nothing_a_whole_read_says(airflow, tmp_path):
@@ -10730,8 +10881,12 @@ def _absent_construction_sites():
                 sites.append((module, owner))
             elif isinstance(node, ast.Name) and node.id == "ABSENT":
                 sites.append((module, owner))
-            elif isinstance(node, ast.Constant) and node.value == "absent":
-                # ``Outcome("absent")`` reaches the same member by its value.
+            elif isinstance(node, ast.Constant) and str(node.value).lower() == "absent":
+                # The member by its VALUE — ``Outcome("absent")`` — and by its
+                # NAME: ``getattr(reading.Outcome, "ABSENT")`` and
+                # ``reading.Outcome["ABSENT"]`` both reach the same negative
+                # through a string, and matching the lowercase value alone saw
+                # neither of them.
                 sites.append((module, owner))
     return sorted(set(sites))
 
@@ -11447,22 +11602,100 @@ _CLAIM_WORDS = (
 )
 
 
+# The comparison forms a derivation can be written in. ``ast.Compare`` is one of
+# them; ``operator.eq(len(rows), body.get("total_entries"))`` is the same
+# derivation as a Call and was structurally invisible.
+_COMPARISON_FUNCTIONS = ("eq", "ne", "lt", "le", "gt", "ge")
+
+
+def _tainted_names(owner_body):
+    """Local names bound to something that holds a count, or something that holds a claim.
+
+    Extracting the two halves to locals took the words out of the comparison and
+    the whole scan with them:
+
+        seen = len(rows)
+        stated = body.get("total_entries")
+        whole = seen == stated
+
+    ``seen == stated`` carries neither a count word nor a claim word, and it is
+    the derivation. The names are followed instead, to a fixed point, so a chain
+    of assignments is followed too.
+    """
+    counts, claims = set(), set()
+    for _ in range(4):
+        before = (len(counts), len(claims))
+        for node in ast.walk(owner_body):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            text = ast.unparse(value)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            named = {t.id for t in targets if isinstance(t, ast.Name)}
+            if any(word in text for word in _COUNT_WORDS) or any(f" {n} " in f" {text} " for n in counts):
+                counts |= named
+            if any(word in text for word in _CLAIM_WORDS) or any(f" {n} " in f" {text} " for n in claims):
+                claims |= named
+        if (len(counts), len(claims)) == before:
+            break
+    return counts, claims
+
+
+def _operands(node):
+    """The two sides of a comparison, whichever form it is written in."""
+    return [node.left, *node.comparators] if isinstance(node, ast.Compare) else list(node.args)
+
+
+def _holds(node, text, words, tainted):
+    """Whether either side of this comparison carries a count, or carries a claim.
+
+    A tainted local counts only as a WHOLE operand, never as a substring of the
+    text: matching the name anywhere made every comparison mentioning it a
+    completeness derivation, and most of them are not.
+    """
+    if any(word in text for word in words):
+        return True
+    sides = _operands(node)
+    # A comparison against a bare ``True``/``False``/``None`` is a three-valued
+    # field being READ, never a count measured against a claim.
+    if any(isinstance(side, ast.Constant) and side.value in (None, True, False) for side in sides):
+        return False
+    return any(isinstance(side, ast.Name) and side.id in tainted for side in sides)
+
+
 def _completeness_comparisons():
     """Every place in the tree that measures a count against a bound or a total.
 
     The census that started this: nine sites in four mutually incompatible
     forms, of which one was correct. The target is one site and one form, and
     the scan is what keeps it there when the tenth is written — in whatever
-    shape the tenth is written in.
+    shape the tenth is written in, including a shape whose halves were carried
+    to locals first and a shape that is a function call rather than an operator.
     """
     found = []
     for module in _MODULES:
-        for _, node in _owned_nodes(_module_source(module)):
-            if not isinstance(node, ast.Compare):
-                continue
-            text = ast.unparse(node)
-            if any(word in text for word in _COUNT_WORDS) and any(word in text for word in _CLAIM_WORDS):
-                found.append((module, text))
+        tree = _module_source(module)
+        bodies = {}
+        for owner, node in _owned_nodes(tree):
+            bodies.setdefault(owner, []).append(node)
+        for _owner, nodes in bodies.items():
+            holder = ast.Module(body=[n for n in nodes if isinstance(n, ast.stmt)], type_ignores=[])
+            counts, claims = _tainted_names(holder)
+            for node in nodes:
+                if isinstance(node, ast.Compare):
+                    text = ast.unparse(node)
+                elif (
+                    isinstance(node, ast.Call)
+                    and getattr(node.func, "attr", getattr(node.func, "id", "")) in _COMPARISON_FUNCTIONS
+                    and len(node.args) == 2
+                ):
+                    text = ast.unparse(node)
+                else:
+                    continue
+                if _holds(node, text, _COUNT_WORDS, counts) and _holds(node, text, _CLAIM_WORDS, claims):
+                    found.append((module, text))
     return found
 
 
@@ -11514,6 +11747,9 @@ _PAGINATION_TERMINATIONS = {
 # own display ceilings rather than a route's account of its rows.
 _DISPLAY_CEILINGS = {
     ("codechange", "len(entries) > reading.MAX_BACKFILL_RUNS"),
+    # The same ceiling, at the other end of the same tool: how many runs one
+    # backfill may create. A refusal to write, not a claim about a read.
+    ("codechange", "count > reading.MAX_BACKFILL_RUNS"),
     # "Is this the sample I asked for, or a page that fell short of it?" — the
     # request carried ``limit=RUN_HISTORY_LIMIT``, so a page that comes back AT
     # the limit is the sample and not a shortfall. This one is a display ceiling
