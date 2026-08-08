@@ -582,7 +582,7 @@ during a move wave, the wave changed behaviour and must be reverted.
 | **D11** | `_tail:355-362`,`_attempt_log:4342`| Clamp to 40 lines / 4000 chars (and`[-600:]`) and return a bare`str`. No caller can tell a truncated log from a whole one;`_extract_error_line`,`_error_signature`and`log_for_new_attempt:6098`all conclude over it. | Return`(text, truncated)`;`log_for_new_attempt`renders`None` when truncated and no marker was found. |
 | **D12** | `_find_import_errors:599-600`| The`except`arm returns a bare`[]`, indistinguishable from "no import errors".`:628`reports truncation only as prose. | Return a`Reading`with`error` set; the diagnosis renders UNKNOWN. |
 | **D13** | `_containment_gate`/`_identities:4225-4227`(Round-4 MAJOR 2) |`_identities`discards`state`and`try_number`, and the **plan's own in-flight refusal is never re-asked** before the POST. Airflow refuses only`running`, so`queued`/`scheduled`clear through — the double-dispatch case the plan's rule exists to prevent. The gate's R2/R2b at`:5276`/`:5298` cover part of this; the *plan-time* rule set and the *gate* rule set are not the same set. | A single declared registry of write preconditions; the gate iterates it. §5 criterion **N7** makes the two sets provably equal. |
-| **D14** | `_enforce_attribution_ceiling:3115`|`event_history["instances_without_attribution"] = detail_reduced`writes a **projection** completeness number onto the **event-history** payload, where a reader attributes it to the event scan. Likewise`coverage["static_checks_suppressed"]`at`:3180`, written from outside`_check_dispatch_evidence`which initialised it at`:2256`. | Each completeness number is owned by the`Reading` it describes; no cross-writing. |
+| **D14** | `_enforce_attribution_ceiling:3115`|`event_history["instances_without_attribution"] = detail_reduced`writes a **projection** completeness number onto the **event-history** payload, where a reader attributes it to the event scan. Likewise`coverage["static_checks_suppressed"]`at`:3180`, written from outside`_check_dispatch_evidence`which initialised it at`:2256`. | Each completeness number is owned by the`Reading` it describes; no cross-writing. **Landed:**`instances_without_attribution`is gone and the count travels as`task_instance_detail_reduced`on the diagnosis. The four`attribution_payload_*`keys still sit on`event_history`, deliberately: every`last_state_change`they measure is that same read's projection onto one instance, so it is one read accounting for its own projection rather than cross-writing. |
 | **D15** | `_projected_extra:1448-1449`,`_bounded_extra_value:1387`|`extra_truncated`/`extra_keys_omitted`are a *field-level* completeness with the same ad-hoc shape as the list-level one. Out of scope for`Reading`as sketched, but the same class. | A`Clamped[T]` sibling type, or an explicit decision to leave field-level clamps as display-only and prove no conclusion is drawn over them. |
 
 **Count: 15 deferred logic changes** (D1–D15), of which 4 are the brief's KNOWN-OPEN defects, 2 are
@@ -689,9 +689,16 @@ incomplete read all take **rows**, never a reading. A helper handed `list[dict]`
 refuse."* The sketch removes each of the four ways a negative can currently be reached:
 
 1. **A negative cannot be constructed outside `find`/`none_match`.**`Outcome.ABSENT` is produced
-   at exactly two places in the tree, both inside `reading.py`, and both sit behind
-   `if not reading.complete: return UNKNOWN`. There is no`Verdict(Outcome.ABSENT)` call site
-   anywhere else — checkable by a one-line AST scan.
+   at exactly two places in the tree, both inside `reading.py`. What sits behind the completeness
+   guard is **the branch that claims the whole universe was examined**, and in the two combinators
+   that is a different branch: in `find` it is ABSENT ("nothing matched, and everything was
+   looked at"), and in `none_match` it is PRESENT ("nothing matched, and everything was looked
+   at") — `none_match`'s ABSENT is a counterexample row that was *found*, which is a presence and
+   survives truncation. The earlier wording said both ABSENT branches sit behind the guard, which
+   is false of `none_match` and describes an invariant the code does not hold.
+   There is no`Verdict(Outcome.ABSENT)` call site anywhere else — checkable by an AST scan, which
+   now guards the OUTCOME rather than one call shape (`reading.Verdict(reading.Outcome("absent"))`
+   and `replace(verdict, outcome=...)` both passed the one-line version).
 
 2. **A negative cannot be reached by ignoring the type.** `Verdict.__bool__` raises. The two idioms
    that produce today's silent hard negatives — `if not rows_matching:` and

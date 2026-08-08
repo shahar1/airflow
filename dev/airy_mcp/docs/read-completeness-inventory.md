@@ -142,10 +142,10 @@ kept  delivered  claimed | _read_is_complete | _recorded_output:5798 | _event_hi
 
 | # | read | line | bound | completeness known | consumers |
 |---|---|---|---|---|---|
-| R21 | `find_failure_clusters` — `POST /dags/~/dagRuns/~/taskInstances/list` | `:6635` | `page_limit=FAILURE_SCAN_LIMIT`=50 (`:6652`) | **computed at the wrong moment** — `failures_omitted` at `:6660` is derived *before* the allowlist filter shrinks `tis` at `:6663-6665`, so it does not describe the list finally used. Reported, never gates | tool result |
+| R21 | `find_failure_clusters` — `POST /dags/~/dagRuns/~/taskInstances/list` | `:6635` | `page_limit=FAILURE_SCAN_LIMIT`=50 (`:6652`) | ~~**computed at the wrong moment**~~ — **fixed**: the scan is a `Reading`, the allowlist filter is a `.filter()` on it, and `failures_omitted` is the reading's own number, so it describes the list the clusters were built from. A log that cannot be read now joins `failures_unreadable` instead of taking the tool down, and `scope` stops asserting the window holds no failure whenever coverage is short | tool result |
 | R22 | `_check_dispatch_evidence` `/tries` budget | `:2145` | `TRIES_PROBE_LIMIT`=20 (`:2203`); beyond it `status: "not_checked"` | **yes** — `attempt_history_unchecked` at `:2243` → `run_health` blocker `:2388` | `diagnose_dag:3104` |
 | R23 | `diagnose_dag` failed-log loop | `:3231` | `DIAGNOSIS_LOG_BUDGET_CHARS`=12000 | **yes** — `logs_omitted` at `:3262` → summary tail `:3000` | own result |
-| R24 | `_project_task_instances` detail projection | `:2261` | `TASK_INSTANCE_DETAIL_LIMIT`=200 (`:2285`) | **yes** — returns `len(tis) - len(detailed)` at `:2340` → `instances_without_attribution` `:3115`, `task_instance_detail_reduced` `:3140` | `diagnose_dag:3107` |
+| R24 | `_project_task_instances` detail projection | `:2261` | `TASK_INSTANCE_DETAIL_LIMIT`=200 (`:2285`) | **yes** — returns `len(tis) - len(detailed)` at `:2340` → `task_instance_detail_reduced` on the diagnosis. `instances_without_attribution` on the event history is **gone**: it was this projection's number written onto a different read's payload (D14) | `diagnose_dag:3107` |
 
 ---
 
@@ -247,9 +247,9 @@ Exact line numbers. A single site can appear in more than one class.
 | `:1902-1907` | four `history[...]` keys rewritten by `_enforce_attribution_ceiling` after the fact |
 | `:1914` | `events_omitted_for_instance` overwritten with `events_recorded` |
 | `:1923-1928` | `extra_keys_omitted` incremented, `extra_truncated` forced `True` |
-| `:3115` | `event_history["instances_without_attribution"] = detail_reduced` — a *projection* completeness number written onto the *event-history* payload, where a reader will attribute it to the event scan |
+| ~~`:3115`~~ | ~~`event_history["instances_without_attribution"] = detail_reduced`~~ — **removed**; the count travels as `task_instance_detail_reduced` on the diagnosis, and `test_d14` asserts the key is absent |
 | `:3180` | `coverage["static_checks_suppressed"]` written into `coverage` from outside `_check_dispatch_evidence`, which initialised it to `0` at `:2256` |
-| `:6665` | `tis` rebound after `failures_omitted` was computed off the old binding |
+| ~~`:6665`~~ | ~~`tis` rebound after `failures_omitted` was computed off the old binding~~ — **fixed**; the filter is a `.filter()` on the `Reading` and the count is the reading's own |
 
 ### 3.4 dropped
 
