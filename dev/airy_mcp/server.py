@@ -23,13 +23,23 @@ source as one atomic change, ``plan_task_instance_clear``/``apply_task_instance_
 re-run an instance that already exists, and ``rerun_dag`` starts a fresh run.
 Deliberately goes beyond AIP-91 phase 1 (read-only) to show where the value ends up.
 
-Every mutation that changes something already there is planned first: the planning
-tool is read-only and hands back a single-use token, and the writing tool refuses
-without it.  That is what makes the approval card show the user the change they are
-actually approving.  ``rerun_dag`` is the one deliberate exception - it only ADDS a
-run, and the tool call's own arguments describe it completely - and it is declared
-as such, with the reason, in ``approvals._UNGATED_WRITES``; the lasting part of it,
-unpausing, has a token and a warning of its own.
+Every mutation a USER ASKS FOR that changes something already there is planned
+first: the planning tool is read-only and hands back a single-use token, and the
+writing tool refuses without it.  That is what makes the approval card show the
+user the change they are actually approving.
+
+Four writes are outside that rule, and ``approvals._UNGATED_WRITES`` is the
+authority on which - this sentence is not, and used to say "``rerun_dag`` is the
+one deliberate exception" while the registry it points at held four.  Two are
+asked for: ``rerun_dag`` only ADDS a run and the call's own arguments describe it
+completely (the lasting part of it, unpausing, has a token and a warning of its
+own).  The other two are COMPENSATING actions inside a write the user already
+approved - cancelling a backfill that did not match the runs they reviewed, and
+re-parsing a file that was just written - and neither is a change the user could
+have been asked about separately, because neither exists until the approved write
+has already happened.  ``_abandon_backfill``'s cancel does change something that
+was already there: it pauses the backfill and fails its queued runs.  That is a
+rollback attempt, not a rollback, and the tool says so in its own result.
 
 Runs as a second MCP sidecar next to the read-only ``astro-airflow-mcp``.
 

@@ -209,6 +209,12 @@ _GATED_WRITES = {
     ("codechange", "rerun_dag", "PATCH /dags/<dag>"): "_redeem_token",
     ("codechange", "apply_dag_code_changes", "WRITE the Dag file"): "_redeem_token",
     ("codechange", "revert_dag_code", "WRITE the Dag file"): "_redeem_token",
+    # The backup is a write of its own, and it was covered only by the entry
+    # beside it — a classification that was per FUNCTION rather than per
+    # request, so any further write inside either of these was auto-classified
+    # by an entry written for a different one.
+    ("codechange", "apply_dag_code_changes", "WRITE the Dag file's backup"): "_redeem_token",
+    ("codechange", "revert_dag_code", "DELETE the Dag file's backup"): "_redeem_token",
 }
 
 # Writes this server makes WITHOUT a reviewed plan, each with the reason. A
@@ -244,4 +250,5 @@ _READ_SEARCHES = (
     "/backfills/dry_run",
     "/dags/~/dagRuns/~/taskInstances/list",
     "dry_run=True",
+    "'dry_run': True",
 )

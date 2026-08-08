@@ -265,6 +265,31 @@ _PARTIAL_UNSETTLED_BY_HISTORY = (
 )
 
 
+def _unsettled_at_plan_time(evidence: dict[str, Any], expansion: dict[str, Any]) -> str | None:
+    """The two gate facts the plan can already see, and the refusal they earn.
+
+    A precondition the gate refuses on and the plan does not is a guaranteed
+    wasted approval whenever the fact is unsettled — the plan hands out a token,
+    the gate declines it, and the next plan does the same. They are asked here,
+    against the same evidence the card is built from, so the user is told before
+    they approve anything.
+    """
+    if not expansion["settled"]:
+        return (
+            f"whether this clear's instance set is closed was NOT established: the expandability "
+            f"probe did not answer for {expansion['unprobed']}, so clearing may create instances "
+            f"this plan cannot enumerate. No approval is offered for a set that is not closed."
+        )
+    history = evidence.get("attempt_history") or {}
+    if history.get("not_read_whole"):
+        return (
+            f"the target's attempt history was NOT read whole ({history['not_read_whole']}), so "
+            f"whether an earlier attempt of this instance already reached the outside world is not "
+            f"established. No approval is offered over a safety reading that could not be taken."
+        )
+    return None
+
+
 def _partial_effect_possible(ti: dict[str, Any], history_rules_out_partial: bool) -> bool | None:
     """Whether a half-completed external operation can be ruled out for this row.
 
@@ -879,6 +904,14 @@ def plan_task_instance_clear(
         mapped_settled=mapped_settled,
         unprobed_tasks=expansion["unprobed"],
     )
+    # Refused HERE, before a token is issued. Both facts are re-asked at the gate
+    # and neither was asked at plan time, so a plan over an unsettled one always
+    # issued a token that the gate then always refused: the approval was spent
+    # for nothing, every time, in a loop that re-planning reproduces exactly.
+    # Any 500 on the live /listMapped call reaches it.
+    unsettled = _unsettled_at_plan_time(evidence, expansion)
+    if unsettled is not None:
+        return {**plan, "planned": False, "error": unsettled, "next_step": _DO_NOT_BYPASS}
     plan["next_step"] = (
         "Show the user recovery_evidence, blast_radius and every entry of warnings, then propose "
         "apply_task_instance_clear with this plan_token AND reviewed_instances set to "
@@ -1329,13 +1362,13 @@ _WRITE_PRECONDITIONS: tuple[_WritePrecondition, ...] = (
     # "gate" made the subset test unfailable in both directions.
     _WritePrecondition(
         "closure_expandability_settled",
-        frozenset({"gate"}),
+        frozenset({"plan", "gate"}),
         "the expandability probe answered for every task in the closure",
         _rule_closure_settled,
     ),
     _WritePrecondition(
         "target_attempt_history_read_whole",
-        frozenset({"gate"}),
+        frozenset({"plan", "gate"}),
         "the target's attempt history was read whole",
         _rule_target_attempt_history_read_whole,
     ),
@@ -1565,7 +1598,14 @@ def apply_task_instance_clear(
     # which is false and reads as a user error. Nothing has been written on this
     # path, so the honest answer is a refusal that says the approval is gone.
     try:
-        preview = transport._api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
+        # ``body`` already carries ``dry_run=True``; restating it AT THE CALL is
+        # what makes this visibly a read. Spelled only inside ``_clear_body``, it
+        # was indistinguishable from the write below to every scan — and the
+        # scan that has to tell them apart is the one asserting the gate
+        # dominates the write.
+        preview = transport._api(
+            "POST", _dag_url(dag_id, "/clearTaskInstances"), json={**body, "dry_run": True}
+        )
         now = _affected(preview)
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         return _approval_spent_before_the_write(dag_id, dag_run_id, "the pre-write preview", e)

@@ -2922,6 +2922,23 @@ def test_rerun_dag_says_the_dag_is_still_unpaused_when_the_trigger_fails(airflow
     assert result["triggered"] is False
     assert result["unpaused"] is True
     assert "is still unpaused" in result["error"]
+    # R7. The unpause COMMITTED. Reporting "nothing was applied" over it left
+    # the drawer red and every view unrefreshed while the scheduler queued runs
+    # — the same shape as the abandoned backfill, fixed there and left here.
+    assert result["mutation_applied"] is True
+    assert result["ui_updates"] == [{"kind": "dag_definition", "dag_id": DAG_ID}]
+
+
+def test_rerun_dag_applies_nothing_when_the_trigger_fails_and_nothing_was_unpaused(airflow):
+    """The other direction: no unpause, no write, and the flag says so."""
+    airflow.fail_trigger = httpx.ConnectError("boom")
+
+    result = server.rerun_dag(DAG_ID)
+
+    assert result["triggered"] is False
+    assert result["unpaused"] is False
+    assert result["mutation_applied"] is False
+    assert "ui_updates" not in result
 
 
 def test_rerun_dag_relays_the_api_detail_when_the_trigger_is_refused(airflow):
@@ -7955,7 +7972,13 @@ def test_an_apply_over_a_mapped_group_declines_to_state_a_creation_count(group_z
 
 
 def test_a_probe_that_cannot_answer_leaves_the_closure_possibly_expandable(group_zero_run):
-    """A read that errors is not a read that said no; the set is reported as not closed."""
+    """A read that errors is not a read that said no; the set is not closed.
+
+    It used to be planned anyway, with the caveat in the card — and the gate
+    then refused the token every time, so the approval was spent for nothing on
+    every attempt and re-planning reproduced it exactly. The plan refuses now,
+    and names the tasks the probe did not answer for.
+    """
     group_zero_run.fail_list_mapped = httpx.HTTPStatusError(
         "boom",
         request=httpx.Request("GET", "/listMapped"),
@@ -7964,21 +7987,21 @@ def test_a_probe_that_cannot_answer_leaves_the_closure_possibly_expandable(group
 
     plan = _group_plan()
 
-    assert plan["planned"] is True
-    assert plan["blast_radius"]["mapped_tasks"] == []
-    assert plan["blast_radius"]["mapped_tasks_settled"] is False
-    assert plan["blast_radius"]["expansion_unprobed_tasks"] == ["grp.inner", "seed", "transmit"]
-    assert "This set is NOT closed" in plan["blast_radius"]["note"]
-    warning = next(w for w in plan["warnings"] if "MAY CREATE" in w)
-    assert "is NOT settled" in warning
-    assert "'grp.inner'" in warning
+    assert plan["planned"] is False
+    assert "plan_token" not in plan
+    assert "NOT established" in plan["error"]
+    assert "'grp.inner'" in plan["error"]
 
 
 def test_an_apply_under_an_unanswered_probe_refuses_instead_of_writing(group_zero_run):
-    """An unanswered probe leaves the closure unread, and the closure authorises the write."""
-    group_zero_run.fail_list_mapped = httpx.RequestError("connection reset")
+    """An unanswered probe leaves the closure unread, and the closure authorises the write.
 
+    Broken AFTER the plan: an unanswered probe at plan time is now refused
+    before a token is issued, so what this asks is the gate's own case — the
+    probe stopped answering between the approval and the click.
+    """
     plan = _group_plan()
+    group_zero_run.fail_list_mapped = httpx.RequestError("connection reset")
     result = server.apply_task_instance_clear(
         DAG_ID,
         plan["dag_run_id"],
@@ -8856,7 +8879,14 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
         (11, None, True),
         (10, 10, True),
         (10, 11, False),
+        # The route handed over fifteen and accounts for three. A source whose
+        # count is BELOW what it sent has not truncated anything, and the five
+        # rows this tool discards for display are not a shortfall of the read —
+        # so the write goes through. Fifteen rather than eleven so the discard
+        # is unmistakable, and the whole point is that it does not refuse.
         (15, 3, True),
+        # And the discard on its own, with the route silent about the count.
+        (25, None, True),
     ],
     ids=[
         "exact-limit",
@@ -8864,6 +8894,7 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
         "exact-limit-source-agrees",
         "source-accounts-for-one-more",
         "source-claims-complete-while-rows-are-discarded",
+        "source-says-nothing-while-rows-are-discarded",
     ],
 )
 def test_the_target_attempt_history_must_be_read_whole_before_the_write(
@@ -8871,10 +8902,16 @@ def test_the_target_attempt_history_must_be_read_whole_before_the_write(
 ):
     """The gate asks the READ, not the display. ``/tries`` is not paginated, so
     the only thing that could make the displayed reading short is this tool's own
-    ten-row clamp — and a write refused over that is refused permanently."""
+    ten-row clamp — and a write refused over that is refused permanently.
+
+    The history is made short AFTER the plan, because the plan now refuses over
+    a history it could not read whole rather than issuing a token the gate is
+    certain to decline. What is asked here is the gate's own case: the read went
+    short in the window between the approval and the click.
+    """
+    plan = _gate_plan(cleared_run)
     cleared_run.tries_by_task[("summarize", -1)] = _attempts(delivered)
     cleared_run.tries_total = claimed
-    plan = _gate_plan(cleared_run)
 
     result = _gate_apply(plan)
 
@@ -8888,9 +8925,9 @@ def test_the_target_attempt_history_must_be_read_whole_before_the_write(
 def test_a_matching_attempt_outside_the_retained_slice_refuses_rather_than_denying_it(cleared_run):
     """The record the READ never reached is the one the safety reading would have
     found, so the gate refuses rather than concluding over it."""
+    plan = _gate_plan(cleared_run)
     cleared_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=12)
     cleared_run.tries_total = 40
-    plan = _gate_plan(cleared_run)
 
     result = _gate_apply(plan)
 
@@ -12117,11 +12154,44 @@ def test_an_instance_with_more_attempts_than_the_display_shows_can_still_be_clea
     assert len(cleared_run.cleared) == 1
 
 
+def test_a_fact_the_gate_refuses_on_is_refused_before_the_approval_is_issued(cleared_run):
+    """R3. Two preconditions were asked only at the gate, so a plan over an
+    unsettled one ALWAYS issued a token the gate ALWAYS declined: the approval
+    was spent for nothing, every time, in a loop re-planning reproduces exactly.
+    Any 500 on the live /listMapped call reaches it."""
+    cleared_run.fail_list_mapped = _http_status_error(500)
+
+    for _ in range(3):
+        plan = server.plan_task_instance_clear(DAG_ID, task_id="summarize", only_failed=False)
+        assert plan["planned"] is False
+        assert "plan_token" not in plan, "a token was issued for a fact the gate is certain to refuse"
+    assert cleared_run.cleared == []
+
+
+def test_every_fact_the_gate_refuses_on_is_one_the_plan_refuses_on_too():
+    """The rule that makes the loop above impossible for any future precondition:
+    a fact re-asked at the gate and never asked at plan time is an approval the
+    gate can always decline."""
+    for rule in recovery._WRITE_PRECONDITIONS:
+        assert "gate" in rule.asked_at
+    gate_only = {rule.id for rule in recovery._WRITE_PRECONDITIONS if "plan" not in rule.asked_at}
+
+    assert gate_only == {
+        "target_set_matches_approval",
+        "target_attempt_not_moved",
+        "no_newly_expandable_task",
+    }, (
+        "a gate-only rule has appeared: it can only be one the plan cannot ask, because it "
+        "compares the world against the approval that does not exist yet — every one of these "
+        "three does, so none of them can be asked before the plan is made"
+    )
+
+
 def test_a_route_that_really_did_truncate_the_history_still_refuses_the_write(cleared_run):
     """The repair may not cost the refusal it was protecting."""
+    plan = _gate_plan(cleared_run)
     cleared_run.tries_by_task[("summarize", -1)] = _attempts(12)
     cleared_run.tries_total = 40
-    plan = _gate_plan(cleared_run)
 
     result = _gate_apply(plan)
 
@@ -12414,12 +12484,24 @@ def _mutating_calls():
 def test_every_write_in_the_tree_is_either_gated_or_declared_ungated():
     """N6. Baseline was one of seven writes gated; the other six gated on an
     identity or a digest, and the run this server creates passed through nothing
-    at all — while server.py's own docstring said every mutation is planned."""
+    at all — while server.py's own docstring said every mutation is planned.
+
+    Matched on the REQUEST, not on the function that holds it. A classification
+    was per ``(module, owner)``, so a second write injected into an
+    already-classified function was auto-classified by the entry written for a
+    different request entirely — proven by adding a bare
+    ``DELETE /dagRuns/EVIL`` to ``apply_task_instance_clear`` and watching both
+    N6 tests pass.
+    """
     classified = set(approvals._GATED_WRITES) | set(approvals._UNGATED_WRITES)
     seen = set()
     unclassified = []
     for module, owner, text in _mutating_calls():
-        match = [entry for entry in classified if entry[0] == module and entry[1] == owner]
+        match = [
+            entry
+            for entry in classified
+            if entry[0] == module and entry[1] == owner and _same_request(entry[2], text)
+        ]
         if not match:
             unclassified.append((module, owner, text))
             continue
@@ -12430,32 +12512,137 @@ def test_every_write_in_the_tree_is_either_gated_or_declared_ungated():
     assert stale == [], f"a classification for a write that is gone: {stale}"
 
 
+def _calls_named(body, name):
+    return [
+        node
+        for node in ast.walk(body)
+        if isinstance(node, ast.Call)
+        and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")) == name
+    ]
+
+
+def _function_body(module, owner):
+    return next(
+        node
+        for node in ast.walk(_module_source(module))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner
+    )
+
+
 def test_every_gated_write_really_passes_through_the_gate_it_names():
     """A registry that names a gate and is never checked against the code is a
-    comment. The gate has to be called, in that function, before the write."""
-    for (module, owner, _), gate in approvals._GATED_WRITES.items():
-        source = _module_source(module)
-        body = next(
+    comment. The gate has to DOMINATE the write: every path from the function's
+    entry to the write passes through it.
+
+    ``min(gates) < max(writes)`` was not dominance and could not fail once a
+    function held two writes — and ``apply_task_instance_clear`` already writes
+    once before the gate and once after, so a third write injected anywhere at
+    all satisfied it.
+    """
+    for (module, owner, request), gate in approvals._GATED_WRITES.items():
+        body = _function_body(module, owner)
+        gates = _calls_named(body, gate)
+        # Off ``_mutating_calls`` rather than off every call in the body: the
+        # clear's dry-run PREVIEW is the same route and the same method and is
+        # a read, and only that scan knows it.
+        mutating = {
+            text for holder, function, text in _mutating_calls() if (holder, function) == (module, owner)
+        }
+        writes = [
             node
-            for node in ast.walk(source)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner
-        )
-        gates = [
-            node.lineno
             for node in ast.walk(body)
             if isinstance(node, ast.Call)
-            and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", ""))
-            == gate
-        ]
-        writes = [
-            node.lineno
-            for module_name, function, text in _mutating_calls()
-            if module_name == module and function == owner
-            for node in ast.walk(body)
-            if isinstance(node, ast.Call) and ast.unparse(node) == text
+            and ast.unparse(node) in mutating
+            and _same_request(request, ast.unparse(node))
         ]
         assert gates, f"{module}.{owner} names {gate} and never calls it"
-        assert min(gates) < max(writes), f"{module}.{owner} writes before it reaches {gate}"
+        assert writes, f"{module}.{owner} is classified for a request it does not make: {request}"
+        for write in writes:
+            assert _dominates(body, gates, write), (
+                f"{module}.{owner} can reach {request} on a path that does not pass {gate}"
+            )
+
+
+# What each declared request looks like in the source, when the declaration is
+# prose rather than an HTTP line. A file write has no method and no path.
+_FILE_WRITE_CALLS = {
+    "WRITE the Dag file": ("_write_if_unchanged(",),
+    "WRITE the Dag file's backup": ("backup.write_text(",),
+    "DELETE the Dag file's backup": ("backup.unlink(",),
+    "os.unlink of its own temp file": ("os.unlink(",),
+}
+
+
+def _same_request(declared, text):
+    """Whether this call IS the declared request, not merely inside the same function.
+
+    Matched on the REQUEST. The classification used to be per ``(module,
+    owner)``, so a second write injected into an already-classified function was
+    auto-classified by an entry written for a different request entirely — a
+    bare ``DELETE /dagRuns/EVIL`` added to ``apply_task_instance_clear`` before
+    the gate left both N6 tests passing.
+    """
+    for shape, needles in _FILE_WRITE_CALLS.items():
+        if declared == shape:
+            return any(needle in text for needle in needles)
+    method, _, path = declared.partition(" ")
+    if not text.startswith(("transport._api(", "_api(")):
+        return False
+    if not any(quoted in text.split(",")[0] for quoted in (f'"{method}"', f"'{method}'")):
+        return False
+    # The path as the SOURCE spells it. ``/dags/<dag>`` is what ``_dag_url``
+    # builds, so it is dropped and the suffix compared; anything else is
+    # compared up to its first placeholder.
+    if path.startswith("/dags/<dag>"):
+        suffix = path[len("/dags/<dag>") :]
+        return suffix in text if suffix else "_dag_url(dag_id)" in text
+    return path.split("<")[0] in text
+
+
+def _dominates(body, gates, write):
+    """Whether every path from the function's entry to ``write`` passes a gate call.
+
+    Walked over the statement tree rather than a real CFG, which is enough for
+    the one shape that matters here: a write is dominated when a gate call is
+    made at the same nesting level BEFORE it, at every level from the function
+    body down to the block that holds it. A gate inside one arm of an ``if`` does
+    not dominate a write in the other arm, and a gate after the write dominates
+    nothing.
+    """
+    lines = {node.lineno for node in gates}
+
+    def reaches(block):
+        gated = False
+        for statement in block:
+            if any(gate is node for gate in gates for node in ast.walk(statement)):
+                gated = True
+            if any(write is node for node in ast.walk(statement)):
+                if gated:
+                    return True
+                # Not gated at this level: the write has to be gated inside its
+                # own nested block, on every branch of it.
+                return all(
+                    reaches(nested)
+                    for nested in _blocks_of(statement)
+                    if any(write is node for stmt in nested for node in ast.walk(stmt))
+                ) and any(_blocks_of(statement))
+        return False
+
+    return bool(lines) and reaches(body.body)
+
+
+def _blocks_of(statement):
+    """Every statement list this statement holds — one per branch."""
+    blocks = []
+    for field in ("body", "orelse", "finalbody", "handlers"):
+        value = getattr(statement, field, None)
+        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+            blocks.append(value)
+        elif isinstance(value, list):
+            for handler in value:
+                if isinstance(handler, ast.ExceptHandler):
+                    blocks.append(handler.body)
+    return blocks
 
 
 def test_the_declared_ungated_writes_each_carry_a_reason_about_the_write():
@@ -12585,6 +12772,70 @@ def test_a_transport_blip_inside_the_gate_does_not_raise_past_the_caller(cleared
     assert result["mutation_applied"] is False
     assert "The approval was already spent" in result["error"]
     assert cleared_run.cleared == []
+
+
+@pytest.mark.parametrize(
+    "blip", [_http_status_error(500), httpx.ConnectError("connection refused")], ids=["500", "connect"]
+)
+@pytest.mark.parametrize("route", [f"/dags/{DAG_ID}", f"/dags/{DAG_ID}/dagVersions"], ids=["dag", "versions"])
+def test_a_transport_blip_after_the_code_approval_does_not_raise_past_the_caller(
+    airflow, tmp_path, blip, route
+):
+    """R1. The clear path was repaired for exactly this and both code paths were
+    left with it: three unguarded live reads sit after ``_redeem_token``, and a
+    dropped connection on any of them raised out of the tool with the approval
+    already spent — so the retry with the same token answered "no reviewed plan
+    for this change", which is false and reads as the user's own mistake."""
+    changes = _changes(('"ammount"', '"amount"'))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    real = transport._api
+
+    def blip_on(method, path, **kwargs):
+        if path == route:
+            raise blip
+        return real(method, path, **kwargs)
+
+    transport._api = blip_on
+    try:
+        result = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+    finally:
+        transport._api = real
+
+    assert result["applied"] is False
+    assert result["mutation_applied"] is False
+    assert "The approval was already spent" in result["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+@pytest.mark.parametrize(
+    "blip", [_http_status_error(500), httpx.ConnectError("connection refused")], ids=["500", "connect"]
+)
+@pytest.mark.parametrize("route", [f"/dags/{DAG_ID}", f"/dags/{DAG_ID}/dagVersions"], ids=["dag", "versions"])
+def test_a_transport_blip_after_the_revert_approval_does_not_raise_past_the_caller(
+    airflow, tmp_path, blip, route
+):
+    """``revert_dag_code`` has the identical shape and the identical hole."""
+    _apply(('"ammount"', '"amount"'))
+    _parses(airflow, tmp_path)
+    reverted = (tmp_path / "sales_summary.py").read_text()
+    plan = server.plan_revert_dag_code(DAG_ID)
+    real = transport._api
+
+    def blip_on(method, path, **kwargs):
+        if path == route:
+            raise blip
+        return real(method, path, **kwargs)
+
+    transport._api = blip_on
+    try:
+        result = server.revert_dag_code(DAG_ID, plan["plan_token"], diff=plan["diff"])
+    finally:
+        transport._api = real
+
+    assert result["reverted"] is False
+    assert result["mutation_applied"] is False
+    assert "The approval was already spent" in result["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == reverted
 
 
 def test_an_instance_on_its_way_to_a_worker_is_refused_under_the_tools_own_default(cleared_run):

@@ -88,6 +88,7 @@ from dagsource import (
     _patch,
     _write_if_unchanged,
 )
+from primitives import _quoted
 from reading import (
     _backfill_runs,
     _build_asset_note,
@@ -193,8 +194,10 @@ def revert_dag_code(
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
-            raise
+            return _approval_spent_before_the_write("reverted", "the Dag record", e)
         return {"reverted": False, "mutation_applied": False, "error": message}
+    except _READ_FAILURES as e:
+        return _approval_spent_before_the_write("reverted", "the Dag record", e)
     try:
         path = _dag_path(dag_id, dag)
         backup = _backup_path(path)
@@ -202,12 +205,17 @@ def revert_dag_code(
         return {"reverted": False, "mutation_applied": False, "error": str(e)}
     if not backup.exists():
         return {"reverted": False, "mutation_applied": False, "error": f"no backup for {path.name}"}
-    version_before_write = _latest_version(dag_id)
+    try:
+        version_before_write = _latest_version(dag_id)
+    except _READ_FAILURES as e:
+        return _approval_spent_before_the_write("reverted", "the Dag's version list", e)
     with _exclusive(path):
         try:
             current = dagsource._read_reviewed_file(dag_id, path, source_digest)
         except DagFileDriftError as e:
             return {"reverted": False, "mutation_applied": False, "error": str(e)}
+        except _READ_FAILURES as e:
+            return _approval_spent_before_the_write("reverted", "the reviewed source", e)
         if md5(current.encode("utf-8")).hexdigest() != plan["current_digest"]:
             return {
                 "reverted": False,
@@ -342,6 +350,32 @@ def plan_dag_code_changes(
 
 # Appended to apply-time drift refusals: a small model that hits one tends to
 # retry the doomed apply, so the refusal itself must spell out the way back.
+# Every live read between redeeming the approval and the write. A blip on one of
+# them used to raise out of the tool with the approval already spent, and the
+# retry with the same token answered "no reviewed plan for this change" — which
+# is false, and reads to the user as their own mistake. The clear path was
+# repaired for exactly this; both code paths were left with it.
+_READ_FAILURES = (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError)
+
+
+def _approval_spent_before_the_write(outcome_key: str, which: str, error: Exception) -> dict[str, Any]:
+    """The answer when a read between the approval and the write did not come back.
+
+    Pre-mutation, so "not applied" is a fact rather than an inference: the file
+    has not been touched and no request has gone out.
+    """
+    return {
+        outcome_key: False,
+        "mutation_applied": False,
+        "error": (
+            f"this change was NOT made: {which} could not be read "
+            f"({_quoted(_explain_error(error), 240)}), so the facts this write rests on were not "
+            f"re-established. Nothing was written. The approval was already spent by this attempt "
+            f"and is gone — re-plan and show the user again."
+        ),
+    }
+
+
 _REPLAN_STEER = (
     "the file changed since this plan was made. Make a NEW plan from the current source "
     "that contains every remaining change, show it, and apply that instead."
@@ -408,15 +442,22 @@ def apply_dag_code_changes(
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
-            raise
+            return _approval_spent_before_the_write("applied", "the Dag record", e)
         return {"applied": False, "mutation_applied": False, "error": message}
+    except _READ_FAILURES as e:
+        return _approval_spent_before_the_write("applied", "the Dag record", e)
     path = _dag_path(dag_id, dag)
-    version_before_write = _latest_version(dag_id)
+    try:
+        version_before_write = _latest_version(dag_id)
+    except _READ_FAILURES as e:
+        return _approval_spent_before_the_write("applied", "the Dag's version list", e)
     with _exclusive(path):
         try:
             source = dagsource._read_reviewed_file(dag_id, path, source_digest)
         except DagFileDriftError as e:
             return {"applied": False, "mutation_applied": False, "error": f"{e} — {_REPLAN_STEER}"}
+        except _READ_FAILURES as e:
+            return _approval_spent_before_the_write("applied", "the reviewed source", e)
         # The plan's impact findings were computed from these exact bytes; if
         # they still hash the same there is nothing to recompute, and if they do
         # not, no amount of recomputing makes the reviewed diff the right one.
@@ -666,15 +707,26 @@ def rerun_dag(
         # the user thinking nothing happened, with the Dag now scheduling again.
         return {
             "triggered": False,
-            # The unpause may well have committed, so this is not "nothing
-            # happened" — but no run exists, and no view of one can be refreshed.
-            "mutation_applied": False,
+            # ``unpaused`` is a WRITE that committed: the Dag is scheduling
+            # again, on its own schedule, whether or not this run exists.
+            # Reporting "nothing was applied" over it left the drawer red and
+            # the views unrefreshed while the scheduler queued runs — the same
+            # shape as the abandoned backfill, fixed there and left here.
+            "mutation_applied": unpaused,
             "dag_id": dag_id,
             "unpaused": unpaused,
             "error": (
                 f"triggering the run failed: {_explain_error(e)}"
-                + (f". {dag_id} was unpaused first and is still unpaused." if unpaused else "")
+                + (
+                    f". {dag_id} WAS unpaused first and is still unpaused, so it is scheduling "
+                    f"again — tell the user, and pause it again if that is not what they wanted."
+                    if unpaused
+                    else ""
+                )
             ),
+            # The Dag's paused state changed even though no run was created, so
+            # the views the user is looking at are stale.
+            **({"ui_updates": [{"kind": "dag_definition", "dag_id": dag_id}]} if unpaused else {}),
         }
     return {
         "triggered": True,
