@@ -37,6 +37,7 @@ if "fastmcp" not in sys.modules:
 
 import approvals
 import dagsource
+import diagnosis
 import evidence
 import reading
 import server
@@ -664,7 +665,7 @@ def test_diagnose_summary_elides_an_oversized_error_between_words(airflow):
 
 
 def test_diagnose_dag_caps_the_total_log_it_returns(airflow, monkeypatch):
-    monkeypatch.setattr(server, "DIAGNOSIS_LOG_BUDGET_CHARS", 10)
+    monkeypatch.setattr(diagnosis, "DIAGNOSIS_LOG_BUDGET_CHARS", 10)
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
     airflow.task_instances = [{"task_id": f"t{i}", "try_number": 1, "state": "failed"} for i in range(3)]
     airflow.log = f"{'x' * 100}KeyError"
@@ -826,7 +827,7 @@ def test_diagnose_dag_summary_when_nothing_is_wrong(airflow):
 
 
 def test_diagnose_dag_summary_counts_the_logs_it_had_to_omit(airflow, monkeypatch):
-    monkeypatch.setattr(server, "DIAGNOSIS_LOG_BUDGET_CHARS", 10)
+    monkeypatch.setattr(diagnosis, "DIAGNOSIS_LOG_BUDGET_CHARS", 10)
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
     airflow.task_instances = [{"task_id": f"t{i}", "try_number": 1, "state": "failed"} for i in range(3)]
     airflow.log = f"{'x' * 100}KeyError"
@@ -4608,7 +4609,7 @@ def test_diagnose_folds_the_findings_past_the_limit_into_one_entry(airflow, monk
     assert "the other 475 are not" in checks[0]["detail"]
 
     summary = result["summary"]
-    assert len(summary) <= server.DIAGNOSIS_SUMMARY_BUDGET_CHARS + 2000
+    assert len(summary) <= diagnosis.DIAGNOSIS_SUMMARY_BUDGET_CHARS + 2000
     assert len(json.dumps(checks)) < 200_000
     # The entry that speaks for the rest is the one entry that cannot be cut.
     assert "(1) Note: 500 successful task instance(s)" in summary
@@ -4618,7 +4619,7 @@ def test_diagnose_folds_the_findings_past_the_limit_into_one_entry(airflow, monk
 
 
 def test_the_summary_stops_at_its_character_budget(airflow, monkeypatch):
-    monkeypatch.setattr(server, "DIAGNOSIS_SUMMARY_BUDGET_CHARS", 900)
+    monkeypatch.setattr(diagnosis, "DIAGNOSIS_SUMMARY_BUDGET_CHARS", 900)
     forged = [{**FORGED_TI, "task_id": f"forged_{index:03d}"} for index in range(6)]
 
     summary = _green_run(airflow, *forged)["summary"]
@@ -7019,7 +7020,7 @@ def test_the_finding_counts_the_consecutive_runs_it_is_missing_from(airflow):
 
 
 def test_the_recurrence_clause_names_no_more_runs_than_its_ceiling(airflow, monkeypatch):
-    monkeypatch.setattr(server, "DISPATCH_CONTRAST_RUN_LIMIT", 2)
+    monkeypatch.setattr(diagnosis, "DISPATCH_CONTRAST_RUN_LIMIT", 2)
 
     detail = _findings(_recurring_forgery(airflow, bare=4))[0]["detail"]
 
@@ -7084,7 +7085,7 @@ def test_the_impact_clause_never_says_a_failed_run_raised_no_alert(airflow):
 
 
 def test_the_impact_clause_names_no_more_tasks_than_its_ceiling(airflow, monkeypatch):
-    monkeypatch.setattr(server, "DISPATCH_IMPACT_TASK_LIMIT", 1)
+    monkeypatch.setattr(diagnosis, "DISPATCH_IMPACT_TASK_LIMIT", 1)
 
     detail = _findings(_recurring_forgery(airflow, bare=1))[0]["detail"]
 
