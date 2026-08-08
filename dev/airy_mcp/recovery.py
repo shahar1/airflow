@@ -265,6 +265,25 @@ _PARTIAL_UNSETTLED_BY_HISTORY = (
 )
 
 
+def _partial_effect_possible(ti: dict[str, Any], history_rules_out_partial: bool) -> bool | None:
+    """Whether a half-completed external operation can be ruled out for this row.
+
+    The ONE place this is decided, because ``False`` is the value that suppresses
+    the half-operation warning on the operator's card and it needs two conjuncts,
+    not one: the recorded attempt itself carries nothing a dispatch writes, AND
+    the attempt history was read whole with no other attempt carrying execution
+    fields. The gate re-asked only the second and published ``False`` over an
+    attempt whose own row named a hostname, a pid and a real duration.
+    """
+    if _is_never_dispatched_attempt(ti):
+        return False if history_rules_out_partial else None
+    if any(key not in ti for key in _DISPATCH_EVIDENCE_KEYS):
+        return None
+    if not any(ti.get(name) not in (None, "") for name in _EXECUTION_FIELDS):
+        return None
+    return True
+
+
 def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str, Any]:
     """What the evidence says about the attempt this instance has recorded.
 
@@ -276,18 +295,23 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     """
     row = {name: ti.get(name) for name in _RECOVERY_ROW_KEYS}
     row["rendered_fields_present"] = bool(ti.get("rendered_fields"))
-    # The reading, not the response: what this function may conclude an absence
-    # from is what it read, and it reads at most RECOVERY_ATTEMPT_LIMIT rows.
-    history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
-    rows = list(history.rows)
-    history_status = reading.history_status(history)
+    # The READ, not the display. ``/tries`` hands over the whole history in one
+    # page, and the ten-row clamp below decides only how many of those rows are
+    # SHOWN. Asking the safety question of the clamped reading made the plan card
+    # answer "a half-operation cannot be ruled out" over a history the gate — one
+    # find() away, on the same rows — settled outright, and it labelled a
+    # whole-page read "partial", which is the word a route truncation gets.
+    whole = _attempt_history(dag_id, run_path, ti)
+    shown = _attempt_reading(whole)
+    rows = list(shown.rows)
+    history_status = reading.history_status(whole)
     live_executed = _carries_execution_fields(ti)
     # A truncated list can only ever prove presence, and this is the one field
     # that suppresses the half-operation warning when it comes back False.
     earlier_executed = reading.find(
-        history
+        whole
         if history_status in ("checked", "partial")
-        else reading.failed_read(history.route, reading.attempt_error(history) or history_status),
+        else reading.failed_read(whole.route, reading.attempt_error(whole) or history_status),
         lambda r: r.get("try_number") != ti.get("try_number") and _carries_execution_fields(r),
         f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
     ).as_field()
@@ -300,9 +324,9 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     # fields; a truncated history, an unread one, or one that does hold such an
     # attempt leaves the question open, which is ``None``, not ``False``.
     history_rules_out_partial = history_status == "checked" and earlier_executed is False
+    partial_possible = _partial_effect_possible(ti, history_rules_out_partial)
     if _is_never_dispatched_attempt(ti):
         dispatched: bool | None = False
-        partial_possible: bool | None = False if history_rules_out_partial else None
         narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} and this attempt carries none of the fields a "
@@ -313,7 +337,6 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         ) + ("" if history_rules_out_partial else f" {_PARTIAL_UNSETTLED_BY_HISTORY}")
     elif missing:
         dispatched = None
-        partial_possible = None
         narrative = (
             f"the response for {_ti_where(ti)} did not carry {missing}, so nothing here establishes "
             f"whether this attempt was dispatched."
@@ -326,7 +349,6 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         # was the tool asserting the external system was untouched on the
         # strength of four empty fields it has no such reach over.
         dispatched = None
-        partial_possible = None
         narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} with duration {_quoted(ti.get('duration'))}, and none "
@@ -337,7 +359,6 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         )
     else:
         dispatched = True
-        partial_possible = True
         narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} and this attempt carries execution fields "
@@ -355,10 +376,15 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         "partial_external_effect_possible": partial_possible,
         "attempt_history": {
             "status": history_status,
-            "attempts_recorded": None if history.read_failed else history.universe,
+            "attempts_recorded": None if whole.read_failed else whole.universe,
             "attempts": rows,
+            # How many recorded attempts are NOT in the list above. The list is
+            # a display and the read behind it was whole, so this is the one
+            # place the clamp is disclosed — ``status`` no longer wears the word
+            # a route truncation earns.
+            "attempts_omitted_from_display": max(whole.kept - len(rows), 0),
             "earlier_attempt_carries_execution_fields": earlier_executed,
-            "error": reading.attempt_error(history),
+            "error": reading.attempt_error(whole),
         },
         "live_row_carries_execution_fields": live_executed,
         "log_for_recorded_attempt": _tagged_log(_attempt_log(dag_id, run_path, ti, ti.get("try_number"))),
@@ -1198,11 +1224,32 @@ def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any]
             # half-operation warning on the operator's card, and it was computed
             # at plan time and never recomputed — the gate held the fresh rows
             # one find() away and read only how many there were.
-            ctx.state["earlier_attempt_executed"] = reading.find(
+            earlier_executed = reading.find(
                 history,
                 lambda row: row.get("try_number") != ti.get("try_number") and _carries_execution_fields(row),
                 f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
             ).as_field()
+            ctx.state["earlier_attempt_executed"] = earlier_executed
+            # The SAME decision the plan card makes, taken through the same
+            # function. Re-asking only "does an OTHER attempt carry execution
+            # fields" answers a strictly weaker question, and publishing its
+            # False as the half-operation verdict told the operator nothing
+            # outside Airflow was touched over a row naming a hostname and a pid.
+            #
+            # Off the RUN's rows: the clear preview carries four fields and the
+            # dispatch shape is read from eight, so the preview row cannot
+            # answer it either way.
+            live = next(
+                (
+                    row
+                    for row in ctx.run_scan().rows
+                    if row.get("task_id") == target and row.get("map_index", -1) == wanted
+                ),
+                None,
+            )
+            ctx.state["partial_effect_possible"] = (
+                None if live is None else _partial_effect_possible(live, earlier_executed is False)
+            )
             return None
         return _incomplete_read(
             ctx.dag_id,
@@ -1676,9 +1723,7 @@ def apply_task_instance_clear(
         # before this write — not carried forward from the plan. ``False`` is
         # what suppresses the half-operation warning on the operator's card, and
         # it used to be computed once, at plan time, and never looked at again.
-        "partial_external_effect_possible": (
-            None if recheck.get("earlier_attempt_executed") is not False else False
-        ),
+        "partial_external_effect_possible": recheck.get("partial_effect_possible"),
         "partial_external_effect_source": (
             "re-read from the target's attempt history immediately before the write"
         ),

@@ -291,6 +291,29 @@ class Reading:
         return replace(self, rows=(), _delivered=0, _claimed=None, error=error)
 
 
+def _accountable_total(claimed: Any, delivered: int, limit: int | None) -> int | None:
+    """What a route's own count is worth to a completeness question.
+
+    THE one place a ``total_entries`` is turned into a number a reading may
+    reason with, because there are three ways it fails to be one and each was
+    handled at a different call site — or, in ``matches_of``, at none:
+
+    * a count in a form this reading cannot use (``"12"``) is not a count, and
+      dropping it to "no count at all" made an unreadable total
+      indistinguishable from an exhaustive read;
+    * no count at all beside a page that came back FULL at the limit this read
+      asked for is evidence of at least one more row;
+    * no count at all beside a short page is a page that ended naturally.
+    """
+    if isinstance(claimed, int) and not isinstance(claimed, bool):
+        return claimed
+    if claimed is not None:
+        return delivered + 1
+    if limit is not None and delivered >= limit:
+        return delivered + 1
+    return None
+
+
 def read_of(
     resp: Any,
     key: str,
@@ -299,11 +322,17 @@ def read_of(
     pages: int = 1,
     exhausted: bool = True,
     delivered: int | None = None,
+    limit: int | None = None,
 ) -> Reading:
     """One list-shaped response body as a ``Reading``.
 
     ``delivered`` is passed only by a paginating caller, which has accumulated
     more rows than the last page holds.
+
+    ``limit`` is the row count this read ASKED the route for, and passing it buys
+    the overflow sentinel: a page that comes back full at the limit while the
+    route sends no usable count is evidence of at least one more row. Without
+    it, a route's silence both ended the read and certified it.
     """
     body = resp if isinstance(resp, dict) else {}
     rows = body.get(key) or []
@@ -314,12 +343,7 @@ def read_of(
         # answer a confident negative over a response nobody could parse.
         return failed_read(route, f"{key!r} came back as {type(rows).__name__} and not as a list")
     kept = tuple(row for row in rows if isinstance(row, dict))
-    claimed = body.get("total_entries")
-    if claimed is not None and (not isinstance(claimed, int) or isinstance(claimed, bool)):
-        # The route accounted for its rows in a form this reading cannot use, so
-        # it cannot say it saw all of them. Dropping it to "no count at all" made
-        # an unreadable total indistinguishable from an exhaustive read.
-        claimed = len(rows) + 1
+    claimed = _accountable_total(body.get("total_entries"), len(rows), limit)
     return Reading(
         rows=kept,
         route=route,
@@ -359,6 +383,7 @@ def matches_of(
     scanned: int,
     claimed: Any,
     route: str,
+    limit: int | None = None,
 ) -> Reading:
     """The rows that answered a question, over a scan that may not have covered everything.
 
@@ -367,10 +392,14 @@ def matches_of(
     and every unexamined row could have matched — so the universe is raised by
     exactly that many, and completeness comes out True only for an exhaustive
     scan.
+
+    ``claimed`` goes through the same accounting ``read_of`` uses, and for the
+    same reasons: this consumed the same ``total_entries`` and trusted it in
+    forms ``read_of`` refuses, so ``total_entries: "12"`` and a full page beside
+    no count at all both certified a scan that had stopped at its own page.
     """
-    unexamined = (
-        max(claimed - scanned, 0) if isinstance(claimed, int) and not isinstance(claimed, bool) else 0
-    )
+    accountable = _accountable_total(claimed, scanned, limit)
+    unexamined = max(accountable - scanned, 0) if accountable is not None else 0
     return Reading(
         rows=tuple(matched),
         route=route,
@@ -611,6 +640,9 @@ def _tasks(dag_id: str) -> Reading:
 
 
 _IMPORT_ERRORS_ROUTE = "GET /importErrors"
+# One page of import errors. Named rather than spelled at the call site so the
+# read's own bound and the number it is measured against are the same token.
+IMPORT_ERROR_SCAN = 100
 
 
 def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
@@ -628,7 +660,7 @@ def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
     if not names:
         return failed_read(_IMPORT_ERRORS_ROUTE, "the Dag record names no file to match an import error to")
     try:
-        resp = transport._api("GET", "/importErrors", params={"limit": 100})
+        resp = transport._api("GET", "/importErrors", params={"limit": IMPORT_ERROR_SCAN})
         errors = resp["import_errors"]
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         # A bare empty list here was indistinguishable from "this Dag's file
@@ -670,7 +702,11 @@ def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
     # WHOLE, with ``omitted`` zero. The truncation travels as the reading's own
     # note, and the caller renders it as a check.
     return matches_of(
-        checks, scanned=len(errors), claimed=resp.get("total_entries"), route=_IMPORT_ERRORS_ROUTE
+        checks,
+        scanned=len(errors),
+        claimed=resp.get("total_entries"),
+        route=_IMPORT_ERRORS_ROUTE,
+        limit=IMPORT_ERROR_SCAN,
     )
 
 
@@ -759,6 +795,7 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
                 scanned=len(returned),
                 claimed=resp.get("total_entries"),
                 route=_RUN_TASK_HISTORY_ROUTE,
+                limit=RUN_HISTORY_LIMIT,
             )
             tasks[task_id] = reading
             omitted[task_id] = reading.omitted
@@ -820,7 +857,7 @@ def _recent_runs(dag_id: str) -> Reading:
         "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": RUN_HISTORY_LIMIT}
     )
     resp["dag_runs"]
-    return read_of(resp, "dag_runs", _DAG_RUNS_ROUTE)
+    return read_of(resp, "dag_runs", _DAG_RUNS_ROUTE, limit=RUN_HISTORY_LIMIT)
 
 
 def _build_asset_note(dag_id: str) -> str:
@@ -1034,7 +1071,7 @@ def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bo
         context["versions_status"] = "unavailable"
         context["error"] = _explain_error(e)
         return context
-    versions = read_of(listed, "dag_versions", _DAG_VERSIONS_ROUTE)
+    versions = read_of(listed, "dag_versions", _DAG_VERSIONS_ROUTE, limit=DAG_VERSION_SCAN)
     known = [row.get("version_number") for row in versions.rows]
     context["latest_version"] = known[0] if known else None
     context["versions_status"] = "checked" if versions.complete else "partial"
@@ -1231,7 +1268,7 @@ def _duration_baseline(
             f"{_DURATION_HISTORY_SOURCE} only — the same task's rows in this Dag's other runs "
             f"could not be read ({_explain_error(e)})",
         )
-    rest = read_of(resp, "task_instances", _RUN_TASK_HISTORY_ROUTE)
+    rest = read_of(resp, "task_instances", _RUN_TASK_HISTORY_ROUTE, limit=RUN_HISTORY_LIMIT)
     samples += [
         {"duration": row["duration"]}
         for row in rest.rows
@@ -1240,19 +1277,28 @@ def _duration_baseline(
         and usable(row)
     ]
     # A median is a statistic OVER A SAMPLE and does not need the population, so
-    # the sample size this tool asked for is not a shortfall: ``limit`` is
-    # RUN_HISTORY_LIMIT, and a page that comes back AT it is the sample that was
-    # requested. Charging it to the reading made the leg unanswerable for every
-    # task with more than ten runs — a permanent null, not a caution.
+    # the sample size this tool ASKED THE ROUTE FOR is not a shortfall: ``limit``
+    # is RUN_HISTORY_LIMIT, and a page that comes back AT it is the sample that
+    # was requested. Charging it to the reading made the leg unanswerable for
+    # every task with more than ten runs — a permanent null, not a caution.
     #
     # A page that comes back UNDER the limit while the route accounts for more IS
     # a read that fell short, and that one still counts.
-    unread = rest.omitted if rest.kept < RUN_HISTORY_LIMIT else 0
+    #
+    # ``attempts`` is NOT the same case and is charged in full. ``/tries`` is
+    # unpaginated: it hands over every recorded attempt and this tool discards
+    # the oldest of them AFTER they arrive. That is a discard, not a sample
+    # size, and dropping it let a baseline drawn over the ten most recent
+    # attempts — all of them fast — vouch for a re-run that a whole history
+    # would have called far too fast to have done the work.
+    unread = attempts.omitted + (rest.omitted if rest.kept < RUN_HISTORY_LIMIT else 0)
     # Rows EXAMINED, not rows kept: ``usable()`` is this reading's own filter for
     # what may enter a baseline, and charging its discards to the shortfall
     # counted the tool's own judgement as unread records.
     examined = len(attempts.rows) + len(rest.rows)
     sampled = f"the most recent {RUN_HISTORY_LIMIT} run(s) of this task" if rest.omitted else "every run read"
+    if attempts.omitted:
+        sampled += f", and {attempts.omitted} earlier recorded attempt(s) were not among the rows compared"
     return (
         matches_of(
             samples,
@@ -1309,7 +1355,7 @@ def read_asset_catalog() -> Reading:
     # catalog took the whole tool down instead of coming back as a failed read.
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         return failed_read(ASSET_CATALOG_ROUTE, _explain_error(e))
-    return read_of(resp, "assets", ASSET_CATALOG_ROUTE)
+    return read_of(resp, "assets", ASSET_CATALOG_ROUTE, limit=ASSET_CATALOG_LIMIT)
 
 
 def _compute_asset_edges(dag_id: str, catalog: Reading) -> dict[str, list[str] | None]:

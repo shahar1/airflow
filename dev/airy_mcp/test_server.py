@@ -69,6 +69,11 @@ def _tries_reading(rows, total=None):
     return reading.Reading(rows=tuple(rows), route=reading._TRIES_ROUTE, _delivered=len(rows), _claimed=total)
 
 
+def _counted(body, total, omit):
+    """A response body with its row count, or without it — some routes send none."""
+    return body if omit else {**body, "total_entries": total}
+
+
 class FakeAirflow:
     """Minimal stand-in for the Airflow REST API."""
 
@@ -151,6 +156,16 @@ class FakeAirflow:
         self.run_tis_total: int | None = None
         self.dry_run_total: int | None = None
         self.omit_backfill_total = False
+        # Routes that hand back a page and NO count at all. A single-page read
+        # that took the page's own length as the total let the route's silence
+        # both end the read and certify it, so every bounded single-page read
+        # gets this lever and not only the one that was found by hand.
+        self.omit_cross_run_total = False
+        self.omit_assets_total = False
+        self.omit_import_errors_total = False
+        self.omit_versions_total = False
+        self.omit_dag_runs_total = False
+        self.omit_tries_total = False
         self.fleet_filter = True
         self.fail_cross_run: Exception | None = None
 
@@ -198,21 +213,15 @@ class FakeAirflow:
             wanted = (kwargs.get("params") or {}).get("task_id")
             rows = [ti for ti in self.cross_run_tis if ti["task_id"] == wanted]
             total = len(rows) if self.cross_run_total is None else self.cross_run_total
-            return {"task_instances": rows, "total_entries": total}
+            return _counted({"task_instances": rows}, total, self.omit_cross_run_total)
         if path == "/assets":
-            return {
-                "assets": self.assets,
-                "total_entries": len(self.assets) if self.assets_total is None else self.assets_total,
-            }
+            total = len(self.assets) if self.assets_total is None else self.assets_total
+            return _counted({"assets": self.assets}, total, self.omit_assets_total)
         if path == "/importErrors":
             if self.fail_import_errors:
                 raise self.fail_import_errors
-            return {
-                "import_errors": self.import_errors,
-                "total_entries": (
-                    len(self.import_errors) if self.import_errors_total is None else self.import_errors_total
-                ),
-            }
+            total = len(self.import_errors) if self.import_errors_total is None else self.import_errors_total
+            return _counted({"import_errors": self.import_errors}, total, self.omit_import_errors_total)
         if path == f"/dags/{DAG_ID}/details":
             return {"dag_id": DAG_ID, "params": self.dag_params}
         if path == f"/dags/{DAG_ID}/tasks":
@@ -289,10 +298,12 @@ class FakeAirflow:
                 raise self.fail_versions
             numbers = sorted(self.versions or [self.version], reverse=True)
             limit = (kwargs.get("params") or {}).get("limit", len(numbers))
-            return {
-                "dag_versions": [{"version_number": n} for n in numbers[:limit]],
-                "total_entries": len(numbers) if self.versions_total is None else self.versions_total,
-            }
+            total = len(numbers) if self.versions_total is None else self.versions_total
+            return _counted(
+                {"dag_versions": [{"version_number": n} for n in numbers[:limit]]},
+                total,
+                self.omit_versions_total,
+            )
         if path.startswith("/parseDagFile/"):
             if self.reparse_status:
                 # The message carries the URL, exactly as httpx's own does.
@@ -313,10 +324,8 @@ class FakeAirflow:
                 if self.fail_trigger:
                     raise self.fail_trigger
                 return {"dag_run_id": "manual__new", "state": "queued"}
-            return {
-                "dag_runs": self.runs,
-                "total_entries": len(self.runs) if self.runs_total is None else self.runs_total,
-            }
+            total = len(self.runs) if self.runs_total is None else self.runs_total
+            return _counted({"dag_runs": self.runs}, total, self.omit_dag_runs_total)
         if path == "/dags/~/dagRuns/~/taskInstances/list":
             # ``False`` stands for a server-side filter regression, which is the
             # only reason the tool filters again on its side.
@@ -368,10 +377,8 @@ class FakeAirflow:
             task_id = path.split("/taskInstances/")[1][: -len("/tries")]
             map_index = (kwargs.get("params") or {}).get("map_index", -1)
             rows = self.tries_by_task.get((task_id, map_index), [])
-            return {
-                "task_instances": rows,
-                "total_entries": len(rows) if self.tries_total is None else self.tries_total,
-            }
+            total = len(rows) if self.tries_total is None else self.tries_total
+            return _counted({"task_instances": rows}, total, self.omit_tries_total)
         if path.endswith("/taskInstances"):
             return {"task_instances": self.task_instances}
         if "/logs/" in path:
@@ -6890,6 +6897,34 @@ def test_the_comparison_reports_no_omission_when_the_page_held_it_all(airflow):
     assert comparison["rows_omitted"] == {"remit_payment_batch": 0}
 
 
+def test_a_full_page_with_no_count_at_all_is_not_a_read_of_everything(airflow):
+    """R5. ``read_of`` refuses a route's silence beside a full page and this
+    read did not: a page that came back FULL at the limit it asked for, with no
+    ``total_entries``, was reported whole — so an absence in it read as an
+    absence in the history."""
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [
+        {**FORGED_TI, "dag_run_id": f"manual__{n}"} for n in range(reading.RUN_HISTORY_LIMIT)
+    ]
+    airflow.omit_cross_run_total = True
+
+    comparison = _green_run(airflow, FORGED_TI)["run_history"]["task_comparison"]
+
+    assert comparison["rows_omitted"]["remit_payment_batch"] >= 1
+
+
+def test_a_row_count_in_a_form_this_read_cannot_use_is_not_a_row_count(airflow):
+    """``total_entries: "12"`` is refused by ``read_of`` and was silently
+    accepted here, so a scan certified itself off a string."""
+    _with_own_history(airflow)
+    airflow.cross_run_tis = [{**FORGED_TI, "dag_run_id": "manual__1"}]
+    airflow.cross_run_total = "12"
+
+    comparison = _green_run(airflow, FORGED_TI)["run_history"]["task_comparison"]
+
+    assert comparison["rows_omitted"]["remit_payment_batch"] >= 1
+
+
 def test_the_top_level_dag_version_carries_the_same_caveat_as_the_run_rows(airflow):
     """F14/C4: the top-level display is the one a model reads out, so it cannot
     be the one without the caveat."""
@@ -8363,6 +8398,40 @@ def test_a_whole_page_this_tool_clamped_is_reported_as_a_partial_read(recovered_
     assert "prior_attempt_preserved" in entry["unestablished_checks"]
 
 
+def test_the_attempts_the_baseline_discarded_are_charged_to_the_baseline(recovered_run):
+    """P2. ``/tries`` is unpaginated: it hands over every recorded attempt and
+    this tool keeps the newest ten. Those are DISCARDED rows, not a sample size,
+    and dropping them let a median over ten fast attempts vouch for a re-run
+    that the whole history calls far too fast to have done the work."""
+    slow = [
+        {
+            "try_number": n,
+            "state": "failed",
+            "hostname": "worker-1",
+            "pid": 4000 + n,
+            "duration": 100.0,
+            "start_date": "2026-08-07T22:00:00+00:00",
+            "end_date": "2026-08-07T22:01:40+00:00",
+        }
+        for n in range(1, 16)
+    ]
+    fast = [{**row, "try_number": n, "duration": 0.9} for n, row in enumerate(slow[:9], 16)]
+    recovered_run.tries_by_task[("summarize", -1)] = slow + fast
+    recovered_run.tis_by_run["manual__1"] = [
+        dict(EXECUTED),
+        {**RECOVERED, "try_number": 25, "max_tries": 25, "duration": 0.5},
+        dict(REPORTED),
+    ]
+
+    leg = _leg(
+        _verify(prior_attempts={"summarize": 24, "report": 1})["instances"][0],
+        "duration_in_line_with_history",
+    )
+
+    assert leg["passed"] is None
+    assert "NOT read whole" in leg["detail"]
+
+
 def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recovered_run):
     recovered_run.tries_by_task[("summarize", -1)] = _attempts(12)
     recovered_run.tries_total = 40
@@ -8376,8 +8445,28 @@ def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recover
 
 
 def test_the_clamp_cannot_rule_out_an_earlier_dispatched_attempt(recovered_run):
-    """`False` here suppresses the half-operation warning, so it needs a whole read."""
+    """`False` here suppresses the half-operation warning, so it needs a whole read.
+
+    The ten-row clamp keeps the executed attempt off the DISPLAY. It must not
+    keep it out of the answer: ``/tries`` is unpaginated, the row was read, and
+    the question is asked of the read.
+    """
     recovered_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=1)
+
+    evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", dict(FORGED))
+
+    assert evidence["attempt_history"]["status"] == "checked"
+    assert len(evidence["attempt_history"]["attempts"]) == 10
+    assert evidence["attempt_history"]["attempts_omitted_from_display"] == 2
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is True
+    assert evidence["partial_external_effect_possible"] is None
+    assert server._PARTIAL_UNSETTLED_BY_HISTORY in evidence["reading"]
+
+
+def test_a_short_tries_page_cannot_rule_out_an_earlier_dispatched_attempt(recovered_run):
+    """The read falling short is what leaves the question open — not the display."""
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(3)
+    recovered_run.tries_total = 40
 
     evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", dict(FORGED))
 
@@ -11506,7 +11595,33 @@ def test_the_gate_re_asks_the_half_operation_risk_off_the_rows_it_just_read(clea
     assert "immediately before the write" in result["partial_external_effect_source"]
 
 
+def _bare_target(fake):
+    """Give the clear's target the shape of an attempt that was never dispatched.
+
+    ``False`` needs BOTH conjuncts, so a fixture whose live row simply omits the
+    dispatch fields cannot earn it — and pinning ``False`` over one is what let
+    the apply path publish it over a row naming a hostname and a pid.
+    """
+    rows = fake.tis_by_run["manual__1"]
+    for index, row in enumerate(rows):
+        if row["task_id"] == "summarize":
+            rows[index] = {
+                **row,
+                "try_number": 0,
+                "max_tries": 0,
+                "hostname": "",
+                "pid": None,
+                "queued_when": None,
+                "scheduled_when": None,
+                "duration": 0.0,
+                "start_date": "2026-08-07T22:21:17.323403+00:00",
+                "end_date": "2026-08-07T22:21:17.323403+00:00",
+            }
+    return fake
+
+
 def test_a_history_with_no_earlier_dispatched_attempt_still_settles_the_risk(cleared_run):
+    _bare_target(cleared_run)
     cleared_run.tries_by_task[("summarize", -1)] = [
         {"try_number": 0, "state": "failed", "hostname": "", "pid": None, "duration": 0.0}
     ]
@@ -11515,6 +11630,42 @@ def test_a_history_with_no_earlier_dispatched_attempt_still_settles_the_risk(cle
     result = _gate_apply(plan)
 
     assert result["partial_external_effect_possible"] is False
+
+
+def test_the_gate_never_rules_out_a_half_operation_over_a_dispatched_attempt(cleared_run):
+    """P1. The gate re-asked a strictly weaker question — whether some OTHER
+    attempt carries execution fields — and published its ``False`` as the
+    half-operation verdict. The plan card said ``True`` and warned about a
+    duplicate of half an operation over the same row."""
+    rows = cleared_run.tis_by_run["manual__1"]
+    for index, row in enumerate(rows):
+        if row["task_id"] == "summarize":
+            rows[index] = {
+                **row,
+                "state": "failed",
+                "try_number": 1,
+                "max_tries": 1,
+                "hostname": "worker-1",
+                "pid": 4110,
+                "queued_when": "2026-08-07T22:21:10+00:00",
+                "scheduled_when": "2026-08-07T22:21:09+00:00",
+                "duration": 812.0,
+                "start_date": "2026-08-07T22:07:45+00:00",
+                "end_date": "2026-08-07T22:21:17+00:00",
+            }
+    # Nothing OTHER than the recorded attempt carries execution fields, which is
+    # the only thing the gate used to ask.
+    cleared_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 1, "state": "failed", "hostname": "worker-1", "pid": 4110, "duration": 812.0}
+    ]
+    plan = _gate_plan(cleared_run)
+    assert plan["recovery_evidence"]["partial_external_effect_possible"] is True
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert result["partial_external_effect_possible"] is True
+    assert "duplicate of half an operation" in " ".join(plan["warnings"])
 
 
 @pytest.mark.parametrize(
