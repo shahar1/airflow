@@ -233,9 +233,30 @@ def _rows_by_run(rows: reading.Reading) -> dict[str, dict[str, Any]]:
     return {row["dag_run_id"]: dict(row) for row in rows.rows if isinstance(row.get("dag_run_id"), str)}
 
 
+# Always interpolated after "… and ", so it starts lower case: the sentence used
+# to render as "…, and The same task's rows…".
 _NOT_COMPARED_WHOLE = (
-    "The same task's rows on the other runs were NOT read whole, so nothing here rules that in or out"
+    "the same task's rows on the other runs were NOT read whole, so nothing here rules that in or out"
 )
+
+
+def _said_once(clauses: list[str]) -> list[str]:
+    """The comparison's shortfall stated once per finding, not once per clause.
+
+    Two of the three clauses draw over the same comparison, so both carried the
+    same sentence and the same parenthesised reason — the reader got the
+    identical clause twice inside one summary entry.
+    """
+    marker = f", and {_NOT_COMPARED_WHOLE}"
+    kept = []
+    stated = False
+    for clause in clauses:
+        if marker not in clause:
+            kept.append(clause)
+            continue
+        kept.append(clause.split(marker)[0] if stated else clause)
+        stated = True
+    return kept
 
 
 def _recurrence_clause(order: list[str], rows: reading.Reading, run_id: str) -> str:
@@ -452,6 +473,7 @@ def _augment_dispatch_findings(
             )
             if clause
         ]
+        clauses = _said_once(clauses)
         if not clauses:
             continue
         added = ". ".join(clauses)
@@ -467,6 +489,12 @@ _CHECK_LABELS = {
     "unknown_xcom_task_id": "Latent blocker",
     "import_error": "Import error",
     "import_errors_truncated": "Note",
+    # Read-coverage caveats, the same kind of entry as the truncation note above:
+    # they say what this diagnosis did not get to look at, which is not a problem
+    # found IN the run. Missing here, they rendered as "Check:" and were counted
+    # into "this diagnosis found N problems".
+    "import_errors_unreadable": "Note",
+    "task_list_truncated": "Note",
     "source_graph_disagreement": "Note",
     # Names what was observed — the absence of the fields — and not what wrote
     # the state or whether anything ran.
@@ -480,6 +508,16 @@ _CHECK_LABELS = {
 _FOLD_KINDS = (_DISPATCH_TRUNCATED_KIND, _STATIC_CHECKS_FOLDED_KIND)
 
 
+def _is_a_problem(check: dict[str, Any]) -> bool:
+    """Whether this entry is a finding about the run rather than about coverage.
+
+    Derived from the label rather than from a second list: everything this file
+    labels "Note" is a caveat — a fold entry standing for others, or a read that
+    did not cover everything — and neither is a problem the run has.
+    """
+    return _CHECK_LABELS.get(check["kind"], "Check") != "Note"
+
+
 def _summarize_failure(failure: dict[str, Any]) -> str:
     where = _fenced(_ti_where(failure))
     # The log line is whatever the task printed, so it is quoted and clamped like
@@ -487,9 +525,18 @@ def _summarize_failure(failure: dict[str, Any]) -> str:
     # ``_extract_error_line`` already clips at 400 on a word boundary; the limit
     # here only has to leave room for the quotes and the escapes it adds.
     line = _quoted(_extract_error_line(failure.get("log_tail") or "") or "no log available", 440)
+    # The line is drawn from a TAIL. Where the tail is not the log, the error it
+    # names is the last one in what was kept and not necessarily the cause, so
+    # the sentence says so rather than asserting the failure was that line.
+    cut = (
+        " The log was read as a tail only, so this line is the last error in the part that was "
+        "read and may not be the one that failed the task."
+        if failure.get("log_tail_truncated")
+        else ""
+    )
     if failure.get("still_retrying"):
-        return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log)."
-    return f"Confirmed failure: {where} failed with {line} (see log)."
+        return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log).{cut}"
+    return f"Confirmed failure: {where} failed with {line} (see log).{cut}"
 
 
 def _census_clause(health: dict[str, Any]) -> str:
@@ -572,6 +619,7 @@ def _build_diagnosis_summary(
     checks: list[dict[str, Any]],
     logs_omitted: int,
     health: dict[str, Any],
+    nothing_failed: reading.Verdict | None = None,
 ) -> str:
     """One deterministic digest the model can echo, enumerating every finding.
 
@@ -579,10 +627,13 @@ def _build_diagnosis_summary(
     was handed, and just as reliably drops one finding out of two it has to
     assemble from separate fields.
 
-    The strong "No problems found" sentence is gated on ``health['clean']`` and
-    on nothing else, and every finding it would have to contradict is an entry
-    in the same ``checks`` list this enumerates — so there is no second
-    computation for it to drift from.
+    Both no-finding sentences are gated on a verdict rather than on the absence
+    of entries. The strong one is gated on ``health['clean']``; the medium one is
+    gated on ``nothing_failed``, which is the same three-valued answer the
+    ``no_task_instance_failed`` field carries — because "No failures found" over
+    a run whose instance list stopped at the scan ceiling is a claim about
+    instances nobody read, and this is the field the plugin tells the model
+    outranks every other one.
     """
     items = [_summarize_failure(failure) for failure in failures]
     items += [f"{_CHECK_LABELS.get(check['kind'], 'Check')}: {check['detail']}." for check in checks]
@@ -596,6 +647,13 @@ def _build_diagnosis_summary(
                 f"{health['successes_scanned']} task instances succeeded, and every one of them "
                 f"carries a worker-written dispatch field (hostname or pid) on the attempt recorded "
                 f"successful.{_coverage_clauses(health)}"
+            )
+        if nothing_failed is not None and not nothing_failed.is_present():
+            return (
+                f"NO FAILURE was found among the task instances this diagnosis READ, and that is not "
+                f"the same as no failure: run {_fenced(run_id)} is {run_state}, and its instance list "
+                f"was NOT read whole, so whether an instance this diagnosis did not reach failed is "
+                f"NOT established.{_census_clause(health)}{_coverage_clauses(health)}"
             )
         return (
             f"No failures found: run {_fenced(run_id)} is {run_state}."
@@ -618,8 +676,11 @@ def _build_diagnosis_summary(
     # problem reported 26 for a run holding 500. The headline counts problems;
     # the numbering counts entries, and the fold entry says which is which.
     folded_away = health["dispatch_findings_suppressed"] + health["static_checks_suppressed"]
-    fold_entries = sum(1 for check in checks if check["kind"] in _FOLD_KINDS)
-    problems = len(items) - fold_entries + folded_away
+    # Every "Note" is a caveat rather than a finding: a fold entry standing for
+    # others, or a read that did not cover everything. A read-coverage caveat
+    # counted as a problem told the reader the run holds a problem it does not.
+    caveats = sum(1 for check in checks if not _is_a_problem(check))
+    problems = len(items) - caveats + folded_away
     # The run's id and state, in the branch that reports findings. The clean
     # branch always named them; this one did not, so the sentence a model had to
     # assemble to say "the run is green and something in it still did not run"
@@ -870,7 +931,7 @@ def diagnose_dag(
         # sentence that got read out. It now says what ``summary`` says, and
         # points at it.
         result["summary"] = _build_diagnosis_summary(
-            run["dag_run_id"], run["state"], [], checks, 0, result["run_health"]
+            run["dag_run_id"], run["state"], [], checks, 0, result["run_health"], nothing_failed
         )
         # Not a count of its own — the count belongs to ``summary`` and a second
         # computation of it is a second thing to drift.
@@ -913,13 +974,20 @@ def diagnose_dag(
         # From the end, like _tail itself: the exception and its traceback are
         # the last thing in the log, and keeping the first N characters of a
         # tail would spend the budget on the lines nobody needs.
-        tail = _tail(log.get("content") if isinstance(log, dict) else log).text[-budget:]
+        clipped = _tail(log.get("content") if isinstance(log, dict) else log)
+        tail = clipped.text[-budget:]
+        # ``Clipped`` carries whether anything was cut and the slice above threw
+        # it away: this text lands verbatim in ``summary``, and the error line
+        # named there is drawn from the tail. A real error at the top of a 5000
+        # line log left the summary confidently naming a progress line as the
+        # cause, with nothing in the payload to say otherwise.
         budget -= len(tail)
         failures.append(
             {
                 "task_id": ti["task_id"],
                 "map_index": ti.get("map_index", -1),
                 "log_tail": tail,
+                "log_tail_truncated": clipped.truncated or len(clipped.text) > len(tail),
                 "still_retrying": ti.get("state") == "up_for_retry",
             }
         )
@@ -931,7 +999,7 @@ def diagnose_dag(
         run, tis, failures, checks, omitted, coverage, attribution_census, event_history, run_history
     )
     result["summary"] = _build_diagnosis_summary(
-        run["dag_run_id"], run["state"], failures, checks, logs_omitted, result["run_health"]
+        run["dag_run_id"], run["state"], failures, checks, logs_omitted, result["run_health"], nothing_failed
     )
     if stale_note:
         result["summary"] = f"{stale_note} {result['summary']}"
@@ -1067,6 +1135,18 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         "task_durations": task_durations,
         "conf_changes": conf_changes,
         "source_diff": source_diff,
+        # The three-valued fields say what null MEANS, in the payload, next to
+        # the nulls. The docstring defines only true and false, and a small model
+        # handed a null under a two-valued contract reads it as false — which is
+        # the one reading these fields exist to prevent.
+        "scope": (
+            "`run_a_worker_field` / `run_b_worker_field` and `run_a_instances` / `run_b_instances` "
+            "are three-valued. null is NOT false: it means that run's task-instance list came back "
+            "incomplete, so an instance carrying a worker-written field — or a further mapped "
+            "instance — may be sitting past what this comparison read. false means the rows WERE "
+            "all read and none of them records one. Read `task_instances_read_whole` on each run "
+            "before treating any null here as an answer."
+        ),
     }
 
 
@@ -1145,6 +1225,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
 
     clusters: dict[str, dict[str, Any]] = {}
     unreadable: list[str] = []
+    clipped_logs = 0
     for ti in tis:
         try:
             log = transport._api(
@@ -1164,7 +1245,13 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
             # the unreadable log joins them instead of raising past the caller.
             unreadable.append(f"{_ti_where(ti)} in {ti['dag_id']}/{ti['dag_run_id']} ({_explain_error(e)})")
             continue
-        signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log).text)
+        clipped = _tail(log.get("content") if isinstance(log, dict) else log)
+        if clipped.truncated:
+            # The signature is drawn from the last error in the tail, which over
+            # a cut log is not necessarily the error that failed the task — so
+            # two instances can land in different clusters for no other reason.
+            clipped_logs += 1
+        signature = _error_signature(clipped.text)
         cluster = clusters.setdefault(signature, {"error": signature, "count": 0, "examples": []})
         cluster["count"] += 1
         if len(cluster["examples"]) < 5:
@@ -1201,6 +1288,8 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     }
     if unreadable:
         result["failures_unreadable"] = unreadable
+    if clipped_logs:
+        result["logs_read_as_a_tail"] = clipped_logs
     return result
 
 

@@ -941,7 +941,15 @@ def test_diagnose_dag_reports_a_task_that_is_still_retrying(airflow):
     result = server.diagnose_dag(DAG_ID)
 
     assert result["failures"] == [
-        {"task_id": "flaky", "map_index": -1, "log_tail": "ValueError: boom", "still_retrying": True}
+        {
+            "task_id": "flaky",
+            "map_index": -1,
+            "log_tail": "ValueError: boom",
+            # The tail carries whether it IS one: the log is short enough here
+            # that nothing was cut, and the summary may name its error line.
+            "log_tail_truncated": False,
+            "still_retrying": True,
+        }
     ]
     assert "Still retrying: `flaky`" in result["summary"]
     assert "diagnosis" not in result
@@ -10309,6 +10317,12 @@ def test_d2_a_run_whose_instance_list_stopped_short_gets_no_all_clear(airflow):
 
     assert result["no_task_instance_failed"] is None
     assert "NOT established" in result["diagnosis"]
+    # And in ``summary``, which is the field the plugin tells the model outranks
+    # every other one. This test's own fixture used to get the all-clear there:
+    # "No failures found: run `...` is success", beside a null in the field that
+    # answers the same question.
+    assert "No failures found" not in result["summary"]
+    assert "NOT established" in result["summary"]
 
 
 def test_d3_a_worker_field_past_the_ceiling_is_unknown_and_not_false(airflow):
@@ -10901,3 +10915,126 @@ def test_the_failure_scan_never_claims_the_window_holds_no_failure_it_did_not_re
     assert short["failures_omitted"] == 1
     assert "No clusters means no FAILED task instance in the window" not in short["scope"]
     assert "not whole" in short["scope"]
+
+
+# ---------------------------------------------------------------------------
+# The prose layer, wired to the plumbing underneath it.
+#
+# The typed reads are only worth what the sentences over them say. Each of these
+# is a sentence that contradicted, or silently outranked, the field beside it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_summary_never_reports_no_failures_over_instances_nobody_read(airflow):
+    """The worst of them: byte-identical to the pre-typing sentence, over a run
+    whose instance list stopped at the scan ceiling — and the plugin instructs
+    the model that `summary` outranks every other field, so the honest one
+    (`no_task_instance_failed: null`) is the one it is told to discard."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
+    airflow.tis_by_run = {"manual__1": [{"task_id": "extract", "state": "success", "map_index": -1}]}
+    airflow.run_tis_total = 900
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert result["no_task_instance_failed"] is None
+    assert "No failures found: run" not in result["summary"]
+    assert "NOT established" in result["summary"]
+    # The self-contradiction the sentence used to carry in its own clause.
+    assert not ("No failures found" in result["summary"] and "is failed" in result["summary"])
+
+
+def test_a_run_read_whole_with_nothing_failed_still_gets_the_plain_sentence(airflow):
+    """The repair may not cost the honest all-clear: a whole read that finds no
+    failure says so plainly."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "success"}}
+    airflow.tis_by_run = {"manual__1": [{"task_id": "extract", "state": "skipped", "map_index": -1}]}
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert result["no_task_instance_failed"] is True
+    assert result["summary"].startswith("No failures found: run")
+
+
+def test_a_summary_built_off_a_clipped_log_says_the_line_may_not_be_the_cause(airflow):
+    """``Clipped`` carries whether anything was cut and the tail slice threw it
+    away — so a real error at the top of a 5000-line log left the summary
+    confidently naming a progress line as the failure."""
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
+    airflow.tis_by_run = {
+        "manual__1": [{"task_id": "report", "state": "failed", "map_index": -1, "try_number": 1}]
+    }
+    airflow.log = ["ValueError: the real cause"] + [f"INFO progress line {n}" for n in range(5000)]
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert result["failures"][0]["log_tail_truncated"] is True
+    assert "may not be the one that failed the task" in result["summary"]
+
+
+def test_a_summary_built_off_a_whole_log_makes_no_such_caveat(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
+    airflow.tis_by_run = {
+        "manual__1": [{"task_id": "report", "state": "failed", "map_index": -1, "try_number": 1}]
+    }
+    airflow.log = "ValueError: the real cause"
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert result["failures"][0]["log_tail_truncated"] is False
+    assert "may not be the one that failed the task" not in result["summary"]
+
+
+def test_compare_dag_runs_says_what_its_nulls_mean(airflow):
+    """The docstring is frozen and defines only true and false. A small model
+    handed a null under a two-valued contract reads it as false, which is the
+    one reading these fields exist to prevent."""
+    _sweep_world(airflow)
+
+    result = server.compare_dag_runs(DAG_ID, "manual__1", "manual__2")
+
+    assert "null is NOT false" in result["scope"]
+    assert "run_a_worker_field" in result["scope"]
+    assert "task_instances_read_whole" in result["scope"]
+
+
+@pytest.mark.parametrize("kind", ["task_list_truncated", "import_errors_unreadable"])
+def test_a_read_coverage_caveat_is_a_note_and_not_a_problem_in_the_run(kind):
+    """Both new kinds rendered as "Check:" and were counted into "this diagnosis
+    found N problems" — a coverage caveat is neither."""
+    assert diagnosis._CHECK_LABELS[kind] == "Note"
+    assert diagnosis._is_a_problem({"kind": kind}) is False
+
+
+def test_a_truncated_task_list_does_not_inflate_the_problem_count(airflow):
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
+    airflow.tis_by_run = {
+        "manual__1": [{"task_id": "report", "state": "failed", "map_index": -1, "try_number": 1}]
+    }
+    airflow.tasks = DEMO_TASKS
+    airflow.tasks_total = 900
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    kinds = [check["kind"] for check in result["checks"]]
+    assert "task_list_truncated" in kinds
+    assert "Note: the Dag's task list was not read whole" in result["summary"]
+    assert "found 1 problem." in result["summary"]
+
+
+def test_the_comparison_shortfall_is_stated_once_and_reads_as_a_sentence(airflow, monkeypatch):
+    """Two of the three clauses draw over the same comparison, so the identical
+    sentence appeared twice in one summary entry — and, being interpolated after
+    "… and ", it read "…, and The same task's rows…"."""
+    rows = _reading(0, 0, 1)
+
+    contrast = diagnosis._contrast_clause(["manual__1"], rows, "manual__1", None, {})
+    recurrence = diagnosis._recurrence_clause(["manual__1"], rows, "manual__1")
+    said = diagnosis._said_once([contrast, recurrence])
+
+    assert "and The same task" not in ". ".join(said)
+    assert ". ".join(said).count("the same task's rows on the other runs were NOT read whole") == 1
