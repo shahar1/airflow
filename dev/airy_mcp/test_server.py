@@ -1989,7 +1989,12 @@ def test_apply_task_instance_clear_repeats_the_dry_run_before_writing(cleared_ru
 
     assert result["cleared"] is False
     assert result["mutation_applied"] is False
-    assert "changed since the user reviewed it" in result["error"]
+    # Named for what happened. ``only_failed`` is on, so an instance that starts
+    # running LEAVES the preview — and the set-mismatch rule used to fire first
+    # and tell the operator the scope had changed, never that their target was
+    # on a worker, which is the fact that decides what they do next.
+    assert result["refused_precondition"] == "target_not_in_flight"
+    assert "is on its way to a worker or already has one" in result["error"]
     assert cleared_run.cleared == []
 
 
@@ -9679,10 +9684,15 @@ _WRITE_REFUSALS = {
     ),
     "run_backfill": lambda: server.run_backfill(DAG_ID, "2024-01-01", "2024-01-02", ""),
     "revert_dag_code": lambda: server.revert_dag_code(DAG_ID, ""),
-    "rerun_dag": lambda: server.rerun_dag(DAG_ID),
 }
 
-_WRITING_TOOLS = frozenset(_WRITE_REFUSALS)
+# The one writing tool that deliberately makes its write without a reviewed
+# plan, declared in ``approvals._UNGATED_WRITES`` with the reason. Named here so
+# that leaving a tool out of the refusal sweep is a decision recorded in the
+# code and not a gap in the sweep.
+_DELIBERATELY_UNGATED_TOOLS = {"rerun_dag"}
+
+_WRITING_TOOLS = frozenset(_WRITE_REFUSALS) | _DELIBERATELY_UNGATED_TOOLS
 
 
 def test_the_sweep_covers_every_registered_tool():
@@ -9707,6 +9717,15 @@ def test_every_writing_tool_refuses_without_a_reviewed_plan(airflow, tmp_path, t
 
     assert _writes(airflow) == [], f"{tool} wrote without a reviewed plan"
     assert result.get("mutation_applied") is False, result
+
+
+def test_a_tool_left_out_of_the_refusal_sweep_is_declared_ungated_in_the_code():
+    """The escape the writing set used to be: adding a tool to it and bumping a
+    count bought an exemption from both sweeps and demanded nothing."""
+    declared = {function for _, function, _ in approvals._UNGATED_WRITES}
+
+    assert declared >= _DELIBERATELY_UNGATED_TOOLS
+    assert set(_WRITE_REFUSALS) & _DELIBERATELY_UNGATED_TOOLS == set()
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
@@ -11379,9 +11398,242 @@ def test_an_abandoned_backfill_does_not_count_its_own_truncation_as_a_survivor(a
     airflow.created_run_state = "failed"
     airflow.omit_backfill_total = True
 
-    result = server._abandon_backfill(7, planned=[("a", "b")], created=[{}])
+    result = server._abandon_backfill(7, dag_id=DAG_ID, planned=[("a", "b")], created=[{}])
 
     assert result["surviving_runs"] == []
     assert result["surviving_runs_read_whole"] is False
     assert "run(s) were already past queued" not in result["error"]
     assert "NOT established" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# N6: every write is classified, and the classification is derived from the
+# tree rather than recited beside it.
+# ---------------------------------------------------------------------------
+
+
+def _mutating_calls():
+    """Every call in the tree that could change something, by module and function."""
+    found = []
+    for module in _MODULES:
+        for owner, node in _owned_nodes(_module_source(module)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            text = ast.unparse(node)
+            if name == "_api":
+                method = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+                if method not in ("POST", "PUT", "PATCH", "DELETE"):
+                    continue
+                if any(search in text for search in approvals._READ_SEARCHES):
+                    continue
+                found.append((module, owner, text))
+            elif name in ("_write_if_unchanged", "unlink", "write_text", "write_bytes"):
+                found.append((module, owner, text))
+    return found
+
+
+def test_every_write_in_the_tree_is_either_gated_or_declared_ungated():
+    """N6. Baseline was one of seven writes gated; the other six gated on an
+    identity or a digest, and the run this server creates passed through nothing
+    at all — while server.py's own docstring said every mutation is planned."""
+    classified = set(approvals._GATED_WRITES) | set(approvals._UNGATED_WRITES)
+    seen = set()
+    unclassified = []
+    for module, owner, text in _mutating_calls():
+        match = [entry for entry in classified if entry[0] == module and entry[1] == owner]
+        if not match:
+            unclassified.append((module, owner, text))
+            continue
+        seen |= set(match)
+
+    assert unclassified == [], f"a write nothing classifies: {unclassified}"
+    stale = sorted(classified - seen)
+    assert stale == [], f"a classification for a write that is gone: {stale}"
+
+
+def test_every_gated_write_really_passes_through_the_gate_it_names():
+    """A registry that names a gate and is never checked against the code is a
+    comment. The gate has to be called, in that function, before the write."""
+    for (module, owner, _), gate in approvals._GATED_WRITES.items():
+        source = _module_source(module)
+        body = next(
+            node
+            for node in ast.walk(source)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner
+        )
+        gates = [
+            node.lineno
+            for node in ast.walk(body)
+            if isinstance(node, ast.Call)
+            and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", ""))
+            == gate
+        ]
+        writes = [
+            node.lineno
+            for module_name, function, text in _mutating_calls()
+            if module_name == module and function == owner
+            for node in ast.walk(body)
+            if isinstance(node, ast.Call) and ast.unparse(node) == text
+        ]
+        assert gates, f"{module}.{owner} names {gate} and never calls it"
+        assert min(gates) < max(writes), f"{module}.{owner} writes before it reaches {gate}"
+
+
+def test_the_declared_ungated_writes_each_carry_a_reason_about_the_write():
+    for entry, reason in approvals._UNGATED_WRITES.items():
+        assert len(reason) > 80, entry
+
+
+# ---------------------------------------------------------------------------
+# The window between the approval and the write.
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_re_asks_the_half_operation_risk_off_the_rows_it_just_read(cleared_run):
+    """``partial_external_effect_possible`` is the value that SUPPRESSES the
+    half-operation warning on the operator's card. It was computed at plan time
+    and never recomputed — while the gate re-read the very rows that answer it
+    and looked only at how many there were."""
+    cleared_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "failed", "hostname": "worker-1", "pid": 4110, "duration": 2.3}
+    ]
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert result["partial_external_effect_possible"] is None
+    assert "immediately before the write" in result["partial_external_effect_source"]
+
+
+def test_a_history_with_no_earlier_dispatched_attempt_still_settles_the_risk(cleared_run):
+    cleared_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "failed", "hostname": "", "pid": None, "duration": 0.0}
+    ]
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["partial_external_effect_possible"] is False
+
+
+@pytest.mark.parametrize(
+    "blip", [_http_status_error(500), httpx.ConnectError("connection refused")], ids=["500", "connect"]
+)
+@pytest.mark.parametrize("route", ["/clearTaskInstances", "/taskInstances", "/tasks"])
+def test_a_transport_blip_inside_the_gate_does_not_raise_past_the_caller(cleared_run, blip, route):
+    """Three unguarded live reads sat between the redeemed approval and the
+    write. A blip raised out of the tool with the approval already spent, and
+    the retry with the same token answered "no reviewed plan for this clear",
+    which is false."""
+    plan = _gate_plan(cleared_run)
+    real = transport._api
+
+    def blip_on(method, path, **kwargs):
+        if path.endswith(route):
+            raise blip
+        return real(method, path, **kwargs)
+
+    transport._api = blip_on
+    try:
+        result = _gate_apply(plan)
+    finally:
+        transport._api = real
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert "The approval was already spent" in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_an_instance_on_its_way_to_a_worker_is_refused_under_the_tools_own_default(cleared_run):
+    """``only_failed`` is on by default, and Airflow then restricts the clear
+    preview to [FAILED, UPSTREAM_FAILED] — disjoint from the in-flight states.
+    The rule that exists to stop a double dispatch could not fire at all where
+    the tool is normally used, and the operator was never told the instance was
+    on its way to a worker."""
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
+    assert "plan_token" in plan
+    for ti in cleared_run.tis_by_run["manual__1"]:
+        if ti["task_id"] == "report":
+            ti["state"] = "queued"
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, "manual__1", plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["cleared"] is False
+    assert result["refused_precondition"] == "target_not_in_flight"
+    assert "on its way to a worker" in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_a_code_write_whose_graph_re_read_cannot_connect_fails_closed(airflow, tmp_path):
+    """The docstring promises "fail closed, for a short read exactly as for an
+    unreadable one" — and the net caught two exception types, missing the
+    commonest unreadable case of all."""
+    airflow.tasks = DEMO_TASKS
+    changes = _changes(('"ammount"}', '"amount"}'))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+
+    real = transport._api
+
+    def refuse_the_graph(method, path, **kwargs):
+        if path.endswith("/tasks"):
+            raise httpx.ConnectError("connection refused")
+        return real(method, path, **kwargs)
+
+    transport._api = refuse_the_graph
+    try:
+        result = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+    finally:
+        transport._api = real
+
+    assert result["applied"] is False
+    assert result["mutation_applied"] is False
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_an_abandoned_backfill_reports_the_two_writes_it_made(airflow):
+    """The prose says in as many words that cancelling is a compensating action
+    and not a rollback; ``mutation_applied: False`` said the opposite, and no
+    ui_updates left the views stale while the surviving runs executed."""
+    airflow.created_dates = ["2024-01-01T00:00:00+00:00"]
+    airflow.created_run_state = "running"
+
+    result = server._abandon_backfill(7, dag_id=DAG_ID, planned=[("a", "b")], created=[{}])
+
+    assert result["mutation_applied"] is True
+    assert result["ui_updates"] == [{"kind": "dag_run", "dag_id": DAG_ID}]
+    assert result["surviving_runs"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: server.revert_dag_code(DAG_ID, "gone"),
+        lambda: server.apply_dag_code_changes(DAG_ID, [{"old": "a", "new": "b"}], "gone"),
+    ],
+    ids=["revert", "apply-code"],
+)
+def test_every_token_miss_says_the_token_may_have_been_evicted(airflow, tmp_path, monkeypatch, call):
+    monkeypatch.setattr(approvals, "_TOKEN_MAX", 1)
+    server._issue_token("clear", {"dag_id": DAG_ID})
+    server._issue_token("clear", {"dag_id": DAG_ID})
+
+    result = call()
+
+    assert "may no longer be on it" in result["error"]
+
+
+def test_the_plans_own_enumeration_guard_says_what_it_could_not_enumerate(cleared_run):
+    """Two plan-side guards cover the short run-instance list and the first one
+    masks the second, so neither fails on its own. This pins the message of the
+    one that fires, so it cannot be deleted in silence."""
+    cleared_run.run_tis_total = 900
+
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
+
+    assert plan["planned"] is False
+    assert "cannot enumerate what this clear would touch" in plan["error"]

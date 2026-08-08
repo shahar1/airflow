@@ -174,7 +174,10 @@ def revert_dag_code(
         return {
             "reverted": False,
             "mutation_applied": False,
-            "error": "no reviewed plan for this revert; call plan_revert_dag_code and show the user the diff",
+            "error": (
+                "no reviewed plan for this revert; call plan_revert_dag_code and show the user the diff"
+                + eviction_note("tokens")
+            ),
         }
     if plan["dag_id"] != dag_id or plan["diff"] != diff:
         return {
@@ -376,7 +379,10 @@ def apply_dag_code_changes(
         return {
             "applied": False,
             "mutation_applied": False,
-            "error": "no reviewed plan for this change; call plan_dag_code_changes and show the user the diff",
+            "error": (
+                "no reviewed plan for this change; call plan_dag_code_changes and show the user the diff"
+                + eviction_note("tokens")
+            ),
         }
     if plan["dag_id"] != dag_id or plan["changes"] != pairs:
         return {
@@ -855,7 +861,11 @@ def run_backfill(
     # answer — a missing run reads as one that was never created.
     if not created_reading.complete or not _same_runs([_run_identity(entry) for entry in landed], planned):
         return _abandon_backfill(
-            resp["id"], planned=planned, created=created, read_whole=created_reading.complete
+            resp["id"],
+            dag_id=dag_id,
+            planned=planned,
+            created=created,
+            read_whole=created_reading.complete,
         )
     return {
         "created": True,
@@ -875,6 +885,7 @@ def run_backfill(
 def _abandon_backfill(
     backfill_id: int,
     *,
+    dag_id: str,
     planned: list[tuple[Any, Any]],
     created: list[dict[str, Any]],
     read_whole: bool = True,
@@ -918,7 +929,12 @@ def _abandon_backfill(
         aftermath += f", and {unread}, so whether any further run outlived the cancel is NOT established"
     result = {
         "created": False,
-        "mutation_applied": False,
+        # Two writes went out on this path — the backfill POST and the cancel PUT
+        # — and a run the scheduler had already picked up is still running. This
+        # field is what a caller reads to decide whether anything changed, and
+        # it contradicted the prose beside it, which says in as many words that
+        # cancelling is a compensating action and not a rollback.
+        "mutation_applied": True,
         "backfill_id": backfill_id,
         "planned_run_count": len(planned),
         "created_run_count": len(created),
@@ -932,6 +948,10 @@ def _abandon_backfill(
             f"the backfill did not match the {len(planned)} runs the user approved; {aftermath}. "
             f"Tell the user to check backfill {backfill_id}."
         ),
+        # The runs exist and some of them may still be running, so the views the
+        # user is looking at are stale. Emitting nothing here left them showing a
+        # Dag with no backfill while its runs executed.
+        "ui_updates": [{"kind": "dag_run", "dag_id": dag_id}],
     }
     if unread:
         result["surviving_runs_unread"] = unread

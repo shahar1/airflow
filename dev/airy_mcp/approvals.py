@@ -184,3 +184,64 @@ def _discard_same_source_plans(dag_id: str, digest: str) -> bool:
     for token in stale:
         del _issued_tokens[token]
     return bool(stale)
+
+
+# ---------------------------------------------------------------------------
+# What stands between an approval and a write.
+#
+# Every call in this tree that could change something is classified HERE, at one
+# call site's granularity, so a write added later is either gated or is a
+# deliberate decision somebody wrote down. It used to be neither: the gate
+# covered one of seven writes, five gated on identity or on a digest, and one —
+# the run this server creates — passed through nothing at all while the server's
+# own module docstring said every mutation is planned first.
+# ---------------------------------------------------------------------------
+
+# The functions a write may pass through. A write inside a function that calls
+# one of these, before the write, is gated by it.
+_WRITE_GATES = ("_redeem_token", "_containment_gate")
+
+# Every mutating call site, by module, function and the request it makes, with
+# the gate that dominates it.
+_GATED_WRITES = {
+    ("recovery", "apply_task_instance_clear", "POST /clearTaskInstances"): "_containment_gate",
+    ("codechange", "run_backfill", "POST /backfills"): "_redeem_token",
+    ("codechange", "rerun_dag", "PATCH /dags/<dag>"): "_redeem_token",
+    ("codechange", "apply_dag_code_changes", "WRITE the Dag file"): "_redeem_token",
+    ("codechange", "revert_dag_code", "WRITE the Dag file"): "_redeem_token",
+}
+
+# Writes this server makes WITHOUT a reviewed plan, each with the reason. A
+# write here is a decision, not an oversight, and the reason has to be a
+# property of the write rather than of the effort of gating it.
+_UNGATED_WRITES = {
+    ("codechange", "rerun_dag", "POST /dags/<dag>/dagRuns"): (
+        "creating a run is fully described by this call's own arguments — the dag_id, the conf and "
+        "the note — so the tool call the user confirms IS the approval card, and a plan would show "
+        "them the same three values a second time. It is also additive: it creates a new run and "
+        "changes no existing instance, unlike a clear, a source write or a backfill range. The "
+        "lasting part of it, unpausing, is separately gated and separately warned."
+    ),
+    ("codechange", "_abandon_backfill", "PUT /backfills/<id>/cancel"): (
+        "the compensating action inside run_backfill, reached only after that tool has redeemed its "
+        "token and only when what was created does not match what was approved; gating it again "
+        "would leave the mismatched backfill running"
+    ),
+    ("dagsource", "_write_if_unchanged", "os.unlink of its own temp file"): (
+        "the atomic-replace helper cleaning up the temporary file it just created and nothing else; "
+        "the Dag file itself is written by the two tools above, each of which has redeemed its token "
+        "before it reaches here"
+    ),
+    ("dagsource", "_force_reparse", "PUT /parseDagFile/<token>"): (
+        "a post-write call, reached only from a tool that has already redeemed its token, that asks "
+        "Airflow to re-read the file that write just changed"
+    ),
+}
+
+# The two POSTs that read. Neither changes anything, and both are named here
+# rather than inferred from the verb.
+_READ_SEARCHES = (
+    "/backfills/dry_run",
+    "/dags/~/dagRuns/~/taskInstances/list",
+    "dry_run=True",
+)

@@ -546,7 +546,12 @@ def _change_impact(dag_id: str, source: str, patched: str) -> dict[str, Any]:
     )
     try:
         graph = reading._tasks(dag_id)
-    except (httpx.HTTPStatusError, KeyError) as e:
+    # The full net, as every sibling read uses. A connect refusal or a timeout is
+    # the COMMONEST unreadable case and it was not in here, so the docstring's
+    # "fail closed, for a short read exactly as for an unreadable one" held for
+    # the short read and failed OPEN for the unreachable one — raising out of
+    # apply_dag_code_changes from inside the file lock, with the token burnt.
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         graph = reading.failed_read(reading._TASKS_ROUTE, _explain_error(e))
     if not graph.complete:
         # Fail closed, for a short read exactly as for an unreadable one. Without
@@ -625,7 +630,12 @@ def _find_unaddressed_findings(dag_id: str, patched: str) -> list[dict[str, str]
     """
     try:
         graph = reading._tasks(dag_id)
-    except (httpx.HTTPStatusError, KeyError) as e:
+    # The full net, as every sibling read uses. A connect refusal or a timeout is
+    # the COMMONEST unreadable case and it was not in here, so the docstring's
+    # "fail closed, for a short read exactly as for an unreadable one" held for
+    # the short read and failed OPEN for the unreachable one — raising out of
+    # apply_dag_code_changes from inside the file lock, with the token burnt.
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         graph = reading.failed_read(reading._TASKS_ROUTE, _explain_error(e))
     if not graph.complete:
         # An empty list here reads as "the patch leaves nothing unaddressed",

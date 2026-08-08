@@ -106,7 +106,7 @@ from reading import (
     _tasks_reading,
     _version_context,
 )
-from transport import _api_detail, _dag_url
+from transport import _api_detail, _dag_url, _explain_error
 
 
 def _clear_body(
@@ -982,6 +982,12 @@ class _GateContext:
             self.state["expansion"] = _mapped_in_closure(self.dag_id, self.run_path, self.now)
         return self.state["expansion"]
 
+    def run_scan(self) -> reading.Reading:
+        """The run's live task instances, unfiltered by the clear's own flags."""
+        if "run_scan" not in self.state:
+            self.state["run_scan"] = reading._run_task_instances(self.dag_id, self.run_path)
+        return self.state["run_scan"]
+
 
 @dataclass(frozen=True)
 class _WritePrecondition:
@@ -1033,8 +1039,27 @@ def _rule_target_not_in_flight(ctx: _GateContext) -> dict[str, Any] | None:
 
     An identity set that still matches proves nothing about an attempt that
     landed in between, and ``_identities`` throws state and try_number away.
+
+    Asked of the RUN's rows, not of the clear preview. With ``only_failed`` on —
+    the default, and how this tool is normally used — Airflow restricts the
+    preview to [FAILED, UPSTREAM_FAILED], which is disjoint from the in-flight
+    states: the rule that exists to stop a double dispatch could not fire at
+    all, and an instance already on its way to a worker was refused by a
+    different rule that never mentioned it.
     """
-    live_states = {_ti_where(ti): ti.get("state") for ti in ctx.now}
+    closure = {(ti["task_id"], ti.get("map_index", -1)) for ti in ctx.now}
+    target = _plan_target(ctx.plan)
+    marker = (ctx.plan.get("task_ids") or [None])[0]
+    closure.add((target, marker[1] if isinstance(marker, (list, tuple)) and len(marker) > 1 else -1))
+    live_states: dict[str, Any] = {}
+    for ti in ctx.run_scan().rows:
+        if (ti["task_id"], ti.get("map_index", -1)) in closure:
+            live_states[_ti_where(ti)] = ti.get("state")
+    # A row the preview named and the run scan does not describe is a row this
+    # rule has no state for. Falling back to the preview's own ``.get(...)``
+    # default made an absent field read as permission to write.
+    for ti in ctx.now:
+        live_states.setdefault(_ti_where(ti), ti.get("state"))
     in_flight = sorted(where for where, state in live_states.items() if state in _IN_FLIGHT_TARGET_STATES)
     if not in_flight:
         return None
@@ -1168,6 +1193,16 @@ def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any]
             continue
         history = _attempt_history(ctx.dag_id, ctx.run_path, ti)
         if history.complete:
+            # The CONTENT, not only the count. Whether an earlier attempt
+            # reached the outside world is the value that SUPPRESSES the
+            # half-operation warning on the operator's card, and it was computed
+            # at plan time and never recomputed — the gate held the fresh rows
+            # one find() away and read only how many there were.
+            ctx.state["earlier_attempt_executed"] = reading.find(
+                history,
+                lambda row: row.get("try_number") != ti.get("try_number") and _carries_execution_fields(row),
+                f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
+            ).as_field()
             return None
         return _incomplete_read(
             ctx.dag_id,
@@ -1193,17 +1228,22 @@ _WRITE_PRECONDITIONS: tuple[_WritePrecondition, ...] = (
         "the clear preview lists every instance the write would touch",
         _rule_target_set_read_whole,
     ),
-    _WritePrecondition(
-        "target_set_matches_approval",
-        frozenset({"gate"}),
-        "the instances that would be cleared are the ones the user reviewed",
-        _rule_target_set_matches_approval,
-    ),
+    # Asked BEFORE the set comparison. With ``only_failed`` on, an instance that
+    # starts running LEAVES the preview, so the set-mismatch rule fired first
+    # and the operator was told the scope had changed rather than that their
+    # target was on its way to a worker — which is the fact that decides what
+    # they do next.
     _WritePrecondition(
         "target_not_in_flight",
         frozenset({"plan", "gate"}),
         "no instance in the closure is on its way to a worker or already has one",
         _rule_target_not_in_flight,
+    ),
+    _WritePrecondition(
+        "target_set_matches_approval",
+        frozenset({"gate"}),
+        "the instances that would be cleared are the ones the user reviewed",
+        _rule_target_set_matches_approval,
     ),
     _WritePrecondition(
         "target_attempt_not_moved",
@@ -1261,15 +1301,17 @@ def _containment_gate(
     plan: dict[str, Any],
     preview: Any,
     now: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any]]:
     """Every decision-bearing read behind this write, re-asked and proven whole.
 
-    Returns ``(refusal, expansion)``. A refusal is returned when any read the
+    Returns ``(refusal, expansion, recheck)``. A refusal is returned when any read the
     authorization, the target set, the closure, the idempotency or the safety of
     this write depends on is truncated, clamped, unreadable, stale or internally
     inconsistent. ``expansion`` is handed back so the caller does not re-ask the
     probe after the write — a network call there turns a clear that landed into a
-    reported failure.
+    reported failure. ``recheck`` carries what the gate's own re-reads
+    established, so a value the plan computed and the card renders is restated
+    from fresh rows rather than carried forward unre-asked.
 
     The rules are a declared registry rather than a run of ``if`` statements, so
     "which facts does this write rest on" and "which of them are re-asked" are
@@ -1285,11 +1327,39 @@ def _containment_gate(
     )
     _LAST_GATE_RULES.clear()
     for rule in _WRITE_PRECONDITIONS:
-        _LAST_GATE_RULES.append(rule.id)
         refusal = rule.check(ctx)
+        # Recorded AFTER the check returns, so the list is evidence the check
+        # ran rather than evidence the registry was iterated.
+        _LAST_GATE_RULES.append(rule.id)
         if refusal is not None:
-            return {**refusal, "refused_precondition": rule.id}, _NO_EXPANSION
-    return None, ctx.expansion()
+            return {**refusal, "refused_precondition": rule.id}, _NO_EXPANSION, ctx.state
+    return None, ctx.expansion(), ctx.state
+
+
+def _approval_spent_before_the_write(
+    dag_id: str, dag_run_id: str, which: str, error: Exception
+) -> dict[str, Any]:
+    """The answer when a read between the approval and the write did not come back.
+
+    Three live reads sit between redeeming the token and the POST, and none of
+    them was guarded: a 500 or a dropped connection raised out of the tool with
+    the approval already spent, and the retry answered "no reviewed plan for this
+    clear" — which is not what happened. Pre-mutation, so "not applied" is a
+    fact rather than an inference.
+    """
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_id": dag_id,
+        "dag_run_id": dag_run_id,
+        "error": (
+            f"this clear was NOT sent: {which} could not be read ({_quoted(_explain_error(error), 240)}), "
+            f"so the facts this write rests on were not re-established. The approval was already "
+            f"spent by this attempt and is gone — re-plan and show the user again. "
+            f"{_NOTHING_CLEARED}"
+        ),
+        "next_step": _DO_NOT_BYPASS,
+    }
 
 
 def _clear_outcome_unknown(
@@ -1438,8 +1508,15 @@ def apply_task_instance_clear(
     # The preview and the clear are two calls, so state can move between them:
     # a task that started running since would otherwise be killed by an approval
     # given for a failed one.
-    preview = transport._api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
-    now = _affected(preview)
+    # The approval is already spent, so a read that raises here must not escape
+    # past the caller: the retry then answers "no reviewed plan for this clear",
+    # which is false and reads as a user error. Nothing has been written on this
+    # path, so the honest answer is a refusal that says the approval is gone.
+    try:
+        preview = transport._api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
+        now = _affected(preview)
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        return _approval_spent_before_the_write(dag_id, dag_run_id, "the pre-write preview", e)
     # Every write precondition is re-established HERE, in one place, immediately
     # before the POST, so the window where the world could move under the
     # approval is as narrow as REST calls allow. It cannot be closed from out
@@ -1448,9 +1525,12 @@ def apply_task_instance_clear(
     # rests on is used without first showing it was read whole. A refusal on this
     # path is PRE-mutation: the POST has not been sent, so "not applied" is a
     # fact, not an inference.
-    contained, expansion = _containment_gate(
-        dag_id, dag_run_id, f"/dagRuns/{quote(dag_run_id, safe='')}", plan, preview, now
-    )
+    try:
+        contained, expansion, recheck = _containment_gate(
+            dag_id, dag_run_id, f"/dagRuns/{quote(dag_run_id, safe='')}", plan, preview, now
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        return _approval_spent_before_the_write(dag_id, dag_run_id, "a read inside the write gate", e)
     if contained is not None:
         return contained
     try:
@@ -1592,6 +1672,17 @@ def apply_task_instance_clear(
             "reviewed plan and with the map_index the write itself returned"
         ),
         "expansion_unprobed_tasks": unprobed_tasks,
+        # Re-asked at the gate, off the attempt history it re-read immediately
+        # before this write — not carried forward from the plan. ``False`` is
+        # what suppresses the half-operation warning on the operator's card, and
+        # it used to be computed once, at plan time, and never looked at again.
+        "partial_external_effect_possible": (
+            None if recheck.get("earlier_attempt_executed") is not False else False
+        ),
+        "partial_external_effect_source": (
+            "re-read from the target's attempt history immediately before the write"
+        ),
+        "expansion_unprobed_tasks_note": _MAPPED_CREATION_NOT_ESTABLISHED,
         "ui_updates": [
             {
                 "kind": "task_instances",

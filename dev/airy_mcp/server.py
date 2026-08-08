@@ -23,9 +23,13 @@ source as one atomic change, ``plan_task_instance_clear``/``apply_task_instance_
 re-run an instance that already exists, and ``rerun_dag`` starts a fresh run.
 Deliberately goes beyond AIP-91 phase 1 (read-only) to show where the value ends up.
 
-Every mutation is planned first: the planning tool is read-only and hands back a
-single-use token, and the writing tool refuses without it.  That is what makes the
-approval card show the user the change they are actually approving.
+Every mutation that changes something already there is planned first: the planning
+tool is read-only and hands back a single-use token, and the writing tool refuses
+without it.  That is what makes the approval card show the user the change they are
+actually approving.  ``rerun_dag`` is the one deliberate exception - it only ADDS a
+run, and the tool call's own arguments describe it completely - and it is declared
+as such, with the reason, in ``approvals._UNGATED_WRITES``; the lasting part of it,
+unpausing, has a token and a warning of its own.
 
 Runs as a second MCP sidecar next to the read-only ``astro-airflow-mcp``.
 
