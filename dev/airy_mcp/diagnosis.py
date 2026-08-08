@@ -153,6 +153,21 @@ def _comparison_task_ids(checks: list[dict[str, Any]], tis: list[dict[str, Any]]
     return ordered
 
 
+def _widen_not_covered(
+    comparison: dict[str, Any], beyond_window: list[Any], windowed: reading.Reading
+) -> dict[str, Any]:
+    """Charge the runs the WINDOW dropped to the comparison's own coverage list.
+
+    A run outside the window is a run this comparison holds no rows for, exactly
+    like a run inside it that returned none — and keeping the two apart let the
+    list empty out as the window narrowed.
+    """
+    named = list(comparison.get("runs_not_covered") or [])
+    comparison["runs_not_covered"] = named + [run for run in beyond_window if run not in named]
+    comparison["runs_not_covered_read_whole"] = windowed.complete
+    return comparison
+
+
 def _run_history(
     dag_id: str,
     diagnosed_run_id: str | None,
@@ -170,6 +185,11 @@ def _run_history(
     # clause below may conclude an absence over.
     windowed = runs.clamp(RUN_HISTORY_LIMIT)
     window = list(windowed.rows)
+    # Runs this comparison did not reach AT ALL. ``runs_not_covered`` used to be
+    # relative to the window, so narrowing the window EMPTIED it — an
+    # enumeration that reads "every run was covered" produced by the tool
+    # covering fewer of them.
+    beyond_window = [row.get("dag_run_id") for row in runs.rows[len(window) :]]
     listed = []
     for run in window:
         entry = {name: run.get(name) for name in _RUN_HISTORY_KEYS}
@@ -188,13 +208,14 @@ def _run_history(
         ),
         "runs": listed,
         "task_comparison": (
-            _task_comparison(dag_id, window, task_ids)
+            _widen_not_covered(_task_comparison(dag_id, window, task_ids), beyond_window, windowed)
             if error is None
             else {
                 "selection": _TASK_COMPARISON_SELECTION,
                 "task_ids_compared": [],
                 "task_ids_omitted": 0,
                 "runs_not_covered": [],
+                "runs_not_covered_read_whole": False,
                 "tasks": {},
                 "rows_omitted": {},
                 "error": error,

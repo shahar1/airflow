@@ -382,7 +382,7 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
             # a display and the read behind it was whole, so this is the one
             # place the clamp is disclosed — ``status`` no longer wears the word
             # a route truncation earns.
-            "attempts_omitted_from_display": max(whole.kept - len(rows), 0),
+            "attempts_omitted": max(whole.kept - len(rows), 0),
             "earlier_attempt_carries_execution_fields": earlier_executed,
             "error": reading.attempt_error(whole),
         },
@@ -1976,7 +1976,7 @@ def _verify_instance(
         )
     )
 
-    baseline, source = _duration_baseline(dag_id, dag_run_id, ti, history)
+    baseline, source, beyond_the_sample = _duration_baseline(dag_id, dag_run_id, ti, history)
     others = sorted(row["duration"] for row in baseline.rows)
     if not isinstance(duration, (int, float)):
         checks.append(_check("duration_in_line_with_history", None, "the row carries no duration to compare"))
@@ -2167,6 +2167,13 @@ def _verify_instance(
     }
     if short_reads:
         entry["reads_not_read_whole"] = short_reads
+    if beyond_the_sample:
+        # The comparison's own reach, said in the payload rather than only in
+        # the prose of one check's detail. The sample size this leg asks the
+        # route for is deliberately not charged to the reading — that made the
+        # leg unanswerable for every task with more than ten runs — so this is
+        # the one place the population behind it reaches the reader.
+        entry["duration_sample_rows_omitted"] = beyond_the_sample
     return entry
 
 
@@ -2404,6 +2411,19 @@ def verify_task_instance_recovery(
         "dag_run_id": resolved_run_id,
         "instances": results,
         "approved_instance_set": instance_set,
+        # The audit read's own coverage, in the payload rather than only inside
+        # the one branch that could not conclude from it. Every transition leg
+        # rests on this scan, and a PRESENT verdict survives a truncation — so
+        # the whole result came back byte-identical over a scan that had stopped
+        # at a third of the rows, and nothing said so.
+        "audit_read": {
+            "status": events["status"],
+            "events_scanned": events["events_scanned"],
+            "total_entries": events["total_entries"],
+            "events_omitted": events["events_omitted"],
+            "events_read_whole": events["reading"].complete,
+            "error": events.get("error"),
+        },
         "unverified_instances": unverified,
         "summary": summary,
         "external_system_checked": False,

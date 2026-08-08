@@ -1221,7 +1221,7 @@ _DURATION_HISTORY_SOURCE = "this instance's other dispatched attempts"
 
 def _duration_baseline(
     dag_id: str, dag_run_id: str, ti: dict[str, Any], attempts: Reading
-) -> tuple[Reading, str]:
+) -> tuple[Reading, str, int]:
     """What this task's own successful work costs, to compare one attempt against.
 
     Only DISPATCHED attempts contribute. The attempt that made this recovery
@@ -1267,6 +1267,7 @@ def _duration_baseline(
             ),
             f"{_DURATION_HISTORY_SOURCE} only — the same task's rows in this Dag's other runs "
             f"could not be read ({_explain_error(e)})",
+            0,
         )
     rest = read_of(resp, "task_instances", _RUN_TASK_HISTORY_ROUTE, limit=RUN_HISTORY_LIMIT)
     samples += [
@@ -1307,6 +1308,11 @@ def _duration_baseline(
             route=_RUN_TASK_HISTORY_ROUTE,
         ),
         f"{_DURATION_HISTORY_SOURCE} and the same task in this Dag's other runs, sampled over {sampled}",
+        # The population BEYOND the sample. The median does not need it and the
+        # leg stays answerable without it, but a hard verdict drawn over ten of
+        # five hundred runs is a verdict whose reach the reader has to be told —
+        # and the exemption that keeps the leg answerable was swallowing it.
+        rest.omitted,
     )
 
 

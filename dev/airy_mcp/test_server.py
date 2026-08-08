@@ -74,6 +74,20 @@ def _counted(body, total, omit):
     return body if omit else {**body, "total_entries": total}
 
 
+def _paged(rows, params):
+    """The rows a real route would hand back for this ``limit``/``offset``.
+
+    Every list route honours the limit it is sent. Ignoring it here made every
+    request-limit bound in the boundary unfalsifiable: sixteen of nineteen clamp
+    levers could not shorten a single read, because the double handed over the
+    whole list whatever was asked for.
+    """
+    params = params or {}
+    offset = params.get("offset", 0)
+    limit = params.get("limit")
+    return rows[offset:] if limit is None else rows[offset : offset + limit]
+
+
 class FakeAirflow:
     """Minimal stand-in for the Airflow REST API."""
 
@@ -213,15 +227,18 @@ class FakeAirflow:
             wanted = (kwargs.get("params") or {}).get("task_id")
             rows = [ti for ti in self.cross_run_tis if ti["task_id"] == wanted]
             total = len(rows) if self.cross_run_total is None else self.cross_run_total
-            return _counted({"task_instances": rows}, total, self.omit_cross_run_total)
+            page = _paged(rows, kwargs.get("params"))
+            return _counted({"task_instances": page}, total, self.omit_cross_run_total)
         if path == "/assets":
             total = len(self.assets) if self.assets_total is None else self.assets_total
-            return _counted({"assets": self.assets}, total, self.omit_assets_total)
+            page = _paged(self.assets, kwargs.get("params"))
+            return _counted({"assets": page}, total, self.omit_assets_total)
         if path == "/importErrors":
             if self.fail_import_errors:
                 raise self.fail_import_errors
             total = len(self.import_errors) if self.import_errors_total is None else self.import_errors_total
-            return _counted({"import_errors": self.import_errors}, total, self.omit_import_errors_total)
+            page = _paged(self.import_errors, kwargs.get("params"))
+            return _counted({"import_errors": page}, total, self.omit_import_errors_total)
         if path == f"/dags/{DAG_ID}/details":
             return {"dag_id": DAG_ID, "params": self.dag_params}
         if path == f"/dags/{DAG_ID}/tasks":
@@ -325,7 +342,8 @@ class FakeAirflow:
                     raise self.fail_trigger
                 return {"dag_run_id": "manual__new", "state": "queued"}
             total = len(self.runs) if self.runs_total is None else self.runs_total
-            return _counted({"dag_runs": self.runs}, total, self.omit_dag_runs_total)
+            page = _paged(self.runs, kwargs.get("params"))
+            return _counted({"dag_runs": page}, total, self.omit_dag_runs_total)
         if path == "/dags/~/dagRuns/~/taskInstances/list":
             # ``False`` stands for a server-side filter regression, which is the
             # only reason the tool filters again on its side.
@@ -8457,7 +8475,7 @@ def test_the_clamp_cannot_rule_out_an_earlier_dispatched_attempt(recovered_run):
 
     assert evidence["attempt_history"]["status"] == "checked"
     assert len(evidence["attempt_history"]["attempts"]) == 10
-    assert evidence["attempt_history"]["attempts_omitted_from_display"] == 2
+    assert evidence["attempt_history"]["attempts_omitted"] == 2
     assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is True
     assert evidence["partial_external_effect_possible"] is None
     assert server._PARTIAL_UNSETTLED_BY_HISTORY in evidence["reading"]
@@ -9231,46 +9249,56 @@ def test_clipped_text_carries_whether_it_was_cut():
 # ---------------------------------------------------------------------------
 
 
-def _package_modules():
-    """Every module of the sidecar itself, taken off the filesystem.
+# The files in this directory that are NOT the server, each NAMED and each with
+# why. Not a predicate. The rule used to be "everything that does not import
+# airflow", and ``ast.walk`` finds an import anywhere — including inside a
+# function nothing calls — so one dead ``import airflow`` line took a whole
+# module out of every scan below. A module carrying a raw transport read, a
+# hand-spelled ABSENT and a second completeness derivation passed the entire
+# suite on the strength of that line, and failed six ways the moment it was
+# removed.
+_NOT_THE_SERVER = {
+    "demo_dag.py": "a Dag the demo loads; an input to the server, not part of it",
+    "incident_digest_dag.py": "a Dag the demo loads; an input to the server, not part of it",
+    "incident_triage_dag.py": "a Dag the demo loads; an input to the server, not part of it",
+}
 
-    A hand-written tuple is a list somebody has to remember: a whole new module
-    carrying a raw transport read, a hand-spelled ABSENT and a second
-    completeness derivation was added while every scan below stayed green,
-    because none of them looked at it. The Dag files that share this directory
-    are inputs to the demo rather than parts of the server, and they are the
-    only modules here that import Airflow, so that is what separates them.
-    """
-    found = []
-    for path in sorted(Path(__file__).parent.glob("*.py")):
-        if path.stem.startswith("test_"):
-            continue
-        tree = ast.parse(path.read_text())
-        imports_airflow = any(
-            (isinstance(node, ast.Import) and any(a.name.split(".")[0] == "airflow" for a in node.names))
-            or (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "airflow")
-            for node in ast.walk(tree)
+
+def _package_modules():
+    """Every module of the sidecar itself: the directory listing, minus named files."""
+    here = Path(__file__).parent
+    return tuple(
+        sorted(
+            path.stem
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and path.name not in _NOT_THE_SERVER
         )
-        if not imports_airflow:
-            found.append(path.stem)
-    return tuple(found)
+    )
 
 
 _MODULES = _package_modules()
 
 
 def test_the_swept_module_list_is_the_package_on_disk():
-    """A module the scans below never open is a module every rule is off in."""
-    here = Path(__file__).parent
-    on_disk = {path.stem for path in here.glob("*.py") if not path.stem.startswith("test_")}
-    dag_files = on_disk - set(_MODULES)
+    """A module the scans below never open is a module every rule is off in.
 
+    The swept set is the directory listing minus a NAMED list, and both
+    directions are checked: a file no exclusion covers has to be swept, and an
+    exclusion for a file that is gone is a hole waiting for a file of that name.
+    """
+    here = Path(__file__).parent
+    on_disk = {path.name for path in here.glob("*.py")}
+    tests = {name for name in on_disk if name.startswith("test_")}
+
+    assert set(_NOT_THE_SERVER) <= on_disk, "an exclusion names a file that is not here"
+    assert {f"{name}.py" for name in _MODULES} == on_disk - tests - set(_NOT_THE_SERVER)
     assert "server" in _MODULES
-    assert set(_MODULES) <= on_disk
-    # Every file that is NOT swept has to be a Dag definition, and the only way
-    # to be one here is to import Airflow.
-    for name in dag_files:
-        assert "airflow" in here.joinpath(f"{name}.py").read_text()
+    # The reason is checked, not merely recorded: every excluded file has to
+    # actually define a Dag, and none of them may reach the transport.
+    for name in _NOT_THE_SERVER:
+        source = here.joinpath(name).read_text()
+        assert "DAG(" in source or "@dag" in source, f"{name} is excluded as a Dag and defines none"
+        assert "transport" not in source, f"{name} is excluded from the reader scan and reaches Airflow"
 
 
 def _module_source(name):
@@ -9294,10 +9322,108 @@ def _owned_nodes(tree, owner="<module>"):
         yield from _owned_nodes(node, name)
 
 
+# ---------------------------------------------------------------------------
+# The reader registry is OBSERVED, not spelled.
+#
+# A read is a read because it reached the wire. The scan below matches one
+# literal AST form — ``something._api(...)`` — and four lines inside
+# ``transport`` itself defeat every rule that rests on it:
+#
+#     def _fetch(path, **kwargs): return _api("GET", path, **kwargs)
+#
+# ``_transport_indirections`` skips ``transport``, so it never sees the new
+# entry point; ``_functions_calling_transport`` matches on the attribute name,
+# so it never sees the callers. The registry went to zero and the suite stayed
+# green. What follows watches the boundary while the tools RUN, attributes each
+# read to the first frame outside ``transport``, and holds that site to the
+# registry — through any number of indirections, under any alias.
+# ---------------------------------------------------------------------------
+
+_SIDECAR_DIR = Path(__file__).parent
+
+
+def _reading_site():
+    """The function that made the read now in progress: the first frame outside transport.
+
+    Frames inside ``transport`` are the boundary itself and frames inside this
+    file are the harness, so what is left is the sidecar function that asked.
+    """
+    for frame in inspect.stack()[1:]:
+        path = Path(frame.filename)
+        if path.parent != _SIDECAR_DIR or path.stem in ("transport", "test_server"):
+            continue
+        return (path.stem, frame.function)
+    return ("<outside the package>", "<unknown>")
+
+
+def _watch_reads(monkeypatch):
+    """Record every call that actually reaches Airflow, by the site that made it."""
+    seen: list[tuple[tuple[str, str], str, str]] = []
+    real = transport._api
+
+    def watched(method, path, **kwargs):
+        seen.append((_reading_site(), method, path))
+        return real(method, path, **kwargs)
+
+    monkeypatch.setattr(transport, "_api", watched)
+    return seen
+
+
+def _unregistered_reads(seen):
+    """Observed reads that nothing in the registry accounts for.
+
+    A site is accounted for by an entry in one of the two exclusion tables, or
+    by being a function of the boundary whose RETURN TYPE is a Reading the
+    caller cannot get out of. Neither test asks how the call was spelled.
+    """
+    declared = set(_READS_WITHOUT_A_UNIVERSE) | set(_READS_CARRYING_A_READING)
+    unaccounted = []
+    for site in sorted({site for site, _, _ in seen}):
+        if site in declared:
+            continue
+        module, function = site
+        target = getattr(sys.modules.get(module), function, None)
+        if module == "reading" and callable(target) and _reads_as_a_reading(target):
+            continue
+        unaccounted.append(site)
+    return unaccounted
+
+
 # Ways of reaching Airflow that a scan for ``transport._api(...)`` cannot see.
 # The scan is one literal AST form, so rather than teach it every indirection,
 # the indirections are forbidden and this is what forbids them.
 _HTTPX_CALLS = ("request", "get", "post", "put", "patch", "delete", "stream", "Client", "AsyncClient")
+
+# The only two functions of the boundary that may speak HTTP, and the only two
+# that may reach ``_api``. A third — ``def _fetch(path): return _api(...)`` — is
+# a second entry point that every syntactic rule in this file is blind to.
+_TRANSPORT_SPEAKERS = ("_api", "_login")
+
+
+def _second_entry_points():
+    """Anything inside ``transport`` that reaches httpx or ``_api`` and is not declared."""
+    offenders = []
+    for owner, node in _owned_nodes(_module_source("transport")):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        reaches_httpx = (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "httpx"
+            and func.attr in _HTTPX_CALLS
+        )
+        reaches_api = getattr(func, "id", None) == "_api" or getattr(func, "attr", None) == "_api"
+        if (reaches_httpx or reaches_api) and owner not in _TRANSPORT_SPEAKERS:
+            offenders.append((owner, ast.unparse(node)))
+    return sorted(set(offenders))
+
+
+def test_the_boundary_has_exactly_the_entry_points_it_declares():
+    """A second way into ``_api`` from inside ``transport`` is a reader every
+    scan outside it is blind to, and the four lines that build one are the
+    cheapest defeat of the whole registry."""
+    assert _second_entry_points() == []
 
 
 def _transport_indirections():
@@ -9650,16 +9776,46 @@ def _row_count_bounds():
 _LEVER_CLAMPED_TO = 1
 
 
+def _holders_of(module_name, name):
+    """Every module object that holds this bound, not only the one that defines it.
+
+    Six of these are re-imported by name in the module that reads them —
+    ``from reading import RUN_HISTORY_LIMIT`` at the top of ``diagnosis`` — so a
+    lever that patched the DEFINING module moved a name nobody was reading. The
+    whole clamp axis was inert: nineteen levers, zero short reads, and every
+    tool's answer byte-identical under eighteen of them.
+    """
+    origin = getattr(sys.modules[module_name], name)
+    return [
+        holder
+        for holder in (sys.modules[other] for other in _MODULES)
+        if getattr(holder, name, object()) == origin
+    ]
+
+
+def _clamp_everywhere(monkeypatch, module_name, name):
+    for holder in _holders_of(module_name, name):
+        monkeypatch.setattr(holder, name, _LEVER_CLAMPED_TO)
+
+
 def _levers():
     counts, flags = _truncation_knobs()
     levers = {}
     for knob in counts:
         levers[f"claims-more:{knob}"] = lambda fake, mp, knob=knob: setattr(fake, knob, 9_999)
     for knob in flags:
-        levers[f"no-total:{knob}"] = lambda fake, mp, knob=knob: setattr(fake, knob, True)
+        # COMPOUND on purpose. The sentinel these levers exist to exercise fires
+        # on a page that comes back FULL at the limit it asked for beside no
+        # count at all, so a knob that only removes the count, over a world
+        # whose pages are never full, cannot shorten a single read — and seven
+        # of them could not.
+        levers[f"no-total:{knob}"] = lambda fake, mp, knob=knob: (
+            setattr(fake, knob, True),
+            [_clamp_everywhere(mp, module, name) for module, name in _row_count_bounds()],
+        )
     for module_name, name in _row_count_bounds():
-        levers[f"clamped:{module_name}.{name}"] = lambda fake, mp, m=module_name, n=name: mp.setattr(
-            sys.modules[m], n, _LEVER_CLAMPED_TO
+        levers[f"clamped:{module_name}.{name}"] = lambda fake, mp, m=module_name, n=name: _clamp_everywhere(
+            mp, m, n
         )
     return levers
 
@@ -9667,14 +9823,43 @@ def _levers():
 _LEVERS = _levers()
 
 
+# How many rows every route in the sweep world hands over. Every clamp on the
+# other axis is driven to ``_LEVER_CLAMPED_TO``, and ``Reading.clamp`` returns
+# the reading UNCHANGED when the limit is at or above what it holds — so a world
+# of one to three rows per route made eighteen of the nineteen clamp levers a
+# no-op that could not have failed. Five clamp calls happened across all nine
+# tools, none of them short.
+_SWEEP_ROWS = 4
+
+
 def _sweep_world(fake):
-    """Enough of everything that every swept tool has real rows to read."""
+    """Enough of everything that every swept tool has real rows to read.
+
+    Deliberately WIDE: the sweep is only worth what its levers move, and a lever
+    that cannot shorten anything certifies silence.
+
+    Idempotent, including over the knobs the levers pull: a caller that sets up
+    the world twice around one lever has to get the same world both times, and
+    a ``*_total`` left behind by the previous case is a lever that looks live
+    because the one before it was.
+    """
+    pristine = vars(FakeAirflow())
+    for knob in (name for name in pristine if name.endswith("_total")):
+        setattr(fake, knob, pristine[knob])
     fake.tasks = DEMO_TASKS
     fake.runs = [
-        {"dag_run_id": "manual__2", "state": "success", "run_after": "2024-01-02T00:00:00+00:00"},
-        {"dag_run_id": "manual__1", "state": "failed", "run_after": "2024-01-01T00:00:00+00:00"},
+        {
+            "dag_run_id": f"manual__{n}",
+            "state": "success" if n > 1 else "failed",
+            "run_after": f"2024-01-{n:02d}T00:00:00+00:00",
+        }
+        for n in range(_SWEEP_ROWS, 0, -1)
     ]
     fake.runs_by_id = {run["dag_run_id"]: run for run in fake.runs}
+    # ``report`` stays UNMAPPED: it is the instance the recovery tools are aimed
+    # at, and a run whose target is only present at map_index >= 0 refuses
+    # before it reads anything — a sweep over a tool that refused in its first
+    # line certifies nothing. The extra rows are the other two tasks' retries.
     rows = [
         {
             "task_id": "extract",
@@ -9685,48 +9870,82 @@ def _sweep_world(fake):
             "pid": 1,
         },
         {"task_id": "summarize", "state": "success", "map_index": -1, "try_number": 2},
-        {"task_id": "report", "state": "failed", "map_index": -1, "try_number": 1},
+        {"task_id": "report", "state": "failed", "map_index": -1, "try_number": 1, "duration": 1.0},
     ]
-    fake.tis_by_run = {"manual__1": rows, "manual__2": [dict(row) for row in rows]}
+    fake.tis_by_run = {run["dag_run_id"]: [dict(row) for row in rows] for run in fake.runs}
     # The fleet scan reads dag_id/dag_run_id off the row, as the batch route does.
+    # Widened across runs so the scan itself has rows to stop short of.
     fake.task_instances = [
-        {**row, "dag_id": DAG_ID, "dag_run_id": "manual__1"} for row in rows if row["state"] == "failed"
+        {**row, "dag_id": DAG_ID, "dag_run_id": run["dag_run_id"]}
+        for run in fake.runs
+        for row in rows
+        if row["state"] == "failed"
     ]
-    fake.tries_by_task = {("report", -1): [{"try_number": 1, "state": "failed"}]}
-    fake.xcoms_by_task = {("report", -1): [{"key": "artefact", "timestamp": "2024-01-01T00:00:05+00:00"}]}
+    fake.tries_by_task = {
+        (task_id, -1): [
+            {
+                "try_number": n,
+                "state": "failed",
+                "hostname": "w",
+                "pid": 3000 + n,
+                "duration": 2.0 + n,
+                "start_date": "2024-01-01T00:00:00+00:00",
+                "end_date": "2024-01-01T00:00:04+00:00",
+            }
+            for n in range(1, _SWEEP_ROWS + 1)
+        ]
+        for task_id in ("report", "summarize")
+    }
+    fake.xcoms_by_task = {
+        (task_id, -1): [
+            {"key": f"artefact_{n}", "timestamp": f"2024-01-01T00:00:0{n}+00:00"} for n in range(_SWEEP_ROWS)
+        ]
+        for task_id in ("report", "summarize")
+    }
     fake.event_logs = [
         {
-            "event_log_id": 1,
+            "event_log_id": n,
             "dag_id": DAG_ID,
-            "task_id": "report",
-            "when": "2024-01-01T00:00:01+00:00",
-            "event": "running",
+            "task_id": task_id,
+            "when": f"2024-01-01T00:00:0{n}+00:00",
+            "event": "running" if n % 2 else "success",
             "owner": "airflow",
             "map_index": -1,
-        },
+        }
+        for task_id in ("report", "summarize")
+        for n in range(_SWEEP_ROWS)
     ]
     fake.assets = [
         {
-            "name": "daily_sales",
+            "name": f"daily_sales_{n}",
             "producing_tasks": [{"dag_id": DAG_ID, "task_id": "report"}],
-            "scheduled_dags": [{"dag_id": "downstream"}],
+            "scheduled_dags": [{"dag_id": f"downstream_{n}"}],
             "consuming_tasks": [],
-        },
+        }
+        for n in range(_SWEEP_ROWS)
     ]
     fake.cross_run_tis = [
         {
             "task_id": "report",
-            "dag_run_id": "manual__2",
+            "dag_run_id": f"manual__{n}",
             "state": "success",
             "map_index": -1,
             "try_number": 1,
             "duration": 4.0,
             "hostname": "w",
             "pid": 7,
-        },
+        }
+        for n in range(2, _SWEEP_ROWS + 2)
     ]
-    fake.dry_run_dates = ["2024-01-01T00:00:00+00:00"]
-    fake.import_errors = []
+    fake.versions = list(range(1, _SWEEP_ROWS + 1))
+    fake.dry_run_dates = [f"2024-01-{n:02d}T00:00:00+00:00" for n in range(1, _SWEEP_ROWS + 1)]
+    # Import errors for OTHER files. The Dag under test still imports cleanly —
+    # the sweep is about how a short read is reported, not about a broken Dag —
+    # but the list the read walks has rows in it to fall short of.
+    fake.import_errors = [
+        {"filename": f"other_{n}.py", "stack_trace": "ImportError: no module named x"}
+        for n in range(_SWEEP_ROWS)
+    ]
     fake.log = "ValueError: boom"
     return fake
 
@@ -9735,7 +9954,10 @@ def _sweep_world(fake):
 # WRITES instead (below): running them here would mutate the double, and what a
 # truncated read must do to them is refuse rather than answer differently.
 _SWEPT_TOOLS = {
-    "diagnose_dag": lambda: server.diagnose_dag(DAG_ID, audit_scope="granted"),
+    # PINNED to a run. Unpinned, a shorter run list makes this tool diagnose a
+    # DIFFERENT run, and two payloads about two different runs cannot be
+    # compared for what a truncation did to one of them.
+    "diagnose_dag": lambda: server.diagnose_dag(DAG_ID, "manual__1", audit_scope="granted"),
     "compare_dag_runs": lambda: server.compare_dag_runs(DAG_ID, "manual__1", "manual__2"),
     "find_failure_clusters": lambda: server.find_failure_clusters(hours=24, dag_ids=[DAG_ID]),
     "get_blast_radius": lambda: server.get_blast_radius(DAG_ID),
@@ -9828,6 +10050,83 @@ def test_no_tool_in_the_value_sweep_writes_anything(airflow, tmp_path, tool):
     assert _writes(airflow) == []
 
 
+def _planned_code_change():
+    changes = [{"old": "ammount", "new": "amount"}]
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    return server.apply_dag_code_changes(DAG_ID, changes, plan.get("plan_token", ""))
+
+
+def _planned_clear():
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
+    return server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan.get("plan_token", ""),
+        only_failed=False,
+        reviewed_instances=plan["blast_radius"]["instances"],
+    )
+
+
+def _planned_backfill():
+    plan = server.plan_backfill(DAG_ID, "2024-01-01", "2024-01-02")
+    return server.run_backfill(DAG_ID, "2024-01-01", "2024-01-02", plan.get("plan_token", ""))
+
+
+def _planned_revert():
+    plan = server.plan_revert_dag_code(DAG_ID)
+    return server.revert_dag_code(DAG_ID, plan.get("plan_token", ""))
+
+
+# Every tool, driven all the way to its reads. The writers are handed a REAL
+# approval here rather than an empty token: a tool that refuses in its first
+# line reaches Airflow not once, and a sweep over a tool that never read
+# anything certifies nothing about how it reads.
+_ALL_TOOLS = {
+    **_SWEPT_TOOLS,
+    "apply_dag_code_changes": _planned_code_change,
+    "apply_task_instance_clear": _planned_clear,
+    "run_backfill": _planned_backfill,
+    "revert_dag_code": _planned_revert,
+    "rerun_dag": lambda: server.rerun_dag(DAG_ID),
+}
+
+
+def _all_tools():
+    return _ALL_TOOLS
+
+
+@pytest.mark.parametrize("tool", sorted(_all_tools()))
+def test_every_read_that_reaches_airflow_was_made_by_a_registered_reader(
+    airflow, tmp_path, monkeypatch, tool
+):
+    """The load-bearing half of the reader registry, and the behavioural one.
+
+    Measured at the boundary while the tool runs, so a read reaches this test
+    however it is spelled, through however many indirections, under whatever
+    alias — and the AST scans beside it are then belt to this braces rather
+    than the only thing standing.
+    """
+    _sweep_world(airflow)
+    seen = _watch_reads(monkeypatch)
+
+    _all_tools()[tool]()
+
+    assert seen, f"{tool} reached Airflow not once, so this sweep proves nothing about it"
+    assert _unregistered_reads(seen) == [], (
+        f"{tool} read Airflow from a site no exclusion covers and no Reading-returning "
+        f"function made: {_unregistered_reads(seen)}"
+    )
+
+
+def test_the_observed_registry_would_catch_a_read_through_a_second_entry_point():
+    """The instrument's own discrimination, stated as a test rather than asserted
+    in a comment: a site nothing declares is reported whatever route it used."""
+    seen = [((_MODULES[0], "scan_pools"), "GET", "/pools")]
+
+    assert _unregistered_reads(seen) == [(_MODULES[0], "scan_pools")]
+
+
 def _leaves(value, path="$"):
     """Every scalar in a result, by the path that reaches it."""
     if isinstance(value, dict):
@@ -9845,96 +10144,233 @@ def _leaves(value, path="$"):
 # ``True -> False`` on one of these under a shorter read is the conservative
 # direction and the whole point of the gate: the tool refused, or withheld a
 # verdict, because it could not see enough. A claim ABOUT THE WORLD may never
-# make that move, which is what everything outside this set is held to.
+# make that move, which is what everything outside these tables is held to.
 #
-# Every member is DECLARED. The set used to carry a suffix rule as well — any
-# leaf ending ``_complete`` or ``_read_whole``, at any depth — and a hard
-# negative only had to be spelled ``no_upstream_assets_complete`` to walk out of
-# the sweep entirely. Its identical twin ``no_upstream_assets`` was caught; the
-# suffixed one was not.
-_CONSERVATIVE_FLAGS = frozenset(
-    {
-        "planned",
-        "cleared",
-        "created",
-        "verified",
-        "mutation_applied",
-        "recovery_verified",
-        # A world claim, not a call claim: ``clean`` is the conjunction over the
-        # run's health, and it is here because every leg of that conjunction
-        # withholds itself under a short read rather than answering false.
-        "clean",
-        "mapped_tasks_settled",
-        "settled",
-        # Inert as it stands — the verdict reaches the payload through
-        # ``.as_field()`` under other names — and kept because the leg exists.
-        "pair_recorded",
-        # The read-coverage leaves: each one IS the completeness of one read, so
-        # ``True -> False`` on it is the sweep working rather than failing.
-        "task_instances_read_whole",
-        "task_list_read_whole",
-        "asset_catalog_read_whole",
-        "failures_read_whole",
-        "runs_read_whole",
-        "planned_runs_read_whole",
-        "surviving_runs_read_whole",
-    }
-)
+# Each entry is a NAME bound to the exact PATHS where its reasoning applies. The
+# exemption used to be by name at any depth, so injecting ``{"downstream":
+# {"clean": ...}}`` into ``get_blast_radius`` made a ``True -> False`` hard
+# negative at ``$.downstream.clean`` invisible — on a name excused for a
+# conjunction in a different tool's payload entirely.
+_CONSERVATIVE_FLAGS = {
+    "planned": ("$.planned",),
+    "cleared": ("$.cleared",),
+    "created": ("$.created",),
+    "verified": ("$.verified",),
+    "mutation_applied": ("$.mutation_applied",),
+    "recovery_verified": ("$.recovery_verified",),
+    # A world claim, not a call claim: ``clean`` is the conjunction over the
+    # run's health, and it is here because every leg of that conjunction
+    # withholds itself under a short read rather than answering false. Bound to
+    # the one path that conjunction reaches.
+    "clean": ("$.run_health.clean",),
+    "mapped_tasks_settled": ("$.blast_radius.mapped_tasks_settled", "$.mapped_tasks_settled"),
+    "settled": ("$.blast_radius.expansion.settled",),
+    # Inert as it stands — the verdict reaches the payload through
+    # ``.as_field()`` under other names — and kept because the leg exists.
+    "pair_recorded": ("$.instances[].audit.pair_recorded",),
+    # The read-coverage leaves: each one IS the completeness of one read, so
+    # ``True -> False`` on it is the sweep working rather than failing.
+    "task_instances_read_whole": ("$.run_a.task_instances_read_whole", "$.run_b.task_instances_read_whole"),
+    "task_list_read_whole": ("$.tasks.task_list_read_whole",),
+    "asset_catalog_read_whole": ("$.asset_catalog_read_whole",),
+    "failures_read_whole": ("$.failures_read_whole",),
+    "runs_read_whole": ("$.run_history.runs_read_whole",),
+    "runs_not_covered_read_whole": ("$.run_history.task_comparison.runs_not_covered_read_whole",),
+    "events_read_whole": ("$.audit_read.events_read_whole",),
+    "planned_runs_read_whole": ("$.planned_runs_read_whole",),
+    "surviving_runs_read_whole": ("$.surviving_runs_read_whole",),
+}
 
 # Leaves that report what a read did NOT cover. A key that appears only under a
 # short read is normally a claim manufactured by the truncation — exactly one
 # exists, ``instances_not_found`` — but one of THESE appearing is the tool
-# naming its own shortfall, which is the opposite move.
-_COVERAGE_DISCLOSURES = frozenset(
-    {
-        "reads_not_read_whole",
-        "failures_unreadable",
-        "instances_not_located",
-        "instances_omitted",
-        "surviving_runs_unread",
-        "logs_read_as_a_tail",
-        "log_tail_truncated",
-        "task_instances_omitted",
-    }
-)
+# naming its own shortfall, which is the opposite move. Bound to paths for the
+# same reason as the table above.
+_COVERAGE_DISCLOSURES = {
+    "reads_not_read_whole": ("$.instances[].reads_not_read_whole",),
+    "failures_unreadable": ("$.failures_unreadable",),
+    "instances_not_located": ("$.instances_not_located",),
+    "instances_omitted": ("$.instances_omitted",),
+    "surviving_runs_unread": ("$.surviving_runs_unread",),
+    "logs_read_as_a_tail": ("$.logs_read_as_a_tail",),
+    "log_tail_truncated": ("$.failures[].log_tail_truncated", "$.log_tail_truncated"),
+    "task_instances_omitted": (
+        "$.run_a.task_instances_omitted",
+        "$.run_b.task_instances_omitted",
+        "$.run_health.task_instances_omitted",
+        "$.task_instances_omitted",
+    ),
+    "events_omitted": ("$.audit_read.events_omitted", "$.event_history.events_omitted"),
+}
+
+
+def _path_shape(path):
+    """A leaf path with its list indices blanked, so one entry covers every element."""
+    return re.sub(r"\[\d+\]", "[]", path).removesuffix("[]")
 
 
 def _is_conservative(path):
-    leaf = path.rsplit(".", 1)[-1].removesuffix("[]")
-    return leaf in _CONSERVATIVE_FLAGS or leaf in _COVERAGE_DISCLOSURES
+    leaf = _path_shape(path).rsplit(".", 1)[-1]
+    declared = _CONSERVATIVE_FLAGS.get(leaf, ()) + _COVERAGE_DISCLOSURES.get(leaf, ())
+    return _path_shape(path) in declared
 
 
-def _manufactured_negatives(complete, truncated):
-    """Keys whose claim got STRONGER because a read got shorter.
+def test_every_conservative_exemption_names_the_leaf_it_is_keyed_under():
+    """A path filed under the wrong name exempts nothing and hides that it does not."""
+    for table in (_CONSERVATIVE_FLAGS, _COVERAGE_DISCLOSURES):
+        for leaf, paths in table.items():
+            assert paths, f"{leaf} is declared conservative at no path at all"
+            for path in paths:
+                assert path.rsplit(".", 1)[-1] == leaf, f"{path} is filed under {leaf}"
+                assert path == _path_shape(path), f"{path} carries a list index"
 
-    Walks the union of both results, not just the keys the complete read
-    produced: a key that only APPEARS under truncation — ``instances_not_found``
-    is exactly one — was never examined at all by an iteration over ``before``.
+
+def test_a_conservative_name_is_not_exempt_at_a_path_it_was_never_declared_for():
+    """The evasion this table replaces: one declared name, injected anywhere."""
+    assert _is_conservative("$.run_health.clean") is True
+    assert _is_conservative("$.downstream.clean") is False
+    assert _is_conservative("$.blast_radius.downstream.verified") is False
+
+
+@pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
+def test_no_leaf_wearing_a_conservative_name_escapes_the_declared_paths(airflow, tmp_path, tool):
+    """The other direction: a payload that grows a SECOND leaf of a declared
+    name has to declare it, or the table has silently stopped describing the
+    payload it exempts."""
+    _sweep_world(airflow)
+
+    result = _SWEPT_TOOLS[tool]()
+
+    undeclared = sorted(
+        {
+            _path_shape(path)
+            for path, _ in _leaves(result)
+            if _path_shape(path).rsplit(".", 1)[-1] in (_CONSERVATIVE_FLAGS | _COVERAGE_DISCLOSURES)
+            and not _is_conservative(path)
+        }
+    )
+    assert undeclared == [], f"{tool} carries a conservative name at an undeclared path: {undeclared}"
+
+
+# Enumerations that are SAMPLES of a read rather than closed sets, each bound to
+# the leaf that says how much of that read they are. An empty sample beside "42
+# rows were not read" is not a claim that there are none, and the counter is
+# what makes that true — so it is named here and asserted to rise, rather than
+# the enumeration being waved through.
+_SAMPLED_ENUMERATIONS = {
+    "$.run_history.task_comparison.tasks": "$.run_history.task_comparison.rows_omitted",
+    "$.run_history.task_comparison.runs_not_covered": "$.run_history.runs_omitted",
+    "$.run_history.task_comparison.task_ids_compared": "$.task_instances_omitted",
+    # The two enumerations of what was verified, against the two enumerations of
+    # what could not be. An empty verified set beside a named unlocatable one is
+    # the tool saying it reached nothing, not that there was nothing.
+    "$.instances": ("$.instances_not_found", "$.instances_not_located", "$.instances_omitted"),
+    "$.unverified_instances": (
+        "$.instances_not_found",
+        "$.instances_not_located",
+        "$.instances_omitted",
+    ),
+}
+
+
+def _sampled_under(path):
+    """The omission counters that stand behind this enumeration, if it is a sample."""
+    shape = _path_shape(path)
+    for prefix, counters in _SAMPLED_ENUMERATIONS.items():
+        if shape == prefix or shape.startswith(prefix + "."):
+            return (counters,) if isinstance(counters, str) else counters
+    return None
+
+
+def test_every_sampled_enumeration_names_a_counter_that_is_not_itself():
+    """A sample excused by a counter that is part of the sample excuses itself."""
+    for prefix, counters in _SAMPLED_ENUMERATIONS.items():
+        for counter in (counters,) if isinstance(counters, str) else counters:
+            assert not counter.startswith(prefix + "."), f"{counter} is inside {prefix}"
+            assert counter != prefix
+
+
+def _discloses_more(complete, truncated, counters):
+    """Whether any of the named omission counters went UP between the two answers."""
+    before, after = dict(_leaves(complete)), dict(_leaves(truncated))
+    for path, now in after.items():
+        if not any(_path_shape(path).startswith(counter) for counter in counters):
+            continue
+        was = before.get(path)
+        if isinstance(now, int) and not isinstance(now, bool):
+            if now > (was if isinstance(was, int) and not isinstance(was, bool) else 0):
+                return True
+    return False
+
+
+def _hard_claims(complete, truncated, wanted):
+    """Leaves that became a hard ``wanted`` because a read got shorter.
+
+    Polarity is NOT inferred from spelling, in either direction. The same fact
+    stated as ``has_downstream_impact: True -> False`` and as
+    ``no_downstream_impact: False -> True`` is the same manufactured claim, and
+    the rule that only recognised "-> False" caught the first and passed the
+    second — as it passed a key appearing only under truncation carrying
+    ``nothing_downstream_of_this_dag: True``. What counts is that a hard
+    boolean appeared, or flipped, where a shorter read is the only thing that
+    changed.
     """
     before, after = dict(_leaves(complete)), dict(_leaves(truncated))
     broken = []
-    for path in before.keys() | after.keys():
+    for path in sorted(before.keys() | after.keys()):
         if _is_conservative(path):
             continue
         was, now = before.get(path, _ABSENT_LEAF), after.get(path, _ABSENT_LEAF)
-        if now is _ABSENT_LEAF:
+        if now is not wanted:
             continue
-        if was is _ABSENT_LEAF:
-            # A claim that did not exist over the whole read and does over the
-            # short one is manufactured by definition — unless it is a null or
-            # an empty enumeration, which claim nothing.
-            if now is False or (path.endswith("[]") and now):
-                broken.append((path, "(absent)", now))
+        if was is _ABSENT_LEAF or was is None or (isinstance(was, bool) and was is not now):
+            broken.append((path, was, now))
+    return broken
+
+
+def _manufactured_negatives(complete, truncated):
+    """Claims of ABSENCE that a shorter read created.
+
+    The hard ``False`` in either direction, plus the two shapes that are a
+    negative without being one: an enumeration that emptied, and a string that
+    went blank. Walks the union of both results rather than the keys the whole
+    read produced — a key that only APPEARS under truncation was never examined
+    at all by an iteration over ``before``.
+    """
+    before, after = dict(_leaves(complete)), dict(_leaves(truncated))
+    broken = _hard_claims(complete, truncated, False)
+    for path in sorted(before.keys() | after.keys()):
+        if _is_conservative(path):
             continue
-        if was is True and now is False:
-            broken.append((path, was, now))
-        elif was is not None and was is not False and now is False:
-            broken.append((path, was, now))
-        elif path.endswith("[]") and was and not now:
-            broken.append((path, was, now))
+        was, now = before.get(path, _ABSENT_LEAF), after.get(path, _ABSENT_LEAF)
+        if now is _ABSENT_LEAF or isinstance(now, bool):
+            continue
+        if path.endswith("[]"):
+            counter = _sampled_under(path)
+            if counter and _discloses_more(complete, truncated, counter):
+                # A sample, and the payload said in the same breath how much of
+                # the read it is. That is the disclosure, not a claim.
+                continue
+            if was is _ABSENT_LEAF and now:
+                broken.append((path, was, now))
+            elif was is not _ABSENT_LEAF and was and not now:
+                broken.append((path, was, now))
         elif isinstance(was, str) and was and now == "":
             broken.append((path, was, now))
     return broken
+
+
+def _manufactured_positives(complete, truncated):
+    """Claims of PRESENCE that a shorter read created — N5a's missing counterpart.
+
+    Nothing guarded this direction at all. Every rule in the redesign was
+    written for "a truncated read never manufactures a NEGATIVE", and both
+    regressions the first repair round introduced were manufactured POSITIVES:
+    a half-operation ruled out over a row that named a hostname, and a duration
+    vouched for against a baseline that had discarded the slow half of its own
+    history.
+    """
+    return _hard_claims(complete, truncated, True)
 
 
 class _AbsentLeaf:
@@ -10035,6 +10471,98 @@ def test_truncating_any_read_never_manufactures_a_negative(airflow, tmp_path, mo
     truncated = _SWEPT_TOOLS[tool]()
 
     assert _manufactured_negatives(complete, truncated) == []
+
+
+@pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
+@pytest.mark.parametrize("lever", sorted(_LEVERS))
+def test_truncating_any_read_never_manufactures_a_positive(airflow, tmp_path, monkeypatch, tool, lever):
+    """N5a's counterpart, over the same matrix. It did not exist: every rule in
+    the redesign guarded "never manufactures a NEGATIVE", so a clamp that turned
+    a null into a hard ``True`` was outside the sweep entirely — which is the
+    class both regressions of the first repair round fell through."""
+    _sweep_world(airflow)
+    complete = _SWEPT_TOOLS[tool]()
+
+    _LEVERS[lever](airflow, monkeypatch)
+    truncated = _SWEPT_TOOLS[tool]()
+
+    assert _manufactured_positives(complete, truncated) == []
+
+
+# Levers that move no tool's answer in this world, each NAMED with why. An
+# inert lever passes both sweeps over it and certifies nothing, and eighteen of
+# nineteen clamp levers were inert while reading as coverage. The test below
+# compares this list against the measured one in BOTH directions, so a lever
+# that goes quiet fails as loudly as one that starts biting.
+_LEVERS_THAT_MOVE_NOTHING = {
+    "clamped:evidence.COVERAGE_NAME_LIMIT": "names instances the sweep world has none of to name",
+    "clamped:evidence.DISPATCH_FINDING_LIMIT": "one dispatch finding at most, so a ceiling of 1 folds none",
+    "clamped:evidence.EXTRA_KEY_LIMIT": "the double's rows carry no extra keys to clamp",
+    "clamped:evidence.EXTRA_LIST_LIMIT": "the double's rows carry no extra lists to clamp",
+    "clamped:evidence.RUN_SCOPED_EVENT_LIMIT": "the double emits no run-scoped events",
+    "clamped:evidence.TRIES_PROBE_LIMIT": "fewer successes need a probe than the ceiling of 1 allows",
+    "clamped:reading.EVENT_SCAN_LIMIT": "the event scan reaches its natural end inside one page",
+    "clamped:reading.EVENT_SCAN_PAGE": "paging is not truncation; the loop follows the pages",
+    "clamped:reading.TASK_COMPARISON_LIMIT": "one task id is selected, so a ceiling of 1 drops none",
+    "clamped:reading.TASK_INSTANCE_PAGE": "paging is not truncation; the loop follows the pages",
+    "clamped:reading.TASK_INSTANCE_SCAN_LIMIT": "the run's list ends before the ceiling of 1 binds",
+}
+
+
+def test_no_lever_is_inert_except_the_ones_declared_inert(airflow, tmp_path, monkeypatch):
+    """The sweep is worth exactly what its levers move.
+
+    Nineteen clamp levers shortened zero reads and left eighteen tools'
+    answers byte-identical — a matrix of 351 cases, of which 3 could have
+    failed. An inert lever is not coverage, so every one of them is named.
+    """
+    moved = set()
+    for lever in sorted(_LEVERS):
+        for tool in sorted(_SWEPT_TOOLS):
+            with monkeypatch.context() as patch:
+                _sweep_world(airflow)
+                whole = _without_tokens(_SWEPT_TOOLS[tool]())
+                _LEVERS[lever](airflow, patch)
+                if _without_tokens(_SWEPT_TOOLS[tool]()) != whole:
+                    moved.add(lever)
+                    break
+
+    assert sorted(set(_LEVERS) - moved) == sorted(_LEVERS_THAT_MOVE_NOTHING), (
+        "a lever's reach changed: it now moves an answer, or it has stopped moving one"
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "negatives", "positives"),
+    [
+        ({"has_downstream_impact": True}, {"has_downstream_impact": False}, 1, 0),
+        ({"no_downstream_impact": False}, {"no_downstream_impact": True}, 0, 1),
+        ({}, {"nothing_downstream_of_this_dag": True}, 0, 1),
+        ({}, {"downstream_is_empty": False}, 1, 0),
+        ({"settled_elsewhere": None}, {"settled_elsewhere": True}, 0, 1),
+        ({"settled_elsewhere": None}, {"settled_elsewhere": False}, 1, 0),
+        ({"names": ["a"]}, {"names": []}, 1, 0),
+        ({"unchanged": True}, {"unchanged": True}, 0, 0),
+        ({"softened": True}, {"softened": None}, 0, 0),
+    ],
+    ids=[
+        "true-to-false",
+        "false-to-true-same-fact",
+        "new-positive-key",
+        "new-negative-key",
+        "null-to-true",
+        "null-to-false",
+        "list-emptied",
+        "no-change",
+        "withdrawn",
+    ],
+)
+def test_the_two_sweeps_read_a_claim_by_its_value_and_not_by_its_name(before, after, negatives, positives):
+    """The polarity blindness, stated directly. ``has_downstream_impact`` going
+    True -> False and ``no_downstream_impact`` going False -> True are one fact
+    spelled twice, and the old rule caught the first and passed the second."""
+    assert len(_manufactured_negatives(before, after)) == negatives
+    assert len(_manufactured_positives(before, after)) == positives
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
@@ -10944,7 +11472,10 @@ _DISPLAY_CEILINGS = {
     ("codechange", "len(entries) > reading.MAX_BACKFILL_RUNS"),
     # "Is this the sample I asked for, or a page that fell short of it?" — the
     # request carried ``limit=RUN_HISTORY_LIMIT``, so a page that comes back AT
-    # the limit is the sample and not a shortfall.
+    # the limit is the sample and not a shortfall. This one is a display ceiling
+    # only because the population beyond the sample is REPORTED beside the
+    # verdict drawn over it (``duration_sample_rows_omitted``); without that it
+    # is a second completeness derivation, and it was.
     ("reading", "rest.kept < RUN_HISTORY_LIMIT"),
     ("evidence", "len(value) > EXTRA_LIST_LIMIT"),
     # Character clamps on text this tool did not write. A different type with a
@@ -11421,7 +11952,7 @@ def test_the_duration_sample_counts_rows_examined_and_not_rows_it_chose_to_keep(
     ]
 
     history = _tries_reading(_attempts(2))
-    baseline, _ = reading._duration_baseline(DAG_ID, "manual__1", dict(RECOVERED), history)
+    baseline, _, _ = reading._duration_baseline(DAG_ID, "manual__1", dict(RECOVERED), history)
 
     assert baseline.complete is True
     assert baseline.omitted == 0
@@ -11930,6 +12461,6 @@ def test_a_non_empty_blast_radius_over_a_short_catalog_is_caveated_too(airflow):
 
     result = server.get_blast_radius(DAG_ID)
 
-    assert result["produces_assets"] == ["daily_sales"]
+    assert result["produces_assets"] == [f"daily_sales_{n}" for n in range(_SWEEP_ROWS)]
     assert result["asset_catalog_read_whole"] is False
     assert "is not closed" in result["scope"]
