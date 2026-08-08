@@ -7870,12 +7870,18 @@ def test_a_read_failure_after_the_write_does_not_turn_a_landed_clear_into_a_fail
     assert fake.cleared != []
 
 
-def test_the_apply_carries_the_expansion_answer_from_the_plan(mapped_run, monkeypatch):
-    """Recomputing it after the write would be the network call that must not happen."""
+def test_the_apply_reprobes_the_expansion_before_the_write_and_never_after(mapped_run, monkeypatch):
+    """Recomputing it AFTER the write is the network call that must not happen; before it is required."""
     plan = _mapped_plan()
-    monkeypatch.setattr(
-        server, "_mapped_in_closure", lambda *a, **k: pytest.fail("recomputed after the write")
-    )
+    fake = mapped_run
+    when: list[bool] = []
+    real = server._mapped_in_closure
+
+    def records_when_it_ran(*args, **kwargs):
+        when.append(bool(fake.cleared))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_mapped_in_closure", records_when_it_ran)
 
     result = server.apply_task_instance_clear(
         DAG_ID,
@@ -7886,6 +7892,7 @@ def test_the_apply_carries_the_expansion_answer_from_the_plan(mapped_run, monkey
         reviewed_instances=_reviewed(plan),
     )
 
+    assert when == [False], "the expansion probe must run exactly once, before the write"
     assert result["mapped_tasks"] == ["fan"]
     assert result["mapped_tasks_settled"] is True
 
@@ -7994,7 +8001,7 @@ def test_a_truncated_tries_page_cannot_decide_the_earlier_attempt_is_gone(recove
 
     assert leg["passed"] is None
     assert "1 of 5 recorded attempt(s)" in leg["detail"]
-    assert "may be one of the attempts this read did not return" in leg["detail"]
+    assert "may be one of the attempts this read did not look at" in leg["detail"]
     assert _verify()["verified"] is False
 
 
@@ -8084,3 +8091,414 @@ def test_a_refusal_that_carries_a_detail_still_says_the_route_explained_itself(c
 
     assert "answered with its own explanation" in result["error"]
     assert "task_ids is empty" in result["error"]
+
+
+# --- Completeness is what was READ, never what the source returned ------------
+#
+# One root cause, two legs. RECOVERY_ATTEMPT_LIMIT truncates the list AFTER the
+# status is derived, so a read the tool itself cut short was reported "checked"
+# and routed into the negative branch — a hard absence asserted over records
+# nobody looked at. Every case below is a boundary of that clamp.
+
+
+_STALE_XCOM = "2026-08-07T22:30:10+00:00"  # before CLEARED_AT
+_FRESH_XCOM = "2026-08-07T22:30:33.300000+00:00"  # after the target's re-run ended
+
+
+def _records(count, *, fresh_index=None, fresh_key=None):
+    """``count`` output records, at most one of which post-dates the clear."""
+    rows = [{"key": f"k{n:02d}", "timestamp": _STALE_XCOM} for n in range(count)]
+    if fresh_index is not None:
+        rows[fresh_index] = {"key": fresh_key or rows[fresh_index]["key"], "timestamp": _FRESH_XCOM}
+    return rows
+
+
+def _leg(entry, name):
+    return next(check for check in entry["checks"] if check["check"] == name)
+
+
+def test_the_only_fresh_record_sorting_past_the_clamp_is_not_read_as_an_absence(recovered_run):
+    """The live counterexample: the route orders keys alphabetically and `return_value` sorts last."""
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(14) + [
+        {"key": "return_value", "timestamp": _FRESH_XCOM}
+    ]
+
+    result = _verify()
+    entry = result["instances"][0]
+    leg = _leg(entry, "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is None
+    assert "recorded_output_post_dates_clear" in entry["unestablished_checks"]
+    assert "10 of 15 output record(s) were read" in leg["detail"]
+    assert "an absence among them is not an absence" in leg["detail"]
+    assert result["verified"] is False
+
+
+def test_a_clamped_read_never_fires_the_stale_artefact_sentence(recovered_run):
+    """The downstream leg's sentence is a claim about a thing that exists; a clamped read cannot make it."""
+    recovered_run.xcoms_by_task[("report", -1)] = _records(14) + [
+        {"key": "return_value", "timestamp": _FRESH_XCOM}
+    ]
+
+    entry = next(e for e in _verify()["instances"] if e["task_id"] == "report")
+    leg = _leg(entry, "output_post_dates_the_task_it_reports_on")
+
+    assert leg["passed"] is None
+    assert server._STALE_ARTEFACT not in leg["detail"]
+    assert "output_post_dates_the_task_it_reports_on" in entry["unestablished_checks"]
+
+
+@pytest.mark.parametrize(
+    ("total", "fresh_index", "expected"),
+    [
+        (12, 0, True),  # first row of the page — well inside the clamp
+        (12, 9, True),  # the last row the clamp keeps
+        (12, 10, None),  # immediately beyond the clamp
+        (12, 11, None),  # the last row of the page, which is what the clamp drops
+        (10, 9, True),  # exact limit: nothing is dropped, so presence holds
+        (10, None, False),  # exact limit and genuinely no fresh record — a complete read
+        (11, 10, None),  # limit plus one: exactly one row dropped, and it is the one
+        (11, 0, True),  # limit plus one, match retained — presence survives truncation
+    ],
+)
+def test_the_output_leg_answers_from_the_records_it_actually_read(
+    recovered_run, total, fresh_index, expected
+):
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(total, fresh_index=fresh_index)
+
+    leg = _leg(_verify()["instances"][0], "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is expected
+
+
+def test_a_source_truncated_page_and_the_local_clamp_are_the_same_incompleteness(recovered_run):
+    """Both leave records unread, and the count reported is the one that was read."""
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(12, fresh_index=11)
+    recovered_run.xcoms_total = 30
+
+    leg = _leg(_verify()["instances"][0], "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is None
+    assert "10 of 30 output record(s) were read" in leg["detail"]
+
+
+def test_a_source_truncated_page_still_proves_presence(recovered_run):
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(8, fresh_index=0)
+    recovered_run.xcoms_total = 30
+
+    assert _leg(_verify()["instances"][0], "recorded_output_post_dates_clear")["passed"] is True
+
+
+def test_the_output_read_reports_how_many_records_it_did_not_look_at(recovered_run):
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(14)
+
+    output = server._recorded_output(DAG_ID, "/dagRuns/manual__1", {"task_id": "summarize"}, "granted")
+
+    assert output["status"] == "partial"
+    assert len(output["entries"]) == 10
+    assert output["total_entries"] == 14
+    assert output["entries_omitted"] == 4
+
+
+# --- The same rule on /tries -------------------------------------------------
+
+
+def _attempts(count, *, executed_try=None):
+    """``count`` recorded attempts, at most one of which carries execution fields."""
+    return [
+        {
+            "try_number": n,
+            "state": "failed",
+            "hostname": "worker-1" if n == executed_try else "",
+            "pid": 4110 if n == executed_try else None,
+            "duration": 2.33,
+            "start_date": "2026-08-07T22:30:29.862440+00:00",
+            "end_date": "2026-08-07T22:30:32.196121+00:00",
+        }
+        for n in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("attempts", "sought", "expected"),
+    [
+        (12, 1, True),  # first row of the page
+        (12, 10, True),  # the last row the clamp keeps
+        (12, 11, None),  # immediately beyond the clamp
+        (12, 12, None),  # the last row of the page — the live 12-attempt case
+        (10, 10, True),  # exact limit: nothing is dropped
+        (10, 99, False),  # exact limit and genuinely absent — a complete read still says no
+        (11, 11, None),  # limit plus one: one row dropped, and it is the one
+        (11, 1, True),  # limit plus one, match retained
+    ],
+)
+def test_the_tries_leg_answers_from_the_attempts_it_actually_read(recovered_run, attempts, sought, expected):
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(attempts)
+
+    entry = _verify(prior_attempts={"summarize": sought, "report": 1})["instances"][0]
+
+    assert _leg(entry, "prior_attempt_preserved")["passed"] is expected
+
+
+def test_a_whole_page_this_tool_clamped_is_reported_as_a_partial_read(recovered_run):
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12)
+
+    entry = _verify(prior_attempts={"summarize": 12, "report": 1})["instances"][0]
+    leg = _leg(entry, "prior_attempt_preserved")
+
+    assert leg["passed"] is None
+    assert "looked at 10 of 12 recorded attempt(s)" in leg["detail"]
+    assert "attempts this read did not look at" in leg["detail"]
+    assert "prior_attempt_preserved" in entry["unestablished_checks"]
+
+
+def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recovered_run):
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12)
+    recovered_run.tries_total = 40
+
+    leg = _leg(
+        _verify(prior_attempts={"summarize": 12, "report": 1})["instances"][0], "prior_attempt_preserved"
+    )
+
+    assert leg["passed"] is None
+    assert "looked at 10 of 40 recorded attempt(s)" in leg["detail"]
+
+
+def test_the_clamp_cannot_rule_out_an_earlier_dispatched_attempt(recovered_run):
+    """`False` here suppresses the half-operation warning, so it needs a whole read."""
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=12)
+
+    evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", dict(FORGED))
+
+    assert evidence["attempt_history"]["status"] == "partial"
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is None
+    assert evidence["partial_external_effect_possible"] is None
+    assert server._PARTIAL_UNSETTLED_BY_HISTORY in evidence["reading"]
+
+
+def test_a_whole_read_still_rules_out_an_earlier_dispatched_attempt(recovered_run):
+    """Over-correcting to None everywhere would make the negative unreachable."""
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(10)
+
+    evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", dict(FORGED))
+
+    assert evidence["attempt_history"]["status"] == "checked"
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is False
+    assert evidence["partial_external_effect_possible"] is False
+    assert server._PARTIAL_UNSETTLED_BY_HISTORY not in evidence["reading"]
+
+
+def test_a_whole_read_still_proves_an_earlier_dispatched_attempt(recovered_run):
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(10, executed_try=3)
+    ti = dict(RECOVERED, try_number=11)
+
+    evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", ti)
+
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is True
+
+
+def test_the_attempt_reading_carries_the_clamp_as_its_own_status():
+    whole = {"status": "checked", "rows": _attempts(10), "attempts_recorded": 10}
+    clamped = {"status": "checked", "rows": _attempts(11), "attempts_recorded": 11}
+
+    assert server._attempt_reading(whole)["status"] == "checked"
+    assert server._attempt_reading(clamped)["status"] == "partial"
+    assert server._attempt_reading(clamped)["attempts_recorded"] == 11
+    assert server._attempt_reading(clamped)["error"] == server._HISTORY_CLAMPED
+    assert server._attempt_reading({"status": "empty", "rows": [], "error": "x"})["status"] == "empty"
+
+
+def test_a_clamped_read_blocks_the_verification_from_reaching_verified(recovered_run):
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12)
+
+    result = _verify(prior_attempts={"summarize": 12, "report": 1})
+
+    assert result["verified"] is False
+    assert result["instances"][0]["verdict"] == "unverified"
+
+
+def test_an_unclamped_recovery_still_verifies_end_to_end(recovered_run):
+    """The whole point of the repair is that a complete read still passes."""
+    assert _verify()["verified"] is True
+
+
+# --- Write preconditions are re-established immediately before the write ------
+
+
+def test_a_task_that_became_expandable_between_plan_and_apply_is_refused_before_the_write(cleared_run):
+    """`_version_drift` compares task-id sets, so the same id gaining a fan-out is invisible to it."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    assert plan["blast_radius"]["mapped_tasks"] == []
+    cleared_run.needs_expansion = {"report"}
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert result["newly_expandable_tasks"] == ["report"]
+    assert "became expandable since the user reviewed this clear" in result["error"]
+    assert "MAY CREATE" in result["error"]
+    assert "Nothing was cleared" in result["error"]
+    assert cleared_run.cleared == []
+
+
+def test_the_expansion_probe_is_the_last_check_before_the_write(cleared_run, monkeypatch):
+    """It has to sit after the repeated dry run and the drift check, not at plan time."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    real_clear = cleared_run._clear
+
+    def gains_a_fan_out_during_the_dry_run(body):
+        result = real_clear(body)
+        if body["dry_run"]:
+            cleared_run.needs_expansion = {"report"}
+        return result
+
+    monkeypatch.setattr(cleared_run, "_clear", gains_a_fan_out_during_the_dry_run)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert result["newly_expandable_tasks"] == ["report"]
+    assert cleared_run.cleared == []
+
+
+def test_the_expansion_refusal_leaves_no_approved_set_behind(cleared_run):
+    """A clear that never landed must not leave a baseline a later verification reads as an approval."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.needs_expansion = {"report"}
+
+    server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert server._approved_set_record(DAG_ID, "manual__1") is None
+
+
+def test_a_refused_clear_leaves_no_approved_set_behind(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.HTTPStatusError(
+        "bad request",
+        request=httpx.Request("POST", "/clearTaskInstances"),
+        response=httpx.Response(400, json={"detail": "task_ids is empty"}),
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["mutation_outcome"] == "refused"
+    assert server._approved_set_record(DAG_ID, "manual__1") is None
+
+
+def test_a_clear_that_landed_does_record_the_approved_set(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+
+    server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert server._approved_set_record(DAG_ID, "manual__1")["approved"] == [("report", -1)]
+
+
+def test_an_unknown_outcome_records_the_approved_set_because_the_write_may_have_landed(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.RequestError("connection reset")
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["mutation_outcome"] == "unknown"
+    assert server._approved_set_record(DAG_ID, "manual__1")["approved"] == [("report", -1)]
+
+
+def test_partial_probe_coverage_unsettles_the_claim_without_refusing_the_clear(cleared_run, monkeypatch):
+    """One closure task answers, another declines: an unanswered probe is not an addition."""
+    plan = server.plan_task_instance_clear(
+        DAG_ID, task_id="summarize", only_failed=False, include_downstream=True
+    )
+    assert plan["blast_radius"]["mapped_tasks"] == []
+    monkeypatch.setattr(
+        server,
+        "_expandable_probe",
+        lambda dag_id, run_path, task_id: None if task_id == "report" else False,
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["mapped_tasks_settled"] is False
+    assert result["expansion_unprobed_tasks"] == ["report"]
+    assert "['report']" in result["mapped_tasks_unsettled_warning"]
+    assert "MAY CREATE" in result["mapped_tasks_unsettled_warning"]
+
+
+def test_a_probe_that_answers_for_every_closure_task_still_settles_it(cleared_run, monkeypatch):
+    plan = server.plan_task_instance_clear(
+        DAG_ID, task_id="summarize", only_failed=False, include_downstream=True
+    )
+    monkeypatch.setattr(server, "_expandable_probe", lambda dag_id, run_path, task_id: False)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["mapped_tasks_settled"] is True
+    assert result["expansion_unprobed_tasks"] == []
+    assert "mapped_tasks_unsettled_warning" not in result
+
+
+def test_the_expansion_probe_runs_before_the_write_and_its_answer_is_carried(mapped_run, monkeypatch):
+    """Re-asking it after the write is the network call that turned a landed clear red."""
+    plan = _mapped_plan()
+    calls: list[bool] = []
+    real = server._expandable_probe
+    monkeypatch.setattr(
+        server,
+        "_expandable_probe",
+        lambda *args: (calls.append(bool(mapped_run.cleared)), real(*args))[1],
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert calls != []
+    assert not any(calls), "no expansion probe may run after the write"
+    assert result["mapped_tasks"] == ["fan"]
+    assert result["mapped_tasks_settled"] is True
+    assert result["mapped_tasks_source"].startswith("re-probed against the live Dag")
+
+
+def test_the_missing_approval_record_enumerates_nothing_rather_than_an_empty_list(recovered_run):
+    """An empty list reads as "none were added"; there was no comparison to say that from."""
+    result = _verify(approved=None)
+    record = result["approved_instance_set"]
+
+    assert record["check"]["passed"] is None
+    assert record["approved"] == server._APPROVED_SET_NOT_ESTABLISHED
+    assert record["added_since_approval"] == server._APPROVED_SET_NOT_ESTABLISHED
+    assert record["absent_since_approval"] == server._APPROVED_SET_NOT_ESTABLISHED

@@ -4350,6 +4350,36 @@ def _attempt_rows(history: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+_HISTORY_CLAMPED = (
+    f"the page held more attempts than this reading keeps ({RECOVERY_ATTEMPT_LIMIT}), so the "
+    f"attempts below are not the whole history and an absence among them is not an absence"
+)
+
+
+def _attempt_reading(history: dict[str, Any]) -> dict[str, Any]:
+    """The attempt history as this reading actually READ it, status included.
+
+    The local clamp is part of the read, so it has to be part of the status.
+    ``_attempt_history`` honestly reports ``checked`` over a whole page;
+    ``_attempt_rows`` then keeps at most ``RECOVERY_ATTEMPT_LIMIT`` of it, and
+    every absence-based leg downstream keys off the word ``checked``. Deriving
+    the status from what was returned rather than from what was read let those
+    legs assert hard negatives over records they never looked at.
+    """
+    rows = _attempt_rows(history)
+    status = history["status"]
+    recorded = history.get("attempts_recorded")
+    error = history.get("error")
+    if status in ("checked", "partial"):
+        returned = len(history.get("rows") or [])
+        if not isinstance(recorded, int) or recorded < returned:
+            recorded = returned
+        if len(rows) < returned:
+            status = "partial"
+            error = error or _HISTORY_CLAMPED
+    return {"status": status, "rows": rows, "attempts_recorded": recorded, "error": error}
+
+
 def _carries_execution_fields(row: dict[str, Any]) -> bool:
     return bool(row.get("hostname")) or row.get("pid") is not None
 
@@ -4385,8 +4415,10 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     """
     row = {name: ti.get(name) for name in _RECOVERY_ROW_KEYS}
     row["rendered_fields_present"] = bool(ti.get("rendered_fields"))
-    history = _attempt_history(dag_id, run_path, ti)
-    rows = _attempt_rows(history)
+    # The reading, not the response: what this function may conclude an absence
+    # from is what it read, and it reads at most RECOVERY_ATTEMPT_LIMIT rows.
+    history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
+    rows = history["rows"]
     live_executed = _carries_execution_fields(ti)
     others = [r for r in rows if r.get("try_number") != ti.get("try_number")]
     if history["status"] in ("checked", "partial"):
@@ -5078,6 +5110,10 @@ def _clear_outcome_unknown(
     is what makes the drawer refuse to paint it green — and ``mutation_applied``
     is absent rather than false.
     """
+    # The write may have landed, so the verification this answer sends the caller
+    # to needs the server-side baseline. Written here for the same reason it is
+    # NOT written on the refusal paths: those settled that nothing was applied.
+    _record_approved_set(dag_id, dag_run_id, plan["affected"])
     return {
         "cleared": False,
         "mutation_outcome": "unknown",
@@ -5190,11 +5226,13 @@ def apply_task_instance_clear(
     # From here the plan is committed to this call, whatever the outcome: one
     # approval buys one attempt at the write, never a second.
     _redeem_token("clear", plan_token)
-    # Written by the server at the moment the approval is spent, so the later
-    # verification compares the run against what was actually approved instead
-    # of against a list its own caller supplied.
-    _record_approved_set(dag_id, dag_run_id, plan["affected"])
-
+    # The BASELINE is not written here. Redeeming the token spends the approval;
+    # it does not make a clear happen, and this route still refuses on drift, on
+    # a changed affected set and on a newly expandable task. A baseline written
+    # before those checks outlived a clear that never landed, and a later
+    # verification read it as a real approval of a set no write was made for. It
+    # is written on the two paths where a write may have reached the API, and
+    # nowhere else.
     body = _clear_body(
         dag_run_id,
         task_ids,
@@ -5218,9 +5256,12 @@ def apply_task_instance_clear(
                 f"({len(plan['affected'])} instance(s) then, {len(now)} now); re-plan and show them"
             ),
         }
-    # Last thing before the write, so the window where the Dag could gain a task
-    # is as small as two REST calls allow. It cannot be closed from out here —
-    # the same is true of the backfill preview — but it can be this narrow.
+    # Every write precondition is re-established here, immediately before the
+    # POST, so the window where the Dag could change under the approval is as
+    # narrow as REST calls allow. It cannot be closed from out here — the same is
+    # true of the backfill preview — but nothing decided at plan time is carried
+    # into the write unre-checked. A refusal on this path is PRE-mutation: the
+    # POST has not been sent, so "not applied" is a fact, not an inference.
     drift, drift_error = _version_drift(dag_id, dag_run_id)
     if drift or drift_error:
         return {
@@ -5232,6 +5273,29 @@ def apply_task_instance_clear(
             or (
                 f"the Dag's tasks changed since the user reviewed this clear ({drift}), so re-queuing "
                 f"the run would now add or drop instances they never saw; re-plan and show them"
+            ),
+        }
+    # ``_version_drift`` compares task-id SETS, so it is blind to a task that
+    # became expandable under the same id — the fan-out changes, the id does not.
+    # The plan's answer is therefore not carried into the result; it is asked
+    # again here, against the live Dag, and a task the plan enumerated as
+    # unmapped that now probes expandable is a blast radius the user never
+    # reviewed. A probe that DECLINES is not an addition and does not refuse:
+    # it lands in expansion_unprobed_tasks and unsettles the claim instead.
+    expansion = _mapped_in_closure(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}", now)
+    gained = sorted(set(expansion["tasks"]) - set(plan.get("mapped_tasks") or []))
+    if gained:
+        return {
+            "cleared": False,
+            "mutation_applied": False,
+            "dag_run_id": dag_run_id,
+            "newly_expandable_tasks": gained,
+            "error": (
+                f"the task(s) {gained} became expandable since the user reviewed this clear, so "
+                f"their instances are now recomputed from upstream output when the run is "
+                f"re-queued and this clear MAY CREATE instances the reviewed plan did not "
+                f"enumerate; re-plan and show them. Nothing was cleared — this was checked before "
+                f"the write was sent."
             ),
         }
     try:
@@ -5294,17 +5358,29 @@ def apply_task_instance_clear(
     # this is truthful reporting of a drifted outcome, not a rollback.
     cleared_identities = _identities(cleared)
     planned_identities = plan["affected"]
-    # Read off the plan and off the rows the write itself returned — never off a
-    # fresh HTTP call. A network read here raised out of both ``except`` arms and
-    # turned a clear that had LANDED into "no reviewed plan for this clear" on
-    # the retry, which the drawer painted red.
+    # The write landed. THIS is where the approved set becomes a fact worth
+    # recording — the baseline is what the operator approved, not what cleared,
+    # so it is still the plan's set and not the drifted one.
+    _record_approved_set(dag_id, dag_run_id, planned_identities)
+    # Read off the pre-write probe, off the plan and off the rows the write
+    # itself returned — never off a fresh HTTP call. A network read HERE raised
+    # out of both ``except`` arms and turned a clear that had LANDED into "no
+    # reviewed plan for this clear" on the retry, which the drawer painted red.
+    # The probe is not a post-write call: it ran before the POST, on this path,
+    # and its answer is carried rather than re-asked.
     mapped_tasks = sorted(
         set(plan.get("mapped_tasks") or [])
+        | set(expansion["tasks"])
         | {ti["task_id"] for ti in cleared if ti.get("map_index", -1) >= 0}
     )
-    # The plan settled the question for the set the plan enumerated. A drifted
-    # set is a different set, and nothing here has probed it.
-    mapped_settled = bool(plan.get("mapped_settled")) and cleared_identities == planned_identities
+    # Three conditions, all necessary. The plan settled it for the set the plan
+    # enumerated; the pre-write probe settled it for the live Dag at the moment
+    # of the write; and a drifted set is a different set that neither has
+    # probed. A declining probe leaves the claim unsettled — never true.
+    mapped_settled = (
+        bool(plan.get("mapped_settled")) and expansion["settled"] and cleared_identities == planned_identities
+    )
+    unprobed_tasks = sorted(set(plan.get("expansion_unprobed_tasks") or []) | set(expansion["unprobed"]))
     result: dict[str, Any] = {
         "cleared": True,
         "mutation_applied": True,
@@ -5356,7 +5432,11 @@ def apply_task_instance_clear(
         "created_task_instances": _MAPPED_CREATION_NOT_ESTABLISHED,
         "mapped_tasks": mapped_tasks,
         "mapped_tasks_settled": mapped_settled,
-        "expansion_unprobed_tasks": plan.get("expansion_unprobed_tasks") or [],
+        "mapped_tasks_source": (
+            "re-probed against the live Dag immediately before the write, then unioned with the "
+            "reviewed plan and with the map_index the write itself returned"
+        ),
+        "expansion_unprobed_tasks": unprobed_tasks,
         "ui_updates": [
             {
                 "kind": "task_instances",
@@ -5366,6 +5446,22 @@ def apply_task_instance_clear(
             }
         ],
     }
+    if not mapped_settled:
+        # Said in the result and not only in the plan's warnings: this is the
+        # field a reader turns into "nothing else was created", and it must
+        # carry its own limitation wherever it is read.
+        result["mapped_tasks_unsettled_warning"] = (
+            f"Whether this closure holds a task whose fan-out the scheduler recomputes is NOT "
+            f"settled here. The pre-write probe did not answer for "
+            f"{sorted(set(expansion['unprobed']))}"
+            + (
+                ""
+                if cleared_identities == planned_identities
+                else ", and what cleared drifted from the reviewed plan, which nothing has probed"
+            )
+            + ". Treat mapped_tasks as a floor, not a closed list: this clear MAY CREATE task "
+            "instances that are not enumerated here."
+        )
     if not result["cleared_matches_plan"]:
         result["cleared_delta"] = {
             "missing": sorted(set(planned_identities) - set(cleared_identities)),
@@ -5436,9 +5532,15 @@ def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope:
         for row in rows[:RECOVERY_ATTEMPT_LIMIT]
     ]
     return {
-        "status": "checked" if len(rows) >= total else "partial",
+        # Derived from what was READ, never from what the route returned. The
+        # clamp above is this tool's own truncation and is indistinguishable, to
+        # every absence-based leg downstream, from the route's: both leave
+        # records unlooked-at. Comparing len(rows) against total called a
+        # locally-clamped read "checked" and routed it into the negative branch.
+        "status": "checked" if len(entries) >= total else "partial",
         "entries": entries,
         "total_entries": total,
+        "entries_omitted": max(total - len(entries), 0),
     }
 
 
@@ -5600,8 +5702,8 @@ def _verify_instance(
     """
     where = _ti_where(ti)
     try_number = ti.get("try_number")
-    history = _attempt_history(dag_id, run_path, ti)
-    rows = _attempt_rows(history)
+    history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
+    rows = history["rows"]
     checks = []
 
     if not isinstance(prior_try_number, int) or not isinstance(try_number, int):
@@ -5649,16 +5751,17 @@ def _verify_instance(
             )
         )
     elif history["status"] == "partial":
-        # A truncated page can only ever prove presence. ``_recovery_evidence``
-        # obeys that rule; deciding an absence from the same page did not.
+        # A truncated read can only ever prove presence. Truncated by the route
+        # or truncated by this tool's own clamp is the same incompleteness, so
+        # the count is what was READ, never what /tries returned.
         checks.append(
             _check(
                 "prior_attempt_preserved",
                 None,
-                f"/tries returned {len(rows)} of {history.get('attempts_recorded')} recorded "
+                f"this reading looked at {len(rows)} of {history.get('attempts_recorded')} recorded "
                 f"attempt(s) and no record at try_number {prior_try_number} is among them, so "
                 f"whether the earlier attempt survived is not established — it may be one of the "
-                f"attempts this read did not return",
+                f"attempts this read did not look at ({_quoted(history.get('error'), 200)})",
             )
         )
     else:
@@ -5866,6 +5969,12 @@ _APPROVED_SET_SCOPE_NOTE = (
     "Restricted to the task ids the approval named. An instance of any other task in this run is "
     "outside this comparison and is neither reported nor implied to be absent."
 )
+# There is no baseline, so there is no comparison, so there is nothing to
+# enumerate. An empty list here reads as "none were added" / "none are absent" —
+# a positive claim standing in for a comparison that never ran.
+_APPROVED_SET_NOT_ESTABLISHED = (
+    "not established: no approved set is on record for this run, so nothing was compared"
+)
 
 
 def _approved_instance_set_check(
@@ -5898,9 +6007,9 @@ def _approved_instance_set_check(
                 "and are not used as one.",
             ),
             "baseline_source": "none",
-            "approved": [],
-            "added_since_approval": [],
-            "absent_since_approval": [],
+            "approved": _APPROVED_SET_NOT_ESTABLISHED,
+            "added_since_approval": _APPROVED_SET_NOT_ESTABLISHED,
+            "absent_since_approval": _APPROVED_SET_NOT_ESTABLISHED,
             "scope_note": _APPROVED_SET_SCOPE_NOTE,
         }
     wanted: list[tuple[str, int]] = list(record["approved"])
