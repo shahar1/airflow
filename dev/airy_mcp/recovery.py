@@ -59,6 +59,8 @@ tools are never rebound, so re-exporting them is the same object either way.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
@@ -75,6 +77,7 @@ from approvals import (
     _peek_token,
     _record_approved_set,
     _redeem_token,
+    eviction_note,
 )
 from dagsource import _resolve_task
 from evidence import (
@@ -188,14 +191,15 @@ def _version_drift(dag_id: str, dag_run_id: str) -> tuple[dict[str, list[str]] |
     if not run_scan.complete:
         return None, (
             f"run {dag_run_id} has more task instances than this tool will read "
-            f"({run_scan.omitted} not seen), so it cannot tell whether clearing would change the task set"
+            f"({run_scan.omitted} not seen on {run_scan.route}), so it cannot tell whether clearing "
+            f"would change the task set"
         )
     tasks = _tasks_reading(dag_id)
     if not tasks.complete:
         return None, (
             f"the latest version of {dag_id} lists more tasks than this tool read "
-            f"({tasks.kept} of {tasks.universe}), so it cannot tell whether clearing would change "
-            f"the task set"
+            f"({tasks.kept} of {tasks.universe} on {tasks.route}), so it cannot tell whether clearing "
+            f"would change the task set"
         )
     current = {ti["task_id"] for ti in run_scan.rows}
     latest = {task["task_id"] for task in tasks.rows}
@@ -932,6 +936,285 @@ def _expired_evidence(dag_id: str, dag_run_id: str, why: str, **fields: Any) -> 
     }
 
 
+@dataclass(frozen=True)
+class _GateContext:
+    """Everything the write preconditions are evaluated against, read once."""
+
+    dag_id: str
+    dag_run_id: str
+    run_path: str
+    plan: dict[str, Any]
+    preview: reading.Reading
+    now: list[dict[str, Any]]
+    state: dict[str, Any] = field(default_factory=dict)
+
+    def drift(self) -> tuple[dict[str, list[str]] | None, str | None]:
+        """The run's instance list against the Dag's task list, read once for three rules."""
+        if "drift" not in self.state:
+            self.state["drift"] = _version_drift(self.dag_id, self.dag_run_id)
+        return self.state["drift"]
+
+    def expansion(self) -> dict[str, Any]:
+        """The closure probe, read once for two rules and handed to the caller."""
+        if "expansion" not in self.state:
+            self.state["expansion"] = _mapped_in_closure(self.dag_id, self.run_path, self.now)
+        return self.state["expansion"]
+
+
+@dataclass(frozen=True)
+class _WritePrecondition:
+    """One fact the clear may not be written without, and where it is asked.
+
+    ``asked_at`` is the whole point. A rule the PLAN refuses on and the gate does
+    not re-ask is a rule that stops applying the moment the user clicks, and the
+    plan and the gate were two different rule sets with no way to see that they
+    were. They are one declared set now, and a test asserts the plan's members
+    are a subset of the gate's.
+    """
+
+    id: str
+    asked_at: frozenset[str]
+    what: str
+    check: Callable[[_GateContext], dict[str, Any] | None]
+
+
+def _rule_target_set_read_whole(ctx: _GateContext) -> dict[str, Any] | None:
+    """The preview IS the set that gets written, so it has to be the whole of it."""
+    if ctx.preview.complete:
+        return None
+    return _incomplete_read(
+        ctx.dag_id,
+        ctx.dag_run_id,
+        "clear preview",
+        _CLEAR_PREVIEW_ROUTE,
+        f"{ctx.preview.kept} instance(s) were read of {ctx.preview.universe} the route accounted for",
+    )
+
+
+def _rule_target_set_matches_approval(ctx: _GateContext) -> dict[str, Any] | None:
+    if _identities(ctx.now) == ctx.plan["affected"]:
+        return None
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_run_id": ctx.dag_run_id,
+        "affected": ctx.now,
+        "error": (
+            f"what this clear would affect changed since the user reviewed it "
+            f"({len(ctx.plan['affected'])} instance(s) then, {len(ctx.now)} now); re-plan and show them"
+        ),
+    }
+
+
+def _rule_target_not_in_flight(ctx: _GateContext) -> dict[str, Any] | None:
+    """The plan's own in-flight refusal, re-asked against the live rows.
+
+    An identity set that still matches proves nothing about an attempt that
+    landed in between, and ``_identities`` throws state and try_number away.
+    """
+    live_states = {_ti_where(ti): ti.get("state") for ti in ctx.now}
+    in_flight = sorted(where for where, state in live_states.items() if state in _IN_FLIGHT_TARGET_STATES)
+    if not in_flight:
+        return None
+    return _expired_evidence(
+        ctx.dag_id,
+        ctx.dag_run_id,
+        f"{in_flight} is on its way to a worker or already has one "
+        f"({sorted({str(live_states[where]) for where in in_flight})}). Airflow itself "
+        f"refuses a clear only for {_quoted(_REFUSED_BY_THE_API_STATE)} "
+        f"(models/taskinstance.py:387), so a queued or scheduled instance would clear "
+        f"through and be dispatched twice",
+        in_flight_instances=in_flight,
+    )
+
+
+def _rule_target_attempt_not_moved(ctx: _GateContext) -> dict[str, Any] | None:
+    live_states = {_ti_where(ti): ti.get("state") for ti in ctx.now}
+    live_attempts = {_ti_where(ti): ti.get("try_number") for ti in ctx.now}
+    planned_states = ctx.plan.get("states") or {}
+    planned_attempts = ctx.plan.get("attempts") or {}
+    moved = sorted(
+        where
+        for where in live_states
+        if (where in planned_states and live_states[where] != planned_states[where])
+        or (where in planned_attempts and live_attempts[where] != planned_attempts[where])
+    )
+    if not moved:
+        return None
+    return _expired_evidence(
+        ctx.dag_id,
+        ctx.dag_run_id,
+        f"{moved} moved since the plan was shown — state or try_number is not what was read "
+        f"then (planned "
+        f"{ {where: (planned_states.get(where), planned_attempts.get(where)) for where in moved} }, "
+        f"now { {where: (live_states[where], live_attempts[where]) for where in moved} })",
+        instances_that_moved=moved,
+    )
+
+
+def _rule_run_and_task_lists_read_whole(ctx: _GateContext) -> dict[str, Any] | None:
+    """Both lists the task-set comparison rests on, each proven whole.
+
+    ``_version_drift`` reports its own incompleteness for the run's instance
+    list and for the Dag's task list; the decision is taken here.
+    """
+    drift, drift_error = ctx.drift()
+    if not drift_error:
+        return None
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_run_id": ctx.dag_run_id,
+        "migration": drift,
+        "error": drift_error,
+    }
+
+
+def _rule_task_set_unchanged(ctx: _GateContext) -> dict[str, Any] | None:
+    drift, _ = ctx.drift()
+    if not drift:
+        return None
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_run_id": ctx.dag_run_id,
+        "migration": drift,
+        "error": (
+            f"the Dag's tasks changed since the user reviewed this clear ({drift}), so "
+            f"re-queuing the run would now add or drop instances they never saw; re-plan "
+            f"and show them"
+        ),
+    }
+
+
+def _rule_no_newly_expandable_task(ctx: _GateContext) -> dict[str, Any] | None:
+    """``_version_drift`` compares task-id SETS, so it is blind to a task that
+    became expandable under the same id: the fan-out changes and the id does not."""
+    gained = sorted(set(ctx.expansion()["tasks"]) - set(ctx.plan.get("mapped_tasks") or []))
+    if not gained:
+        return None
+    return {
+        "cleared": False,
+        "mutation_applied": False,
+        "dag_run_id": ctx.dag_run_id,
+        "newly_expandable_tasks": gained,
+        "error": (
+            f"the task(s) {gained} became expandable since the user reviewed this clear, so "
+            f"their instances are now recomputed from upstream output when the run is "
+            f"re-queued and this clear MAY CREATE instances the reviewed plan did not "
+            f"enumerate; re-plan and show them. {_NOTHING_CLEARED}"
+        ),
+        "next_step": _DO_NOT_BYPASS,
+    }
+
+
+def _rule_closure_settled(ctx: _GateContext) -> dict[str, Any] | None:
+    """A probe that declines leaves the closure unread, and the closure is what
+    says whether this write can create instances nobody reviewed."""
+    expansion = ctx.expansion()
+    if expansion["settled"]:
+        return None
+    return _incomplete_read(
+        ctx.dag_id,
+        ctx.dag_run_id,
+        "expandability probe over the cleared closure",
+        "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/listMapped",
+        f"the probe did not answer for {expansion['unprobed']}, so whether this clear's "
+        f"instance set is closed was not established",
+    )
+
+
+def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any] | None:
+    """The read behind the safety reading the approval rests on: whether an
+    earlier attempt of the target already reached the outside world."""
+    target = _plan_target(ctx.plan)
+    marker = (ctx.plan.get("task_ids") or [None])[0]
+    wanted = marker[1] if isinstance(marker, (list, tuple)) and len(marker) > 1 else -1
+    for ti in ctx.now:
+        if ti["task_id"] != target or ti.get("map_index", -1) != wanted:
+            continue
+        history = _attempt_reading(_attempt_history(ctx.dag_id, ctx.run_path, ti))
+        if history.complete:
+            return None
+        return _incomplete_read(
+            ctx.dag_id,
+            ctx.dag_run_id,
+            f"attempt history of {_ti_where(ti)}",
+            history.route,
+            f"the reading came back {reading.history_status(history)} — {history.kept} attempt(s) "
+            f"read of {'an unknown number' if history.read_failed else history.universe} "
+            f"({_quoted(reading.attempt_error(history), 200)})",
+        )
+    return None
+
+
+# Every fact this write may not be made without, in the order it is asked. The
+# ``plan`` members are the ones ``plan_task_instance_clear`` refuses or withholds
+# a token on; every one of them is re-asked here, immediately before the POST,
+# because a fact established at plan time describes a world the user has since
+# had time to change.
+_WRITE_PRECONDITIONS: tuple[_WritePrecondition, ...] = (
+    _WritePrecondition(
+        "target_set_read_whole",
+        frozenset({"plan", "gate"}),
+        "the clear preview lists every instance the write would touch",
+        _rule_target_set_read_whole,
+    ),
+    _WritePrecondition(
+        "target_set_matches_approval",
+        frozenset({"gate"}),
+        "the instances that would be cleared are the ones the user reviewed",
+        _rule_target_set_matches_approval,
+    ),
+    _WritePrecondition(
+        "target_not_in_flight",
+        frozenset({"plan", "gate"}),
+        "no instance in the closure is on its way to a worker or already has one",
+        _rule_target_not_in_flight,
+    ),
+    _WritePrecondition(
+        "target_attempt_not_moved",
+        frozenset({"gate"}),
+        "no instance's state or try_number has moved since the plan was shown",
+        _rule_target_attempt_not_moved,
+    ),
+    _WritePrecondition(
+        "run_and_task_lists_read_whole",
+        frozenset({"plan", "gate"}),
+        "the run's instance list and the Dag's task list were both read whole",
+        _rule_run_and_task_lists_read_whole,
+    ),
+    _WritePrecondition(
+        "task_set_unchanged",
+        frozenset({"plan", "gate"}),
+        "the latest Dag version has the same tasks as the run",
+        _rule_task_set_unchanged,
+    ),
+    _WritePrecondition(
+        "no_newly_expandable_task",
+        frozenset({"gate"}),
+        "no task in the closure became expandable since the plan",
+        _rule_no_newly_expandable_task,
+    ),
+    _WritePrecondition(
+        "closure_expandability_settled",
+        frozenset({"plan", "gate"}),
+        "the expandability probe answered for every task in the closure",
+        _rule_closure_settled,
+    ),
+    _WritePrecondition(
+        "target_attempt_history_read_whole",
+        frozenset({"plan", "gate"}),
+        "the target's attempt history was read whole",
+        _rule_target_attempt_history_read_whole,
+    ),
+)
+
+# Which rules the last gate run actually evaluated. Instrumentation, not state a
+# decision reads: a registry nothing iterates is a list, not a gate.
+_LAST_GATE_RULES: list[str] = []
+
+
 def _containment_gate(
     dag_id: str,
     dag_run_id: str,
@@ -948,167 +1231,26 @@ def _containment_gate(
     inconsistent. ``expansion`` is handed back so the caller does not re-ask the
     probe after the write — a network call there turns a clear that landed into a
     reported failure.
+
+    The rules are a declared registry rather than a run of ``if`` statements, so
+    "which facts does this write rest on" and "which of them are re-asked" are
+    the same question with one answer.
     """
-    # R1 — the target set. The preview IS the set that gets written, so a preview
-    # that accounted for more instances than it handed over describes a write
-    # this call cannot enumerate.
-    preview_reading = reading.read_of(preview, "task_instances", _CLEAR_PREVIEW_ROUTE).project(_affected_row)
-    if not preview_reading.complete:
-        return (
-            _incomplete_read(
-                dag_id,
-                dag_run_id,
-                "clear preview",
-                _CLEAR_PREVIEW_ROUTE,
-                f"{preview_reading.kept} instance(s) were read of {preview_reading.universe} the "
-                f"route accounted for",
-            ),
-            _NO_EXPANSION,
-        )
-
-    # R1 — and the same set the user reviewed, by identity.
-    if _identities(now) != plan["affected"]:
-        return (
-            {
-                "cleared": False,
-                "mutation_applied": False,
-                "dag_run_id": dag_run_id,
-                "affected": now,
-                "error": (
-                    f"what this clear would affect changed since the user reviewed it "
-                    f"({len(plan['affected'])} instance(s) then, {len(now)} now); re-plan and show them"
-                ),
-            },
-            _NO_EXPANSION,
-        )
-
-    # R2 — the fields ``_identities`` throws away. An identity set that still
-    # matches proves nothing about an attempt that landed in between, and the
-    # plan's own in-flight refusal was never re-asked before the write.
-    live_states = {_ti_where(ti): ti.get("state") for ti in now}
-    live_attempts = {_ti_where(ti): ti.get("try_number") for ti in now}
-    in_flight = sorted(where for where, state in live_states.items() if state in _IN_FLIGHT_TARGET_STATES)
-    if in_flight:
-        return (
-            _expired_evidence(
-                dag_id,
-                dag_run_id,
-                f"{in_flight} is on its way to a worker or already has one "
-                f"({sorted({str(live_states[where]) for where in in_flight})}). Airflow itself "
-                f"refuses a clear only for {_quoted(_REFUSED_BY_THE_API_STATE)} "
-                f"(models/taskinstance.py:387), so a queued or scheduled instance would clear "
-                f"through and be dispatched twice",
-                in_flight_instances=in_flight,
-            ),
-            _NO_EXPANSION,
-        )
-    planned_states = plan.get("states") or {}
-    planned_attempts = plan.get("attempts") or {}
-    moved = sorted(
-        where
-        for where in live_states
-        if (where in planned_states and live_states[where] != planned_states[where])
-        or (where in planned_attempts and live_attempts[where] != planned_attempts[where])
+    ctx = _GateContext(
+        dag_id=dag_id,
+        dag_run_id=dag_run_id,
+        run_path=run_path,
+        plan=plan,
+        preview=reading.read_of(preview, "task_instances", _CLEAR_PREVIEW_ROUTE).project(_affected_row),
+        now=now,
     )
-    if moved:
-        return (
-            _expired_evidence(
-                dag_id,
-                dag_run_id,
-                f"{moved} moved since the plan was shown — state or try_number is not what was read "
-                f"then (planned "
-                f"{ {where: (planned_states.get(where), planned_attempts.get(where)) for where in moved} }, "
-                f"now { {where: (live_states[where], live_attempts[where]) for where in moved} })",
-                instances_that_moved=moved,
-            ),
-            _NO_EXPANSION,
-        )
-
-    # R3 / R4 — the run's instance list and the Dag's task list, both of which
-    # decide whether re-queuing this run changes its task set. ``_version_drift``
-    # reports its own incompleteness for each; the decision is taken here.
-    drift, drift_error = _version_drift(dag_id, dag_run_id)
-    if drift or drift_error:
-        return (
-            {
-                "cleared": False,
-                "mutation_applied": False,
-                "dag_run_id": dag_run_id,
-                "migration": drift,
-                "error": drift_error
-                or (
-                    f"the Dag's tasks changed since the user reviewed this clear ({drift}), so "
-                    f"re-queuing the run would now add or drop instances they never saw; re-plan "
-                    f"and show them"
-                ),
-            },
-            _NO_EXPANSION,
-        )
-
-    # R5 / R6 — the closure. ``_version_drift`` compares task-id SETS, so it is
-    # blind to a task that became expandable under the same id: the fan-out
-    # changes and the id does not. The plan's answer is therefore not carried
-    # into the write; it is asked again here, against the live Dag.
-    expansion = _mapped_in_closure(dag_id, run_path, now)
-    gained = sorted(set(expansion["tasks"]) - set(plan.get("mapped_tasks") or []))
-    if gained:
-        return (
-            {
-                "cleared": False,
-                "mutation_applied": False,
-                "dag_run_id": dag_run_id,
-                "newly_expandable_tasks": gained,
-                "error": (
-                    f"the task(s) {gained} became expandable since the user reviewed this clear, so "
-                    f"their instances are now recomputed from upstream output when the run is "
-                    f"re-queued and this clear MAY CREATE instances the reviewed plan did not "
-                    f"enumerate; re-plan and show them. {_NOTHING_CLEARED}"
-                ),
-                "next_step": _DO_NOT_BYPASS,
-            },
-            _NO_EXPANSION,
-        )
-    if not expansion["settled"]:
-        # A probe that declines leaves the closure unread, and the closure is
-        # what says whether this write can create instances nobody reviewed. It
-        # used to unsettle a claim in the result; it now refuses the write.
-        return (
-            _incomplete_read(
-                dag_id,
-                dag_run_id,
-                "expandability probe over the cleared closure",
-                "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/listMapped",
-                f"the probe did not answer for {expansion['unprobed']}, so whether this clear's "
-                f"instance set is closed was not established",
-            ),
-            _NO_EXPANSION,
-        )
-
-    # R7 — the attempt history behind the safety reading the approval rests on:
-    # whether an earlier attempt of the target already reached the outside world,
-    # which is what makes this clear a possible duplicate of half an operation.
-    target = _plan_target(plan)
-    marker = (plan.get("task_ids") or [None])[0]
-    wanted = marker[1] if isinstance(marker, (list, tuple)) and len(marker) > 1 else -1
-    for ti in now:
-        if ti["task_id"] != target or ti.get("map_index", -1) != wanted:
-            continue
-        history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
-        if history.complete:
-            break
-        return (
-            _incomplete_read(
-                dag_id,
-                dag_run_id,
-                f"attempt history of {_ti_where(ti)}",
-                history.route,
-                f"the reading came back {reading.history_status(history)} — {history.kept} attempt(s) "
-                f"read of {'an unknown number' if history.read_failed else history.universe} "
-                f"({_quoted(reading.attempt_error(history), 200)})",
-            ),
-            _NO_EXPANSION,
-        )
-    return None, expansion
+    _LAST_GATE_RULES.clear()
+    for rule in _WRITE_PRECONDITIONS:
+        _LAST_GATE_RULES.append(rule.id)
+        refusal = rule.check(ctx)
+        if refusal is not None:
+            return {**refusal, "refused_precondition": rule.id}, _NO_EXPANSION
+    return None, ctx.expansion()
 
 
 def _clear_outcome_unknown(
@@ -1193,7 +1335,10 @@ def apply_task_instance_clear(
         return {
             "cleared": False,
             "mutation_applied": False,
-            "error": "no reviewed plan for this clear; call plan_task_instance_clear and show the user",
+            "error": (
+                "no reviewed plan for this clear; call plan_task_instance_clear and show the user"
+                + eviction_note("tokens")
+            ),
         }
     flag_error = _clear_flag_error(only_failed, include_downstream, run_on_latest_version)
     if flag_error:
@@ -1875,7 +2020,7 @@ def _approved_instance_set_check(record: dict[str, Any] | None, run_scan: readin
                 "clear plan for it (a different process, a restarted one, or a clear made outside "
                 "this tool), so there is no server-side baseline to compare the run against. The "
                 "instances named in this call are the caller's assertion about what was approved "
-                "and are not used as one.",
+                "and are not used as one." + eviction_note("approved_sets"),
             ),
             "baseline_source": "none",
             "approved": _APPROVED_SET_NOT_ESTABLISHED,

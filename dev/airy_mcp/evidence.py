@@ -1029,13 +1029,12 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
     # Defence in depth: the query is already dag_id-scoped, so a row for another
     # Dag can only be a server-side filter regression. Dropped and counted.
     # Copied rather than mutated, and the parse happens exactly once per row.
-    scan = reading.Reading(
-        rows=tuple({**row, _PARSED_EXTRA_KEY: _parsed_extra(row.get("extra"))} for row in fetched),
-        route=_EVENT_QUERY,
-        _delivered=len(fetched),
-        _claimed=total if isinstance(total, int) else None,
-        _pages=pages,
-        _exhausted=exhausted,
+    scan = reading.paged_read(
+        [{**row, _PARSED_EXTRA_KEY: _parsed_extra(row.get("extra"))} for row in fetched],
+        _EVENT_QUERY,
+        claimed=total,
+        pages=pages,
+        exhausted=exhausted,
     )
     # A dropped row is a row this reading did not look at, exactly like a page it
     # never fetched. Counting it only into ``rows_rejected`` let a read that

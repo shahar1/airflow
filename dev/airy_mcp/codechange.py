@@ -70,6 +70,7 @@ from approvals import (
     _redeem_token,
     _run_identity,
     _same_runs,
+    eviction_note,
 )
 from dagsource import (
     DagFileDriftError,
@@ -750,7 +751,10 @@ def run_backfill(
         return {
             "created": False,
             "mutation_applied": False,
-            "error": "no reviewed plan for this backfill; call plan_backfill and show the user the result",
+            "error": (
+                "no reviewed plan for this backfill; call plan_backfill and show the user the result"
+                + eviction_note("tokens")
+            ),
         }
     if (plan["dag_id"], plan["from_date"], plan["to_date"]) != (dag_id, from_date, to_date):
         return {

@@ -80,6 +80,29 @@ _issued_tokens: dict[str, dict[str, Any]] = {}
 _TOKEN_TTL_S = 900.0
 _TOKEN_MAX = 20
 
+# Both stores are bounded reads of themselves, and the bound has no signal: a
+# lookup that misses is "no such plan" AND "a plan that was pushed out by
+# twenty newer ones", with nothing to tell them apart. Counted here so a miss
+# can say which of the two it might be.
+_evictions = {"tokens": 0, "approved_sets": 0}
+
+
+def evicted() -> dict[str, int]:
+    """How many entries each store has silently dropped for capacity."""
+    return dict(_evictions)
+
+
+def eviction_note(store: str) -> str:
+    """The sentence a lookup miss carries when the store has dropped entries."""
+    count = _evictions.get(store, 0)
+    if not count:
+        return ""
+    return (
+        f" This server has dropped {count} older entr(y/ies) from that store for capacity since it "
+        f"started, so a record that existed may no longer be on it — the miss is not evidence that "
+        f"nothing was ever recorded."
+    )
+
 
 def _issue_token(kind: str, payload: dict[str, Any]) -> str:
     now = time.monotonic()
@@ -87,6 +110,7 @@ def _issue_token(kind: str, payload: dict[str, Any]) -> str:
         del _issued_tokens[token]
     while len(_issued_tokens) >= _TOKEN_MAX:
         del _issued_tokens[next(iter(_issued_tokens))]
+        _evictions["tokens"] += 1
     token = secrets.token_urlsafe(12)
     _issued_tokens[token] = {**payload, "kind": kind, "created_at": now}
     return token
@@ -128,6 +152,7 @@ _APPROVED_SET_MAX = 20
 def _record_approved_set(dag_id: str, dag_run_id: str, approved: list[Any]) -> None:
     while len(_approved_clear_sets) >= _APPROVED_SET_MAX:
         del _approved_clear_sets[next(iter(_approved_clear_sets))]
+        _evictions["approved_sets"] += 1
     _approved_clear_sets[(dag_id, dag_run_id)] = {
         "approved": sorted({(str(task), int(index)) for task, index in approved}),
         "recorded_at": _now_iso(),

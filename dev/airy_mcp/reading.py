@@ -291,6 +291,26 @@ def read_of(
     )
 
 
+def paged_read(
+    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    route: str,
+    *,
+    claimed: Any,
+    pages: int,
+    exhausted: bool,
+) -> Reading:
+    """A read that followed its own pages, with the evidence of how far it got."""
+    kept = tuple(rows)
+    return Reading(
+        rows=kept,
+        route=route,
+        _delivered=len(kept),
+        _claimed=claimed if isinstance(claimed, int) and not isinstance(claimed, bool) else None,
+        _pages=pages,
+        _exhausted=exhausted,
+    )
+
+
 def matches_of(
     matched: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
