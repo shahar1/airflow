@@ -36,6 +36,7 @@ if "fastmcp" not in sys.modules:
     sys.modules["fastmcp"] = _stub
 
 import approvals
+import dagsource
 import reading
 import server
 import transport
@@ -364,8 +365,8 @@ class FakeAirflow:
 def airflow(monkeypatch, tmp_path):
     fake = FakeAirflow()
     monkeypatch.setattr(transport, "_api", fake)
-    monkeypatch.setattr(server, "DAGS_DIR", tmp_path)
-    monkeypatch.setattr(server, "REPARSE_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(dagsource, "DAGS_DIR", tmp_path)
+    monkeypatch.setattr(dagsource, "REPARSE_TIMEOUT_S", 2.0)
     (tmp_path / "sales_summary.py").write_text(SOURCE)
     fake.dags_dir = tmp_path
     return fake
@@ -1227,7 +1228,7 @@ def test_plan_dag_code_changes_reports_the_findings_the_plan_leaves_unfixed(airf
     airflow.parsed_source = (
         "op_kwargs={'column': 'ammount', 'total': \"{{ ti.xcom_pull(task_ids='summarise') }}\"}\n"
     )
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
 
     partial = server.plan_dag_code_changes(DAG_ID, _changes(("'ammount'", "'amount'")))
 
@@ -1244,7 +1245,7 @@ def test_plan_dag_code_changes_reports_the_findings_the_plan_leaves_unfixed(airf
 def test_plan_dag_code_changes_reports_nothing_when_the_plan_fixes_every_finding(airflow):
     airflow.tasks = DEMO_TASKS
     airflow.parsed_source = "op_kwargs={'total': \"{{ ti.xcom_pull(task_ids='summarise') }}\"}\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
 
     fixed = server.plan_dag_code_changes(DAG_ID, _changes(("'summarise'", "'summarize'")))
 
@@ -1259,7 +1260,7 @@ def test_plan_dag_code_changes_blocks_removing_a_task_others_still_need(airflow,
         "summarize = PythonOperator(task_id='summarize')\n"
         f"report = PythonOperator(task_id='report', op_kwargs={{'t': {quote}summarize{quote}}})\n"
     )
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = [
         {"task_id": "extract", "downstream_task_ids": ["summarize"]},
         {"task_id": "summarize", "downstream_task_ids": ["report"]},
@@ -1279,7 +1280,7 @@ def test_plan_dag_code_changes_blocks_removing_a_task_others_still_need(airflow,
 def test_plan_dag_code_changes_blocks_removing_a_taskflow_task(airflow):
     """A @task function declares no task_id — a declaration diff would miss it."""
     airflow.parsed_source = "@task\ndef summarize():\n    pass\n\n\n@task\ndef report():\n    pass\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = DEMO_TASKS
 
     result = server.plan_dag_code_changes(DAG_ID, _changes(("@task\ndef summarize():\n    pass\n\n\n", "")))
@@ -1298,7 +1299,7 @@ def test_plan_dag_code_changes_sees_a_taskflow_task_however_it_is_decorated(airf
     """The decorator's arguments can run over several lines; a regex loses that."""
     definition = f"{decorator}\ndef summarize():\n    pass\n"
     airflow.parsed_source = f"{definition}\n\n@task\ndef report():\n    summarize()\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = DEMO_TASKS
 
     result = server.plan_dag_code_changes(DAG_ID, _changes((definition, "")))
@@ -1330,7 +1331,7 @@ def test_plan_dag_code_changes_blocks_a_removal_a_co_located_twin_would_hide(air
     question has to be how many definitions there were and how many are left.
     """
     airflow.parsed_source = source
-    (server.DAGS_DIR / "sales_summary.py").write_text(source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(source)
     airflow.tasks = [
         {"task_id": "load", "downstream_task_ids": ["report"]},
         {"task_id": "report", "downstream_task_ids": []},
@@ -1346,7 +1347,7 @@ def test_plan_dag_code_changes_blocks_a_removal_a_co_located_twin_would_hide(air
 def test_plan_dag_code_changes_does_not_mistake_a_sensor_for_the_task_it_waits_on(airflow):
     """`external_task_id="load"` points at a task; it does not define one."""
     airflow.parsed_source = 'load = EmptyOperator(task_id="load")\n'
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = [
         {"task_id": "load", "downstream_task_ids": ["report"]},
         {"task_id": "report", "downstream_task_ids": []},
@@ -1390,7 +1391,7 @@ def test_plan_dag_code_changes_refuses_when_it_cannot_read_the_task_graph(airflo
 def test_plan_dag_code_changes_blocks_dropping_the_task_decorator(airflow):
     """The decorator is what makes it a task; losing it removes the task."""
     airflow.parsed_source = "@task\ndef summarize():\n    pass\n\n\n@task\ndef report():\n    pass\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = DEMO_TASKS
 
     result = server.plan_dag_code_changes(DAG_ID, _changes(("@task\ndef summarize", "def summarize")))
@@ -1402,7 +1403,7 @@ def test_plan_dag_code_changes_blocks_dropping_the_task_decorator(airflow):
 def test_plan_dag_code_changes_blocks_a_removal_a_bare_name_still_points_at(airflow):
     """`registry = [orphan]` is a NameError the compile check cannot see."""
     airflow.parsed_source = "@task\ndef orphan():\n    pass\n\n\nregistry = [orphan]\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.tasks = [{"task_id": "orphan", "downstream_task_ids": []}]
 
     result = server.plan_dag_code_changes(DAG_ID, _changes(("@task\ndef orphan():\n    pass\n\n\n", "")))
@@ -1436,14 +1437,14 @@ def test_apply_dag_code_changes_leaves_no_backup_behind_when_it_refuses(airflow,
     path = tmp_path / "sales_summary.py"
     change = ('"column": "ammount"', '"column": "amount"')
     token = server.plan_dag_code_changes(DAG_ID, _changes(change))["plan_token"]
-    real_read = server._read_reviewed_file
+    real_read = dagsource._read_reviewed_file
 
     def read_then_someone_else_writes(*args, **kwargs):
         source = real_read(*args, **kwargs)
         path.write_text(SOURCE + "someone_else = 1\n")
         return source
 
-    monkeypatch.setattr(server, "_read_reviewed_file", read_then_someone_else_writes)
+    monkeypatch.setattr(dagsource, "_read_reviewed_file", read_then_someone_else_writes)
 
     assert server.apply_dag_code_changes(DAG_ID, _changes(change), token)["applied"] is False
     assert not (tmp_path / "sales_summary.py.airy-bak").exists()
@@ -1467,7 +1468,7 @@ ASSET_FIXTURE = [
 
 def test_plan_dag_code_changes_carries_an_asset_note_for_an_asset_change(airflow):
     airflow.parsed_source = "outlets=[Asset('sales')]\nprint('unrelated')\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.assets = ASSET_FIXTURE
 
     touching = server.plan_dag_code_changes(DAG_ID, _changes(("Asset('sales')", "Asset('sales_v2')")))
@@ -1484,7 +1485,7 @@ def test_plan_dag_code_changes_carries_an_asset_note_for_an_asset_change(airflow
 def test_plan_dag_code_changes_skips_the_asset_note_for_an_unrelated_change(airflow):
     """A change elsewhere in a Dag that happens to mention assets is not one."""
     airflow.parsed_source = "outlets=[Asset('sales')]\nprint('unrelated')\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.assets = ASSET_FIXTURE
 
     unrelated = server.plan_dag_code_changes(DAG_ID, _changes(("'unrelated'", "'still unrelated'")))
@@ -1496,7 +1497,7 @@ def test_plan_dag_code_changes_skips_the_asset_note_for_an_unrelated_change(airf
 def test_apply_dag_code_changes_requires_the_planned_asset_note(airflow, tmp_path):
     """The note goes in the arguments so the approval card must show it."""
     airflow.parsed_source = "outlets=[Asset('sales')]\n"
-    (server.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
+    (dagsource.DAGS_DIR / "sales_summary.py").write_text(airflow.parsed_source)
     airflow.assets = ASSET_FIXTURE
     changes = _changes(("Asset('sales')", "Asset('sales_v2')"))
     plan = server.plan_dag_code_changes(DAG_ID, changes)
@@ -1693,7 +1694,7 @@ def test_apply_dag_code_changes_refuses_when_the_file_changes_mid_patch(airflow,
     path = tmp_path / "sales_summary.py"
     change = ('"column": "ammount"', '"column": "amount"')
     token = server.plan_dag_code_changes(DAG_ID, _changes(change))["plan_token"]
-    real_read = server._read_reviewed_file
+    real_read = dagsource._read_reviewed_file
 
     def read_then_someone_else_writes(*args, **kwargs):
         source = real_read(*args, **kwargs)
@@ -1702,7 +1703,7 @@ def test_apply_dag_code_changes_refuses_when_the_file_changes_mid_patch(airflow,
         path.write_text(SOURCE + "\nsomeone_else = 1\n")
         return source
 
-    monkeypatch.setattr(server, "_read_reviewed_file", read_then_someone_else_writes)
+    monkeypatch.setattr(dagsource, "_read_reviewed_file", read_then_someone_else_writes)
 
     result = server.apply_dag_code_changes(DAG_ID, _changes(change), token)
 
