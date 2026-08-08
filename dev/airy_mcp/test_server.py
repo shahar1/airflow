@@ -37,6 +37,7 @@ if "fastmcp" not in sys.modules:
 
 import approvals
 import dagsource
+import evidence
 import reading
 import server
 import transport
@@ -4255,7 +4256,7 @@ def test_diagnose_keeps_presence_conclusions_from_a_truncated_history(airflow):
 
 
 def test_diagnose_spends_the_history_budget_on_the_flagged_rows_first(airflow, monkeypatch):
-    monkeypatch.setattr(server, "TRIES_PROBE_LIMIT", 1)
+    monkeypatch.setattr(evidence, "TRIES_PROBE_LIMIT", 1)
     airflow.tries_by_task = {("mmm_no_dispatch", -1): [{**FORGED_TI, "task_id": "mmm_no_dispatch"}]}
     probe_candidates = [
         _executed("aaa_cleared", try_number=1, max_tries=1),
@@ -4459,7 +4460,7 @@ def test_diagnose_projects_every_dispatch_field_without_dropping_nulls(airflow):
 
 
 def test_diagnose_reduces_the_projection_but_keeps_the_rows_that_matter(airflow, monkeypatch):
-    monkeypatch.setattr(server, "TASK_INSTANCE_DETAIL_LIMIT", 1)
+    monkeypatch.setattr(evidence, "TASK_INSTANCE_DETAIL_LIMIT", 1)
     crowd = [_executed(f"t{index}") for index in range(4)]
 
     result = _green_run(airflow, *crowd, FORGED_TI)
@@ -4474,7 +4475,7 @@ def test_diagnose_reduces_the_projection_but_keeps_the_rows_that_matter(airflow,
 
 def test_diagnose_keeps_the_full_projection_for_failed_instances(airflow, monkeypatch):
     # One slot, and the failed instance is what it goes to.
-    monkeypatch.setattr(server, "TASK_INSTANCE_DETAIL_LIMIT", 1)
+    monkeypatch.setattr(evidence, "TASK_INSTANCE_DETAIL_LIMIT", 1)
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
     airflow.task_instances = [{**EXECUTED_TI, "task_id": "broke", "state": "failed"}]
     airflow.log = "ValueError: boom"
@@ -4489,7 +4490,7 @@ def test_diagnose_keeps_the_full_projection_for_failed_instances(airflow, monkey
 def test_diagnose_caps_the_detailed_rows_even_when_every_row_is_forced(airflow, monkeypatch, limit):
     """How many rows are flagged is chosen by whoever wrote the states being
     read, so the flagged set is ranked first and still counted against the cap."""
-    monkeypatch.setattr(server, "TASK_INSTANCE_DETAIL_LIMIT", limit)
+    monkeypatch.setattr(evidence, "TASK_INSTANCE_DETAIL_LIMIT", limit)
     forged = [{**FORGED_TI, "task_id": f"forged_{index}"} for index in range(6)]
 
     result = _green_run(airflow, *forged)
@@ -4595,7 +4596,7 @@ def test_a_task_id_cannot_break_out_of_the_prose_it_is_named_in(airflow):
 def test_diagnose_folds_the_findings_past_the_limit_into_one_entry(airflow, monkeypatch):
     """500 flagged successes is 500 paragraphs, and how many there are is not
     this tool's choice — so the tail is folded and the fold is reported."""
-    monkeypatch.setattr(server, "DISPATCH_FINDING_LIMIT", 25)
+    monkeypatch.setattr(evidence, "DISPATCH_FINDING_LIMIT", 25)
     forged = [{**FORGED_TI, "task_id": f"forged_{index:03d}"} for index in range(500)]
 
     result = _green_run(airflow, *forged)
@@ -4940,7 +4941,7 @@ def test_a_giant_operator_cannot_scale_the_size_of_the_result(airflow):
     assert giant_size < 420_000
     # 500 rows, but only TASK_INSTANCE_DETAIL_LIMIT of them carry an operator at
     # all, and each is clamped — so the 999 extra characters buy ~119 apiece.
-    assert giant_size - tiny_size < server.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
+    assert giant_size - tiny_size < evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
 
 
 # The size of the result must not be a function of what the event log holds.
@@ -6284,7 +6285,7 @@ def test_run_scoped_events_are_capped_and_the_remainder_counted(airflow):
 
 
 def test_instances_outside_the_detailed_projection_are_counted_not_guessed_at(airflow, monkeypatch):
-    monkeypatch.setattr(server, "TASK_INSTANCE_DETAIL_LIMIT", 1)
+    monkeypatch.setattr(evidence, "TASK_INSTANCE_DETAIL_LIMIT", 1)
     crowd = [_executed(f"t{index}") for index in range(4)]
 
     result = _audited_run(airflow, *crowd, events=[SUCCESS_EVENT])
