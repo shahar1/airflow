@@ -74,6 +74,16 @@ class FakeAirflow:
         self.tasks: list[dict] = []
         self.cleared: list[dict] = []
         self.fail_clear: Exception | None = None
+        # Every version the Dag still lists, newest first. ``None`` means "just
+        # the current one", which is what every pre-Gate-4 test assumed.
+        self.versions: list[int] | None = None
+        self.versions_total: int | None = None
+        self.fail_versions: Exception | None = None
+        # /xcomEntries: the output records one instance has, keyed the way the
+        # route identifies it — (task_id, map_index).
+        self.xcoms_by_task: dict[tuple[str, int], list[dict]] = {}
+        self.xcoms_total: int | None = None
+        self.fail_xcoms: Exception | None = None
         self.import_errors: list[dict] = []
         self.import_errors_total: int | None = None
         self.dag_params: dict = {}
@@ -92,6 +102,13 @@ class FakeAirflow:
         self.fail_event_logs: Exception | None = None
         self.event_log_pages: list[list[dict]] | None = None
         self.runs_total: int | None = None
+        # /listMapped: gated on get_needs_expansion() — "MappedOperator or is in
+        # a mapped task group" — which is NOT what /tasks reports as is_mapped.
+        # ``None`` derives it from is_mapped, as a Dag with no task groups
+        # behaves; a set states it, which is how a group-expanded task is
+        # expressed (is_mapped false on /tasks, still expandable here).
+        self.needs_expansion: set[str] | None = None
+        self.fail_list_mapped: Exception | None = None
         # /dags/{dag}/dagRuns/~/taskInstances — the cross-run comparison route.
         self.cross_run_tis: list[dict] = []
         self.cross_run_total: int | None = None
@@ -196,7 +213,14 @@ class FakeAirflow:
                 "bundle_name": self.bundle_name,
             }
         if path == f"/dags/{DAG_ID}/dagVersions":
-            return {"dag_versions": [{"version_number": self.version}]}
+            if self.fail_versions:
+                raise self.fail_versions
+            numbers = sorted(self.versions or [self.version], reverse=True)
+            limit = (kwargs.get("params") or {}).get("limit", len(numbers))
+            return {
+                "dag_versions": [{"version_number": n} for n in numbers[:limit]],
+                "total_entries": len(numbers) if self.versions_total is None else self.versions_total,
+            }
         if path.startswith("/parseDagFile/"):
             if self.reparse_status:
                 # The message carries the URL, exactly as httpx's own does.
@@ -230,6 +254,40 @@ class FakeAirflow:
                 "task_instances": tis[: (kwargs["json"]).get("page_limit", 100)],
                 "total_entries": len(tis),
             }
+        if path.endswith("/xcomEntries"):
+            if self.fail_xcoms:
+                raise self.fail_xcoms
+            task_id = path.split("/taskInstances/")[1][: -len("/xcomEntries")]
+            map_index = (kwargs.get("params") or {}).get("map_index", -1)
+            rows = self.xcoms_by_task.get((task_id, map_index), [])
+            return {
+                "xcom_entries": rows,
+                "total_entries": len(rows) if self.xcoms_total is None else self.xcoms_total,
+            }
+        if path.endswith("/listMapped"):
+            if self.fail_list_mapped:
+                raise self.fail_list_mapped
+            task_id = path.split("/taskInstances/")[1][: -len("/listMapped")]
+            run_id = path.split("/dagRuns/")[1].split("/taskInstances/")[0]
+            rows = [
+                ti
+                for ti in self.tis_by_run.get(run_id, [])
+                if ti["task_id"] == task_id and ti.get("map_index", -1) >= 0
+            ]
+            if rows:
+                return {"task_instances": rows, "total_entries": len(rows)}
+            expandable = (
+                task_id in self.needs_expansion
+                if self.needs_expansion is not None
+                else any(t["task_id"] == task_id and t.get("is_mapped") for t in self.tasks)
+            )
+            if not expandable:
+                raise httpx.HTTPStatusError(
+                    "not mapped",
+                    request=httpx.Request("GET", path),
+                    response=httpx.Response(404, json={"detail": f"Task id {task_id} is not mapped"}),
+                )
+            return {"task_instances": [], "total_entries": 0}
         if path.endswith("/tries"):
             if self.fail_tries:
                 raise self.fail_tries
@@ -308,6 +366,7 @@ def airflow(monkeypatch, tmp_path):
 def fresh_token_store():
     """A token left unredeemed by one test must not refuse another test's plan."""
     server._issued_tokens.clear()
+    server._approved_clear_sets.clear()
 
 
 def _parses(airflow, tmp_path):
@@ -1659,6 +1718,11 @@ def cleared_run(airflow):
     return airflow
 
 
+def _reviewed(plan):
+    """The enumerated set an apply has to name back — the plan's own list, verbatim."""
+    return plan["blast_radius"]["instances"]
+
+
 def test_plan_task_instance_clear_resolves_latest_and_the_position(cleared_run):
     plan = server.plan_task_instance_clear(DAG_ID, position=3)
 
@@ -1753,7 +1817,7 @@ def test_apply_task_instance_clear_re_checks_the_task_set_before_writing(cleared
     cleared_run.tasks = DEMO_TASKS + [{"task_id": "publish", "downstream_task_ids": []}]
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is False
@@ -1775,7 +1839,7 @@ def test_apply_task_instance_clear_checks_the_task_set_after_the_repeated_dry_ru
     monkeypatch.setattr(cleared_run, "_clear", gains_a_task_during_the_dry_run)
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is False
@@ -1801,7 +1865,7 @@ def test_apply_task_instance_clear_clears_the_existing_instance(cleared_run):
     plan = server.plan_task_instance_clear(DAG_ID, position=3)
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is True
@@ -1809,7 +1873,7 @@ def test_apply_task_instance_clear_clears_the_existing_instance(cleared_run):
     assert result["cleared_matches_plan"] is True
     assert "cleared_delta" not in result
     assert result["created_dag_run"] is False
-    assert result["created_task_instances"] == []
+    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
     assert result["ui_updates"] == [
         {
             "kind": "task_instances",
@@ -1822,7 +1886,8 @@ def test_apply_task_instance_clear_clears_the_existing_instance(cleared_run):
     assert len(cleared_run.cleared) == 1
     assert cleared_run.cleared[0]["dag_run_id"] == "manual__1"
     assert cleared_run.cleared[0]["prevent_running_task"] is True
-    assert cleared_run.cleared[0]["run_on_latest_version"] is True
+    # Omitted, not sent: Airflow's own precedence decides it.
+    assert "run_on_latest_version" not in cleared_run.cleared[0]
     assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in cleared_run.calls
 
 
@@ -1832,7 +1897,7 @@ def test_apply_task_instance_clear_repeats_the_dry_run_before_writing(cleared_ru
     cleared_run.tis_by_run["manual__1"][2]["state"] = "running"
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is False
@@ -1873,7 +1938,7 @@ def test_apply_task_instance_clear_reports_a_clear_that_drifted_from_the_plan(cl
     monkeypatch.setattr(cleared_run, "_clear", loses_an_instance_on_the_real_clear)
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is True
@@ -1896,22 +1961,803 @@ def test_apply_task_instance_clear_refusal_names_the_plan_in_words(cleared_run):
     assert f"('{DAG_ID}'," not in error
 
 
+_RUNNING_CONFLICT = (
+    "AirflowClearRunningTaskException: Disable 'prevent_running_task' to proceed, or wait until "
+    "the task is not running, queued, or scheduled state."
+)
+
+
 def test_apply_task_instance_clear_reports_a_refused_clear_without_a_fallback(cleared_run):
+    """The route answers HTTPException(409, str(e)), which FastAPI renders as a JSON detail."""
     plan = server.plan_task_instance_clear(DAG_ID, position=3)
     cleared_run.fail_clear = httpx.HTTPStatusError(
         "conflict",
         request=httpx.Request("POST", "/clearTaskInstances"),
-        response=httpx.Response(409, text="AirflowClearRunningTaskException"),
+        response=httpx.Response(409, json={"detail": _RUNNING_CONFLICT}),
     )
 
     result = server.apply_task_instance_clear(
-        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"]
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
     )
 
     assert result["cleared"] is False
-    assert result["mutation_applied"] is False
     assert "AirflowClearRunningTaskException" in result["error"]
     assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in cleared_run.calls
+
+
+# ---------------------------------------------------------------------------
+# Recovering from a state nobody executed.
+#
+# ``summarize`` is the external operation and ``report`` is the notice that went
+# out on the strength of it. The whole point of these tests is that turning
+# ``summarize`` green again is not the recovery.
+# ---------------------------------------------------------------------------
+
+FORGED = {
+    "task_id": "summarize",
+    "map_index": -1,
+    "state": "success",
+    "try_number": 0,
+    "max_tries": 0,
+    "hostname": "",
+    "pid": None,
+    "queued_when": None,
+    "scheduled_when": None,
+    "start_date": "2026-08-07T22:21:17.323403+00:00",
+    "end_date": "2026-08-07T22:21:17.323403+00:00",
+    "duration": 0.0,
+    "rendered_fields": {},
+}
+EXECUTED = {
+    "task_id": "extract",
+    "map_index": -1,
+    "state": "success",
+    "try_number": 1,
+    "max_tries": 0,
+    "hostname": "worker-1",
+    "pid": 4001,
+    "queued_when": "2026-08-07T22:20:59.100000+00:00",
+    "scheduled_when": "2026-08-07T22:20:59.000000+00:00",
+    "start_date": "2026-08-07T22:21:00.000000+00:00",
+    "end_date": "2026-08-07T22:21:03.100000+00:00",
+    "duration": 3.1,
+    "rendered_fields": {"op_args": []},
+}
+NOTICE = {
+    **EXECUTED,
+    "task_id": "report",
+    "try_number": 1,
+    "pid": 4009,
+    "start_date": "2026-08-07T22:21:17.641820+00:00",
+    "end_date": "2026-08-07T22:21:17.998000+00:00",
+    "duration": 0.356,
+}
+
+
+@pytest.fixture
+def forged_run(airflow):
+    """A run whose middle task is recorded success on an attempt nothing dispatched."""
+    airflow.tasks = DEMO_TASKS
+    run = {
+        "dag_run_id": "manual__1",
+        "state": "success",
+        "dag_versions": [{"version_number": 1}],
+    }
+    airflow.runs = [run]
+    airflow.runs_by_id = {"manual__1": run}
+    airflow.tis_by_run = {"manual__1": [dict(EXECUTED), dict(FORGED), dict(NOTICE)]}
+    airflow.logs_by_task[(DAG_ID, "summarize")] = "No logs available for this task."
+    return airflow
+
+
+def _clear_plan(**kwargs):
+    return server.plan_task_instance_clear(DAG_ID, task_id="summarize", **kwargs)
+
+
+def test_the_default_plan_names_the_flag_that_has_to_change_for_a_succeeded_instance(forged_run):
+    """only_failed on means the endpoint answers 200 and clears nothing — say which flag, and why."""
+    plan = _clear_plan()
+
+    assert plan["planned"] is False
+    assert "nothing to clear" in plan["error"]
+    assert "only_failed=false" in plan["next_step"]
+    assert '"success"' in plan["next_step"]
+    assert "plan_token" not in plan
+
+
+def test_no_flag_advice_is_offered_when_there_is_no_instance_to_describe(forged_run):
+    """The advice names the state that excluded the match; with no row there is no state to name."""
+    plan = server.plan_task_instance_clear(
+        DAG_ID, task_id="summarize", map_index=7, only_failed=False, include_downstream=False
+    )
+
+    assert plan["planned"] is False
+    assert "nothing to clear" in plan["error"]
+    assert "next_step" not in plan
+
+
+def test_only_failed_off_reaches_the_succeeded_instance_and_says_why_the_flag_moved(forged_run):
+    plan = _clear_plan(only_failed=False)
+
+    assert plan["planned"] is True
+    assert plan["blast_radius"]["instances"] == ["summarize", "report"]
+    assert plan["flags"]["only_failed"]["sent"] is False
+    assert 'recorded "success" rather than failed' in plan["flags"]["only_failed"]["why"]
+    assert "HTTP 200" in plan["flags"]["only_failed"]["why"]
+
+
+def test_the_plan_quotes_the_recorded_attempt_rather_than_summarising_it(forged_run):
+    evidence = _clear_plan(only_failed=False)["recovery_evidence"]
+
+    assert evidence["row"] == {
+        "state": "success",
+        "try_number": 0,
+        "max_tries": 0,
+        "hostname": "",
+        "pid": None,
+        "queued_when": None,
+        "scheduled_when": None,
+        "start_date": FORGED["start_date"],
+        "end_date": FORGED["end_date"],
+        "duration": 0.0,
+        "rendered_fields_present": False,
+    }
+    assert evidence["current_attempt_dispatched"] is False
+
+
+def test_the_plans_reading_stops_where_the_evidence_does(forged_run):
+    """Dispatch is what the fields describe. Everything past that is not claimed."""
+    evidence = _clear_plan(only_failed=False)["recovery_evidence"]
+
+    assert (
+        "consistent with the task process never having been dispatched on this attempt"
+        in (evidence["reading"])
+    )
+    assert "never ran" not in evidence["reading"]
+    assert "did not execute" not in evidence["reading"]
+    assert "not a finding about the external system" in evidence["reading"]
+    assert evidence["external_system"]["observed"] is False
+    assert "has to be established there, by the operator" in evidence["external_system"]["note"]
+    assert "never 'never executed historically'" in evidence["scope_note"]
+
+
+def test_the_plan_keeps_this_attempt_apart_from_the_instances_history(forged_run):
+    """An earlier attempt that really executed does not make this attempt a dispatch."""
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0},
+        {"try_number": 1, "state": "failed", "hostname": "worker-1", "pid": 3900, "duration": 41.2},
+    ]
+
+    history = _clear_plan(only_failed=False)["recovery_evidence"]["attempt_history"]
+
+    assert history["status"] == "checked"
+    assert history["earlier_attempt_carries_execution_fields"] is True
+    assert [row["try_number"] for row in history["attempts"]] == [0, 1]
+
+
+def test_a_truncated_attempt_history_can_prove_presence_but_never_absence(forged_run):
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0}
+    ]
+    forged_run.tries_total = 4
+
+    history = _clear_plan(only_failed=False)["recovery_evidence"]["attempt_history"]
+
+    assert history["status"] == "partial"
+    assert history["earlier_attempt_carries_execution_fields"] is None
+
+
+def test_the_plan_reads_no_logs_available_as_the_routes_own_sentence(forged_run):
+    log = _clear_plan(only_failed=False)["recovery_evidence"]["log_for_recorded_attempt"]
+
+    assert log["status"] == "no_logs_reported"
+    assert "synthesises its 'no logs available' answer" in log["caveat"]
+
+
+def test_an_unreadable_log_does_not_take_the_plan_down_with_it(forged_run):
+    forged_run.fail_log = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("GET", "/logs/0"), response=httpx.Response(500)
+    )
+
+    plan = _clear_plan(only_failed=False)
+
+    assert plan["planned"] is True
+    assert plan["recovery_evidence"]["log_for_recorded_attempt"]["status"] == "unavailable"
+
+
+def test_the_blast_radius_is_enumerated_by_identity_not_by_count(forged_run):
+    radius = _clear_plan(only_failed=False)["blast_radius"]
+
+    assert radius["target"] == "summarize"
+    assert radius["downstream_instances"] == ["report"]
+    assert radius["downstream_included"] is True
+    assert "transitive" in radius["note"]
+
+
+def test_holding_the_clear_to_one_task_warns_that_the_false_notice_survives(forged_run):
+    plan = _clear_plan(only_failed=False, include_downstream=False)
+
+    assert plan["blast_radius"]["instances"] == ["summarize"]
+    assert any("SURVIVES unchanged" in warning for warning in plan["warnings"])
+    assert any("asserting that this task completed" in warning for warning in plan["warnings"])
+
+
+def test_the_plan_carries_the_warnings_nobody_asked_for(forged_run):
+    warnings = " ".join(_clear_plan(only_failed=False)["warnings"])
+
+    assert "not idempotent" in warnings
+    assert "produces a duplicate" in warnings
+    assert "start_date, end_date and queued_at are rewritten" in warnings
+    assert "reads as an ordinary success" in warnings
+    assert "the Dag file as it stands on disk" in warnings
+    assert "['report']" in warnings
+
+
+def test_a_row_carrying_execution_fields_leaves_a_partial_effect_open(forged_run):
+    """A state written over a running attempt keeps every field that says it ran."""
+    forged_run.tis_by_run["manual__1"][1].update(
+        hostname="worker-1", pid=670008, duration=6.03, end_date="2026-08-07T22:21:23.35+00:00"
+    )
+
+    plan = _clear_plan(only_failed=False)
+    evidence = plan["recovery_evidence"]
+
+    assert evidence["current_attempt_dispatched"] is True
+    assert evidence["partial_external_effect_possible"] is True
+    assert "cannot distinguish an attempt that finished its work" in evidence["reading"]
+    assert any("duplicate of half an operation" in warning for warning in plan["warnings"])
+
+
+def test_an_incomplete_response_concludes_nothing_about_dispatch(forged_run):
+    del forged_run.tis_by_run["manual__1"][1]["pid"]
+
+    evidence = _clear_plan(only_failed=False)["recovery_evidence"]
+
+    assert evidence["current_attempt_dispatched"] is None
+    assert evidence["partial_external_effect_possible"] is None
+    assert "did not carry ['pid']" in evidence["reading"]
+
+
+def test_run_on_latest_version_is_omitted_so_airflows_own_precedence_decides(forged_run):
+    plan = _clear_plan(only_failed=False)
+    server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert plan["flags"]["run_on_latest_version"]["sent"] == "omitted"
+    assert "[core] rerun_with_latest_version" in plan["flags"]["run_on_latest_version"]["why"]
+    assert "run_on_latest_version" not in forged_run.cleared[0]
+
+
+@pytest.mark.parametrize("chosen", [True, False])
+def test_a_run_on_latest_version_the_user_chose_is_sent_through(forged_run, chosen):
+    plan = _clear_plan(only_failed=False, run_on_latest_version=chosen)
+    server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        run_on_latest_version=chosen,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert plan["flags"]["run_on_latest_version"]["sent"] is chosen
+    assert forged_run.cleared[0]["run_on_latest_version"] is chosen
+
+
+def test_the_plan_refuses_to_promise_the_runs_original_dag_version(forged_run):
+    """Observed: the scheduler rebinds the re-queued instance either way."""
+    version = _clear_plan(only_failed=False, run_on_latest_version=False)["version"]
+
+    assert version["run_versions"] == [1]
+    assert version["run_on_latest_version_sent"] is False
+    assert "Not a promise that the run's original Dag version is preserved" in version["guarantee"]
+    assert "the file as it stands on disk" in version["code_note"].replace("Dag file", "file")
+
+
+def test_the_plan_says_when_the_runs_own_dag_version_is_no_longer_listed(forged_run):
+    forged_run.versions = [2, 3]
+
+    version = _clear_plan(only_failed=False)["version"]
+
+    assert version["latest_version"] == 3
+    assert version["original_version_listed"] is False
+    assert version["missing_versions"] == [1]
+    assert "cannot be identified from here" in version["missing_version_note"]
+
+
+def test_a_dag_version_list_that_could_not_be_read_is_reported_as_such(forged_run):
+    forged_run.fail_versions = httpx.HTTPStatusError(
+        "denied", request=httpx.Request("GET", "/dagVersions"), response=httpx.Response(403)
+    )
+
+    version = _clear_plan(only_failed=False)["version"]
+
+    assert version["versions_status"] == "unavailable"
+    assert "original_version_listed" not in version
+
+
+def test_a_truncated_dag_version_list_never_reports_a_version_as_missing(forged_run):
+    forged_run.versions = [2, 3]
+    forged_run.versions_total = 9
+
+    version = _clear_plan(only_failed=False)["version"]
+
+    assert version["versions_status"] == "partial"
+    assert "original_version_listed" not in version
+
+
+def test_widening_the_scope_after_the_plan_is_refused_and_says_to_re_plan(forged_run):
+    """The confirmation the user gave named the narrow scope, so it cannot buy the wide one."""
+    plan = _clear_plan(only_failed=False, include_downstream=False)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        include_downstream=True,
+    )
+
+    assert result["cleared"] is False
+    assert "Changing the scope needs a new plan" in result["error"]
+    assert "include_downstream=False" in result["error"]
+    assert forged_run.cleared == []
+
+
+def test_a_refusal_that_wrote_nothing_leaves_the_approved_plan_alive(forged_run):
+    """Spending the plan on a mis-parameterised call answers the corrected one with a lie."""
+    plan = _clear_plan(only_failed=False)
+
+    wrong = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        include_downstream=False,
+    )
+    corrected = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert wrong["cleared"] is False
+    assert corrected["cleared"] is True
+    assert len(forged_run.cleared) == 1
+
+
+def test_a_plan_token_buys_exactly_one_clear(forged_run):
+    plan = _clear_plan(only_failed=False)
+    args = (DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"])
+    reviewed = {"only_failed": False, "reviewed_instances": _reviewed(plan)}
+
+    first = server.apply_task_instance_clear(*args, **reviewed)
+    second = server.apply_task_instance_clear(*args, **reviewed)
+
+    assert first["cleared"] is True
+    assert second["cleared"] is False
+    assert "no reviewed plan" in second["error"]
+    assert len(forged_run.cleared) == 1
+
+
+def test_a_plan_whose_instance_set_moved_is_stale_and_is_refused(forged_run):
+    """A mapped instance appearing under the same task changes what the clear touches."""
+    plan = _clear_plan(only_failed=False)
+    forged_run.tis_by_run["manual__1"].append({**NOTICE, "map_index": 0})
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is False
+    assert "changed since the user reviewed it" in result["error"]
+    assert forged_run.cleared == []
+
+
+def test_the_apply_hands_back_the_verification_it_has_not_performed(forged_run):
+    plan = _clear_plan(only_failed=False)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["recovery_verified"] is False
+    assert result["verify_with"]["tool"] == "verify_task_instance_recovery"
+    args = result["verify_with"]["args"]
+    assert args["instances"] == [["report", -1], ["summarize", -1]]
+    assert args["target_task_id"] == "summarize"
+    assert args["prior_attempts"] == {"summarize": 0, "report": 1}
+    assert args["cleared_after"]
+    assert "Do not report this as a recovery" in result["next_step"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.HTTPStatusError(
+            "boom", request=httpx.Request("POST", "/c"), response=httpx.Response(500, text="upstream gone")
+        ),
+        httpx.ReadTimeout("timed out"),
+    ],
+    ids=["http_error", "transport_error"],
+)
+def test_a_clear_that_failed_after_it_was_sent_is_reported_as_unknown(forged_run, failure):
+    """The request was already out. "Nothing happened" is a claim this tool cannot make."""
+    plan = _clear_plan(only_failed=False)
+    forged_run.fail_clear = failure
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is False
+    assert result["mutation_outcome"] == "unknown"
+    assert "mutation_applied" not in result
+    assert "not established from here" in result["error"]
+    assert "do not report it as not made" in result["error"]
+    assert result["verify_with"]["args"]["instances"] == [["report", -1], ["summarize", -1]]
+
+
+# --- verifying that the recovery actually recovered something --------------
+
+
+RECOVERED = {
+    **EXECUTED,
+    "task_id": "summarize",
+    "try_number": 1,
+    "max_tries": 1,
+    "pid": 4110,
+    "queued_when": "2026-08-07T22:30:29.808796+00:00",
+    "scheduled_when": "2026-08-07T22:30:29.784215+00:00",
+    "start_date": "2026-08-07T22:30:29.862440+00:00",
+    "end_date": "2026-08-07T22:30:32.196121+00:00",
+    "duration": 2.33,
+}
+REPORTED = {
+    **NOTICE,
+    "try_number": 2,
+    "max_tries": 1,
+    "start_date": "2026-08-07T22:30:33.000000+00:00",
+    "end_date": "2026-08-07T22:30:33.400000+00:00",
+    "duration": 0.4,
+}
+CLEARED_AT = "2026-08-07T22:30:20+00:00"
+
+
+@pytest.fixture
+def recovered_run(forged_run):
+    """The same run after the clear: both instances re-ran and recorded output."""
+    forged_run.tis_by_run["manual__1"] = [dict(EXECUTED), dict(RECOVERED), dict(REPORTED)]
+    forged_run.logs_by_task[(DAG_ID, "summarize")] = "filing transmitted, confirmation FILE-19226231"
+    forged_run.logs_by_task[(DAG_ID, "report")] = "notice written"
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0},
+        {"try_number": 1, "state": "success", "hostname": "worker-1", "pid": 4110, "duration": 2.33},
+    ]
+    forged_run.tries_by_task[("report", -1)] = [
+        {"try_number": 1, "state": "success", "hostname": "worker-1", "pid": 4009, "duration": 0.356},
+        {"try_number": 2, "state": "success", "hostname": "worker-1", "pid": 4120, "duration": 0.4},
+    ]
+    forged_run.xcoms_by_task[("summarize", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:30:32.100000+00:00"}
+    ]
+    forged_run.xcoms_by_task[("report", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:30:33.300000+00:00"}
+    ]
+    # The same task in the Dag's earlier runs — what a duration is judged against.
+    forged_run.cross_run_tis = [
+        {**EXECUTED, "task_id": "summarize", "dag_run_id": f"manual__{n}", "duration": 2.5} for n in (0, -1)
+    ] + [{**NOTICE, "dag_run_id": f"manual__{n}", "duration": 0.36} for n in (0, -1)]
+    forged_run.event_logs = [
+        {
+            "dag_id": DAG_ID,
+            "run_id": "manual__1",
+            "task_id": task,
+            "event": event,
+            "owner": "airflow",
+            "when": when,
+            "extra": None,
+        }
+        for task, event, when in (
+            ("report", "success", "2026-08-07T22:30:33.500000+00:00"),
+            ("report", "running", "2026-08-07T22:30:33.000000+00:00"),
+            ("summarize", "success", "2026-08-07T22:30:32.300000+00:00"),
+            ("summarize", "running", "2026-08-07T22:30:29.900000+00:00"),
+        )
+    ]
+    return forged_run
+
+
+def _record_approval(*identities, run_id="manual__1", dag_id=DAG_ID):
+    """Record an approved set the way apply_task_instance_clear does at redemption.
+
+    The verification's set leg reads this and never the caller's ``instances``,
+    so a test that wants the leg to have a baseline has to put one here.
+    """
+    server._record_approved_set(dag_id, run_id, [tuple(identity) for identity in identities])
+
+
+def _verify(**kwargs):
+    args = {
+        "instances": [["summarize", -1], ["report", -1]],
+        "prior_attempts": {"summarize": 0, "report": 1},
+        "target_task_id": "summarize",
+        "cleared_after": CLEARED_AT,
+        "audit_scope": "granted",
+        "xcom_scope": "granted",
+    }
+    args.update(kwargs)
+    # Stands in for the apply that would have recorded it; ``approved=None``
+    # leaves the server with no record, which is its own case.
+    approved = args.pop("approved", args["instances"])
+    if approved:
+        _record_approval(*approved)
+    return server.verify_task_instance_recovery(DAG_ID, "manual__1", **args)
+
+
+def test_a_recovery_is_verified_only_when_every_leg_holds(recovered_run):
+    result = _verify()
+
+    assert result["verified"] is True
+    assert [entry["verdict"] for entry in result["instances"]] == ["verified", "verified"]
+    assert [entry["role"] for entry in result["instances"]] == ["target", "downstream"]
+    assert result["unverified_instances"] == []
+    names = {check["check"] for check in result["instances"][0]["checks"]}
+    assert names == {
+        "attempt_advanced",
+        "prior_attempt_preserved",
+        "state_success",
+        "execution_fields_present",
+        "duration_in_line_with_history",
+        "log_for_new_attempt",
+        "audit_running_success_pair",
+        "recorded_output_post_dates_clear",
+    }
+
+
+def test_the_verification_never_reports_the_external_system_as_checked(recovered_run):
+    result = _verify()
+
+    assert result["external_system_checked"] is False
+    assert "exactly once" in result["operator_action_required"]
+    assert "Never report the recovery as complete on the strength of the state alone" in (result["next_step"])
+
+
+def test_a_green_square_with_no_execution_fields_is_not_a_recovery(recovered_run):
+    """The forge shape again, this time after the clear: success, and nothing else."""
+    recovered_run.tis_by_run["manual__1"][1] = {**FORGED, "try_number": 1, "max_tries": 1}
+
+    result = _verify()
+    target = result["instances"][0]
+
+    assert result["verified"] is False
+    assert target["state"] == "success"
+    assert "execution_fields_present" in target["failed_checks"]
+    assert "performed but NOT verified" in result["summary"]
+
+
+def test_an_instance_that_never_gained_an_attempt_fails_the_first_leg(recovered_run):
+    """A task that was already re-run before the clear looks finished and moved nothing."""
+    result = _verify(prior_attempts={"summarize": 1, "report": 2})
+
+    assert result["verified"] is False
+    assert "attempt_advanced" in result["instances"][0]["failed_checks"]
+    assert "attempt_advanced" in result["instances"][1]["failed_checks"]
+
+
+def test_output_recorded_before_the_clear_does_not_count_as_output_of_the_re_run(recovered_run):
+    recovered_run.xcoms_by_task[("summarize", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:21:17+00:00"}
+    ]
+
+    target = _verify()["instances"][0]
+
+    assert "recorded_output_post_dates_clear" in target["failed_checks"]
+    assert any("not an observation of the external system" in check["detail"] for check in target["checks"])
+
+
+def test_a_notice_that_predates_the_task_it_reports_on_is_caught(recovered_run):
+    """The completion notice survived the clear; its own timestamp gives it away."""
+    recovered_run.xcoms_by_task[("report", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:30:31+00:00"}
+    ]
+
+    downstream = _verify()["instances"][1]
+
+    assert "output_post_dates_the_task_it_reports_on" in downstream["failed_checks"]
+    assert result_detail(downstream, "output_post_dates_the_task_it_reports_on").startswith(
+        "this instance's output must be written after the target's re-run ended"
+    )
+
+
+def result_detail(entry, name):
+    return next(check["detail"] for check in entry["checks"] if check["check"] == name)
+
+
+def test_the_target_is_not_held_to_post_dating_itself(recovered_run):
+    assert all(
+        check["check"] != "output_post_dates_the_task_it_reports_on"
+        for check in _verify()["instances"][0]["checks"]
+    )
+
+
+def test_a_duration_out_of_line_with_the_tasks_own_history_is_reported(recovered_run):
+    """6 seconds on a task that takes 45 is the only in-Airflow tell a killed attempt leaves."""
+    for row in recovered_run.cross_run_tis:
+        if row["task_id"] == "summarize":
+            row["duration"] = 45.0
+    recovered_run.tis_by_run["manual__1"][1]["duration"] = 6.03
+
+    target = _verify()["instances"][0]
+
+    assert "duration_in_line_with_history" in target["failed_checks"]
+    assert "against a median of 45.0" in result_detail(target, "duration_in_line_with_history")
+    assert "other runs" in result_detail(target, "duration_in_line_with_history")
+
+
+def test_the_attempt_that_needed_recovering_is_never_the_duration_baseline(recovered_run):
+    """Comparing against a 0.0-second attempt that nothing dispatched makes any duration a pass."""
+    recovered_run.cross_run_tis = []
+
+    target = _verify()["instances"][0]
+
+    assert target["verdict"] == "unverified"
+    assert "duration_in_line_with_history" in target["unestablished_checks"]
+    assert "no dispatched attempt of this task to compare" in result_detail(
+        target, "duration_in_line_with_history"
+    )
+
+
+def test_an_unreadable_leg_is_unestablished_and_never_a_pass(recovered_run):
+    recovered_run.fail_tries = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("GET", "/tries"), response=httpx.Response(500)
+    )
+
+    result = _verify()
+    target = result["instances"][0]
+
+    assert result["verified"] is False
+    assert target["failed_checks"] == []
+    assert "prior_attempt_preserved" in target["unestablished_checks"]
+
+
+def test_the_audit_leg_is_unestablished_without_the_permission_that_reads_it(recovered_run):
+    target = _verify(audit_scope="denied")["instances"][0]
+
+    assert "audit_running_success_pair" in target["unestablished_checks"]
+    assert ("GET", "/eventLogs") not in recovered_run.calls
+
+
+def test_the_audit_leg_says_what_a_recorded_transition_does_and_does_not_prove(recovered_run):
+    detail = result_detail(_verify()["instances"][0], "audit_running_success_pair")
+
+    assert "not that the callable did its work" in detail
+    assert "an absence here is an absence in this view" in detail
+
+
+def test_transitions_recorded_before_the_clear_do_not_count(recovered_run):
+    for row in recovered_run.event_logs:
+        row["when"] = "2026-08-07T22:21:18+00:00"
+
+    target = _verify()["instances"][0]
+
+    assert "audit_running_success_pair" in target["failed_checks"]
+
+
+def test_a_log_that_exists_is_reported_with_what_it_does_not_settle(recovered_run):
+    detail = result_detail(_verify()["instances"][0], "log_for_new_attempt")
+
+    assert "an attempt killed part-way writes a real log too" in detail
+
+
+def test_an_empty_log_for_the_new_attempt_fails_that_leg(recovered_run):
+    recovered_run.logs_by_task[(DAG_ID, "summarize")] = ""
+
+    assert "log_for_new_attempt" in _verify()["instances"][0]["failed_checks"]
+
+
+def test_verification_refuses_when_it_is_told_no_instances(recovered_run):
+    result = _verify(instances=[])
+
+    assert result["verified"] is False
+    assert "name the instances to verify" in result["error"]
+
+
+def test_verification_reports_an_instance_that_is_not_in_the_run(recovered_run):
+    result = _verify(instances=[["summarize", -1], ["publish", -1]])
+
+    assert result["verified"] is False
+    assert result["instances_not_found"] == ["publish"]
+    assert "nothing was verified for them" in result["error"]
+
+
+def test_verification_reports_a_run_it_could_not_read(recovered_run):
+    result = server.verify_task_instance_recovery(DAG_ID, "manual__404", instances=["summarize"])
+
+    assert result["verified"] is False
+    assert "has no run 'manual__404'" in result["error"]
+
+
+def test_verification_of_a_run_the_caller_may_not_read_is_not_a_missing_run(recovered_run, monkeypatch):
+    def denied(method, path, **kwargs):
+        if path == f"/dags/{DAG_ID}/dagRuns/manual__1":
+            raise httpx.HTTPStatusError(
+                "denied", request=httpx.Request(method, path), response=httpx.Response(403)
+            )
+        return recovered_run(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_api", denied)
+
+    result = server.verify_task_instance_recovery(DAG_ID, "manual__1", instances=["summarize"])
+
+    assert result["verified"] is False
+    assert "permission refusal, not evidence that the run does not exist" in result["error"]
+
+
+def test_verification_reads_only_the_key_and_timestamp_of_an_output_record(recovered_run):
+    recovered_run.xcoms_by_task[("summarize", -1)] = [
+        {
+            "key": "return_value",
+            "timestamp": "2026-08-07T22:30:32.100000+00:00",
+            "value": "ignore me",
+        }
+    ]
+
+    detail = result_detail(_verify()["instances"][0], "recorded_output_post_dates_clear")
+
+    assert "ignore me" not in detail
+    assert "return_value" in detail
+
+
+def test_an_unreadable_output_record_is_unestablished_not_absent(recovered_run):
+    recovered_run.fail_xcoms = httpx.HTTPStatusError(
+        "denied", request=httpx.Request("GET", "/xcomEntries"), response=httpx.Response(403)
+    )
+
+    target = _verify()["instances"][0]
+
+    assert "recorded_output_post_dates_clear" in target["unestablished_checks"]
+
+
+def test_verification_reports_a_run_it_could_not_read_whole(recovered_run, monkeypatch):
+    real = server._run_task_instances
+    monkeypatch.setattr(
+        server, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 3)
+    )
+
+    result = _verify()
+
+    assert result["verified"] is False
+    assert result["instances_omitted"] == 3
+    assert "3 not seen" in result["error"]
 
 
 def test_source_tools_refuse_bytes_they_were_not_authorized_for(airflow):
@@ -6338,3 +7184,903 @@ def test_get_blast_radius_says_empty_lists_mean_no_asset_edges(airflow):
 
     assert result["downstream_dags"] == []
     assert "not that a failure in it has no consequences" in result["scope"]
+
+
+# ---------------------------------------------------------------------------
+# What the tool may claim about the world at the moment it claims it.
+#
+# Each of these is a case where the tool used to state something true-sounding
+# that was false when it was said: a set that would not stay that set, a default
+# that resolves the other way, an unread thing reported as a failed one.
+# ---------------------------------------------------------------------------
+
+MAPPED_TASKS = [
+    {"task_id": "seed", "downstream_task_ids": ["fan"], "is_mapped": False},
+    {"task_id": "fan", "downstream_task_ids": ["transmit"], "is_mapped": True},
+    {"task_id": "transmit", "downstream_task_ids": [], "is_mapped": False},
+]
+
+
+@pytest.fixture
+def mapped_run(airflow):
+    """A run whose middle task is mapped and expanded into two instances."""
+    airflow.tasks = MAPPED_TASKS
+    run = {"dag_run_id": "manual__1", "state": "failed", "dag_versions": [{"version_number": 1}]}
+    airflow.runs = [run]
+    airflow.runs_by_id = {"manual__1": run}
+    airflow.tis_by_run = {
+        "manual__1": [
+            {**EXECUTED, "task_id": "seed", "state": "failed"},
+            {**EXECUTED, "task_id": "fan", "map_index": 0},
+            {**EXECUTED, "task_id": "fan", "map_index": 1},
+            {**EXECUTED, "task_id": "transmit"},
+        ]
+    }
+    return airflow
+
+
+def _mapped_plan(**kwargs):
+    return server.plan_task_instance_clear(DAG_ID, task_id="seed", only_failed=False, **kwargs)
+
+
+def test_a_plan_over_a_mapped_task_says_the_enumerated_set_is_not_closed(mapped_run):
+    """The fan-out is recomputed from upstream output, so the list is what exists now."""
+    plan = _mapped_plan()
+
+    assert plan["planned"] is True
+    assert plan["blast_radius"]["mapped_tasks"] == ["fan"]
+    warning = next(w for w in plan["warnings"] if "MAY CREATE" in w)
+    assert "['fan']" in warning
+    assert "recomputed from its upstream's output" in warning
+    assert "not enumerated" in warning
+    assert "no counterpart after the re-run" in warning
+    assert "This set is NOT closed" in plan["blast_radius"]["note"]
+
+
+def test_the_mapped_warning_is_unprompted_and_absent_where_nothing_is_mapped(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
+
+    assert plan["blast_radius"]["mapped_tasks"] == []
+    assert not any("MAY CREATE" in warning for warning in plan["warnings"])
+    assert "This set is NOT closed" not in plan["blast_radius"]["note"]
+
+
+def test_an_unexpanded_mapped_task_is_still_flagged_from_the_declaration(mapped_run):
+    """No row carries a map_index yet; /tasks still says the task is mapped."""
+    mapped_run.tis_by_run["manual__1"] = [
+        {**EXECUTED, "task_id": "seed", "state": "failed"},
+        {**EXECUTED, "task_id": "fan"},
+        {**EXECUTED, "task_id": "transmit"},
+    ]
+
+    assert _mapped_plan()["blast_radius"]["mapped_tasks"] == ["fan"]
+
+
+def test_an_apply_over_a_mapped_task_does_not_claim_it_created_nothing(mapped_run):
+    plan = _mapped_plan()
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["created_dag_run"] is False
+    assert result["mapped_tasks"] == ["fan"]
+    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
+    assert "not established" in result["created_task_instances"]
+    assert "after this call returns" in result["created_task_instances"]
+    # Never a literal empty list: the route itself can create instances inside
+    # the request, and this call does not read the run back.
+    assert result["created_by_this_request"] == server._IN_REQUEST_CREATION_NOT_ESTABLISHED
+    assert "does not read the run back" in result["created_by_this_request"]
+    assert "models/dagrun.py:1859-1863" in result["created_by_this_request"]
+    assert "re-expansion of mapped tasks" in result["created_by_this_request_excludes"]
+
+
+def test_an_apply_over_an_unmapped_closure_still_declines_to_state_a_creation_count(cleared_run):
+    """Nothing read the run back, and the route can create instances inside the request."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
+    assert result["created_by_this_request"] == server._IN_REQUEST_CREATION_NOT_ESTABLISHED
+    assert result["mapped_tasks"] == []
+    assert result["mapped_tasks_settled"] is True
+
+
+def test_the_verification_reports_instances_the_scheduler_added_by_identity(mapped_run):
+    """The re-expansion happens after the clear returns; only reading it back finds it."""
+    mapped_run.tis_by_run["manual__1"].extend(
+        [{**EXECUTED, "task_id": "fan", "map_index": index} for index in (2, 3, 4)]
+    )
+    _record_approval(("seed", -1), ("fan", 0), ("fan", 1), ("transmit", -1))
+
+    result = server.verify_task_instance_recovery(
+        DAG_ID,
+        "manual__1",
+        instances=[["seed", -1], ["fan", 0], ["fan", 1], ["transmit", -1]],
+        target_task_id="seed",
+        xcom_scope="granted",
+    )
+
+    diff = result["approved_instance_set"]
+    assert diff["added_since_approval"] == ["fan[2]", "fan[3]", "fan[4]"]
+    assert diff["absent_since_approval"] == []
+    assert diff["check"]["passed"] is False
+    assert result["verified"] is False
+    assert "instances the approval never enumerated" in diff["check"]["detail"]
+    assert "also no longer matches the approval" in result["summary"]
+
+
+def test_the_verification_reports_an_approved_instance_that_disappeared(mapped_run):
+    mapped_run.tis_by_run["manual__1"] = [
+        ti for ti in mapped_run.tis_by_run["manual__1"] if ti.get("map_index") != 1
+    ]
+    _record_approval(("fan", 0), ("fan", 1))
+
+    result = server.verify_task_instance_recovery(
+        DAG_ID,
+        "manual__1",
+        instances=[["fan", 0], ["fan", 1]],
+        target_task_id="fan",
+        xcom_scope="granted",
+    )
+
+    assert result["approved_instance_set"]["absent_since_approval"] == ["fan[1]"]
+    assert result["verified"] is False
+
+
+def test_the_instance_set_diff_never_reports_a_task_the_approval_never_named(mapped_run):
+    """Comparing against the whole run would call every out-of-scope instance an addition."""
+    _record_approval(("seed", -1))
+
+    result = server.verify_task_instance_recovery(
+        DAG_ID,
+        "manual__1",
+        instances=[["seed", -1]],
+        target_task_id="seed",
+        xcom_scope="granted",
+    )
+
+    diff = result["approved_instance_set"]
+    assert diff["added_since_approval"] == []
+    assert diff["check"]["passed"] is True
+    assert "Restricted to the task ids the approval named" in diff["scope_note"]
+
+
+# --- The verification reports unestablished things as unestablished -----------
+
+
+def test_an_unresolved_target_leaves_the_dating_leg_unestablished_and_the_role_unclassified(recovered_run):
+    """Without a target there is no re-run end time, and no instance is downstream of it."""
+    result = _verify(target_task_id="")
+
+    assert [entry["role"] for entry in result["instances"]] == ["unclassified", "unclassified"]
+    for entry in result["instances"]:
+        leg = next(c for c in entry["checks"] if c["check"] == "output_post_dates_the_task_it_reports_on")
+        assert leg["passed"] is None
+        assert "no target task was resolved" in leg["detail"]
+        assert "output_post_dates_the_task_it_reports_on" in entry["unestablished_checks"]
+    assert result["verified"] is False
+
+
+def test_a_target_with_no_end_date_leaves_the_dating_leg_unestablished(recovered_run):
+    recovered_run.tis_by_run["manual__1"][1] = {**RECOVERED, "end_date": None}
+
+    downstream = _verify()["instances"][1]
+    leg = next(c for c in downstream["checks"] if c["check"] == "output_post_dates_the_task_it_reports_on")
+
+    assert leg["passed"] is None
+    assert "carries no end_date" in leg["detail"]
+
+
+def test_an_instance_that_records_no_output_is_not_reported_as_having_failed(recovered_run):
+    """An EmptyOperator, a callable returning None or do_xcom_push off all land here."""
+    recovered_run.xcoms_by_task[("report", -1)] = []
+
+    downstream = _verify()["instances"][1]
+    dated = next(c for c in downstream["checks"] if c["check"] == "recorded_output_post_dates_clear")
+    against_target = next(
+        c for c in downstream["checks"] if c["check"] == "output_post_dates_the_task_it_reports_on"
+    )
+
+    assert dated["passed"] is None
+    assert against_target["passed"] is None
+    assert server._NO_OUTPUT_AT_ALL in dated["detail"]
+    assert "not evidence that the re-run did nothing" in dated["detail"]
+    # The claim about a stale artefact is a claim about a thing that exists.
+    assert "asserting a completion that had not happened" not in against_target["detail"]
+    assert downstream["verdict"] == "unverified"
+    assert "recorded_output_post_dates_clear" in downstream["unestablished_checks"]
+    assert "recorded_output_post_dates_clear" not in downstream["failed_checks"]
+
+
+def test_the_stale_artefact_sentence_is_kept_for_records_that_exist_and_predate(recovered_run):
+    recovered_run.xcoms_by_task[("report", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:21:18.000000+00:00"}
+    ]
+
+    downstream = _verify()["instances"][1]
+    leg = next(c for c in downstream["checks"] if c["check"] == "output_post_dates_the_task_it_reports_on")
+
+    assert leg["passed"] is False
+    assert "asserting a completion that had not happened" in leg["detail"]
+    assert "output_post_dates_the_task_it_reports_on" in downstream["failed_checks"]
+
+
+def test_xcom_records_the_user_may_not_read_are_unestablished_rather_than_failed(recovered_run):
+    result = _verify(xcom_scope="denied")
+
+    downstream = result["instances"][1]
+    for name in ("recorded_output_post_dates_clear", "output_post_dates_the_task_it_reports_on"):
+        leg = next(c for c in downstream["checks"] if c["check"] == name)
+        assert leg["passed"] is None
+        assert "not readable by the signed-in user" in leg["detail"]
+        assert name in downstream["unestablished_checks"]
+        assert name not in downstream["failed_checks"]
+    assert result["verified"] is False
+
+
+def test_an_unscoped_xcom_read_performs_no_http_call_at_all(recovered_run):
+    _verify(xcom_scope="")
+
+    assert not any(path.endswith("/xcomEntries") for _, path in recovered_run.calls)
+
+
+def test_a_granted_xcom_scope_reads_the_records(recovered_run):
+    _verify()
+
+    assert any(path.endswith("/xcomEntries") for _, path in recovered_run.calls)
+
+
+# --- recovery_evidence stops asserting what the fields do not settle ---------
+
+
+def test_an_ordinary_failed_row_does_not_claim_a_partial_effect_is_impossible(cleared_run):
+    """The failed row carries no execution fields and is not the never-dispatched shape."""
+    cleared_run.tis_by_run["manual__1"][2] = {
+        **FORGED,
+        "task_id": "report",
+        "state": "failed",
+        "try_number": 1,
+    }
+
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report", include_downstream=False)
+    evidence = plan["recovery_evidence"]
+
+    assert evidence["current_attempt_dispatched"] is None
+    assert evidence["partial_external_effect_possible"] is None
+    assert "settle neither" in evidence["reading"]
+    assert "a partial external effect is possible" not in evidence["reading"]
+    # The contradiction used to suppress this warning by reporting False.
+    assert any("may be a duplicate of half an operation" in w for w in plan["warnings"])
+
+
+def test_a_partial_effect_is_ruled_out_only_by_a_history_read_whole(forged_run):
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0}
+    ]
+
+    evidence = _clear_plan(only_failed=False)["recovery_evidence"]
+
+    assert evidence["attempt_history"]["status"] == "checked"
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is False
+    assert evidence["partial_external_effect_possible"] is False
+    assert server._PARTIAL_UNSETTLED_BY_HISTORY not in evidence["reading"]
+
+
+def test_a_truncated_history_leaves_the_partial_question_open(forged_run):
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0}
+    ]
+    forged_run.tries_total = 9
+
+    plan = _clear_plan(only_failed=False)
+    evidence = plan["recovery_evidence"]
+
+    assert evidence["attempt_history"]["status"] == "partial"
+    assert evidence["current_attempt_dispatched"] is False
+    assert evidence["partial_external_effect_possible"] is None
+    assert server._PARTIAL_UNSETTLED_BY_HISTORY in evidence["reading"]
+    assert any("may be a duplicate of half an operation" in w for w in plan["warnings"])
+
+
+def test_an_earlier_dispatched_attempt_keeps_the_partial_question_open(forged_run):
+    forged_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 0, "state": "success", "hostname": "", "pid": None, "duration": 0.0},
+        {"try_number": 1, "state": "failed", "hostname": "worker-1", "pid": 4110, "duration": 2.0},
+    ]
+
+    evidence = _clear_plan(only_failed=False)["recovery_evidence"]
+
+    assert evidence["attempt_history"]["earlier_attempt_carries_execution_fields"] is True
+    assert evidence["partial_external_effect_possible"] is None
+
+
+def test_task_authored_log_text_is_tagged_as_the_tasks_own_words(forged_run):
+    forged_run.logs_by_task[(DAG_ID, "summarize")] = "filing transmitted, confirmation FILE-19226231"
+
+    log = _clear_plan(only_failed=False)["recovery_evidence"]["log_for_recorded_attempt"]
+
+    assert log["tail"] == {
+        "source": "dag_authored_task_log",
+        "text": "filing transmitted, confirmation FILE-19226231",
+    }
+
+
+# --- A refusal is not an unknown outcome -------------------------------------
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_a_pre_mutation_rejection_says_nothing_was_cleared(cleared_run, status):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.HTTPStatusError(
+        "rejected",
+        request=httpx.Request("POST", "/clearTaskInstances"),
+        response=httpx.Response(status, json={"detail": "the run is not in a clearable state"}),
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["cleared"] is False
+    assert result["mutation_applied"] is False
+    assert result["mutation_outcome"] == "refused"
+    assert result["api_detail"] == "the run is not in a clearable state"
+    assert "REFUSED by Airflow" in result["error"]
+    assert "nothing was cleared" in result["error"]
+    assert "not established" not in result["error"]
+    assert "verify_with" not in result
+
+
+def test_the_prevent_running_task_conflict_is_reported_as_the_promised_refusal(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.HTTPStatusError(
+        "conflict",
+        request=httpx.Request("POST", "/clearTaskInstances"),
+        response=httpx.Response(409, json={"detail": _RUNNING_CONFLICT}),
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["mutation_applied"] is False
+    assert result["mutation_outcome"] == "refused"
+    assert "prevent_running_task" in result["error"]
+    assert "exactly what the plan said would happen" in result["error"]
+    assert "not as a failure of the recovery" in result["error"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.HTTPStatusError(
+            "server error",
+            request=httpx.Request("POST", "/clearTaskInstances"),
+            response=httpx.Response(500, text="Internal Server Error"),
+        ),
+        # A 409 that does not explain itself says nothing about where in the
+        # request it was raised, so the outcome stays unknown.
+        httpx.HTTPStatusError(
+            "conflict",
+            request=httpx.Request("POST", "/clearTaskInstances"),
+            response=httpx.Response(409, text=""),
+        ),
+        httpx.ConnectError("connection reset"),
+    ],
+    ids=["server_error", "bare_conflict", "transport_error"],
+)
+def test_only_an_unexplained_failure_keeps_the_outcome_unknown(cleared_run, failure):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = failure
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["mutation_outcome"] == "unknown"
+    assert "mutation_applied" not in result
+    assert "is not established from here" in result["error"]
+    assert result["verify_with"]["tool"] == "verify_task_instance_recovery"
+
+
+def test_a_plan_refuses_a_target_that_is_already_on_its_way_to_a_worker(cleared_run):
+    """prevent_running_task means the API would refuse this write; do not sell it."""
+    cleared_run.tis_by_run["manual__1"][2]["state"] = "running"
+
+    plan = server.plan_task_instance_clear(DAG_ID, position=3, only_failed=False)
+
+    assert plan["planned"] is False
+    assert "plan_token" not in plan
+    assert "prevent_running_task" in plan["error"]
+    assert "a write that cannot land" in plan["error"]
+
+
+@pytest.mark.parametrize("state", ["queued", "scheduled"])
+def test_a_plan_refuses_a_target_that_has_not_settled(cleared_run, state):
+    cleared_run.tis_by_run["manual__1"][2]["state"] = state
+
+    plan = server.plan_task_instance_clear(DAG_ID, position=3, only_failed=False)
+
+    assert plan["planned"] is False
+    assert "plan_token" not in plan
+
+
+# --- The card shows what is being approved -----------------------------------
+
+
+def test_the_apply_is_held_to_the_enumerated_set_the_card_renders(cleared_run):
+    """The displayed set and the applied set have to be the same object."""
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="summarize", only_failed=False)
+
+    assert plan["blast_radius"]["instances"] == ["summarize", "report"]
+
+    without = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], only_failed=False
+    )
+
+    assert without["cleared"] is False
+    assert "reviewed_instances=['summarize', 'report']" in without["error"]
+    assert cleared_run.cleared == []
+
+
+def test_a_reviewed_set_that_is_not_the_planned_one_is_refused(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="summarize", only_failed=False)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=["summarize"],
+    )
+
+    assert result["cleared"] is False
+    assert "Changing the scope needs a new plan" in result["error"]
+    assert cleared_run.cleared == []
+
+
+# --- Flags are compared as flags, not as numbers -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("flags", "named"),
+    [
+        ({"only_failed": 0}, "only_failed"),
+        ({"include_downstream": 1}, "include_downstream"),
+        ({"run_on_latest_version": 0}, "run_on_latest_version"),
+        ({"only_failed": "false"}, "only_failed"),
+    ],
+)
+def test_a_flag_that_is_not_a_bool_is_refused_before_anything_compares_it(cleared_run, flags, named):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+
+    refused_plan = server.plan_task_instance_clear(DAG_ID, position=3, **flags)
+    refused_apply = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        reviewed_instances=_reviewed(plan),
+        **flags,
+    )
+
+    assert refused_plan["planned"] is False
+    assert named in refused_plan["error"]
+    assert "Python treats 0 and 1 as False and True" in refused_plan["error"]
+    assert refused_apply["cleared"] is False
+    assert refused_apply["mutation_applied"] is False
+    assert named in refused_apply["error"]
+    assert cleared_run.cleared == []
+
+
+def test_an_omitted_run_on_latest_version_is_still_accepted(cleared_run):
+    assert server.plan_task_instance_clear(DAG_ID, position=3, run_on_latest_version=None)["planned"] is True
+
+
+# --- only_running says which state it was decided against --------------------
+
+
+def test_the_only_running_flag_names_the_state_it_was_decided_against(cleared_run):
+    why = server.plan_task_instance_clear(DAG_ID, position=3)["flags"]["only_running"]["why"]
+
+    assert '"failed"' in why
+    assert "the target is not a running instance" not in why
+
+
+def test_the_only_running_flag_says_when_no_state_was_read():
+    why = server._clear_flags(
+        only_failed=True, include_downstream=True, target_state=None, run_on_latest_version=None
+    )["only_running"]["why"]
+
+    assert "no state was read for the target" in why
+
+
+# ---------------------------------------------------------------------------
+# The markers that decide whether an enumerated clear is closed.
+#
+# A mapped TASK GROUP is invisible to both cheap markers at once: /tasks reports
+# `is_mapped` false for every task inside one (that field is
+# AbstractOperator._is_mapped, true only for a MappedOperator), and a group that
+# expanded to nothing leaves a single placeholder at map_index -1. The clear then
+# enumerated a set that was not closed and the apply asserted it had created
+# none.
+# ---------------------------------------------------------------------------
+
+GROUP_TASKS = [
+    {"task_id": "seed", "downstream_task_ids": ["grp.inner"], "is_mapped": False},
+    {"task_id": "grp.inner", "downstream_task_ids": ["transmit"], "is_mapped": False},
+    {"task_id": "transmit", "downstream_task_ids": [], "is_mapped": False},
+]
+
+
+@pytest.fixture
+def group_zero_run(airflow):
+    """A task inside `@task_group.expand` whose group expanded to nothing."""
+    airflow.tasks = GROUP_TASKS
+    # What /listMapped is gated on — get_needs_expansion(), "MappedOperator OR
+    # is in a mapped task group" — which /tasks does not expose.
+    airflow.needs_expansion = {"grp.inner"}
+    run = {"dag_run_id": "manual__1", "state": "failed", "dag_versions": [{"version_number": 1}]}
+    airflow.runs = [run]
+    airflow.runs_by_id = {"manual__1": run}
+    airflow.tis_by_run = {
+        "manual__1": [
+            {**EXECUTED, "task_id": "seed", "state": "failed"},
+            {**EXECUTED, "task_id": "grp.inner", "map_index": -1},
+            {**EXECUTED, "task_id": "transmit"},
+        ]
+    }
+    return airflow
+
+
+def _group_plan(**kwargs):
+    return server.plan_task_instance_clear(DAG_ID, task_id="seed", only_failed=False, **kwargs)
+
+
+def test_a_task_in_a_mapped_group_is_caught_though_both_cheap_markers_say_no(group_zero_run):
+    """is_mapped false on /tasks and a placeholder at map_index -1; /listMapped answers 200."""
+    plan = _group_plan()
+
+    assert plan["planned"] is True
+    assert [task["task_id"] for task in group_zero_run.tasks if task["is_mapped"]] == []
+    assert all(ti.get("map_index", -1) == -1 for ti in group_zero_run.tis_by_run["manual__1"])
+    assert plan["blast_radius"]["mapped_tasks"] == ["grp.inner"]
+    assert plan["blast_radius"]["mapped_tasks_settled"] is True
+    assert "This set is NOT closed" in plan["blast_radius"]["note"]
+    warning = next(w for w in plan["warnings"] if "MAY CREATE" in w)
+    assert "grp.inner" in warning
+
+
+def test_an_apply_over_a_mapped_group_declines_to_state_a_creation_count(group_zero_run):
+    plan = _group_plan()
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["mapped_tasks"] == ["grp.inner"]
+    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
+    assert result["created_by_this_request"] == server._IN_REQUEST_CREATION_NOT_ESTABLISHED
+
+
+def test_a_probe_that_cannot_answer_leaves_the_closure_possibly_expandable(group_zero_run):
+    """A read that errors is not a read that said no; the set is reported as not closed."""
+    group_zero_run.fail_list_mapped = httpx.HTTPStatusError(
+        "boom",
+        request=httpx.Request("GET", "/listMapped"),
+        response=httpx.Response(503),
+    )
+
+    plan = _group_plan()
+
+    assert plan["planned"] is True
+    assert plan["blast_radius"]["mapped_tasks"] == []
+    assert plan["blast_radius"]["mapped_tasks_settled"] is False
+    assert plan["blast_radius"]["expansion_unprobed_tasks"] == ["grp.inner", "seed", "transmit"]
+    assert "This set is NOT closed" in plan["blast_radius"]["note"]
+    warning = next(w for w in plan["warnings"] if "MAY CREATE" in w)
+    assert "is NOT settled" in warning
+    assert "'grp.inner'" in warning
+
+
+def test_an_apply_under_an_unanswered_probe_never_claims_it_created_none(group_zero_run):
+    group_zero_run.fail_list_mapped = httpx.RequestError("connection reset")
+
+    plan = _group_plan()
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is True
+    assert result["mapped_tasks_settled"] is False
+    assert result["created_task_instances"] == server._MAPPED_CREATION_NOT_ESTABLISHED
+    assert result["expansion_unprobed_tasks"] == ["grp.inner", "seed", "transmit"]
+
+
+def test_a_404_that_does_not_say_not_mapped_settles_nothing(group_zero_run):
+    """A 404 also covers "no such task" and "no such run"; only the wording decides."""
+    group_zero_run.fail_list_mapped = httpx.HTTPStatusError(
+        "gone",
+        request=httpx.Request("GET", "/listMapped"),
+        response=httpx.Response(404, json={"detail": "Dag run not found"}),
+    )
+
+    assert _group_plan()["blast_radius"]["mapped_tasks_settled"] is False
+
+
+def test_the_probe_is_skipped_where_the_cheap_markers_already_settled_it(mapped_run):
+    """A task with live mapped rows is already answered; probing it would cost a call for nothing."""
+    _mapped_plan()
+
+    probed = [path for method, path in mapped_run.calls if path.endswith("/listMapped")]
+
+    assert not any("/fan/listMapped" in path for path in probed)
+    assert sorted(path.split("/taskInstances/")[1] for path in probed) == [
+        "seed/listMapped",
+        "transmit/listMapped",
+    ]
+
+
+# --- Nothing is read over the network between the write and the answer --------
+
+
+def test_a_read_failure_after_the_write_does_not_turn_a_landed_clear_into_a_failure(cleared_run, monkeypatch):
+    """The clear lands; a GET that raises afterwards used to propagate out of apply."""
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    fake = cleared_run
+
+    def refuses_every_read_once_the_write_has_landed(method, path, **kwargs):
+        if fake.cleared and method == "GET":
+            raise httpx.HTTPStatusError(
+                "gone", request=httpx.Request(method, path), response=httpx.Response(500)
+            )
+        return fake(method, path, **kwargs)
+
+    monkeypatch.setattr(server, "_api", refuses_every_read_once_the_write_has_landed)
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["cleared"] is True
+    assert result["mutation_applied"] is True
+    assert fake.cleared != []
+
+
+def test_the_apply_carries_the_expansion_answer_from_the_plan(mapped_run, monkeypatch):
+    """Recomputing it after the write would be the network call that must not happen."""
+    plan = _mapped_plan()
+    monkeypatch.setattr(
+        server, "_mapped_in_closure", lambda *a, **k: pytest.fail("recomputed after the write")
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["mapped_tasks"] == ["fan"]
+    assert result["mapped_tasks_settled"] is True
+
+
+# --- The approved set is the server's record, never the caller's list ---------
+
+
+def test_the_set_leg_cannot_be_turned_green_by_renaming_the_instance_list(mapped_run):
+    """Handing it the post-clear reality as "the approved set" used to pass it."""
+    server.apply_task_instance_clear(
+        DAG_ID,
+        "manual__1",
+        _mapped_plan()["task_ids"],
+        _mapped_plan()["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(_mapped_plan()),
+    )
+    mapped_run.tis_by_run["manual__1"].extend(
+        [{**EXECUTED, "task_id": "fan", "map_index": index} for index in (2, 3)]
+    )
+    reality = [["seed", -1], ["fan", 0], ["fan", 1], ["fan", 2], ["fan", 3], ["transmit", -1]]
+
+    result = server.verify_task_instance_recovery(
+        DAG_ID, "manual__1", instances=reality, target_task_id="seed", xcom_scope="granted"
+    )
+
+    diff = result["approved_instance_set"]
+    assert diff["check"]["passed"] is False
+    assert diff["added_since_approval"] == ["fan[2]", "fan[3]"]
+    assert "recorded by this server when the clear plan was redeemed" in diff["baseline_source"]
+    assert result["verified"] is False
+
+
+def test_a_run_with_no_recorded_approval_leaves_the_set_leg_unestablished(recovered_run):
+    result = _verify(approved=None)
+
+    diff = result["approved_instance_set"]
+    assert diff["check"]["passed"] is None
+    assert diff["baseline_source"] == "none"
+    assert "not on record here" in diff["check"]["detail"]
+    assert "are the caller's assertion" in diff["check"]["detail"]
+    assert result["verified"] is False
+
+
+# --- A truncated read can prove presence and never absence -------------------
+
+
+def test_a_truncated_output_read_is_unestablished_not_a_failed_leg(recovered_run):
+    """The page stopped short; the record that post-dates the clear may be on the rest of it."""
+    recovered_run.xcoms_by_task[("summarize", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:00:00+00:00"}
+    ]
+    recovered_run.xcoms_total = 9
+
+    entry = _verify()["instances"][0]
+    leg = next(c for c in entry["checks"] if c["check"] == "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is None
+    assert "1 of 9 output record(s) were read" in leg["detail"]
+    assert "an absence among them is not an absence" in leg["detail"]
+    assert "recorded_output_post_dates_clear" in entry["unestablished_checks"]
+
+
+def test_a_truncated_output_read_blocks_the_whole_verification(recovered_run):
+    recovered_run.xcoms_by_task[("summarize", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:00:00+00:00"}
+    ]
+    recovered_run.xcoms_total = 9
+
+    assert _verify()["verified"] is False
+
+
+def test_a_truncated_output_read_never_fires_the_stale_artefact_sentence(recovered_run):
+    """The downstream dating leg is a claim about a record that exists."""
+    recovered_run.xcoms_by_task[("report", -1)] = [
+        {"key": "return_value", "timestamp": "2026-08-07T22:00:00+00:00"}
+    ]
+    recovered_run.xcoms_total = 6
+
+    downstream = _verify()["instances"][1]
+    leg = next(c for c in downstream["checks"] if c["check"] == server._DOWNSTREAM_DATING)
+
+    assert leg["passed"] is None
+    assert server._STALE_ARTEFACT not in leg["detail"]
+    assert "1 of 6 output record(s) were read" in leg["detail"]
+
+
+def test_a_truncated_output_read_that_holds_a_fresh_record_still_passes(recovered_run):
+    """Presence-based conclusions survive a truncated list."""
+    recovered_run.xcoms_total = 9
+
+    entry = _verify()["instances"][0]
+    leg = next(c for c in entry["checks"] if c["check"] == "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is True
+
+
+def test_a_truncated_tries_page_cannot_decide_the_earlier_attempt_is_gone(recovered_run):
+    recovered_run.tries_by_task[("summarize", -1)] = [
+        {"try_number": 1, "state": "success", "hostname": "worker-1", "pid": 4110, "duration": 2.33}
+    ]
+    recovered_run.tries_total = 5
+
+    entry = _verify()["instances"][0]
+    leg = next(c for c in entry["checks"] if c["check"] == "prior_attempt_preserved")
+
+    assert leg["passed"] is None
+    assert "1 of 5 recorded attempt(s)" in leg["detail"]
+    assert "may be one of the attempts this read did not return" in leg["detail"]
+    assert _verify()["verified"] is False
+
+
+def test_a_truncated_tries_page_that_holds_the_earlier_attempt_still_passes(recovered_run):
+    recovered_run.tries_total = 5
+
+    leg = next(c for c in _verify()["instances"][0]["checks"] if c["check"] == "prior_attempt_preserved")
+
+    assert leg["passed"] is True
+
+
+def test_a_truncated_event_read_cannot_decide_a_transition_is_missing(recovered_run):
+    recovered_run.event_logs = [
+        row
+        for row in recovered_run.event_logs
+        if not (row["task_id"] == "summarize" and row["event"] == "success")
+    ]
+    recovered_run.event_logs_total = 40
+
+    leg = next(c for c in _verify()["instances"][0]["checks"] if c["check"] == "audit_running_success_pair")
+
+    assert leg["passed"] is None
+    assert "not seen" in leg["detail"]
+    assert "an absence among them is not an absence" in leg["detail"]
+    assert "rows for a deleted Dag" not in leg["detail"]
+
+
+# --- The in-flight refusal says the true reason for each state ---------------
+
+
+def test_the_running_refusal_cites_the_state_airflow_actually_raises_on(cleared_run):
+    cleared_run.tis_by_run["manual__1"][2]["state"] = "running"
+
+    plan = server.plan_task_instance_clear(DAG_ID, position=3, only_failed=False)
+
+    assert plan["planned"] is False
+    assert "models/taskinstance.py:387" in plan["error"]
+    assert "a write that cannot land" in plan["error"]
+
+
+@pytest.mark.parametrize("state", ["queued", "scheduled"])
+def test_a_queued_or_scheduled_refusal_does_not_claim_the_api_refuses_it(cleared_run, state):
+    """Airflow raises on one state; caution is the reason here, not the route."""
+    cleared_run.tis_by_run["manual__1"][2]["state"] = state
+
+    plan = server.plan_task_instance_clear(DAG_ID, position=3, only_failed=False)
+
+    assert plan["planned"] is False
+    assert f"A clear of a {state} instance is NOT refused by the API" in plan["error"]
+    assert "models/taskinstance.py:387" in plan["error"]
+    assert "a write that cannot land" not in plan["error"]
+
+
+def test_the_prevent_running_task_flag_says_which_state_it_covers(cleared_run):
+    why = server.plan_task_instance_clear(DAG_ID, position=3)["flags"]["prevent_running_task"]["why"]
+
+    assert "models/taskinstance.py:387" in why
+    assert "a queued or scheduled instance is cleared, not refused" in why
+
+
+def test_a_refusal_with_no_detail_does_not_say_the_route_explained_itself(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.HTTPStatusError(
+        "bad request", request=httpx.Request("POST", "/clearTaskInstances"), response=httpx.Response(400)
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert result["mutation_outcome"] == "refused"
+    assert "rejected the request before writing anything" in result["error"]
+    assert "answered with its own explanation" not in result["error"]
+
+
+def test_a_refusal_that_carries_a_detail_still_says_the_route_explained_itself(cleared_run):
+    plan = server.plan_task_instance_clear(DAG_ID, position=3)
+    cleared_run.fail_clear = httpx.HTTPStatusError(
+        "bad request",
+        request=httpx.Request("POST", "/clearTaskInstances"),
+        response=httpx.Response(400, json={"detail": "task_ids is empty"}),
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
+    )
+
+    assert "answered with its own explanation" in result["error"]
+    assert "task_ids is empty" in result["error"]

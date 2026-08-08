@@ -30,6 +30,7 @@ import {
   buildPrompts,
   buildReceiptLabel,
   buildSelectionCss,
+  buildToolStatus,
   buildWriteEffect,
   canRetry,
   collectKnownDagIds,
@@ -156,6 +157,36 @@ describe("buildConfirmState", () => {
     expect(buildConfirmState(request, call, streaming)).toBe(expected);
   });
 
+  // Red says the write did not happen. A clear whose request went out and whose
+  // response went wrong says precisely that it does not know, so it gets the
+  // amber "may have landed" rendering the drawer already has, not the red one.
+  // The server decides that and sends it on the frame; nothing here re-derives
+  // it from a result string that storage clips.
+  const unknownOutcome = '{"cleared": false, "mutation_outcome": "unknown", "http_status": null}';
+
+  it("reads a write whose outcome is unknown as unsettled, not failed", () => {
+    expect(buildToolStatus(tool({ result: unknownOutcome, unsettled: true }))).toBe("unsettled");
+    expect(
+      buildConfirmState(
+        confirm({ resolution: "approved", tool: "apply_task_instance_clear" }),
+        tool({ name: "apply_task_instance_clear", result: unknownOutcome, unsettled: true }),
+        false,
+      ),
+    ).toBe("unknown");
+  });
+
+  it("never paints a clipped unknown-outcome result amber on its own", () => {
+    // The old fallback read `mutation_outcome` out of the result text. A result
+    // the server did NOT flag is a result whose row has no claim to amber.
+    expect(buildToolStatus(tool({ failed: true, result: unknownOutcome }))).toBe("failed");
+  });
+
+  it("still reads a reported refusal as failed", () => {
+    expect(
+      buildToolStatus(tool({ failed: true, result: '{"cleared": false, "error": "no reviewed plan"}' })),
+    ).toBe("failed");
+  });
+
   it("never claims a write landed on the decision alone", () => {
     // The tool is still awaiting: approving is not applying.
     expect(
@@ -181,6 +212,121 @@ describe("buildGroupState", () => {
     expect(
       buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }),
     ).toBe("1 of 3 applied · 2 need attention");
+  });
+});
+
+describe("buildWriteEffect apply_task_instance_clear", () => {
+  const clear = (args: Record<string, unknown>): ConfirmRequest => ({
+    args,
+    callId: "c1",
+    nonce: "n1",
+    tool: "apply_task_instance_clear",
+  });
+  const summarize = (args: Record<string, unknown>): string => buildWriteEffect(clear(args)).summary(args);
+  const base = {
+    dag_id: "dunmore_chargeback_filing",
+    dag_run_id: "manual__1",
+    task_ids: ["seed"],
+  };
+
+  // Airflow resolves an absent `run_on_latest_version` from the Dag's own
+  // `rerun_with_latest_version`, then from `[core] rerun_with_latest_version`,
+  // then falls back to false — so the omitted case is the version the run used
+  // on any deployment that sets neither, which is the opposite of "latest".
+  // The sidecar omits the key by default, putting every default clear here.
+  it.each([
+    ["absent", base],
+    ["false", { ...base, run_on_latest_version: false }],
+  ])("never claims the latest parsed code when run_on_latest_version is %s", (_label, args) => {
+    expect(summarize(args)).not.toContain("latest parsed code");
+  });
+
+  it("names Airflow's own default rather than picking a side, when the key is absent", () => {
+    const summary = summarize(base);
+
+    expect(summary).toContain("whichever Dag version Airflow's own default selects");
+    expect(summary).toContain("the version the run used");
+    expect(summary).toContain("`[core] rerun_with_latest_version`");
+  });
+
+  it("says the run's own version when the caller chose false", () => {
+    expect(summarize({ ...base, run_on_latest_version: false })).toContain(
+      "it runs again on the version that run used",
+    );
+  });
+
+  it("says the latest parsed code only when the caller chose true", () => {
+    expect(summarize({ ...base, run_on_latest_version: true })).toContain(
+      "it runs again on the latest parsed code",
+    );
+  });
+
+  it("names every instance the clear touches instead of 'everything downstream of it'", () => {
+    const summary = summarize({
+      ...base,
+      include_downstream: true,
+      reviewed_instances: ["seed", "fan[0]", "fan[1]", "transmit", "notice"],
+    });
+
+    expect(summary).toContain("5 task instances");
+    for (const instance of ["`seed`", "`fan[0]`", "`fan[1]`", "`transmit`", "`notice`"]) {
+      expect(summary).toContain(instance);
+    }
+    expect(summary).not.toContain("everything downstream of it");
+  });
+
+  it("keeps the count exact when a wide fan-out is too long to name in full", () => {
+    const summary = summarize({
+      ...base,
+      reviewed_instances: Array.from({ length: 26 }, (_, index) => `fan[${index}]`),
+    });
+
+    expect(summary).toContain("26 task instances");
+    expect(summary).toContain("`fan[19]`");
+    expect(summary).toContain("and 6 more");
+    expect(summary).not.toContain("`fan[20]`");
+  });
+
+  it("falls back to the seed only when the reviewed set never arrived", () => {
+    expect(summarize({ ...base, include_downstream: true })).toContain("everything downstream of it");
+  });
+
+  it("states the state rule the server will use when the card carries no flag", () => {
+    // Absent is not "no behaviour": the tool's own default is only_failed=true.
+    expect(summarize(base)).toContain("Only failed and upstream_failed");
+  });
+
+  it("says when the clear reaches instances that already succeeded", () => {
+    expect(summarize({ ...base, only_failed: false })).toContain("including ones that already succeeded");
+    expect(summarize({ ...base, only_failed: true })).toContain("Only failed and upstream_failed");
+  });
+
+  it("renders the reviewed instances on the approval card", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: {
+                  ...base,
+                  include_downstream: true,
+                  only_failed: false,
+                  reviewed_instances: ["seed", "fan[0]", "transmit"],
+                },
+                callId: "c1",
+                nonce: "n1",
+                tool: "apply_task_instance_clear",
+              },
+            ],
+            content: "",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText(/fan\[0\]/u)).toBeTruthy();
+    expect(screen.queryByText(/everything downstream of it/u)).toBeNull();
   });
 });
 

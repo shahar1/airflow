@@ -239,6 +239,10 @@ export const applyEvent = (
                 durationMs: tool.durationMs ?? now - tool.startedAt,
                 failed: event.failed === true,
                 result: typeof event.result === "string" ? event.result : undefined,
+                // The server already decided this from the tool's own result;
+                // forwarding it is what lets the drawer paint amber without
+                // pattern-matching a result string that storage clips.
+                unsettled: event.unsettled === true,
               }
             : tool,
         ),

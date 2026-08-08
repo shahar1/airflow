@@ -335,7 +335,31 @@ result that says so.
    clear takes everything downstream of the task with it, which is what makes
    the re-run mean anything — tell the user which instances `affected` lists.
    If the plan refuses (an ambiguous position, nothing to clear, a task set that
-   would move), report that and clear nothing.
+   would move), report that and clear nothing.  When a refusal carries a
+   `next_step` — for example that `only_failed` excluded a *succeeded* instance
+   — follow it: make ONE new plan with the flag it names, and say in the reply
+   which flag changed and why.  Never re-issue the same plan hoping for a
+   different answer.
+2a. **A clear is a recovery only when it is shown to be one.**  Before proposing
+   the write, relay the plan's `recovery_evidence` (what the recorded attempt's
+   fields say, in its own words — never upgrade "consistent with the task
+   process never having been dispatched on this attempt" into "the task never
+   ran"), the `blast_radius` instance list, and **every** entry of `warnings`.
+   The warnings are not optional context: re-running performs the task's
+   external operation again, and the user is the only one who can say whether
+   that is safe.  Say what the plan's `version` block says about Dag versions —
+   including that it does not promise the original version, and that the code
+   which re-runs is the file on disk now.
+2b. **Then verify.**  `apply_task_instance_clear` re-queues instances and
+   returns; it establishes nothing about whether they ran, which is why it
+   reports `recovery_verified: false`.  Call `verify_task_instance_recovery`
+   with the arguments in its `verify_with.args` and report what comes back:
+   the per-instance verdicts, any `failed_checks` or `unestablished_checks`, and
+   `operator_action_required`.  If the run has not finished, say so and offer to
+   check again — do not report the earlier answer as the outcome.  A task
+   instance that is green is not a recovery: only say the work was restored when
+   the verification says `verified`, and even then say that nothing here
+   observed the external system.
 3. After a successful fix, offer to re-run — do not re-run on your own.
    `rerun_dag` accepts a `conf` validated against the Dag's `params` schema:
    turn what the user asked for into typed conf keys, and pass no conf at all
@@ -736,6 +760,11 @@ TOOL_POLICY: dict[str, dict[str, bool]] = {
     # Same rule: the revert plan reads the backup and the current file whole.
     "plan_revert_dag_code": {"reads_source": True},
     "plan_task_instance_clear": {},
+    # Read-only, and the step that turns a clear into a recovery: it reads back
+    # what the re-run actually recorded. Kept out of WRITE_TOOLS deliberately —
+    # a verification the user has to approve is a verification that does not
+    # happen, and the answer is the same whoever asks for it.
+    "verify_task_instance_recovery": {},
     "apply_dag_code_changes": {"writes": True, "reads_source": True},
     "apply_task_instance_clear": {"writes": True},
     "revert_dag_code": {"writes": True, "reads_source": True},
@@ -825,6 +854,31 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
         ("GET", Entity.RUN),
         ("GET", Entity.TASK),
     )
+    # Planning a clear now reads the evidence the approval turns on — the
+    # target's attempt history, the log of the attempt it recorded, and the
+    # Dag's version list. Those are separate permissions on the real routes, and
+    # they gate the plan rather than widening it: a plan that cannot show the
+    # evidence is not the recovery proposal this tool exists to make.
+    plan_clear = (*clear, ("GET", Entity.TASK_LOGS), ("GET", Entity.VERSION))
+    # Verifying reads instances, their attempt histories and the new attempt's
+    # log. No PUT: it changes nothing.
+    #
+    # XCOM is NOT here — it widens the reading instead, in
+    # ``_tool_optional_access_requirements``. Demanding it made the safety net
+    # removable while the write stayed available: a role holding everything
+    # except XCom could plan the clear, get it approved and apply it, and was
+    # then refused the verification that says whether the re-run actually
+    # happened.
+    #
+    # TASK_LOGS stays mandatory, and the asymmetry is deliberate: ``plan_clear``
+    # demands it too, so a role without it never reaches a plan_token and the
+    # write is unavailable to it in the first place. There is no state in which
+    # dropping TASK_LOGS costs the verification but keeps the clear.
+    verify = (
+        ("GET", Entity.TASK_INSTANCE),
+        ("GET", Entity.RUN),
+        ("GET", Entity.TASK_LOGS),
+    )
     requirements: dict[str, tuple[tuple[str, Any], ...]] = {
         # Reads the Dag itself (for its file location), its runs, instances,
         # logs, source and task graph.
@@ -841,8 +895,9 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
         # A revert plan is a code-change plan computed from the backup.
         "plan_revert_dag_code": (read_dag, ("GET", Entity.CODE), ("GET", Entity.TASK)),
         "apply_dag_code_changes": patch_source,
-        "plan_task_instance_clear": clear,
+        "plan_task_instance_clear": plan_clear,
         "apply_task_instance_clear": clear,
+        "verify_task_instance_recovery": verify,
         # Scans task instances fleet-wide, then reads each failure's log.
         "find_failure_clusters": (("GET", Entity.TASK_INSTANCE), ("GET", Entity.TASK_LOGS)),
         "compare_dag_runs": (*runs, ("GET", Entity.CODE)),
@@ -863,15 +918,19 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
     return requirements[tool_name]
 
 
-def _tool_optional_access_requirements(tool_name: str) -> tuple[tuple[str, Any], ...]:
+def _tool_optional_access_requirements(tool_name: str) -> dict[str, tuple[tuple[str, Any], ...]]:
     """
-    Return permissions that WIDEN a tool rather than gate it.
+    Return permissions that WIDEN a tool rather than gate it, by scope argument.
 
     Evaluated separately from ``_tool_access_requirements`` on purpose: appending
     audit-log access to the mandatory tuple would cost every user who lacks it
     the whole of ``diagnose_dag``, which is a read they are otherwise entitled
     to. The answer here decides how much the tool may read, never whether it may
     run — and the sidecar fails closed on anything but "granted".
+
+    Keyed by the argument each answer is written into, because one tool can have
+    more than one such permission and they are granted independently: a user may
+    read a Dag's audit log and not its XCom records, or the reverse.
 
     ``AUDIT_LOG`` is a first-class per-Dag entity, not a fleet-wide one:
     ``requires_access_dag(method, DagAccessEntity.AUDIT_LOG, dag_id)``
@@ -882,10 +941,20 @@ def _tool_optional_access_requirements(tool_name: str) -> tuple[tuple[str, Any],
     """
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
 
-    optional: dict[str, tuple[tuple[str, Any], ...]] = {
-        "diagnose_dag": (("GET", Entity.AUDIT_LOG),),
+    optional: dict[str, dict[str, tuple[tuple[str, Any], ...]]] = {
+        "diagnose_dag": {"audit_scope": (("GET", Entity.AUDIT_LOG),)},
+        # Both are legs of the verification, not the whole of it: without either
+        # permission the matching legs report "could not be established" and the
+        # rest of the reading stands. XCom is here rather than in the mandatory
+        # tuple so that a role which can apply the clear can always also run the
+        # check on it — a verification a writer can be denied is a safety net
+        # that comes off while the write stays on.
+        "verify_task_instance_recovery": {
+            "audit_scope": (("GET", Entity.AUDIT_LOG),),
+            "xcom_scope": (("GET", Entity.XCOM),),
+        },
     }
-    return optional.get(tool_name, ())
+    return optional.get(tool_name, {})
 
 
 def _policy(tool_name: str, trait: str) -> bool:
@@ -1067,9 +1136,8 @@ def _authorize_tool_call(user: Any, tool_name: str, tool_args: dict[str, Any]) -
     # place would let the model grant itself the permission. Evaluated over the
     # same targets — a source file holding a second Dag is read whole, so the
     # audit read has to clear every Dag in it too.
-    optional = _tool_optional_access_requirements(tool_name)
-    if optional:
-        args["audit_scope"] = (
+    for scope_arg, optional in _tool_optional_access_requirements(tool_name).items():
+        args[scope_arg] = (
             "granted"
             if all(
                 _is_authorized_dag(
@@ -1477,20 +1545,50 @@ _DENIAL_MESSAGE = "The user rejected this action."
 _WRITE_OUTCOME_KEYS = ("mutation_applied", "applied", "reverted", "triggered", "created", "cleared")
 
 
-def _write_refused(content: Any) -> bool:
-    """Whether a write tool's result says it changed nothing."""
+def _write_outcome(content: Any) -> str | None:
+    """
+    Classify what a write tool's own result says became of the write — three answers, not two.
+
+    ``"refused"`` — it changed nothing, and says so.
+    ``"outcome_unknown"`` — the request went out and the tool cannot say whether
+    it landed. That is neither a refusal nor a success, and painting it as a red
+    "failed" told the user their Dag was untouched on the strength of a result
+    that explicitly declines to claim it.
+    ``None`` — nothing here says the write did not happen.
+    """
     if isinstance(content, str):
         # The per-Dag authorization wrapper answers with one of these — a
         # permission denial or an invalid rerun conf — instead of calling the
         # tool at all. Nothing ran, and a green "Edited Dag code" over a
         # refusal is the worst lie the drawer can tell.
         if content.startswith((_ACCESS_DENIED, _INVALID_CONF)):
-            return True
+            return "refused"
         try:
             content = json.loads(content)
         except ValueError:
-            return False
-    return isinstance(content, dict) and any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS)
+            return None
+    if not isinstance(content, dict):
+        return None
+    if content.get("mutation_outcome") == "unknown":
+        return "outcome_unknown"
+    if any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS):
+        return "refused"
+    return None
+
+
+def _write_refused(content: Any) -> bool:
+    """
+    Whether a write tool's result says it changed nothing.
+
+    An unknown outcome is not a refusal and is not counted as one; it keeps the
+    row out of the green path through ``_write_unsettled`` instead.
+    """
+    return _write_outcome(content) == "refused"
+
+
+def _write_unsettled(content: Any) -> bool:
+    """Whether a write tool's result declines to say the write landed."""
+    return _write_outcome(content) == "outcome_unknown"
 
 
 def _plan_refused(content: Any) -> bool:
@@ -1598,12 +1696,18 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
         plan_refused = (
             not failed and not denied and part.tool_name in PLAN_TOOLS and _plan_refused(part.content)
         )
+        # An unsettled write is neither: it must not go green, and it must not be
+        # reported as a failure the user can treat as "nothing happened". The
+        # drawer already has an amber "may have landed" rendering for exactly
+        # this, so the frame says so rather than borrowing the red one.
+        unsettled = refused and _write_unsettled(part.content)
         return {
             "type": "tool_result",
             "id": part.tool_call_id,
             "name": part.tool_name,
             "failed": failed or (refused and _write_refused(part.content)) or plan_refused,
             "denied": denied,
+            "unsettled": unsettled,
             "result": _clip_result(part.model_response() if failed else part.content),
         }
     if kind == "part_delta":

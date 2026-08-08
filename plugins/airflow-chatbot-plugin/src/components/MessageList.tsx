@@ -665,13 +665,7 @@ const WRITE_EFFECTS: Record<string, WriteEffect> = {
     badge: "Re-runs an existing task · creates no Dag run",
     proposed: "Proposed task clear",
     summary: (args) =>
-      `Clears ${describeTaskIds(args)}${
-        args.include_downstream === false ? " (that task only)" : " and everything downstream of it"
-      } in run ${describeArg(args.dag_run_id)} of ${describeDag(args)} so ${
-        args.run_on_latest_version === false
-          ? "it runs again on the version that run used"
-          : "it runs again on the latest parsed code"
-      }. The existing task instances are re-queued — no new Dag run is created.`,
+      `Clears ${describeClearedInstances(args)} in run ${describeArg(args.dag_run_id)} of ${describeDag(args)} so ${describeClearVersion(args)}.${describeOnlyFailed(args)} The existing task instances are re-queued — no new Dag run is created.`,
     title: "Clear a task instance in an existing run",
   },
   rerun_dag: {
@@ -740,6 +734,71 @@ const describeTaskIds = (args: Record<string, unknown>): string => {
     )
     .join(", ");
 };
+
+/**
+ * The instances the clear actually touches, named one by one.
+ *
+ * `task_ids` is the SEED, not the scope: with `include_downstream` on, one name
+ * routinely stands for five instances, and "and everything downstream of it"
+ * asked the user to approve a set the card never showed them.  The planner
+ * enumerates that set and the apply carries it back as `reviewed_instances`, so
+ * the list on the card and the list that gets cleared are the same object.
+ *
+ * Falls back to the seed only when the argument is missing — an older sidecar,
+ * or a call the server is about to refuse for exactly that reason.
+ */
+const CARD_INSTANCE_LIMIT = 20;
+
+const describeClearedInstances = (args: Record<string, unknown>): string => {
+  const reviewed = Array.isArray(args.reviewed_instances)
+    ? args.reviewed_instances.filter((entry): entry is string => typeof entry === "string" && entry !== "")
+    : [];
+  if (reviewed.length > 0) {
+    const shown = reviewed.slice(0, CARD_INSTANCE_LIMIT).map((entry) => `\`${entry}\``);
+    // The count is always exact; only the naming is capped, and the card says so
+    // rather than letting a wide fan-out read as the whole of the change.
+    const rest = reviewed.length - shown.length;
+    const named = rest > 0 ? `${shown.join(", ")}, and ${rest} more` : shown.join(", ");
+    return `${reviewed.length} task instance${reviewed.length === 1 ? "" : "s"} — ${named}`;
+  }
+  return `${describeTaskIds(args)}${
+    args.include_downstream === false ? " (that task only)" : " and everything downstream of it"
+  }`;
+};
+
+/**
+ * Which code the re-run uses — three answers, because the argument has three
+ * values and only two of them were being told apart.
+ *
+ * An OMITTED `run_on_latest_version` is not "latest".  Airflow resolves an
+ * absent value from the Dag's own `rerun_with_latest_version`, then from
+ * `[core] rerun_with_latest_version`, then falls back to false — so on a
+ * deployment that sets neither, the omitted case runs the version the run used,
+ * which is the exact opposite of what the card used to say.  The sidecar now
+ * omits the key by default, which put every default clear on that wrong branch.
+ *
+ * The neutral answer stays neutral: it must not harden into a promise about
+ * code either, because under an unversioned bundle the worker imports the Dag
+ * file as it stands on disk whatever the version says.
+ */
+const describeClearVersion = (args: Record<string, unknown>): string => {
+  if (args.run_on_latest_version === false) return "it runs again on the version that run used";
+  if (args.run_on_latest_version === true) return "it runs again on the latest parsed code";
+  return "it runs again on whichever Dag version Airflow's own default selects — for a clear that is the version the run used, unless this Dag or `[core] rerun_with_latest_version` says otherwise";
+};
+
+/** `only_failed` off reaches instances that already succeeded; the card has to say so. */
+/**
+ * What the clear will do about state, including when the card carries no flag.
+ *
+ * An absent `only_failed` is not an absent behaviour: the tool's own default is
+ * `true`, so saying nothing described a narrower clear than the one the button
+ * authorizes.  The card states the value the server will use.
+ */
+const describeOnlyFailed = (args: Record<string, unknown>): string =>
+  args.only_failed === false
+    ? " This clears instances whatever state they are in, including ones that already succeeded."
+    : " Only failed and upstream_failed instances are cleared; anything else is left alone.";
 
 const describeArg = (value: unknown): string =>
   typeof value === "string" && value ? `\`${value}\`` : "the requested date";
@@ -1530,6 +1589,10 @@ export const buildToolStatus = (tool: ToolCall): ToolStatus => {
   // Suspended outranks proposed: the server is now holding this exact call.
   if (tool.awaitingConfirm === true) return "awaiting";
   if (tool.cancelled === true) return "cancelled";
+  // Before `failed`: red says the write did not happen, and an unsettled result
+  // says precisely that it does not know.  The server decides this — it parses
+  // the tool result and sends `unsettled` on the frame — so nothing here has to
+  // re-derive it by pattern-matching text that storage clips.
   if (tool.unsettled === true) return "unsettled";
   if (tool.durationMs === undefined) return tool.proposed === true ? "proposed" : "running";
   if (tool.failed === true) return "failed";

@@ -119,6 +119,7 @@ def test_event_payload_reports_a_tool_result():
         "name": "diagnose_dag",
         "failed": False,
         "denied": False,
+        "unsettled": False,
         "result": "ok",
     }
 
@@ -194,7 +195,33 @@ def test_event_payload_refuses_to_call_any_no_op_write_a_success(content):
     )
     event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
 
-    assert plugin._event_payload(event)["failed"] is True
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is True
+    assert payload["unsettled"] is False
+
+
+def test_a_write_whose_outcome_is_unknown_is_neither_a_success_nor_a_failure():
+    """
+    The clear request failed after it was sent, so the tool cannot say whether it landed.
+
+    Red says the write did not happen, which is the one thing this result
+    explicitly declines to claim; green says it did. The drawer already has an
+    amber "may have landed" rendering, and this is what it is for.
+    """
+    content = {"cleared": False, "mutation_outcome": "unknown", "error": "not established from here"}
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="apply_task_instance_clear", content=content, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["unsettled"] is True
+    assert payload["failed"] is False
+    assert plugin._write_refused(content) is False
+    assert plugin._write_unsettled(content) is True
+    # Still off the green path: a refresh would be a claim the write happened.
+    assert plugin._resource_changed_frame("apply_task_instance_clear", content) is None
 
 
 def test_event_payload_refuses_to_call_a_conf_refusal_a_success():
@@ -601,6 +628,38 @@ def test_write_prompt_pins_verification_to_the_triggered_run():
     # next_step is the sidecar telling the model what to do with a result.
     assert "`next_step`" in normalized
     assert "never silently drop it" in normalized
+
+
+def test_write_prompt_makes_the_clear_the_middle_of_the_recovery_not_the_end():
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "`verify_task_instance_recovery`" in normalized
+    assert "`recovery_verified: false`" in normalized
+    assert "A task instance that is green is not a recovery" in normalized
+    assert "nothing here observed the external system" in normalized
+    assert "do not report the earlier answer as the outcome" in normalized
+
+
+def test_write_prompt_demands_the_evidence_and_the_warnings_reach_the_user():
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "`recovery_evidence`" in normalized
+    assert "`blast_radius`" in normalized
+    assert "**every** entry of `warnings`" in normalized
+    # The reading the sidecar hands over must not be upgraded on the way out.
+    assert "never upgrade" in normalized
+    assert 'into "the task never ran"' in normalized
+    assert "performs the task's external operation again" in normalized
+    assert "does not promise the original version" in normalized
+
+
+def test_write_prompt_tells_the_model_to_re_plan_rather_than_retry_a_refused_flag():
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "excluded a *succeeded* instance" in normalized
+    assert "make ONE new plan with the flag it names" in normalized
+    assert "which flag changed and why" in normalized
+    assert "Never re-issue the same plan hoping for a different answer" in normalized
 
 
 def test_render_system_prompt_explains_an_admin_kill_switch():
@@ -1302,14 +1361,61 @@ def test_the_audit_log_permission_is_optional_and_never_gates_the_tool(auth_mana
     """
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
 
-    assert plugin._tool_optional_access_requirements("diagnose_dag") == (("GET", Entity.AUDIT_LOG),)
-    assert ("GET", Entity.AUDIT_LOG) not in plugin._tool_access_requirements("diagnose_dag", {})
+    widened = ("diagnose_dag", "verify_task_instance_recovery")
+    for name in widened:
+        optional = plugin._tool_optional_access_requirements(name)
+        assert optional["audit_scope"] == (("GET", Entity.AUDIT_LOG),)
+        assert ("GET", Entity.AUDIT_LOG) not in plugin._tool_access_requirements(name, {})
     # Every other tool asks for nothing optional, so nothing else is widened.
     assert all(
-        plugin._tool_optional_access_requirements(name) == ()
+        plugin._tool_optional_access_requirements(name) == {}
         for name in plugin.TOOL_POLICY
-        if name != "diagnose_dag"
+        if name not in widened
     )
+
+
+def test_the_xcom_permission_widens_the_verification_rather_than_gating_it(auth_manager):
+    """
+    The safety net must not come off while the write stays on.
+
+    XCom gates neither the plan nor the clear, so demanding it for the
+    verification let a role hold everything except XCom, plan the clear, get it
+    approved, apply it — and then be refused the only check that says whether
+    the re-run actually happened. TASK_LOGS is deliberately not treated this way:
+    the plan demands it too, so a role without it never reaches a plan_token.
+    """
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    optional = plugin._tool_optional_access_requirements("verify_task_instance_recovery")
+    mandatory = plugin._tool_access_requirements("verify_task_instance_recovery", {})
+
+    assert optional["xcom_scope"] == (("GET", Entity.XCOM),)
+    assert ("GET", Entity.XCOM) not in mandatory
+    assert ("GET", Entity.TASK_LOGS) in mandatory
+    assert ("GET", Entity.TASK_LOGS) in plugin._tool_access_requirements("plan_task_instance_clear", {})
+
+    _grant(auth_manager, [p for p in VERIFY_ACCESS if p[1] != "XCOM"])
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", args) is None
+    assert args["xcom_scope"] == "denied"
+
+
+def test_the_two_optional_scopes_of_a_verification_are_answered_independently(auth_manager):
+    """A user may read a Dag's XCom records and not its audit log, or the reverse."""
+    _grant(auth_manager, VERIFY_ACCESS)
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", args) is None
+    assert args["xcom_scope"] == "granted"
+    assert args["audit_scope"] == "denied"
+
+    _grant(auth_manager, [*VERIFY_ACCESS, ("GET", "AUDIT_LOG")])
+    both = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", both) is None
+    assert both["xcom_scope"] == "granted"
+    assert both["audit_scope"] == "granted"
 
 
 def test_the_audit_scope_must_clear_every_dag_in_a_shared_source_file(monkeypatch, auth_manager):
@@ -1475,6 +1581,54 @@ def test_clearing_demands_the_permission_airflow_asks_of_its_dry_run(auth_manage
 
     for name in ("plan_task_instance_clear", "apply_task_instance_clear"):
         assert ("PUT", Entity.TASK_INSTANCE) in plugin._tool_access_requirements(name, {})
+
+
+CLEAR_ACCESS = [("PUT", "TASK_INSTANCE"), ("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK")]
+PLAN_CLEAR_ACCESS = [*CLEAR_ACCESS, ("GET", "TASK_LOGS"), ("GET", "VERSION")]
+VERIFY_ACCESS = [("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK_LOGS"), ("GET", "XCOM")]
+
+
+@pytest.mark.parametrize(
+    ("tool", "granted", "missing"),
+    [
+        # The plan reads the evidence the approval turns on; without it there is
+        # no recovery proposal to make, so these gate the plan rather than widen it.
+        ("plan_task_instance_clear", CLEAR_ACCESS, "GET on TASK_LOGS"),
+        (
+            "plan_task_instance_clear",
+            [p for p in PLAN_CLEAR_ACCESS if p != ("GET", "VERSION")],
+            "GET on VERSION",
+        ),
+        # Verification reads what the re-run recorded. XCom is NOT here: it
+        # widens the reading instead, so that a role which can apply the clear
+        # can always also run the check on it.
+        (
+            "verify_task_instance_recovery",
+            [p for p in VERIFY_ACCESS if p[1] != "TASK_LOGS"],
+            "GET on TASK_LOGS",
+        ),
+    ],
+    ids=["plan-logs", "plan-versions", "verify-logs"],
+)
+def test_the_recovery_tools_demand_each_underlying_permission(auth_manager, tool, granted, missing):
+    _grant(auth_manager, granted)
+
+    assert missing in plugin._authorize_tool_call(FakeUser(), tool, {"dag_id": "sales_summary"})
+
+
+def test_verifying_a_recovery_changes_nothing_and_is_never_gated_behind_a_confirmation(auth_manager):
+    """A verification the user has to approve is a verification that does not happen."""
+    assert "verify_task_instance_recovery" not in plugin.WRITE_TOOLS
+    assert not any(
+        method == "PUT" or method == "POST"
+        for method, _ in plugin._tool_access_requirements("verify_task_instance_recovery", {})
+    )
+    _grant(auth_manager, VERIFY_ACCESS)
+
+    assert (
+        plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", {"dag_id": "sales_summary"})
+        is None
+    )
 
 
 def test_the_policy_is_the_only_source_of_write_tools():
@@ -1979,6 +2133,54 @@ async def test_a_cancelled_resume_is_interrupted_not_done(monkeypatch, pending_s
             pass
 
     assert pending.state == "interrupted"
+
+
+def test_an_unknown_clear_outcome_never_refreshes_a_view_into_saying_it_landed():
+    """A refresh is a claim the write happened; nothing here knows that it did."""
+    unknown = {
+        "cleared": False,
+        "mutation_outcome": "unknown",
+        "dag_id": "sales_summary",
+        "error": "not established from here",
+        "ui_updates": [{"kind": "task_instances", "dag_id": "sales_summary", "dag_run_id": "manual__1"}],
+    }
+
+    assert plugin._resource_changed_frame("apply_task_instance_clear", unknown) is None
+    assert plugin._write_unsettled(unknown) is True
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_clear_executes_nothing_and_is_reported_as_denied(monkeypatch, pending_store):
+    """The user cancelling the approval card is a decision, and it settles the run."""
+    from pydantic_ai.messages import FunctionToolResultEvent, ToolReturnPart
+
+    seen: dict = {}
+
+    async def denied_stream(agent, **kwargs):
+        seen["results"] = kwargs.get("deferred_tool_results")
+        yield plugin._event_payload(
+            FunctionToolResultEvent(
+                part=ToolReturnPart(
+                    tool_name="apply_task_instance_clear",
+                    content=plugin._DENIAL_MESSAGE,
+                    tool_call_id="c1",
+                )
+            )
+        )
+
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (object(), None))
+    monkeypatch.setattr(plugin, "_run_and_stream", denied_stream)
+    pending = plugin._get_pending(_store_pending(call_ids=["c1"]))
+
+    frames = [frame async for frame in plugin._resume_agent(pending, False)]
+
+    # Denied, not failed: nothing broke, the user said no.
+    assert [frame["denied"] for frame in frames] == [True]
+    assert [frame["failed"] for frame in frames] == [False]
+    # A rejection ran nothing, so nothing is left in doubt and no refresh goes out.
+    assert pending.state == "done"
+    assert all(frame["type"] != "resource_changed" for frame in frames)
+    assert seen["results"] is not None
 
 
 def test_confirm_endpoint_requires_write_permission(client, monkeypatch, pending_store):
