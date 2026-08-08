@@ -1008,7 +1008,11 @@ def test_diagnose_dag_says_when_the_import_error_list_was_truncated(airflow):
 
     truncated = [c for c in result["checks"] if c["kind"] == "import_errors_truncated"]
     assert len(truncated) == 1
-    assert "only the first 1 of 250 import errors were checked" in truncated[0]["detail"]
+    # The numbers come off the reading itself now: the note used to be appended
+    # into ``rows``, which is the numerator of ``complete``, so a read that had
+    # left exactly one row unexamined reported itself whole with omitted zero.
+    assert "only the first 1 of 250 row(s) were scanned" in truncated[0]["detail"]
+    assert "may be missing from this diagnosis" in truncated[0]["detail"]
     assert "may be missing" in truncated[0]["detail"]
     assert "Note:" in result["summary"]
 
@@ -9766,12 +9770,31 @@ _CONSERVATIVE_FLAGS = frozenset(
         "failures_read_whole",
         "runs_read_whole",
         "planned_runs_read_whole",
+        "surviving_runs_read_whole",
+    }
+)
+
+# Leaves that report what a read did NOT cover. A key that appears only under a
+# short read is normally a claim manufactured by the truncation — exactly one
+# exists, ``instances_not_found`` — but one of THESE appearing is the tool
+# naming its own shortfall, which is the opposite move.
+_COVERAGE_DISCLOSURES = frozenset(
+    {
+        "reads_not_read_whole",
+        "failures_unreadable",
+        "instances_not_located",
+        "instances_omitted",
+        "surviving_runs_unread",
+        "logs_read_as_a_tail",
+        "log_tail_truncated",
+        "task_instances_omitted",
     }
 )
 
 
 def _is_conservative(path):
-    return path.rsplit(".", 1)[-1] in _CONSERVATIVE_FLAGS
+    leaf = path.rsplit(".", 1)[-1].removesuffix("[]")
+    return leaf in _CONSERVATIVE_FLAGS or leaf in _COVERAGE_DISCLOSURES
 
 
 def _manufactured_negatives(complete, truncated):
@@ -10738,6 +10761,7 @@ _CLAIM_WORDS = (
     "expected",
     "claimed",
     "LIMIT",
+    "limit",
     "SCAN",
     "MAX_",
     "_PAGE",
@@ -10796,6 +10820,13 @@ _PAGINATION_TERMINATIONS = {
     ("reading", "len(tis) >= total"),
     ("evidence", "len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT)"),
     ("evidence", "len(fetched) >= total"),
+    # The overflow sentinel, in the two paging loops and in the backfill run
+    # list: a page that comes back FULL when the route gave no count at all is
+    # evidence of at least one more row. It RAISES what the loop believes is out
+    # there rather than deciding whether the read was whole.
+    ("reading", "len(page) >= TASK_INSTANCE_PAGE"),
+    ("evidence", "len(page) >= reading.EVENT_SCAN_PAGE"),
+    ("reading", "reading.kept >= limit"),
 }
 
 # Bounds that decide what to SHOW or whether to offer a plan at all. None of
@@ -10809,6 +10840,13 @@ _DISPLAY_CEILINGS = {
     # the limit is the sample and not a shortfall.
     ("reading", "rest.kept < RUN_HISTORY_LIMIT"),
     ("evidence", "len(value) > EXTRA_LIST_LIMIT"),
+    # Character clamps on text this tool did not write. A different type with a
+    # different invariant: they produce a ``Clipped``, not a short list.
+    ("primitives", "len(text) <= limit"),
+    ("primitives", "len(value) > limit"),
+    # The clamp methods' own early-out: nothing to clamp is not a completeness
+    # question, and what they return goes back through the one derivation.
+    ("reading", "limit >= self.kept"),
     # Inside the type, choosing which sentence describes the shortfall it has
     # already derived.
     ("reading", "claimed > self._delivered"),
@@ -11201,3 +11239,149 @@ def test_the_duration_sample_counts_rows_examined_and_not_rows_it_chose_to_keep(
 
     assert baseline.complete is True
     assert baseline.omitted == 0
+
+
+# ---------------------------------------------------------------------------
+# Where the three numbers come from. Every one of these made a read report
+# itself WHOLE over rows nobody looked at.
+# ---------------------------------------------------------------------------
+
+
+def test_a_note_row_may_not_be_smuggled_into_the_rows_completeness_counts(airflow):
+    """``rows`` is the numerator of ``complete``: appending one synthetic note
+    row raised ``kept`` by one while ``_delivered`` and ``_claimed`` stood, so a
+    read that had left exactly one row unexamined came back whole with omitted
+    zero."""
+    airflow.import_errors = [{"filename": "other.py", "stack_trace": "SyntaxError: elsewhere"}]
+    airflow.import_errors_total = 2
+
+    scan = reading._find_import_errors({"fileloc": "sales_summary.py"})
+
+    assert scan.complete is False
+    assert scan.omitted == 1
+    assert all(row.get("kind") == "import_error" for row in scan.rows)
+
+
+def test_a_dag_that_names_no_file_is_not_a_clean_import(airflow):
+    """``Reading(route=...)`` is a read that never happened with complete True —
+    which is the one thing an unlooked-up import-error list must not be."""
+    assert reading._find_import_errors(None).read_failed is True
+    assert reading._find_import_errors({}).read_failed is True
+    assert reading._find_import_errors({"fileloc": None}).read_failed is True
+
+
+def test_only_the_reading_methods_may_change_the_rows_of_a_reading():
+    """The scan that keeps it that way. ``replace(scan, rows=...)`` anywhere
+    else is a caller choosing its own numerator."""
+    offenders = []
+    for module in _MODULES:
+        for owner, node in _owned_nodes(_module_source(module)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            if name == "replace" and any(keyword.arg == "rows" for keyword in node.keywords):
+                offenders.append((module, owner, ast.unparse(node)))
+    # ``clamp``, ``clamp_last``, ``filter``, ``project``, ``reordered`` and
+    # ``failed`` are the type's own methods and are the only way rows may move.
+    assert {owner for _, owner, _ in offenders} <= {
+        "clamp",
+        "clamp_last",
+        "filter",
+        "project",
+        "reordered",
+        "failed",
+    }, offenders
+
+
+def test_a_route_that_gives_no_count_cannot_end_a_scan_and_certify_it(airflow, monkeypatch):
+    """250 rows behind a 100-row page came back complete AND exhausted, and a
+    row on page two came back ABSENT — because the page's own length stood in
+    for the total the route never gave."""
+    monkeypatch.setattr(reading, "TASK_INSTANCE_PAGE", 100)
+    rows = [{"task_id": f"t{n}", "state": "success", "map_index": -1} for n in range(250)]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1"}}
+    airflow.tis_by_run = {"manual__1": rows}
+    airflow.run_tis_total = None
+
+    scan = reading._run_task_instances(DAG_ID, "/dagRuns/manual__1")
+
+    assert scan.kept == 250
+    assert scan.complete is True
+    assert reading.find(scan, lambda ti: ti["task_id"] == "t150", "why").is_present()
+
+
+def test_a_page_full_at_the_limit_with_no_count_is_evidence_of_one_more_row(airflow, monkeypatch):
+    monkeypatch.setattr(reading, "TASK_INSTANCE_SCAN_LIMIT", 2)
+    monkeypatch.setattr(reading, "TASK_INSTANCE_PAGE", 2)
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1"}}
+    airflow.tis_by_run = {
+        "manual__1": [{"task_id": f"t{n}", "state": "success", "map_index": -1} for n in range(6)]
+    }
+    airflow.run_tis_total = None
+
+    scan = reading._run_task_instances(DAG_ID, "/dagRuns/manual__1")
+
+    assert scan.kept == 2
+    assert scan.complete is False
+    assert reading.find(scan, lambda ti: ti["task_id"] == "t5", "why").is_unknown()
+
+
+def test_a_discarded_row_is_a_row_the_reading_did_not_look_at():
+    """``read_of`` filtered non-dict rows into ``kept`` and then took its
+    ``_delivered`` from the same filtered list, so the discard cancelled out."""
+    scan = reading.read_of({"rows": [{"a": 1}, None, "junk", {"b": 2}], "total_entries": 4}, "rows", "R")
+
+    assert scan.kept == 2
+    assert scan.complete is False
+    assert scan.omitted == 2
+
+
+def test_a_body_whose_list_key_is_not_a_list_is_a_read_that_failed():
+    scan = reading.read_of({"task_instances": "oops"}, "task_instances", "R")
+
+    assert scan.read_failed is True
+    assert scan.complete is False
+    assert reading.none_match(scan, lambda row: True, "why").is_unknown()
+
+
+def test_a_total_this_reading_cannot_read_is_not_an_exhaustive_read():
+    for total in ("5", 5.0, [5]):
+        scan = reading.read_of({"rows": [{"a": 1}], "total_entries": total}, "rows", "R")
+        assert scan.complete is False, total
+
+
+def test_a_reading_that_stopped_at_a_ceiling_is_never_complete():
+    """The exhaustion evidence is part of the answer, not decoration beside it."""
+    stopped = reading.paged_read([{"a": 1}], "R", claimed=1, pages=1, exhausted=False)
+
+    assert stopped.complete is False
+    assert reading.find(stopped, lambda row: row.get("b"), "why").is_unknown()
+
+
+def test_an_earlier_note_does_not_hide_a_later_clamp():
+    """``reason`` returned the note before the numbers, and ``clamp`` carries the
+    note forward — so the sentence described the shortfall the reading was built
+    with and said nothing about the one applied after it."""
+    scanned = reading.matches_of([{"n": n} for n in range(4)], scanned=4, claimed=9, route="R")
+
+    reason = scanned.clamp(2).reason
+
+    assert "could have matched" in reason
+    assert "keeps 2" in reason
+
+
+def test_an_abandoned_backfill_does_not_count_its_own_truncation_as_a_survivor(airflow, monkeypatch):
+    """51 created runs, all failed, and a route that omits its count: the
+    sentinel row landed in ``surviving_runs`` and was counted, so a cancel that
+    killed everything reported one run still going."""
+    monkeypatch.setattr(reading, "MAX_BACKFILL_RUNS", 2)
+    airflow.created_dates = [f"2024-01-{n:02d}T00:00:00+00:00" for n in range(1, 4)]
+    airflow.created_run_state = "failed"
+    airflow.omit_backfill_total = True
+
+    result = server._abandon_backfill(7, planned=[("a", "b")], created=[{}])
+
+    assert result["surviving_runs"] == []
+    assert result["surviving_runs_read_whole"] is False
+    assert "run(s) were already past queued" not in result["error"]
+    assert "NOT established" in result["error"]

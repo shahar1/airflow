@@ -891,6 +891,11 @@ def _abandon_backfill(
     except Exception:
         cancelled = False
     survivors = []
+    # The reason this list may be short of a survivor, kept OUT of the list: a
+    # sentinel row inside it was counted as a run, so a cancel that killed all 51
+    # created runs reported "1 run(s) were already past queued and are still
+    # going" over a survivor set of exactly zero.
+    unread: str | None = None
     try:
         recheck = _backfill_runs(backfill_id)
         survivors = [
@@ -901,20 +906,17 @@ def _abandon_backfill(
         if not recheck.complete:
             # An empty or short survivor list is a claim that nothing outlived
             # the cancel, and this read cannot support one.
-            survivors.append(
-                {
-                    "dag_run_id": None,
-                    "state": f"unknown — the backfill's runs were not read whole ({recheck.reason})",
-                }
-            )
+            unread = f"the backfill's runs were not read whole ({recheck.reason})"
     except Exception:
-        survivors = [{"dag_run_id": None, "state": "unknown — could not re-read the backfill"}]
+        unread = "the backfill's runs could not be re-read"
     aftermath = "cancelled" if cancelled else "CANCELLING IT FAILED"
     if not read_whole:
         aftermath += ", and the created runs were not read whole, so what it created is not established"
     if survivors:
         aftermath += f", but {len(survivors)} run(s) were already past queued and are still going"
-    return {
+    if unread:
+        aftermath += f", and {unread}, so whether any further run outlived the cancel is NOT established"
+    result = {
         "created": False,
         "mutation_applied": False,
         "backfill_id": backfill_id,
@@ -922,8 +924,15 @@ def _abandon_backfill(
         "created_run_count": len(created),
         "cancelled": cancelled,
         "surviving_runs": survivors,
+        # Three-valued, like everything else drawn over a bounded read: null says
+        # the re-read could not settle whether the survivor list is the whole of
+        # it, which an empty list on its own would have read as "none".
+        "surviving_runs_read_whole": unread is None,
         "error": (
             f"the backfill did not match the {len(planned)} runs the user approved; {aftermath}. "
             f"Tell the user to check backfill {backfill_id}."
         ),
     }
+    if unread:
+        result["surviving_runs_unread"] = unread
+    return result

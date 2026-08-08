@@ -2006,7 +2006,16 @@ def _verify_instance(
 
     failed = [check["check"] for check in checks if check["passed"] is False]
     unestablished = [check["check"] for check in checks if check["passed"] is None]
-    return {
+    # Every read behind this instance's legs that came back short, whether or not
+    # a leg happened to turn on it. A read this verification made and did not
+    # cover is a fact about this answer, and a leg that was skipped for an
+    # unrelated reason used to swallow it entirely.
+    short_reads = [
+        f"{scan.route} was NOT read whole: {scan.reason}"
+        for scan in (history, output, baseline)
+        if not scan.complete and not scan.read_failed
+    ]
+    entry = {
         "instance": where,
         "task_id": ti["task_id"],
         "map_index": ti.get("map_index", -1),
@@ -2020,6 +2029,9 @@ def _verify_instance(
         "log_tail": log.get("tail"),
         "end_date": ended,
     }
+    if short_reads:
+        entry["reads_not_read_whole"] = short_reads
+    return entry
 
 
 _APPROVED_SET_SCOPE_NOTE = (

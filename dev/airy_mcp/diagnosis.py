@@ -882,6 +882,29 @@ def diagnose_dag(
         coverage = {**coverage, "static_checks_suppressed": static_suppressed}
     import_errors = _find_import_errors(dag)
     import_checks = list(import_errors.rows)
+    # The read's coverage travels as checks, built HERE from the reading's own
+    # numbers. It used to travel inside ``rows``, where it raised ``kept`` by one
+    # and made a read that had missed exactly one row report itself whole.
+    if import_errors.read_failed:
+        import_checks.append(
+            {
+                "kind": "import_errors_unreadable",
+                "detail": (
+                    f"the import-error list could not be read ({import_errors.error}), so whether "
+                    f"this Dag's file still imports is NOT established by this diagnosis"
+                ),
+            }
+        )
+    elif not import_errors.complete:
+        import_checks.append(
+            {
+                "kind": "import_errors_truncated",
+                "detail": (
+                    f"the import-error list was not read whole ({import_errors.reason}), so an "
+                    f"import error for this Dag's file may be missing from this diagnosis"
+                ),
+            }
+        )
     if not task_graph.complete:
         import_checks = [
             *import_checks,

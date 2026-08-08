@@ -199,7 +199,10 @@ class Reading:
         """
         if self.error is not None:
             return False
-        return self.kept >= self.universe
+        # The exhaustion evidence is part of the answer, not decoration beside
+        # it: a reading that stopped at a ceiling has not reached the end of the
+        # list whatever the arithmetic makes of the count it was given.
+        return self._exhausted and self.kept >= self.universe
 
     @property
     def read_failed(self) -> bool:
@@ -218,15 +221,21 @@ class Reading:
             return f"{self.route or 'the read'} could not be read ({self.error})"
         if self.complete:
             return ""
-        if self.note:
-            return self.note
+        # Every shortfall this reading carries, not the first one that matches:
+        # the branches used to be exclusive and the note was returned ahead of
+        # all of them, so a clamp applied after a short read was described by
+        # the sentence the short read had already written.
         claimed = self._claimed
+        parts = []
+        if self.note:
+            parts.append(self.note)
         if isinstance(claimed, int) and claimed > self._delivered:
-            source = f"the route accounted for {claimed} and handed over {self._delivered}"
-        elif self.kept < self._delivered:
-            source = f"{self._delivered} row(s) came back and this reading keeps {self.kept}"
-        else:
-            source = f"{self.kept} of {self.universe} row(s) were read"
+            parts.append(f"the route accounted for {claimed} and handed over {self._delivered}")
+        if self.kept < self._delivered:
+            parts.append(f"{self._delivered} row(s) came back and this reading keeps {self.kept}")
+        if not parts:
+            parts.append(f"{self.kept} of {self.universe} row(s) were read")
+        source = "; ".join(parts)
         pages = f"; {self._pages} page(s) were followed" if self._pages > 1 else ""
         ceiling = "" if self._exhausted else "; the scan stopped at its own ceiling"
         return f"{source}{pages}{ceiling}"
@@ -299,13 +308,25 @@ def read_of(
     body = resp if isinstance(resp, dict) else {}
     rows = body.get(key) or []
     if not isinstance(rows, list):
-        rows = []
+        # A body whose list key is not a list is a body this reading could not
+        # read. It used to become an empty list, and an empty list over a
+        # malformed body is a complete read of nothing — which lets ``none_match``
+        # answer a confident negative over a response nobody could parse.
+        return failed_read(route, f"{key!r} came back as {type(rows).__name__} and not as a list")
     kept = tuple(row for row in rows if isinstance(row, dict))
     claimed = body.get("total_entries")
+    if claimed is not None and (not isinstance(claimed, int) or isinstance(claimed, bool)):
+        # The route accounted for its rows in a form this reading cannot use, so
+        # it cannot say it saw all of them. Dropping it to "no count at all" made
+        # an unreadable total indistinguishable from an exhaustive read.
+        claimed = len(rows) + 1
     return Reading(
         rows=kept,
         route=route,
-        _delivered=len(kept) if delivered is None else delivered,
+        # What CAME BACK, not what this reading could use: a row it discarded is
+        # a row it did not look at, and counting only the usable ones made the
+        # discard cancel out and the read report itself whole.
+        _delivered=len(rows) if delivered is None else delivered,
         _claimed=claimed if isinstance(claimed, int) and not isinstance(claimed, bool) else None,
         _pages=pages,
         _exhausted=exhausted,
@@ -528,9 +549,18 @@ def _run_task_instances(dag_id: str, run_path: str) -> Reading:
             params={"limit": TASK_INSTANCE_PAGE, "offset": len(tis)},
         )
         page = resp["task_instances"]
-        total = resp.get("total_entries", len(page))
+        claimed = resp.get("total_entries")
         tis += page
         pages += 1
+        if isinstance(claimed, int) and not isinstance(claimed, bool):
+            total = claimed
+        else:
+            # No count at all. Taking the page's own length as the total made
+            # the route's silence end the scan AND certify it: 250 rows behind a
+            # 100-row page came back complete and exhausted, and a row past the
+            # first page came back ABSENT. A FULL page is evidence of at least
+            # one more row, which is the sentinel ``_backfill_runs`` already uses.
+            total = len(tis) + (1 if len(page) >= TASK_INSTANCE_PAGE else 0)
         # An empty page ends it whatever the count says: a total that never
         # comes down would otherwise loop for as long as the ceiling allows.
         if not page:
@@ -580,30 +610,22 @@ def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
     error list is the only place that failure shows up.
     """
     if not dag:
-        return Reading(route=_IMPORT_ERRORS_ROUTE)
+        # NOT an empty complete read: no lookup happened, so whether this Dag's
+        # file still imports is not established by it.
+        return failed_read(_IMPORT_ERRORS_ROUTE, "the Dag record was not read, so it names no file to match")
     names = {name for name in (dag.get("fileloc"), dag.get("relative_fileloc")) if name}
     if not names:
-        return Reading(route=_IMPORT_ERRORS_ROUTE)
+        return failed_read(_IMPORT_ERRORS_ROUTE, "the Dag record names no file to match an import error to")
     try:
         resp = transport._api("GET", "/importErrors", params={"limit": 100})
         errors = resp["import_errors"]
-    except (httpx.HTTPStatusError, KeyError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         # A bare empty list here was indistinguishable from "this Dag's file
         # imports cleanly", which is the one thing an unreadable import-error
-        # list must never be mistaken for. The refusal travels as a check, so it
-        # reaches the summary rather than only the shape of the return value.
-        return replace(
-            failed_read(_IMPORT_ERRORS_ROUTE, _explain_error(e)),
-            rows=(
-                {
-                    "kind": "import_errors_unreadable",
-                    "detail": (
-                        f"the import-error list could not be read ({_explain_error(e)}), so whether "
-                        f"this Dag's file still imports is NOT established by this diagnosis"
-                    ),
-                },
-            ),
-        )
+        # list must never be mistaken for. The caller turns this into a check so
+        # it reaches the summary; it is NOT smuggled into ``rows``, because
+        # ``rows`` is the numerator of ``complete``.
+        return failed_read(_IMPORT_ERRORS_ROUTE, _explain_error(e))
     checks = []
     dag_bundle = dag.get("bundle_name")
     for entry in errors:
@@ -630,26 +652,14 @@ def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
                     "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace}",
                 }
             )
-    scan = matches_of(
+    # Nothing but ``clamp``, ``filter`` and ``project`` may change ``rows``: it
+    # is the numerator of ``complete``, so appending one synthetic note row
+    # raised ``kept`` by one while ``_delivered`` and ``_claimed`` stood still —
+    # and a read that had left exactly one row unexamined then reported itself
+    # WHOLE, with ``omitted`` zero. The truncation travels as the reading's own
+    # note, and the caller renders it as a check.
+    return matches_of(
         checks, scanned=len(errors), claimed=resp.get("total_entries"), route=_IMPORT_ERRORS_ROUTE
-    )
-    if scan.complete:
-        return scan
-    # The truncation travels as a check of its own, so the diagnosis that lists
-    # the findings also lists the reason its list may be short of one.
-    return replace(
-        scan,
-        rows=(
-            *scan.rows,
-            {
-                "kind": "import_errors_truncated",
-                "detail": (
-                    f"only the first {len(errors)} of {resp.get('total_entries')} import errors were "
-                    f"checked, so an import error for this Dag's file may be missing from this "
-                    f"diagnosis"
-                ),
-            },
-        ),
     )
 
 

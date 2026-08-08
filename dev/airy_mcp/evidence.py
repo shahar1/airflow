@@ -1010,9 +1010,17 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
                 },
             )
             page = resp["event_logs"]
-            total = resp.get("total_entries", len(page))
+            claimed = resp.get("total_entries")
             fetched += page
             pages += 1
+            if isinstance(claimed, int) and not isinstance(claimed, bool):
+                total = claimed
+            else:
+                # A route that omits its count does not get to end the scan and
+                # certify it whole; a FULL page is evidence of at least one more
+                # row. Same sentinel as the run-instance scan and the backfill
+                # run list, for the same reason.
+                total = len(fetched) + (1 if len(page) >= reading.EVENT_SCAN_PAGE else 0)
             # An empty page ends it whatever the count says.
             if not page:
                 exhausted = True
