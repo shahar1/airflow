@@ -1,0 +1,4869 @@
+{
+  "source": "/home/shahar/repos/apache/airflow/dev/airy_mcp/server.py",
+  "node_count": 157,
+  "edge_count": 365,
+  "mcp_tools": [
+    "apply_dag_code_changes",
+    "apply_task_instance_clear",
+    "compare_dag_runs",
+    "diagnose_dag",
+    "find_failure_clusters",
+    "get_blast_radius",
+    "plan_backfill",
+    "plan_dag_code_changes",
+    "plan_revert_dag_code",
+    "plan_task_instance_clear",
+    "rerun_dag",
+    "revert_dag_code",
+    "run_backfill",
+    "verify_task_instance_recovery"
+  ],
+  "nodes": [
+    {
+      "name": "DagFileError",
+      "line": 146,
+      "end_line": 147,
+      "kind": "class",
+      "public": true,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 8,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "DagFileDriftError",
+        "_backup_path",
+        "_dag_path",
+        "apply_dag_code_changes",
+        "diagnose_dag",
+        "plan_dag_code_changes",
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_login",
+      "line": 150,
+      "end_line": 153,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_api"
+      ]
+    },
+    {
+      "name": "_api",
+      "line": 156,
+      "end_line": 167,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 31,
+      "calls": [
+        "_login"
+      ],
+      "references": [],
+      "called_by": [
+        "_abandon_backfill",
+        "_attempt_history",
+        "_attempt_log",
+        "_backfill_runs",
+        "_build_asset_note",
+        "_dag_path",
+        "_dry_run_backfill",
+        "_duration_baseline",
+        "_event_history",
+        "_expandable_probe",
+        "_find_import_errors",
+        "_force_reparse",
+        "_latest_version",
+        "_parsed_source",
+        "_recent_runs",
+        "_recorded_output",
+        "_resolve_run",
+        "_run_task_instances",
+        "_task_comparison",
+        "_tasks_reading",
+        "_version_context",
+        "apply_dag_code_changes",
+        "apply_task_instance_clear",
+        "diagnose_dag",
+        "find_failure_clusters",
+        "get_blast_radius",
+        "plan_revert_dag_code",
+        "plan_task_instance_clear",
+        "rerun_dag",
+        "revert_dag_code",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_dag_url",
+      "line": 170,
+      "end_line": 172,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 21,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_attempt_history",
+        "_attempt_log",
+        "_dag_path",
+        "_duration_baseline",
+        "_expandable_probe",
+        "_latest_version",
+        "_recent_runs",
+        "_recorded_output",
+        "_resolve_run",
+        "_run_task_instances",
+        "_task_comparison",
+        "_tasks_reading",
+        "_version_context",
+        "apply_dag_code_changes",
+        "apply_task_instance_clear",
+        "diagnose_dag",
+        "find_failure_clusters",
+        "plan_revert_dag_code",
+        "plan_task_instance_clear",
+        "rerun_dag",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_explain_unknown_dag",
+      "line": 175,
+      "end_line": 185,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 10,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_resolve_run",
+        "apply_dag_code_changes",
+        "compare_dag_runs",
+        "diagnose_dag",
+        "plan_backfill",
+        "plan_dag_code_changes",
+        "plan_revert_dag_code",
+        "rerun_dag",
+        "revert_dag_code",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_explain_error",
+      "line": 188,
+      "end_line": 208,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 12,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_attempt_history",
+        "_attempt_log",
+        "_change_impact",
+        "_event_history",
+        "_recorded_output",
+        "_task_comparison",
+        "_version_context",
+        "apply_dag_code_changes",
+        "diagnose_dag",
+        "plan_dag_code_changes",
+        "rerun_dag",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_dag_path",
+      "line": 211,
+      "end_line": 225,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 5,
+      "calls": [
+        "DagFileError",
+        "_api",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "diagnose_dag",
+        "plan_dag_code_changes",
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_parsed_source",
+      "line": 228,
+      "end_line": 241,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 4,
+      "calls": [
+        "DagFileDriftError",
+        "_api"
+      ],
+      "references": [],
+      "called_by": [
+        "_read_reviewed_file",
+        "compare_dag_runs",
+        "diagnose_dag",
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "DagFileDriftError",
+      "line": 244,
+      "end_line": 245,
+      "kind": "class",
+      "public": true,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 7,
+      "calls": [],
+      "references": [
+        "DagFileError"
+      ],
+      "called_by": [
+        "_parsed_source",
+        "_read_reviewed_file",
+        "_write_if_unchanged",
+        "apply_dag_code_changes",
+        "compare_dag_runs",
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_exclusive",
+      "line": 249,
+      "end_line": 262,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_write_if_unchanged",
+      "line": 265,
+      "end_line": 288,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "DagFileDriftError"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_backup_path",
+      "line": 291,
+      "end_line": 301,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 3,
+      "calls": [
+        "DagFileError"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_read_reviewed_file",
+      "line": 304,
+      "end_line": 317,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 3,
+      "calls": [
+        "DagFileDriftError",
+        "_parsed_source"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_latest_version",
+      "line": 320,
+      "end_line": 324,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 3,
+      "calls": [
+        "_api",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "_force_reparse",
+        "apply_dag_code_changes",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_force_reparse",
+      "line": 327,
+      "end_line": 352,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 2,
+      "calls": [
+        "_api",
+        "_latest_version"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_tail",
+      "line": 355,
+      "end_line": 362,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_attempt_log",
+        "diagnose_dag",
+        "find_failure_clusters"
+      ]
+    },
+    {
+      "name": "_run_task_instances",
+      "line": 365,
+      "end_line": 382,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 5,
+      "calls": [
+        "_api",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "_version_drift",
+        "compare_dag_runs",
+        "diagnose_dag",
+        "plan_task_instance_clear",
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_tasks_reading",
+      "line": 385,
+      "end_line": 395,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 2,
+      "calls": [
+        "_api",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "_tasks",
+        "_version_drift"
+      ]
+    },
+    {
+      "name": "_tasks",
+      "line": 398,
+      "end_line": 400,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 5,
+      "calls": [
+        "_tasks_reading"
+      ],
+      "references": [],
+      "called_by": [
+        "_change_impact",
+        "_find_unaddressed_findings",
+        "_mapped_in_closure",
+        "_resolve_task",
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_display_order",
+      "line": 403,
+      "end_line": 439,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_ambiguous_positions"
+      ],
+      "references": [],
+      "called_by": [
+        "_resolve_task",
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_reachable",
+      "line": 442,
+      "end_line": 457,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_ambiguous_positions"
+      ]
+    },
+    {
+      "name": "_ambiguous_positions",
+      "line": 460,
+      "end_line": 480,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_reachable"
+      ],
+      "references": [],
+      "called_by": [
+        "_display_order"
+      ]
+    },
+    {
+      "name": "_changed_lines_touch_assets",
+      "line": 498,
+      "end_line": 503,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_change_impact"
+      ]
+    },
+    {
+      "name": "_referenced_task_ids",
+      "line": 506,
+      "end_line": 507,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_static_checks"
+      ]
+    },
+    {
+      "name": "_declared_task_ids",
+      "line": 510,
+      "end_line": 511,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_change_impact",
+        "_static_checks"
+      ]
+    },
+    {
+      "name": "_static_checks",
+      "line": 517,
+      "end_line": 581,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 2,
+      "calls": [
+        "_declared_task_ids",
+        "_fenced",
+        "_quoted",
+        "_referenced_task_ids"
+      ],
+      "references": [],
+      "called_by": [
+        "_find_unaddressed_findings",
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_find_import_errors",
+      "line": 584,
+      "end_line": 638,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_quoted"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_ti_key",
+      "line": 681,
+      "end_line": 682,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 7,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_approved_instance_set_check",
+        "_attribution_reader",
+        "_check_dispatch_evidence",
+        "_event_association",
+        "_project_task_instances",
+        "_ti_where",
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_ti_where",
+      "line": 685,
+      "end_line": 687,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 10,
+      "calls": [
+        "_ti_key"
+      ],
+      "references": [],
+      "called_by": [
+        "_approved_instance_set_check",
+        "_check_dispatch_evidence",
+        "_containment_gate",
+        "_dispatch_finding",
+        "_recovery_evidence",
+        "_recovery_warnings",
+        "_summarize_failure",
+        "_verify_instance",
+        "plan_task_instance_clear",
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_quoted",
+      "line": 703,
+      "end_line": 722,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 14,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_clear_flags",
+        "_clear_outcome_unknown",
+        "_containment_gate",
+        "_contrast_clause",
+        "_dispatch_finding",
+        "_downstream_dating_check",
+        "_find_import_errors",
+        "_last_state_change",
+        "_recovery_evidence",
+        "_static_checks",
+        "_summarize_failure",
+        "_verify_instance",
+        "apply_task_instance_clear",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_fenced",
+      "line": 725,
+      "end_line": 734,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 9,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_build_diagnosis_summary",
+        "_contrast_clause",
+        "_coverage_clauses",
+        "_dispatch_finding",
+        "_impact_clause",
+        "_recurrence_clause",
+        "_static_checks",
+        "_summarize_failure",
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_clamped_operator",
+      "line": 737,
+      "end_line": 741,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 5,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_audit_transitions",
+        "_dispatch_finding",
+        "_project_task_instances",
+        "_recorded_output",
+        "_task_comparison"
+      ]
+    },
+    {
+      "name": "_is_never_dispatched_attempt",
+      "line": 744,
+      "end_line": 804,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_dispatch_finding",
+        "_recovery_evidence",
+        "_tries_probe_tier"
+      ]
+    },
+    {
+      "name": "_tries_probe_tier",
+      "line": 807,
+      "end_line": 838,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_is_never_dispatched_attempt"
+      ],
+      "references": [],
+      "called_by": [
+        "_check_dispatch_evidence"
+      ]
+    },
+    {
+      "name": "_attempt_history",
+      "line": 841,
+      "end_line": 869,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 4,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_explain_error"
+      ],
+      "references": [],
+      "called_by": [
+        "_check_dispatch_evidence",
+        "_containment_gate",
+        "_recovery_evidence",
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_attribution_detail",
+      "line": 1239,
+      "end_line": 1241,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_bare_attribution",
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_attribution_sentence",
+      "line": 1244,
+      "end_line": 1246,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_dispatch_finding"
+      ]
+    },
+    {
+      "name": "_clamped_event_text",
+      "line": 1254,
+      "end_line": 1258,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 4,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_bounded_extra_value",
+        "_compact_event",
+        "_last_state_change",
+        "_projected_extra"
+      ]
+    },
+    {
+      "name": "_has_rest_audit_marker",
+      "line": 1261,
+      "end_line": 1280,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_classify_event",
+        "_is_request_settable_targeting"
+      ]
+    },
+    {
+      "name": "_classify_event",
+      "line": 1283,
+      "end_line": 1314,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 4,
+      "calls": [
+        "_has_rest_audit_marker"
+      ],
+      "references": [],
+      "called_by": [
+        "_compact_event",
+        "_is_request_settable_targeting",
+        "_last_state_change",
+        "_recorded_principal_kind"
+      ]
+    },
+    {
+      "name": "_is_request_settable_targeting",
+      "line": 1317,
+      "end_line": 1326,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_classify_event",
+        "_has_rest_audit_marker"
+      ],
+      "references": [],
+      "called_by": [
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_recorded_principal_kind",
+      "line": 1329,
+      "end_line": 1334,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_classify_event"
+      ],
+      "references": [],
+      "called_by": [
+        "_compact_event",
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_parsed_extra",
+      "line": 1337,
+      "end_line": 1349,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_event_history",
+        "_parsed_extra_of"
+      ]
+    },
+    {
+      "name": "_bounded_extra_value",
+      "line": 1379,
+      "end_line": 1394,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_bounded_extra_value",
+        "_clamped_event_text"
+      ],
+      "references": [],
+      "called_by": [
+        "_projected_extra"
+      ]
+    },
+    {
+      "name": "_parsed_extra_of",
+      "line": 1404,
+      "end_line": 1411,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 5,
+      "calls": [
+        "_parsed_extra"
+      ],
+      "references": [],
+      "called_by": [
+        "_compact_event",
+        "_event_association",
+        "_event_history",
+        "_last_state_change",
+        "_projected_extra"
+      ]
+    },
+    {
+      "name": "_is_json_object",
+      "line": 1414,
+      "end_line": 1421,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_projected_extra"
+      ]
+    },
+    {
+      "name": "_projected_extra",
+      "line": 1424,
+      "end_line": 1450,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_bounded_extra_value",
+        "_clamped_event_text",
+        "_is_json_object",
+        "_parsed_extra_of"
+      ],
+      "references": [],
+      "called_by": [
+        "_compact_event"
+      ]
+    },
+    {
+      "name": "_compact_event",
+      "line": 1453,
+      "end_line": 1470,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 5,
+      "fan_in": 2,
+      "calls": [
+        "_clamped_event_text",
+        "_classify_event",
+        "_parsed_extra_of",
+        "_projected_extra",
+        "_recorded_principal_kind"
+      ],
+      "references": [],
+      "called_by": [
+        "_event_history",
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_event_association",
+      "line": 1473,
+      "end_line": 1499,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_parsed_extra_of",
+        "_ti_key"
+      ],
+      "references": [],
+      "called_by": [
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_classification",
+      "line": 1502,
+      "end_line": 1514,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_bare_attribution",
+      "line": 1517,
+      "end_line": 1555,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_attribution_detail"
+      ],
+      "references": [],
+      "called_by": [
+        "_dispatch_finding",
+        "_last_state_change"
+      ]
+    },
+    {
+      "name": "_last_state_change",
+      "line": 1558,
+      "end_line": 1752,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 11,
+      "fan_in": 1,
+      "calls": [
+        "_attribution_detail",
+        "_bare_attribution",
+        "_clamped_event_text",
+        "_classification",
+        "_classify_event",
+        "_compact_event",
+        "_event_association",
+        "_is_request_settable_targeting",
+        "_parsed_extra_of",
+        "_quoted",
+        "_recorded_principal_kind"
+      ],
+      "references": [],
+      "called_by": [
+        "_attribution_reader"
+      ]
+    },
+    {
+      "name": "_event_history",
+      "line": 1755,
+      "end_line": 1863,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 5,
+      "fan_in": 2,
+      "calls": [
+        "_api",
+        "_compact_event",
+        "_explain_error",
+        "_parsed_extra",
+        "_parsed_extra_of"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag",
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_attribution_bytes",
+      "line": 1866,
+      "end_line": 1868,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_enforce_attribution_ceiling"
+      ]
+    },
+    {
+      "name": "_enforce_attribution_ceiling",
+      "line": 1871,
+      "end_line": 1907,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_attribution_bytes"
+      ],
+      "references": [
+        "_strip_context_rows",
+        "_strip_extra_projection"
+      ],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_strip_context_rows",
+      "line": 1910,
+      "end_line": 1916,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_enforce_attribution_ceiling"
+      ]
+    },
+    {
+      "name": "_strip_extra_projection",
+      "line": 1919,
+      "end_line": 1929,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_enforce_attribution_ceiling"
+      ]
+    },
+    {
+      "name": "_prune_unknowns_legend",
+      "line": 1932,
+      "end_line": 1947,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_attribution_reader",
+      "line": 1950,
+      "end_line": 1964,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_last_state_change",
+        "_ti_key"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_dispatch_finding",
+      "line": 1976,
+      "end_line": 2142,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 7,
+      "fan_in": 1,
+      "calls": [
+        "_attribution_sentence",
+        "_bare_attribution",
+        "_clamped_operator",
+        "_fenced",
+        "_is_never_dispatched_attempt",
+        "_quoted",
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "_check_dispatch_evidence"
+      ]
+    },
+    {
+      "name": "_check_dispatch_evidence",
+      "line": 2145,
+      "end_line": 2258,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 5,
+      "fan_in": 1,
+      "calls": [
+        "_attempt_history",
+        "_dispatch_finding",
+        "_ti_key",
+        "_ti_where",
+        "_tries_probe_tier"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_project_task_instances",
+      "line": 2261,
+      "end_line": 2340,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_clamped_operator",
+        "_ti_key"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_run_health",
+      "line": 2352,
+      "end_line": 2435,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_comparison_task_ids",
+      "line": 2471,
+      "end_line": 2484,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_task_comparison",
+      "line": 2487,
+      "end_line": 2544,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_clamped_operator",
+        "_dag_url",
+        "_explain_error"
+      ],
+      "references": [],
+      "called_by": [
+        "_run_history"
+      ]
+    },
+    {
+      "name": "_run_history",
+      "line": 2547,
+      "end_line": 2593,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_run_version",
+        "_task_comparison"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_recent_runs",
+      "line": 2596,
+      "end_line": 2606,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_carries_worker_field",
+      "line": 2616,
+      "end_line": 2618,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_contrast_clause",
+        "_recurrence_clause",
+        "compare_dag_runs"
+      ]
+    },
+    {
+      "name": "_compared_rows_by_run",
+      "line": 2621,
+      "end_line": 2631,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_augment_dispatch_findings"
+      ]
+    },
+    {
+      "name": "_recurrence_clause",
+      "line": 2634,
+      "end_line": 2660,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_carries_worker_field",
+        "_fenced"
+      ],
+      "references": [],
+      "called_by": [
+        "_augment_dispatch_findings"
+      ]
+    },
+    {
+      "name": "_contrast_clause",
+      "line": 2663,
+      "end_line": 2719,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_carries_worker_field",
+        "_fenced",
+        "_quoted"
+      ],
+      "references": [],
+      "called_by": [
+        "_augment_dispatch_findings"
+      ]
+    },
+    {
+      "name": "_downstream_task_ids",
+      "line": 2722,
+      "end_line": 2734,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_impact_clause"
+      ]
+    },
+    {
+      "name": "_impact_clause",
+      "line": 2737,
+      "end_line": 2770,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_downstream_task_ids",
+        "_fenced"
+      ],
+      "references": [],
+      "called_by": [
+        "_augment_dispatch_findings"
+      ]
+    },
+    {
+      "name": "_augment_dispatch_findings",
+      "line": 2773,
+      "end_line": 2831,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_compared_rows_by_run",
+        "_contrast_clause",
+        "_impact_clause",
+        "_recurrence_clause"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_summarize_failure",
+      "line": 2851,
+      "end_line": 2860,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_extract_error_line",
+        "_fenced",
+        "_quoted",
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "_build_diagnosis_summary"
+      ]
+    },
+    {
+      "name": "_census_clause",
+      "line": 2863,
+      "end_line": 2874,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_build_diagnosis_summary"
+      ]
+    },
+    {
+      "name": "_coverage_clauses",
+      "line": 2877,
+      "end_line": 2933,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_fenced"
+      ],
+      "references": [],
+      "called_by": [
+        "_build_diagnosis_summary"
+      ]
+    },
+    {
+      "name": "_build_diagnosis_summary",
+      "line": 2936,
+      "end_line": 3006,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_census_clause",
+        "_coverage_clauses",
+        "_fenced",
+        "_summarize_failure"
+      ],
+      "references": [],
+      "called_by": [
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "diagnose_dag",
+      "line": 3009,
+      "end_line": 3276,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 28,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_attribution_reader",
+        "_augment_dispatch_findings",
+        "_build_diagnosis_summary",
+        "_check_dispatch_evidence",
+        "_comparison_task_ids",
+        "_dag_path",
+        "_dag_url",
+        "_display_order",
+        "_enforce_attribution_ceiling",
+        "_event_history",
+        "_explain_error",
+        "_explain_unknown_dag",
+        "_fenced",
+        "_find_import_errors",
+        "_parsed_source",
+        "_project_task_instances",
+        "_prune_unknowns_legend",
+        "_recent_runs",
+        "_resolve_run",
+        "_run_health",
+        "_run_history",
+        "_run_task_instances",
+        "_run_version",
+        "_static_checks",
+        "_tail",
+        "_tasks"
+      ],
+      "references": [
+        "DagFileError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "_definition_updates",
+      "line": 3279,
+      "end_line": 3288,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "_normalized_changes",
+      "line": 3291,
+      "end_line": 3303,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "_patch",
+      "line": 3306,
+      "end_line": 3324,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "_definition_count",
+      "line": 3327,
+      "end_line": 3342,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_taskflow_definition_count"
+      ],
+      "references": [],
+      "called_by": [
+        "_change_impact"
+      ]
+    },
+    {
+      "name": "_decorator_root",
+      "line": 3345,
+      "end_line": 3351,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_taskflow_definition_count"
+      ]
+    },
+    {
+      "name": "_taskflow_definition_count",
+      "line": 3354,
+      "end_line": 3370,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_decorator_root"
+      ],
+      "references": [],
+      "called_by": [
+        "_definition_count"
+      ]
+    },
+    {
+      "name": "_mentions_task",
+      "line": 3373,
+      "end_line": 3383,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_change_impact"
+      ]
+    },
+    {
+      "name": "_change_impact",
+      "line": 3386,
+      "end_line": 3462,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 6,
+      "fan_in": 1,
+      "calls": [
+        "_changed_lines_touch_assets",
+        "_declared_task_ids",
+        "_definition_count",
+        "_explain_error",
+        "_mentions_task",
+        "_tasks"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "_find_unaddressed_findings",
+      "line": 3465,
+      "end_line": 3480,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_static_checks",
+        "_tasks"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "_build_asset_note",
+      "line": 3483,
+      "end_line": 3503,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_compute_asset_edges"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "_build_revert_diff",
+      "line": 3506,
+      "end_line": 3514,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "plan_revert_dag_code",
+        "revert_dag_code"
+      ]
+    },
+    {
+      "name": "plan_revert_dag_code",
+      "line": 3517,
+      "end_line": 3572,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 10,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_backup_path",
+        "_build_revert_diff",
+        "_dag_path",
+        "_dag_url",
+        "_explain_unknown_dag",
+        "_issue_token",
+        "_read_reviewed_file"
+      ],
+      "references": [
+        "DagFileDriftError",
+        "DagFileError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "revert_dag_code",
+      "line": 3575,
+      "end_line": 3652,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 16,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_backup_path",
+        "_build_revert_diff",
+        "_dag_path",
+        "_dag_url",
+        "_definition_updates",
+        "_exclusive",
+        "_explain_error",
+        "_explain_unknown_dag",
+        "_force_reparse",
+        "_latest_version",
+        "_read_reviewed_file",
+        "_redeem_token",
+        "_write_if_unchanged"
+      ],
+      "references": [
+        "DagFileDriftError",
+        "DagFileError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "plan_dag_code_changes",
+      "line": 3655,
+      "end_line": 3754,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 12,
+      "fan_in": 0,
+      "calls": [
+        "_build_asset_note",
+        "_change_impact",
+        "_dag_path",
+        "_discard_same_source_plans",
+        "_explain_error",
+        "_explain_unknown_dag",
+        "_find_unaddressed_findings",
+        "_issue_token",
+        "_normalized_changes",
+        "_parsed_source",
+        "_patch"
+      ],
+      "references": [
+        "DagFileError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "apply_dag_code_changes",
+      "line": 3765,
+      "end_line": 3897,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 17,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_backup_path",
+        "_dag_path",
+        "_dag_url",
+        "_definition_updates",
+        "_exclusive",
+        "_explain_error",
+        "_explain_unknown_dag",
+        "_force_reparse",
+        "_latest_version",
+        "_normalized_changes",
+        "_patch",
+        "_read_reviewed_file",
+        "_redeem_token",
+        "_write_if_unchanged"
+      ],
+      "references": [
+        "DagFileDriftError",
+        "DagFileError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "_describe_bounds",
+      "line": 3911,
+      "end_line": 3930,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_describe_params",
+        "_validate_conf"
+      ]
+    },
+    {
+      "name": "_describe_params",
+      "line": 3933,
+      "end_line": 3946,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_describe_bounds"
+      ],
+      "references": [],
+      "called_by": [
+        "_validate_conf"
+      ]
+    },
+    {
+      "name": "_validate_conf",
+      "line": 3949,
+      "end_line": 3988,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_describe_bounds",
+        "_describe_params"
+      ],
+      "references": [],
+      "called_by": [
+        "rerun_dag"
+      ]
+    },
+    {
+      "name": "rerun_dag",
+      "line": 3991,
+      "end_line": 4089,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 7,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_explain_error",
+        "_explain_unknown_dag",
+        "_issue_token",
+        "_redeem_token",
+        "_validate_conf"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "_run_version",
+      "line": 4092,
+      "end_line": 4095,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_run_history",
+        "compare_dag_runs",
+        "diagnose_dag"
+      ]
+    },
+    {
+      "name": "_resolve_run",
+      "line": 4098,
+      "end_line": 4133,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 4,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_explain_unknown_dag"
+      ],
+      "references": [],
+      "called_by": [
+        "compare_dag_runs",
+        "diagnose_dag",
+        "plan_task_instance_clear",
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_resolve_task",
+      "line": 4136,
+      "end_line": 4162,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_display_order",
+        "_tasks"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_clear_body",
+      "line": 4165,
+      "end_line": 4210,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_task_instance_clear",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_affected",
+      "line": 4213,
+      "end_line": 4222,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_task_instance_clear",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_identities",
+      "line": 4225,
+      "end_line": 4227,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_containment_gate",
+        "apply_task_instance_clear",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_version_drift",
+      "line": 4230,
+      "end_line": 4256,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 2,
+      "calls": [
+        "_run_task_instances",
+        "_tasks_reading"
+      ],
+      "references": [],
+      "called_by": [
+        "_containment_gate",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_now_iso",
+      "line": 4313,
+      "end_line": 4314,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_clear_outcome_unknown",
+        "_record_approved_set",
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_plan_target",
+      "line": 4317,
+      "end_line": 4323,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_clear_outcome_unknown",
+        "_containment_gate",
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_attempt_log",
+      "line": 4326,
+      "end_line": 4352,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 2,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_explain_error",
+        "_tail"
+      ],
+      "references": [],
+      "called_by": [
+        "_recovery_evidence",
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_attempt_rows",
+      "line": 4355,
+      "end_line": 4368,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_attempt_reading"
+      ]
+    },
+    {
+      "name": "_attempt_reading",
+      "line": 4377,
+      "end_line": 4398,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 3,
+      "calls": [
+        "_attempt_rows"
+      ],
+      "references": [],
+      "called_by": [
+        "_containment_gate",
+        "_recovery_evidence",
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_carries_execution_fields",
+      "line": 4401,
+      "end_line": 4402,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_duration_baseline",
+        "_recovery_evidence"
+      ]
+    },
+    {
+      "name": "_tagged_log",
+      "line": 4412,
+      "end_line": 4416,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_recovery_evidence"
+      ]
+    },
+    {
+      "name": "_recovery_evidence",
+      "line": 4425,
+      "end_line": 4522,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 8,
+      "fan_in": 1,
+      "calls": [
+        "_attempt_history",
+        "_attempt_log",
+        "_attempt_reading",
+        "_carries_execution_fields",
+        "_is_never_dispatched_attempt",
+        "_quoted",
+        "_tagged_log",
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_version_context",
+      "line": 4525,
+      "end_line": 4586,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_explain_error"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_expandable_probe",
+      "line": 4595,
+      "end_line": 4619,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_api_detail",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "_mapped_in_closure"
+      ]
+    },
+    {
+      "name": "_mapped_in_closure",
+      "line": 4622,
+      "end_line": 4653,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 2,
+      "calls": [
+        "_expandable_probe",
+        "_tasks"
+      ],
+      "references": [],
+      "called_by": [
+        "_containment_gate",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_recovery_warnings",
+      "line": 4656,
+      "end_line": 4716,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_clear_flags",
+      "line": 4719,
+      "end_line": 4792,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_quoted"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_api_detail",
+      "line": 4829,
+      "end_line": 4838,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_expandable_probe",
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_clear_flag_error",
+      "line": 4841,
+      "end_line": 4864,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "apply_task_instance_clear",
+        "plan_task_instance_clear"
+      ]
+    },
+    {
+      "name": "plan_task_instance_clear",
+      "line": 4867,
+      "end_line": 5123,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 18,
+      "fan_in": 0,
+      "calls": [
+        "_affected",
+        "_api",
+        "_clear_body",
+        "_clear_flag_error",
+        "_clear_flags",
+        "_dag_url",
+        "_identities",
+        "_issue_token",
+        "_mapped_in_closure",
+        "_quoted",
+        "_recovery_evidence",
+        "_recovery_warnings",
+        "_resolve_run",
+        "_resolve_task",
+        "_run_task_instances",
+        "_ti_where",
+        "_version_context",
+        "_version_drift"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "_read_is_complete",
+      "line": 5155,
+      "end_line": 5168,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_containment_gate"
+      ]
+    },
+    {
+      "name": "_incomplete_read",
+      "line": 5171,
+      "end_line": 5193,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_containment_gate"
+      ]
+    },
+    {
+      "name": "_expired_evidence",
+      "line": 5196,
+      "end_line": 5215,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_containment_gate"
+      ]
+    },
+    {
+      "name": "_containment_gate",
+      "line": 5218,
+      "end_line": 5398,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 11,
+      "fan_in": 1,
+      "calls": [
+        "_attempt_history",
+        "_attempt_reading",
+        "_expired_evidence",
+        "_identities",
+        "_incomplete_read",
+        "_mapped_in_closure",
+        "_plan_target",
+        "_quoted",
+        "_read_is_complete",
+        "_ti_where",
+        "_version_drift"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_clear_outcome_unknown",
+      "line": 5401,
+      "end_line": 5441,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_now_iso",
+        "_plan_target",
+        "_quoted",
+        "_record_approved_set"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "apply_task_instance_clear",
+      "line": 5444,
+      "end_line": 5733,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 15,
+      "fan_in": 0,
+      "calls": [
+        "_affected",
+        "_api",
+        "_api_detail",
+        "_clear_body",
+        "_clear_flag_error",
+        "_clear_outcome_unknown",
+        "_containment_gate",
+        "_dag_url",
+        "_identities",
+        "_now_iso",
+        "_peek_token",
+        "_plan_target",
+        "_quoted",
+        "_record_approved_set",
+        "_redeem_token"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "_check",
+      "line": 5736,
+      "end_line": 5738,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_approved_instance_set_check",
+        "_downstream_dating_check",
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_later_than",
+      "line": 5741,
+      "end_line": 5752,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 3,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_audit_transitions",
+        "_downstream_dating_check",
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_recorded_output",
+      "line": 5760,
+      "end_line": 5802,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 4,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_clamped_operator",
+        "_dag_url",
+        "_explain_error"
+      ],
+      "references": [],
+      "called_by": [
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_audit_transitions",
+      "line": 5805,
+      "end_line": 5830,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_clamped_operator",
+        "_later_than"
+      ],
+      "references": [],
+      "called_by": [
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_duration_baseline",
+      "line": 5833,
+      "end_line": 5871,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_carries_execution_fields",
+        "_dag_url"
+      ],
+      "references": [],
+      "called_by": [
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_downstream_dating_check",
+      "line": 5881,
+      "end_line": 5935,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_check",
+        "_later_than",
+        "_quoted"
+      ],
+      "references": [],
+      "called_by": [
+        "_verify_instance"
+      ]
+    },
+    {
+      "name": "_verify_instance",
+      "line": 5938,
+      "end_line": 6223,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 11,
+      "fan_in": 1,
+      "calls": [
+        "_attempt_history",
+        "_attempt_log",
+        "_attempt_reading",
+        "_audit_transitions",
+        "_check",
+        "_downstream_dating_check",
+        "_duration_baseline",
+        "_later_than",
+        "_quoted",
+        "_recorded_output",
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_approved_instance_set_check",
+      "line": 6238,
+      "end_line": 6312,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 3,
+      "fan_in": 1,
+      "calls": [
+        "_check",
+        "_ti_key",
+        "_ti_where"
+      ],
+      "references": [],
+      "called_by": [
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "verify_task_instance_recovery",
+      "line": 6315,
+      "end_line": 6470,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 8,
+      "fan_in": 0,
+      "calls": [
+        "_approved_instance_set_check",
+        "_approved_set_record",
+        "_event_history",
+        "_resolve_run",
+        "_run_task_instances",
+        "_ti_key",
+        "_ti_where",
+        "_verify_instance"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "compare_dag_runs",
+      "line": 6473,
+      "end_line": 6586,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 7,
+      "fan_in": 0,
+      "calls": [
+        "_carries_worker_field",
+        "_explain_unknown_dag",
+        "_parsed_source",
+        "_resolve_run",
+        "_run_task_instances",
+        "_run_version"
+      ],
+      "references": [
+        "DagFileDriftError"
+      ],
+      "called_by": []
+    },
+    {
+      "name": "_clip_at_word",
+      "line": 6589,
+      "end_line": 6595,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_extract_error_line"
+      ]
+    },
+    {
+      "name": "_extract_error_line",
+      "line": 6598,
+      "end_line": 6621,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_clip_at_word"
+      ],
+      "references": [],
+      "called_by": [
+        "_error_signature",
+        "_summarize_failure"
+      ]
+    },
+    {
+      "name": "_error_signature",
+      "line": 6624,
+      "end_line": 6632,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 1,
+      "calls": [
+        "_extract_error_line"
+      ],
+      "references": [],
+      "called_by": [
+        "find_failure_clusters"
+      ]
+    },
+    {
+      "name": "find_failure_clusters",
+      "line": 6635,
+      "end_line": 6701,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 4,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_dag_url",
+        "_error_signature",
+        "_tail"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "_run_identity",
+      "line": 6704,
+      "end_line": 6724,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "plan_backfill",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_same_runs",
+      "line": 6727,
+      "end_line": 6729,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_dry_run_backfill",
+      "line": 6732,
+      "end_line": 6738,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_api"
+      ],
+      "references": [],
+      "called_by": [
+        "plan_backfill",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_issue_token",
+      "line": 6749,
+      "end_line": 6757,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 5,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "plan_backfill",
+        "plan_dag_code_changes",
+        "plan_revert_dag_code",
+        "plan_task_instance_clear",
+        "rerun_dag"
+      ]
+    },
+    {
+      "name": "_peek_token",
+      "line": 6760,
+      "end_line": 6773,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_redeem_token",
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_redeem_token",
+      "line": 6776,
+      "end_line": 6780,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 5,
+      "calls": [
+        "_peek_token"
+      ],
+      "references": [],
+      "called_by": [
+        "apply_dag_code_changes",
+        "apply_task_instance_clear",
+        "rerun_dag",
+        "revert_dag_code",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_record_approved_set",
+      "line": 6793,
+      "end_line": 6799,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_now_iso"
+      ],
+      "references": [],
+      "called_by": [
+        "_clear_outcome_unknown",
+        "apply_task_instance_clear"
+      ]
+    },
+    {
+      "name": "_approved_set_record",
+      "line": 6802,
+      "end_line": 6804,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "verify_task_instance_recovery"
+      ]
+    },
+    {
+      "name": "_discard_same_source_plans",
+      "line": 6807,
+      "end_line": 6826,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 1,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "plan_dag_code_changes"
+      ]
+    },
+    {
+      "name": "plan_backfill",
+      "line": 6829,
+      "end_line": 6872,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 4,
+      "fan_in": 0,
+      "calls": [
+        "_dry_run_backfill",
+        "_explain_unknown_dag",
+        "_issue_token",
+        "_run_identity"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "run_backfill",
+      "line": 6875,
+      "end_line": 6972,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 8,
+      "fan_in": 0,
+      "calls": [
+        "_abandon_backfill",
+        "_api",
+        "_backfill_runs",
+        "_dry_run_backfill",
+        "_explain_unknown_dag",
+        "_redeem_token",
+        "_run_identity",
+        "_same_runs"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "_backfill_runs",
+      "line": 6975,
+      "end_line": 6977,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 1,
+      "fan_in": 2,
+      "calls": [
+        "_api"
+      ],
+      "references": [],
+      "called_by": [
+        "_abandon_backfill",
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_abandon_backfill",
+      "line": 6980,
+      "end_line": 7018,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 2,
+      "fan_in": 1,
+      "calls": [
+        "_api",
+        "_backfill_runs"
+      ],
+      "references": [],
+      "called_by": [
+        "run_backfill"
+      ]
+    },
+    {
+      "name": "_compute_asset_edges",
+      "line": 7021,
+      "end_line": 7050,
+      "kind": "def",
+      "public": false,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 2,
+      "calls": [],
+      "references": [],
+      "called_by": [
+        "_build_asset_note",
+        "get_blast_radius"
+      ]
+    },
+    {
+      "name": "get_blast_radius",
+      "line": 7053,
+      "end_line": 7087,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": true,
+      "fan_out": 2,
+      "fan_in": 0,
+      "calls": [
+        "_api",
+        "_compute_asset_edges"
+      ],
+      "references": [],
+      "called_by": []
+    },
+    {
+      "name": "main",
+      "line": 7111,
+      "end_line": 7118,
+      "kind": "def",
+      "public": true,
+      "is_mcp_tool": false,
+      "fan_out": 0,
+      "fan_in": 0,
+      "calls": [],
+      "references": [],
+      "called_by": []
+    }
+  ],
+  "edges": [
+    {
+      "from": "DagFileDriftError",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "_abandon_backfill",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_abandon_backfill",
+      "to": "_backfill_runs",
+      "kind": "call"
+    },
+    {
+      "from": "_ambiguous_positions",
+      "to": "_reachable",
+      "kind": "call"
+    },
+    {
+      "from": "_api",
+      "to": "_login",
+      "kind": "call"
+    },
+    {
+      "from": "_approved_instance_set_check",
+      "to": "_check",
+      "kind": "call"
+    },
+    {
+      "from": "_approved_instance_set_check",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_approved_instance_set_check",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_history",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_history",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_history",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_log",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_log",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_log",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_log",
+      "to": "_tail",
+      "kind": "call"
+    },
+    {
+      "from": "_attempt_reading",
+      "to": "_attempt_rows",
+      "kind": "call"
+    },
+    {
+      "from": "_attribution_reader",
+      "to": "_last_state_change",
+      "kind": "call"
+    },
+    {
+      "from": "_attribution_reader",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_audit_transitions",
+      "to": "_clamped_operator",
+      "kind": "call"
+    },
+    {
+      "from": "_audit_transitions",
+      "to": "_later_than",
+      "kind": "call"
+    },
+    {
+      "from": "_augment_dispatch_findings",
+      "to": "_compared_rows_by_run",
+      "kind": "call"
+    },
+    {
+      "from": "_augment_dispatch_findings",
+      "to": "_contrast_clause",
+      "kind": "call"
+    },
+    {
+      "from": "_augment_dispatch_findings",
+      "to": "_impact_clause",
+      "kind": "call"
+    },
+    {
+      "from": "_augment_dispatch_findings",
+      "to": "_recurrence_clause",
+      "kind": "call"
+    },
+    {
+      "from": "_backfill_runs",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_backup_path",
+      "to": "DagFileError",
+      "kind": "call"
+    },
+    {
+      "from": "_bare_attribution",
+      "to": "_attribution_detail",
+      "kind": "call"
+    },
+    {
+      "from": "_bounded_extra_value",
+      "to": "_bounded_extra_value",
+      "kind": "call"
+    },
+    {
+      "from": "_bounded_extra_value",
+      "to": "_clamped_event_text",
+      "kind": "call"
+    },
+    {
+      "from": "_build_asset_note",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_build_asset_note",
+      "to": "_compute_asset_edges",
+      "kind": "call"
+    },
+    {
+      "from": "_build_diagnosis_summary",
+      "to": "_census_clause",
+      "kind": "call"
+    },
+    {
+      "from": "_build_diagnosis_summary",
+      "to": "_coverage_clauses",
+      "kind": "call"
+    },
+    {
+      "from": "_build_diagnosis_summary",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_build_diagnosis_summary",
+      "to": "_summarize_failure",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_changed_lines_touch_assets",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_declared_task_ids",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_definition_count",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_mentions_task",
+      "kind": "call"
+    },
+    {
+      "from": "_change_impact",
+      "to": "_tasks",
+      "kind": "call"
+    },
+    {
+      "from": "_check_dispatch_evidence",
+      "to": "_attempt_history",
+      "kind": "call"
+    },
+    {
+      "from": "_check_dispatch_evidence",
+      "to": "_dispatch_finding",
+      "kind": "call"
+    },
+    {
+      "from": "_check_dispatch_evidence",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_check_dispatch_evidence",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_check_dispatch_evidence",
+      "to": "_tries_probe_tier",
+      "kind": "call"
+    },
+    {
+      "from": "_classify_event",
+      "to": "_has_rest_audit_marker",
+      "kind": "call"
+    },
+    {
+      "from": "_clear_flags",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_clear_outcome_unknown",
+      "to": "_now_iso",
+      "kind": "call"
+    },
+    {
+      "from": "_clear_outcome_unknown",
+      "to": "_plan_target",
+      "kind": "call"
+    },
+    {
+      "from": "_clear_outcome_unknown",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_clear_outcome_unknown",
+      "to": "_record_approved_set",
+      "kind": "call"
+    },
+    {
+      "from": "_compact_event",
+      "to": "_clamped_event_text",
+      "kind": "call"
+    },
+    {
+      "from": "_compact_event",
+      "to": "_classify_event",
+      "kind": "call"
+    },
+    {
+      "from": "_compact_event",
+      "to": "_parsed_extra_of",
+      "kind": "call"
+    },
+    {
+      "from": "_compact_event",
+      "to": "_projected_extra",
+      "kind": "call"
+    },
+    {
+      "from": "_compact_event",
+      "to": "_recorded_principal_kind",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_attempt_history",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_attempt_reading",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_expired_evidence",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_identities",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_incomplete_read",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_mapped_in_closure",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_plan_target",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_read_is_complete",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_containment_gate",
+      "to": "_version_drift",
+      "kind": "call"
+    },
+    {
+      "from": "_contrast_clause",
+      "to": "_carries_worker_field",
+      "kind": "call"
+    },
+    {
+      "from": "_contrast_clause",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_contrast_clause",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_coverage_clauses",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_dag_path",
+      "to": "DagFileError",
+      "kind": "call"
+    },
+    {
+      "from": "_dag_path",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_dag_path",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_definition_count",
+      "to": "_taskflow_definition_count",
+      "kind": "call"
+    },
+    {
+      "from": "_describe_params",
+      "to": "_describe_bounds",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_attribution_sentence",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_bare_attribution",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_clamped_operator",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_is_never_dispatched_attempt",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_dispatch_finding",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_display_order",
+      "to": "_ambiguous_positions",
+      "kind": "call"
+    },
+    {
+      "from": "_downstream_dating_check",
+      "to": "_check",
+      "kind": "call"
+    },
+    {
+      "from": "_downstream_dating_check",
+      "to": "_later_than",
+      "kind": "call"
+    },
+    {
+      "from": "_downstream_dating_check",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_dry_run_backfill",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_duration_baseline",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_duration_baseline",
+      "to": "_carries_execution_fields",
+      "kind": "call"
+    },
+    {
+      "from": "_duration_baseline",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_enforce_attribution_ceiling",
+      "to": "_attribution_bytes",
+      "kind": "call"
+    },
+    {
+      "from": "_enforce_attribution_ceiling",
+      "to": "_strip_context_rows",
+      "kind": "reference"
+    },
+    {
+      "from": "_enforce_attribution_ceiling",
+      "to": "_strip_extra_projection",
+      "kind": "reference"
+    },
+    {
+      "from": "_error_signature",
+      "to": "_extract_error_line",
+      "kind": "call"
+    },
+    {
+      "from": "_event_association",
+      "to": "_parsed_extra_of",
+      "kind": "call"
+    },
+    {
+      "from": "_event_association",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_event_history",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_event_history",
+      "to": "_compact_event",
+      "kind": "call"
+    },
+    {
+      "from": "_event_history",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_event_history",
+      "to": "_parsed_extra",
+      "kind": "call"
+    },
+    {
+      "from": "_event_history",
+      "to": "_parsed_extra_of",
+      "kind": "call"
+    },
+    {
+      "from": "_expandable_probe",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_expandable_probe",
+      "to": "_api_detail",
+      "kind": "call"
+    },
+    {
+      "from": "_expandable_probe",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_extract_error_line",
+      "to": "_clip_at_word",
+      "kind": "call"
+    },
+    {
+      "from": "_find_import_errors",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_find_import_errors",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_find_unaddressed_findings",
+      "to": "_static_checks",
+      "kind": "call"
+    },
+    {
+      "from": "_find_unaddressed_findings",
+      "to": "_tasks",
+      "kind": "call"
+    },
+    {
+      "from": "_force_reparse",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_force_reparse",
+      "to": "_latest_version",
+      "kind": "call"
+    },
+    {
+      "from": "_impact_clause",
+      "to": "_downstream_task_ids",
+      "kind": "call"
+    },
+    {
+      "from": "_impact_clause",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_is_request_settable_targeting",
+      "to": "_classify_event",
+      "kind": "call"
+    },
+    {
+      "from": "_is_request_settable_targeting",
+      "to": "_has_rest_audit_marker",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_attribution_detail",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_bare_attribution",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_clamped_event_text",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_classification",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_classify_event",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_compact_event",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_event_association",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_is_request_settable_targeting",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_parsed_extra_of",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_last_state_change",
+      "to": "_recorded_principal_kind",
+      "kind": "call"
+    },
+    {
+      "from": "_latest_version",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_latest_version",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_mapped_in_closure",
+      "to": "_expandable_probe",
+      "kind": "call"
+    },
+    {
+      "from": "_mapped_in_closure",
+      "to": "_tasks",
+      "kind": "call"
+    },
+    {
+      "from": "_parsed_extra_of",
+      "to": "_parsed_extra",
+      "kind": "call"
+    },
+    {
+      "from": "_parsed_source",
+      "to": "DagFileDriftError",
+      "kind": "call"
+    },
+    {
+      "from": "_parsed_source",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_project_task_instances",
+      "to": "_clamped_operator",
+      "kind": "call"
+    },
+    {
+      "from": "_project_task_instances",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_projected_extra",
+      "to": "_bounded_extra_value",
+      "kind": "call"
+    },
+    {
+      "from": "_projected_extra",
+      "to": "_clamped_event_text",
+      "kind": "call"
+    },
+    {
+      "from": "_projected_extra",
+      "to": "_is_json_object",
+      "kind": "call"
+    },
+    {
+      "from": "_projected_extra",
+      "to": "_parsed_extra_of",
+      "kind": "call"
+    },
+    {
+      "from": "_read_reviewed_file",
+      "to": "DagFileDriftError",
+      "kind": "call"
+    },
+    {
+      "from": "_read_reviewed_file",
+      "to": "_parsed_source",
+      "kind": "call"
+    },
+    {
+      "from": "_recent_runs",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_recent_runs",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_record_approved_set",
+      "to": "_now_iso",
+      "kind": "call"
+    },
+    {
+      "from": "_recorded_output",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_recorded_output",
+      "to": "_clamped_operator",
+      "kind": "call"
+    },
+    {
+      "from": "_recorded_output",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_recorded_output",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_recorded_principal_kind",
+      "to": "_classify_event",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_attempt_history",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_attempt_log",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_attempt_reading",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_carries_execution_fields",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_is_never_dispatched_attempt",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_tagged_log",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_evidence",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_recovery_warnings",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_recurrence_clause",
+      "to": "_carries_worker_field",
+      "kind": "call"
+    },
+    {
+      "from": "_recurrence_clause",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_redeem_token",
+      "to": "_peek_token",
+      "kind": "call"
+    },
+    {
+      "from": "_resolve_run",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_resolve_run",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_resolve_run",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "_resolve_task",
+      "to": "_display_order",
+      "kind": "call"
+    },
+    {
+      "from": "_resolve_task",
+      "to": "_tasks",
+      "kind": "call"
+    },
+    {
+      "from": "_run_history",
+      "to": "_run_version",
+      "kind": "call"
+    },
+    {
+      "from": "_run_history",
+      "to": "_task_comparison",
+      "kind": "call"
+    },
+    {
+      "from": "_run_task_instances",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_run_task_instances",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_static_checks",
+      "to": "_declared_task_ids",
+      "kind": "call"
+    },
+    {
+      "from": "_static_checks",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_static_checks",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_static_checks",
+      "to": "_referenced_task_ids",
+      "kind": "call"
+    },
+    {
+      "from": "_summarize_failure",
+      "to": "_extract_error_line",
+      "kind": "call"
+    },
+    {
+      "from": "_summarize_failure",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "_summarize_failure",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_summarize_failure",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_task_comparison",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_task_comparison",
+      "to": "_clamped_operator",
+      "kind": "call"
+    },
+    {
+      "from": "_task_comparison",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_task_comparison",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_taskflow_definition_count",
+      "to": "_decorator_root",
+      "kind": "call"
+    },
+    {
+      "from": "_tasks",
+      "to": "_tasks_reading",
+      "kind": "call"
+    },
+    {
+      "from": "_tasks_reading",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_tasks_reading",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_ti_where",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "_tries_probe_tier",
+      "to": "_is_never_dispatched_attempt",
+      "kind": "call"
+    },
+    {
+      "from": "_validate_conf",
+      "to": "_describe_bounds",
+      "kind": "call"
+    },
+    {
+      "from": "_validate_conf",
+      "to": "_describe_params",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_attempt_history",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_attempt_log",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_attempt_reading",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_audit_transitions",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_check",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_downstream_dating_check",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_duration_baseline",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_later_than",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_recorded_output",
+      "kind": "call"
+    },
+    {
+      "from": "_verify_instance",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "_version_context",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "_version_context",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "_version_context",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "_version_drift",
+      "to": "_run_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "_version_drift",
+      "to": "_tasks_reading",
+      "kind": "call"
+    },
+    {
+      "from": "_write_if_unchanged",
+      "to": "DagFileDriftError",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "DagFileDriftError",
+      "kind": "reference"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_backup_path",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_dag_path",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_definition_updates",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_exclusive",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_force_reparse",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_latest_version",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_normalized_changes",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_patch",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_read_reviewed_file",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_redeem_token",
+      "kind": "call"
+    },
+    {
+      "from": "apply_dag_code_changes",
+      "to": "_write_if_unchanged",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_affected",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_api_detail",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_clear_body",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_clear_flag_error",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_clear_outcome_unknown",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_containment_gate",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_identities",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_now_iso",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_peek_token",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_plan_target",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_record_approved_set",
+      "kind": "call"
+    },
+    {
+      "from": "apply_task_instance_clear",
+      "to": "_redeem_token",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "DagFileDriftError",
+      "kind": "reference"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_carries_worker_field",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_parsed_source",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_resolve_run",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_run_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "compare_dag_runs",
+      "to": "_run_version",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_attribution_reader",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_augment_dispatch_findings",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_build_diagnosis_summary",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_check_dispatch_evidence",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_comparison_task_ids",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_dag_path",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_display_order",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_enforce_attribution_ceiling",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_event_history",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_fenced",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_find_import_errors",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_parsed_source",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_project_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_prune_unknowns_legend",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_recent_runs",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_resolve_run",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_run_health",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_run_history",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_run_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_run_version",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_static_checks",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_tail",
+      "kind": "call"
+    },
+    {
+      "from": "diagnose_dag",
+      "to": "_tasks",
+      "kind": "call"
+    },
+    {
+      "from": "find_failure_clusters",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "find_failure_clusters",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "find_failure_clusters",
+      "to": "_error_signature",
+      "kind": "call"
+    },
+    {
+      "from": "find_failure_clusters",
+      "to": "_tail",
+      "kind": "call"
+    },
+    {
+      "from": "get_blast_radius",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "get_blast_radius",
+      "to": "_compute_asset_edges",
+      "kind": "call"
+    },
+    {
+      "from": "plan_backfill",
+      "to": "_dry_run_backfill",
+      "kind": "call"
+    },
+    {
+      "from": "plan_backfill",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "plan_backfill",
+      "to": "_issue_token",
+      "kind": "call"
+    },
+    {
+      "from": "plan_backfill",
+      "to": "_run_identity",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_build_asset_note",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_change_impact",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_dag_path",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_discard_same_source_plans",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_find_unaddressed_findings",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_issue_token",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_normalized_changes",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_parsed_source",
+      "kind": "call"
+    },
+    {
+      "from": "plan_dag_code_changes",
+      "to": "_patch",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "DagFileDriftError",
+      "kind": "reference"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_backup_path",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_build_revert_diff",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_dag_path",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_issue_token",
+      "kind": "call"
+    },
+    {
+      "from": "plan_revert_dag_code",
+      "to": "_read_reviewed_file",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_affected",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_clear_body",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_clear_flag_error",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_clear_flags",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_identities",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_issue_token",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_mapped_in_closure",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_quoted",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_recovery_evidence",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_recovery_warnings",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_resolve_run",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_resolve_task",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_run_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_version_context",
+      "kind": "call"
+    },
+    {
+      "from": "plan_task_instance_clear",
+      "to": "_version_drift",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_issue_token",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_redeem_token",
+      "kind": "call"
+    },
+    {
+      "from": "rerun_dag",
+      "to": "_validate_conf",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "DagFileDriftError",
+      "kind": "reference"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "DagFileError",
+      "kind": "reference"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_backup_path",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_build_revert_diff",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_dag_path",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_dag_url",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_definition_updates",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_exclusive",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_explain_error",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_force_reparse",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_latest_version",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_read_reviewed_file",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_redeem_token",
+      "kind": "call"
+    },
+    {
+      "from": "revert_dag_code",
+      "to": "_write_if_unchanged",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_abandon_backfill",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_api",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_backfill_runs",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_dry_run_backfill",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_explain_unknown_dag",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_redeem_token",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_run_identity",
+      "kind": "call"
+    },
+    {
+      "from": "run_backfill",
+      "to": "_same_runs",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_approved_instance_set_check",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_approved_set_record",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_event_history",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_resolve_run",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_run_task_instances",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_ti_key",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_ti_where",
+      "kind": "call"
+    },
+    {
+      "from": "verify_task_instance_recovery",
+      "to": "_verify_instance",
+      "kind": "call"
+    }
+  ],
+  "strongly_connected_components": {
+    "total": 157,
+    "nontrivial": [],
+    "self_recursive": [
+      "_bounded_extra_value"
+    ]
+  },
+  "unreachable_from_tools": []
+}

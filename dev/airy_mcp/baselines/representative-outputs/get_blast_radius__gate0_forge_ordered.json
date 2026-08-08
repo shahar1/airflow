@@ -1,0 +1,16 @@
+{
+  "capture": "get_blast_radius__gate0_forge_ordered",
+  "call": "get_blast_radius('gate0_forge_ordered')",
+  "status": "ok",
+  "http_calls": [
+    "GET /assets"
+  ],
+  "normalized_result": {
+    "dag_id": "gate0_forge_ordered",
+    "produces_assets": [],
+    "downstream_dags": [],
+    "consumes_assets": [],
+    "upstream_dags": [],
+    "scope": "asset edges only. Empty lists mean this Dag declares no asset dependency in the catalog \u2014 not that a failure in it has no consequences. Task-level impact inside a run is in diagnose_dag's task graph, not here."
+  }
+}

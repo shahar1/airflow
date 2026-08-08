@@ -1,0 +1,63 @@
+{
+  "capture": "compare_dag_runs__gate0_forge_ordered",
+  "call": "compare_dag_runs('gate0_forge_ordered', 'gate0_ordered_bulk_001', 'g0r1_ordered_001')",
+  "status": "ok",
+  "http_calls": [
+    "GET /dagSources/gate0_forge_ordered",
+    "GET /dags/gate0_forge_ordered/dagRuns/gate0_ordered_bulk_001",
+    "GET /dags/gate0_forge_ordered/dagRuns/gate0_ordered_bulk_001/taskInstances",
+    "GET /dags/gate0_forge_ordered/dagRuns/g0r1_ordered_001",
+    "GET /dags/gate0_forge_ordered/dagRuns/g0r1_ordered_001/taskInstances"
+  ],
+  "normalized_result": {
+    "dag_id": "gate0_forge_ordered",
+    "run_a": {
+      "dag_run_id": "gate0_ordered_bulk_001",
+      "state": "success",
+      "duration": "<DURATION>",
+      "version": 1
+    },
+    "run_b": {
+      "dag_run_id": "g0r1_ordered_001",
+      "state": "success",
+      "duration": "<DURATION>",
+      "version": 2
+    },
+    "task_durations": [
+      {
+        "task_id": "notify_treasury_complete",
+        "run_a": "<DURATION>",
+        "run_b": "<DURATION>",
+        "delta": "<DURATION>",
+        "run_a_worker_field": true,
+        "run_b_worker_field": true
+      },
+      {
+        "task_id": "prepare_disbursement_file",
+        "run_a": "<DURATION>",
+        "run_b": "<DURATION>",
+        "delta": "<DURATION>",
+        "run_a_worker_field": true,
+        "run_b_worker_field": true
+      },
+      {
+        "task_id": "record_remittance_receipt",
+        "run_a": "<DURATION>",
+        "run_b": null,
+        "delta": null,
+        "run_a_worker_field": true,
+        "run_b_worker_field": false
+      },
+      {
+        "task_id": "remit_payment_batch",
+        "run_a": "<DURATION>",
+        "run_b": "<DURATION>",
+        "delta": "<DURATION>",
+        "run_a_worker_field": false,
+        "run_b_worker_field": false
+      }
+    ],
+    "conf_changes": {},
+    "source_diff": "not shown: comparing v1 with v2 would mean reading source this request was not authorized for. Ask about the current source instead."
+  }
+}

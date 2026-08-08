@@ -1,0 +1,173 @@
+{
+  "capture": "plan_task_instance_clear__dryrun__gate0_version_drop",
+  "call": "plan_task_instance_clear('gate0_version_drop', dag_run_id='gate0_drop_001', position=1)",
+  "status": "ok",
+  "http_calls": [
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001",
+    "GET /dags/gate0_version_drop/tasks",
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001/taskInstances",
+    "POST /dags/gate0_version_drop/clearTaskInstances",
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001/taskInstances",
+    "GET /dags/gate0_version_drop/tasks",
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001/taskInstances/prepare_disbursement_file/tries",
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001/taskInstances/prepare_disbursement_file/logs/1",
+    "GET /dags/gate0_version_drop/tasks",
+    "GET /dags/gate0_version_drop/dagRuns/gate0_drop_001/taskInstances/notify_treasury_complete/listMapped",
+    "GET /dags/gate0_version_drop/dagVersions"
+  ],
+  "normalized_result": {
+    "planned": true,
+    "dag_id": "gate0_version_drop",
+    "dag_run_id": "gate0_drop_001",
+    "task_ids": [
+      "prepare_disbursement_file"
+    ],
+    "resolved_by": "position 1 in topological order ['prepare_disbursement_file', 'remit_payment_batch', 'notify_treasury_complete']",
+    "only_failed": true,
+    "include_downstream": true,
+    "run_on_latest_version": null,
+    "target": {
+      "task_id": "prepare_disbursement_file",
+      "map_index": -1,
+      "state": "success",
+      "try_number": 1
+    },
+    "affected": [
+      {
+        "task_id": "notify_treasury_complete",
+        "map_index": -1,
+        "state": "failed",
+        "try_number": 1
+      }
+    ],
+    "creates_dag_run": false,
+    "recovery_evidence": {
+      "task_id": "prepare_disbursement_file",
+      "map_index": -1,
+      "row": {
+        "state": "success",
+        "try_number": 1,
+        "max_tries": 0,
+        "hostname": "<HOST>",
+        "pid": "<PID>",
+        "queued_when": "<TS>",
+        "scheduled_when": "<TS>",
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "rendered_fields_present": true
+      },
+      "reading": "prepare_disbursement_file is recorded \"success\" at try_number 1 and this attempt carries execution fields (hostname, pid, queued_when, scheduled_when), duration 60.311805. A row like this cannot distinguish an attempt that finished its work from one that was killed part-way and had a state written over it, so a partial external effect is possible and only the external system settles it.",
+      "current_attempt_dispatched": true,
+      "partial_external_effect_possible": true,
+      "attempt_history": {
+        "status": "checked",
+        "attempts_recorded": 1,
+        "attempts": [
+          {
+            "try_number": 1,
+            "state": "success",
+            "hostname": "<HOST>",
+            "pid": "<PID>",
+            "duration": "<DURATION>",
+            "start_date": "<TS>",
+            "end_date": "<TS>"
+          }
+        ],
+        "earlier_attempt_carries_execution_fields": false,
+        "error": null
+      },
+      "live_row_carries_execution_fields": true,
+      "log_for_recorded_attempt": {
+        "try_number": 1,
+        "caveat": "The log route synthesises its 'no logs available' answer from try_number before it consults a handler, so an empty log is not evidence that nothing ran.",
+        "status": "present",
+        "tail": {
+          "source": "dag_authored_task_log",
+          "text": "y_integration='')\", \"ti_id\": \"<UUID>\", \"map_index\": -1, \"run_id\": \"gate0_drop_001\", \"task_id\": \"prepare_disbursement_file\", \"try_number\": 1, \"dag_id\": \"gate0_version_drop\", \"logger\": \"task\", \"filename\": \"task_runner.py\", \"lineno\": 2292}\n{\"timestamp\": \"<TS>\", \"event\": \"::endgroup::\", \"level\": \"info\", \"ti_id\": \"<UUID>\", \"map_index\": -1, \"run_id\": \"gate0_drop_001\", \"task_id\": \"prepare_disbursement_file\", \"try_number\": 1, \"dag_id\": \"gate0_version_drop\", \"logger\": \"task\", \"filename\": \"task_runner.py\", \"lineno\": 2391}"
+        }
+      },
+      "scope_note": "This reading describes the attempt recorded on the live row. It is not a statement about earlier attempts: 'not dispatched on this attempt' is never 'never executed historically'.",
+      "external_system": {
+        "observed": false,
+        "note": "Nothing in this tool observes the system the task talks to. Airflow's fields describe dispatch and nothing else, so whether the external operation happened \u2014 in whole, in part, or not at all \u2014 has to be established there, by the operator, before this clear is approved."
+      }
+    },
+    "blast_radius": {
+      "instances": [
+        "notify_treasury_complete"
+      ],
+      "target": "prepare_disbursement_file",
+      "downstream_included": true,
+      "downstream_instances": [
+        "notify_treasury_complete"
+      ],
+      "mapped_tasks": [],
+      "mapped_tasks_settled": true,
+      "expansion_unprobed_tasks": [],
+      "note": "Enumerated by identity, not by count: two different flag sets can affect the same number of instances and a different set of them. include_downstream is transitive."
+    },
+    "flags": {
+      "only_failed": {
+        "sent": true,
+        "why": "on, so only a failed or upstream_failed instance is a match; a task in any other state is not cleared and the request succeeds having changed nothing"
+      },
+      "include_downstream": {
+        "sent": true,
+        "why": "on, and transitive \u2014 it takes everything reachable from the task, not one hop. The tasks released by the current state wrote artefacts that assert completion; clearing the task alone leaves them standing."
+      },
+      "include_upstream": {
+        "sent": false,
+        "why": "off: the upstream instances have their own execution records, and re-running them would repeat their own side effects for no benefit"
+      },
+      "include_future": {
+        "sent": false,
+        "why": "off: rejected outright on a run with no logical date"
+      },
+      "include_past": {
+        "sent": false,
+        "why": "off: rejected outright on a run with no logical date"
+      },
+      "only_running": {
+        "sent": false,
+        "why": "off: the target is recorded \"success\", and only_running would restrict the clear to instances that are running now"
+      },
+      "reset_dag_runs": {
+        "sent": true,
+        "why": "on, so the run is re-queued and actually re-executes",
+        "cost": "it rewrites the run's start_date, end_date and queued_at to the re-run"
+      },
+      "prevent_running_task": {
+        "sent": true,
+        "why": "on, so an attempt that reached RUNNING since the plan turns this into a refusal rather than a silent kill into RESTARTING. It covers that one state \u2014 Airflow raises for a task instance in `running` and no other (models/taskinstance.py:387) \u2014 so a queued or scheduled instance is cleared, not refused"
+      },
+      "run_on_latest_version": {
+        "sent": "omitted",
+        "why": "omitted so Airflow's own precedence applies \u2014 the Dag's rerun_with_latest_version, then [core] rerun_with_latest_version, then false. Sending it unconditionally inverts that default and bypasses both layers."
+      }
+    },
+    "version": {
+      "run_versions": [
+        1
+      ],
+      "run_on_latest_version_sent": "omitted",
+      "asked_for": "this clear does not send run_on_latest_version at all, so Airflow resolves it \u2014 the Dag's own rerun_with_latest_version, then [core] rerun_with_latest_version, then false",
+      "guarantee": "Not a promise that the run's original Dag version is preserved. Clearing re-queues the instance, and the scheduler rebinds every unfinished instance of a re-queued run to the latest version whenever that version is not already one of the run's \u2014 observed doing exactly that with run_on_latest_version false.",
+      "code_note": "A Dag version does not pin the code either. Under an unversioned bundle the worker imports the Dag file as it stands on disk at re-run time, so what re-runs is the current file whatever this says about versions.",
+      "latest_version": 1,
+      "versions_status": "checked",
+      "original_version_listed": true
+    },
+    "warnings": [
+      "Re-running performs the task's external operation again. Clearing is not idempotent for anything outside Airflow: if the operation already happened, in whole or in part, this produces a duplicate.",
+      "Nothing in this tool observes the system the task talks to. Airflow's fields describe dispatch and nothing else, so whether the external operation happened \u2014 in whole, in part, or not at all \u2014 has to be established there, by the operator, before this clear is approved.",
+      "The live task-instance row will be overwritten. Afterwards it reads as an ordinary success, and the attempt recorded now survives only in /tries, in that attempt's own log, and in whatever audit rows this API can see.",
+      "reset_dag_runs is on, so the Dag run's start_date, end_date and queued_at are rewritten to the re-run. The run row will stop recording when the original run happened.",
+      "The Dag version does not pin the code: what executes is the Dag file as it stands on disk at re-run time.",
+      "This instance's row does not rule out a partly-completed attempt, so the duplicate above may be a duplicate of half an operation.",
+      "The downstream instances ['notify_treasury_complete'] re-run too, so anything they wrote on the strength of the current state \u2014 completion notices, summaries, notifications \u2014 is produced again and replaces what is there now."
+    ],
+    "next_step": "Show the user recovery_evidence, blast_radius and every entry of warnings, then propose apply_task_instance_clear with this plan_token AND reviewed_instances set to blast_radius.instances, so the approval card names the instances that were enumerated here. The clear is not the recovery: verify it afterwards with verify_task_instance_recovery.",
+    "plan_token": "<TOKEN>"
+  }
+}

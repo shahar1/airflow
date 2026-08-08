@@ -1,0 +1,320 @@
+{
+  "capture": "diagnose_dag__eval_fixture_claims_settlement_export",
+  "call": "diagnose_dag('claims_settlement_export')  # paused; not unpaused, not triggered",
+  "status": "ok",
+  "http_calls": [
+    "GET /dags/claims_settlement_export/dagRuns",
+    "GET /dags/claims_settlement_export/dagRuns/manual__2026-07-25T03%3A30%3A00%2B00%3A00/taskInstances",
+    "GET /dags/claims_settlement_export/dagRuns/manual__2026-07-25T03%3A30%3A00%2B00%3A00/taskInstances/export_settlements/tries",
+    "GET /dags/claims_settlement_export/dagRuns/manual__2026-07-25T03%3A30%3A00%2B00%3A00/taskInstances/record_export_receipt/tries",
+    "GET /dags/claims_settlement_export",
+    "GET /dagSources/claims_settlement_export",
+    "GET /dags/claims_settlement_export/tasks",
+    "GET /importErrors"
+  ],
+  "normalized_result": {
+    "dag_id": "claims_settlement_export",
+    "dag_run_id": "manual__<TS>",
+    "run_state": "success",
+    "dag_version": 1,
+    "dag_version_limits": [
+      "`dag_version` records the version stamped on the run's task instances, not the version that executed them. On a bundle with no `bundle_version` the scheduler rewrites it forward (jobs/scheduler_job_runner.py:3047-3057, models/dagbag.py:210-216) and it can name a version the run never ran."
+    ],
+    "task_instances": [
+      {
+        "task_id": "export_settlements",
+        "map_index": -1,
+        "state": "success",
+        "try_number": 1,
+        "max_tries": 2,
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "hostname": "<HOST>",
+        "pid": "<PID>",
+        "queued_when": "<TS>",
+        "scheduled_when": "<TS>",
+        "operator": "PythonOperator",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        }
+      },
+      {
+        "task_id": "record_export_receipt",
+        "map_index": -1,
+        "state": "success",
+        "try_number": 1,
+        "max_tries": 2,
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "hostname": "<HOST>",
+        "pid": "<PID>",
+        "queued_when": "<TS>",
+        "scheduled_when": "<TS>",
+        "operator": "PythonOperator",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        }
+      }
+    ],
+    "event_history": {
+      "status": "not_scoped",
+      "events_scanned": 0,
+      "total_entries": 0,
+      "events_omitted": 0,
+      "oldest_scanned_when": null,
+      "rows_rejected": 0,
+      "instances_without_attribution": 0,
+      "attribution_payload_bytes": 2168,
+      "attribution_payload_limit": 400000,
+      "attribution_reduced_for_size": 0,
+      "attribution_payload_over_limit": false,
+      "clear_with_include_flags": false,
+      "run_scoped_events": [],
+      "run_scoped_events_omitted": 0,
+      "error": "no audit scope was supplied, so the audit log was not read",
+      "query": "GET /api/v2/eventLogs?dag_id=<dag>&run_id=<run> (order_by=-when)",
+      "limits": [
+        "At most 300 event rows are read, newest first by `when`; anything older than that window was not looked at.",
+        "The query is scoped to this Dag and this run, so it cannot see a row recorded against any other Dag or any other run.",
+        "Rows with a null `dag_id` are unreachable by a dag_id-scoped query and need a separate fleet-wide audit-log permission, so this reading never covers them.",
+        "The `log` table is cleanable by `airflow db clean` (utils/db_cleanup.py:189, included when `--tables` is omitted), so an empty history can also mean retention removed the rows.",
+        "`cli_*` rows are written with NO `run_id` at all - the CLI action logger inserts only event, owner, extra, task_id, dag_id and logical_date (utils/cli_action_loggers.py:133-146, off the metrics built at utils/cli.py:210-224) - so `run_id` is null on every one of them and a run-scoped query structurally cannot return any. That includes `cli_dag_test`, the `airflow dags test --mark-success-pattern` route named in the unknowns above: a CLI-driven state change is invisible to this reading whether or not it happened.",
+        "`extra` is projected to the four keys this tool reads (`method`, `new_state`, `task_ids`, `map_index`) and only for the HEADLINE row of each task instance; every other key is named in `extra_keys` and withheld, and the context rows under `events` carry no `extra` at all. Airflow masks `extra` by key NAME only, so relaying it whole passed through anything the requester chose to call something else.",
+        "The attribution payload is bounded at runtime, not only by the per-field clamps: the serialized `last_state_change` objects are measured and, past the ceiling reported in `attribution_payload_limit`, context rows and then `extra` projections are dropped from the oldest instances first. Any row that lost content says so with `size_reduced`, and the count is in `attribution_reduced_for_size`."
+      ],
+      "unknowns_legend": {
+        "U14": "The event history was not read because the call carried no audit scope, so nothing about a recorded event is established either way."
+      }
+    },
+    "run_history": {
+      "returned": 6,
+      "total_entries": 6,
+      "runs_omitted": 0,
+      "window": "the most recent 6 run(s) of this Dag by run_after, newest first",
+      "runs": [
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": true
+        },
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        },
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        },
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        },
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        },
+        {
+          "dag_run_id": "manual__<TS>",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": "<TS>",
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        }
+      ],
+      "task_comparison": {
+        "selection": "task instances this diagnosis flagged, then failed or retrying ones, newest-first, capped at 5 task ids",
+        "task_ids_compared": [],
+        "task_ids_omitted": 0,
+        "runs_not_covered": [],
+        "tasks": {},
+        "rows_omitted": {},
+        "error": null
+      },
+      "limits": [
+        "`dag_version` records the version stamped on the run's task instances, not the version that executed them. On a bundle with no `bundle_version` the scheduler rewrites it forward (jobs/scheduler_job_runner.py:3047-3057, models/dagbag.py:210-216) and it can name a version the run never ran.",
+        "`triggering_user_name` is the authenticated principal recorded for triggering the run. It says nothing about who changed any task instance's state."
+      ],
+      "error": null
+    },
+    "diagnosed_run_is_latest": true,
+    "source": "\"\"\"Daily export of adjudicated claim settlements to the payments partner.\"\"\"\n\nfrom __future__ import annotations\n\nimport configparser\nimport json\nimport logging\nimport time\nfrom datetime import timedelta\nfrom pathlib import Path\nfrom typing import Any\n\nimport pendulum\n\nfrom airflow.providers.standard.operators.python import PythonOperator\nfrom airflow.sdk import DAG\n\nlogger = logging.getLogger(__name__)\n\nCONFIG_FILE = Path(__file__).with_name(\"claims_settlement_export.cfg\")\n\nPARTNER_FEED = \"partner.settlement_batch_v3\"\n\n\ndef read_config() -> configparser.ConfigParser:\n    parser = configparser.ConfigParser()\n    parser.read(CONFIG_FILE)\n    return parser\n\n\ndef gather_settlements(business_date: str, source_bucket: str) -> list[dict[str, Any]]:\n    \"\"\"Pull the adjudicated settlements booked for a business date.\"\"\"\n    seed = sum(ord(character) * position for position, character in enumerate(business_date, 1))\n    volume = 8_400 + (seed * 29) % 1_600\n    return [\n        {\n            \"source\": f\"{source_bucket}/{business_date}\",\n            \"claim_ref\": f\"CLM-{business_date.replace('-', '')}-{index:06d}\",\n            \"amount_cents\": 1_500 + (index * 37) % 240_000,\n        }\n        for index in range(volume)\n    ]\n\n\ndef transmit(\n    settlements: list[dict[str, Any]],\n    business_date: str,\n    feed: str,\n    config: configparser.ConfigParser,\n) -> None:\n    manifest_dir = Path(config[\"export\"][\"manifest_dir\"]) / feed\n    manifest_dir.mkdir(parents=True, exist_ok=True)\n    batch_size = config[\"export\"].getint(\"batch_size\")\n    pause = config[\"export\"].getfloat(\"batch_pause_seconds\")\n    batches = 0\n    for _ in range(0, len(settlements), batch_size):\n        time.sleep(pause)\n        batches += 1\n    (manifest_dir / f\"{business_date}.json\").write_text(\n        json.dumps(\n            {\n                \"business_date\": business_date,\n                \"settlements\": len(settlements),\n                \"batches\": batches,\n                \"total_cents\": sum(row[\"amount_cents\"] for row in settlements),\n            }\n        )\n    )\n\n\ndef export_settlements(business_date: str, transmission_mode: str, feed: str) -> None:\n    config = read_config()\n    settlements = gather_settlements(business_date, config[\"export\"][\"source_bucket\"])\n    logger.info(\"prepared %s settlements for %s\", len(settlements), feed)\n    if transmission_mode != \"stage\":\n        transmit(settlements, business_date, feed, config)\n    logger.info(\"settlement export finished for %s\", business_date)\n\n\ndef record_export_receipt(business_date: str) -> None:\n    config = read_config()\n    receipt_dir = Path(config[\"archive\"][\"receipt_dir\"])\n    receipt_dir.mkdir(parents=True, exist_ok=True)\n    (receipt_dir / f\"{business_date}.txt\").write_text(f\"settlement export receipt {business_date}\\n\")\n    logger.info(\n        \"recorded settlement export receipt for %s (retention %s days)\",\n        business_date,\n        config[\"archive\"][\"retention_days\"],\n    )\n\n\nwith DAG(\n    dag_id=\"claims_settlement_export\",\n    description=\"Export adjudicated claim settlements to the payments partner.\",\n    schedule=\"30 3 * * *\",\n    start_date=pendulum.datetime(2026, 5, 15, tz=\"UTC\"),\n    catchup=False,\n    max_active_runs=1,\n    default_args={\"retries\": 2, \"retry_delay\": timedelta(minutes=10)},\n    tags=[\"claims\", \"partner-feed\"],\n):\n    export = PythonOperator(\n        task_id=\"export_settlements\",\n        python_callable=export_settlements,\n        op_kwargs={\n            \"business_date\": \"{{ ds }}\",\n            \"transmission_mode\": \"{{ var.value.settlement_export_mode }}\",\n            \"feed\": PARTNER_FEED,\n        },\n    )\n    receipt = PythonOperator(\n        task_id=\"record_export_receipt\",\n        python_callable=record_export_receipt,\n        op_kwargs={\"business_date\": \"{{ ds }}\"},\n    )\n\n    export >> receipt\n",
+    "source_file": "/home/shahar/repos/apache/airflow/files/dags/claims_settlement_export.py",
+    "tasks": {
+      "order": [
+        "export_settlements",
+        "record_export_receipt"
+      ],
+      "ordering": "topological",
+      "ambiguous_positions": [],
+      "edges": {
+        "export_settlements": [
+          "record_export_receipt"
+        ]
+      }
+    },
+    "checks": [],
+    "run_health": {
+      "state": "success",
+      "task_instance_states": {
+        "success": 2
+      },
+      "successes_scanned": 2,
+      "successes_with_incomplete_evidence": 0,
+      "attempt_history_checked": 2,
+      "attempt_history_unchecked": 0,
+      "successes_without_history_check": 0,
+      "successes_no_probe_needed": 0,
+      "successes_without_worker_fields": 0,
+      "successes_with_no_dispatch_field": 0,
+      "successes_without_worker_fields_named": [],
+      "dispatch_findings_suppressed": 0,
+      "static_checks_suppressed": 0,
+      "task_instances_omitted": 0,
+      "state_change_attribution": {
+        "by_attribution": {
+          "event_history_not_scoped": 2
+        },
+        "corroborated": {},
+        "row_claimed": {},
+        "instances_attributed_by_unpinned_row": 0,
+        "distinct_event_log_ids": 0
+      },
+      "clean": false,
+      "clean_blockers": [
+        "event_history_not_scoped"
+      ]
+    },
+    "summary": "No failures found: run `manual__<TS>` is success. Attempt history was read for 2 of 2 successful task instance(s).",
+    "diagnosis": "run manual__<TS> is success and no task instance in it failed; see `summary` for what was and was not established"
+  }
+}

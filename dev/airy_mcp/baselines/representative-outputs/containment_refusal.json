@@ -1,0 +1,68 @@
+{
+  "capture": "containment_gate_refusals",
+  "call": "server._containment_gate(dag_id, dag_run_id, run_path, plan, preview, now)",
+  "status": "ok",
+  "constructed_offline": true,
+  "http_calls": [],
+  "no_write_proof": "server._api was replaced by a raiser for the whole capture; the empty http_calls list is the proof that neither branch reached the wire, and neither branch is downstream of a POST in any case -- the gate runs before the mutating write at server.py:5561.",
+  "gate_site": "dev/airy_mcp/server.py:5218 (_containment_gate), single call site :5554",
+  "refusals": [
+    {
+      "branch": "R1 -- the target set could not be shown complete",
+      "constructed_by": "a fake preview claiming total_entries=7 while handing over 3 rows; _read_is_complete(3, 3, 7) is False",
+      "gate_inputs": {
+        "len(now)": 3,
+        "len(preview['task_instances'])": 3,
+        "preview['total_entries']": 7
+      },
+      "refusal": {
+        "cleared": false,
+        "mutation_applied": false,
+        "dag_id": "fake_dag_for_refusal_capture",
+        "dag_run_id": "fake_run_001",
+        "incomplete_read": {
+          "read": "clear preview",
+          "route": "POST /dags/<dag>/clearTaskInstances (dry_run=true)",
+          "detail": "3 instance(s) were read of 7 the route accounted for"
+        },
+        "error": "this clear was NOT sent: the clear preview could not be shown to be complete at the moment before the write (3 instance(s) were read of 7 the route accounted for). A decision taken over part of a list is a decision about the part that was read, and this one would have authorised a write. Nothing was cleared \u2014 this was checked before the write was sent. What the unread records hold is not established here, in either direction.",
+        "next_step": "Tell the user nothing was cleared and name the read that could not be shown complete. Do not re-issue this call to get past it: re-plan, and if the read is still incomplete the clear stays unsent."
+      },
+      "expansion_returned": {
+        "tasks": [],
+        "settled": false,
+        "unprobed": []
+      }
+    },
+    {
+      "branch": "R2 -- evidence expired: an approved instance is on its way to a worker",
+      "constructed_by": "a complete fake preview whose identity set matches the plan, with one instance now in a state from _IN_FLIGHT_TARGET_STATES",
+      "gate_inputs": {
+        "live_states": {
+          "load_ledger": "queued",
+          "post_entries": "failed"
+        },
+        "planned_states": {
+          "load_ledger": "failed",
+          "post_entries": "failed"
+        }
+      },
+      "refusal": {
+        "cleared": false,
+        "mutation_applied": false,
+        "dag_id": "fake_dag_for_refusal_capture",
+        "dag_run_id": "fake_run_001",
+        "in_flight_instances": [
+          "load_ledger"
+        ],
+        "error": "this clear was NOT sent: ['load_ledger'] is on its way to a worker or already has one (['queued']). Airflow itself refuses a clear only for \"running\" (models/taskinstance.py:387), so a queued or scheduled instance would clear through and be dispatched twice. The approval the user gave named the state as it was read at plan time, so it no longer describes what would be written. Nothing was cleared \u2014 this was checked before the write was sent.",
+        "next_step": "Tell the user nothing was cleared and name the read that could not be shown complete. Do not re-issue this call to get past it: re-plan, and if the read is still incomplete the clear stays unsent."
+      },
+      "expansion_returned": {
+        "tasks": [],
+        "settled": false,
+        "unprobed": []
+      }
+    }
+  ]
+}

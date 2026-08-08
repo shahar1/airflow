@@ -1,0 +1,670 @@
+{
+  "frozen_at_commit": "b933d63ec34555feb6bb390dcc1752b014a69bfc",
+  "source_file": "dev/airy_mcp/server.py",
+  "source_sha256": "319ece9be018ed6c95a53f6212c025d53058d248087ffd48bbf0fa3eb047d518",
+  "mcp_server_name": "airy-selfheal",
+  "fastmcp_import": "stubbed (same stub test_server.py uses)",
+  "registered_tool_count": 14,
+  "registration_site": "dev/airy_mcp/server.py -- `for _tool in (...): mcp.tool(_tool)`",
+  "capture_method": "inspect.signature + inspect.getdoc over the module's plain functions; the tool list is parsed out of the registration loop in the source, not hand-listed",
+  "tools": [
+    {
+      "name": "diagnose_dag",
+      "qualname": "diagnose_dag",
+      "module": "server",
+      "signature": "diagnose_dag(dag_id: 'str', dag_run_id: 'str' = '', source_digest: 'str | None' = None, audit_scope: 'str' = '') -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "dag_run_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "audit_scope",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        }
+      ],
+      "parameter_count": 4,
+      "docstring": "Find out what is wrong with a run of this Dag.\n\n``dag_run_id`` takes an exact run id, or ``latest``/``previous`` \u2014 use those\nrather than composing a run id from a date, which is how a run that exists\ncomes back as \"no such run\". Left empty, the first failed of the last 5 runs\nis diagnosed (else the newest). Returns every task instance with the\nfields that show whether its recorded attempt was dispatched, the log tail\nof **every** failed or retrying one, the task graph, the full Dag source,\ndeterministic checks that spot broken task references, import errors and\nsuccesses carrying no dispatch evidence, a ``run_health`` that names every\nreason the run cannot be called clean, and a ``summary`` that enumerates\nevery finding. Relay the ``summary`` completely \u2014 every numbered item, not\nonly the first. A green run is not automatically a healthy one: report what\n``summary`` says, not what the run state says.\n\nAlso returns ``event_history`` \u2014 what the Dag's audit log recorded for this\nrun \u2014 with a ``last_state_change`` on every detailed task instance naming\nwhat was recorded, when, against which principal NAME, through which\nrecorded interface, and, in ``unknowns``, what that does not establish. A\nrecorded row proves an action was ATTEMPTED, never that it wrote the state;\nNO recorded row is not evidence of a direct database write. And\n``run_history`` \u2014 the Dag's recent runs and the same task's rows across them.\n\n``source_digest`` and ``audit_scope`` are set by the caller's permissions, not by you.",
+      "docstring_sha256": "3ee25360b58f08ece2bcabfd3eebb5975834d09d4f12c14d4f5604a3e078cf31",
+      "is_coroutine": false,
+      "defined_at_line": 3009,
+      "source_line_count": 268,
+      "source_sha256": "5e33b627faf2a4d20e7903276485ce67dc04285df4f95f7ec0d33ffbac88012a"
+    },
+    {
+      "name": "compare_dag_runs",
+      "qualname": "compare_dag_runs",
+      "module": "server",
+      "signature": "compare_dag_runs(dag_id: 'str', run_a: 'str', run_b: 'str', source_digest: 'str | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "run_a",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "run_b",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 4,
+      "docstring": "Compare two runs of a Dag: per-task duration changes and conf differences.\n\nAnswers \"was it my change?\" after a run that used to work starts failing.\n``run_a``/``run_b`` take exact run ids, or ``latest``/``previous`` \u2014 so\n\"compare the last two runs\" is run_a=\"previous\", run_b=\"latest\".\nA mapped task is aggregated per task: instance count and the longest\ninstance's duration. Each row also carries ``run_a_worker_field`` /\n``run_b_worker_field`` \u2014 whether any instance of that task on that run\nrecorded a hostname or pid. A task whose duration is unchanged at 0 on both\nruns has NOT been stable if those flags differ, or if both are false.\nNames the Dag versions each run used, but does not\ndiff them \u2014 an older version can contain a co-located Dag this caller was\nnever authorized for.\n``source_digest`` is set by the caller's permissions, not by you.",
+      "docstring_sha256": "cc8194f12dd1d2d64c0936efa3dbd2bd791a15da98cfcc56f77ee4ecb89ad9dd",
+      "is_coroutine": false,
+      "defined_at_line": 6473,
+      "source_line_count": 114,
+      "source_sha256": "7c56a3119c20f771a0f73933c94d0fe6ca41d901274a8b58a273bdb158c07f8a"
+    },
+    {
+      "name": "find_failure_clusters",
+      "qualname": "find_failure_clusters",
+      "module": "server",
+      "signature": "find_failure_clusters(hours: 'float' = 24, dag_ids: 'list[str] | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "hours",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'float'",
+          "default": "24",
+          "required": false
+        },
+        {
+          "name": "dag_ids",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[str] | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 2,
+      "docstring": "Group recent task failures by error signature.\n\nAnswers \"what is breaking, fleet-wide?\" \u2014 biggest clusters first, each\nwith example task instances to drill into.\n\n``dag_ids`` is set by the caller's permissions, not by you: whatever you pass\nis replaced with the Dags the signed-in user may actually read.",
+      "docstring_sha256": "ece36af50ebef6186499e0094acf935ea2614770568fc232d0f5d7366e227290",
+      "is_coroutine": false,
+      "defined_at_line": 6635,
+      "source_line_count": 67,
+      "source_sha256": "ff6a9f62f79d744c415a032b7e059e9e0b8cb6f590436e69972c8a48de0cb370"
+    },
+    {
+      "name": "plan_backfill",
+      "qualname": "plan_backfill",
+      "module": "server",
+      "signature": "plan_backfill(dag_id: 'str', from_date: 'str', to_date: 'str') -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "from_date",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "to_date",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        }
+      ],
+      "parameter_count": 3,
+      "docstring": "Preview the runs a backfill would create, without creating anything.\n\nRead-only. Show the user every run listed in ``planned_runs``, then pass the\n``plan_token`` back to run_backfill \u2014 that is what proves the backfill you\ncreate is the one they reviewed.",
+      "docstring_sha256": "364086e02187866f89ecdc8da87fe670a768d64b547f2b595d93d172a0d31a29",
+      "is_coroutine": false,
+      "defined_at_line": 6829,
+      "source_line_count": 44,
+      "source_sha256": "40eb44a49c798dcc2415ca34dcaa6600c4cbe38e927ebbe5ba7fd7e9de5f7582"
+    },
+    {
+      "name": "run_backfill",
+      "qualname": "run_backfill",
+      "module": "server",
+      "signature": "run_backfill(dag_id: 'str', from_date: 'str', to_date: 'str', plan_token: 'str' = '', planned_runs: 'list[dict[str, Any]] | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "from_date",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "to_date",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "plan_token",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "planned_runs",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[dict[str, Any]] | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 5,
+      "docstring": "Create the backfill previewed by plan_backfill.\n\nPass back both the ``plan_token`` *and* the exact ``planned_runs`` list that\nplan_backfill returned. The runs go in the arguments so the confirmation the\nuser clicks spells out every run it creates; the token is what proves the\nlist was not invented. Refuses if either is missing or they disagree.",
+      "docstring_sha256": "3e079ed244d44aca0f4a21baa507fdd5065981720499bcf6f2bc9367a452c4ad",
+      "is_coroutine": false,
+      "defined_at_line": 6875,
+      "source_line_count": 98,
+      "source_sha256": "b5f9ef6df8bceccc90428e11bc89129f3f21c39d79ba9ae40af4d14ca4950f8e"
+    },
+    {
+      "name": "get_blast_radius",
+      "qualname": "get_blast_radius",
+      "module": "server",
+      "signature": "get_blast_radius(dag_id: 'str') -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        }
+      ],
+      "parameter_count": 1,
+      "docstring": "Show what a failure in this Dag knocks over: the assets it produces and\nthe Dags scheduled on or reading those assets \u2014 plus the upstream side,\nthe assets this Dag depends on and who produces them.",
+      "docstring_sha256": "7022506df082c4de80a1b74b88ae2ffa413900aa196e29a1b4e2e4a1e76ee01e",
+      "is_coroutine": false,
+      "defined_at_line": 7053,
+      "source_line_count": 35,
+      "source_sha256": "87a81019401dba8e8f1a6dcb8e1ec28c5e8e3b98a4a983fa7aaa374d124883bb"
+    },
+    {
+      "name": "plan_dag_code_changes",
+      "qualname": "plan_dag_code_changes",
+      "module": "server",
+      "signature": "plan_dag_code_changes(dag_id: 'str', changes: 'list[dict[str, str]]', source_digest: 'str | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "changes",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[dict[str, str]]'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 3,
+      "docstring": "Preview one atomic set of source edits, without writing anything.\n\nRead-only. ``changes`` is a list of ``{\"old\": ..., \"new\": ...}``; each\n``old`` must appear exactly once at the point it is applied. Put **every**\nfix you intend to make in one call \u2014 a second plan made after the first one\nlands is a plan against source that no longer exists, and a second plan made\nfrom the *same* source is refused outright and discards the earlier plan's\ntoken: one repair is one plan.\n\nReturns the combined diff, what the change does to the task graph, and a\nsingle-use ``plan_token``. Show the user the diff and every ``blocking``\nentry; a plan with blockers gets no token and must not be applied.\n\n``source_digest`` is set by the caller's permissions, not by you.",
+      "docstring_sha256": "2cf2c7421b7d5ed98f80a6d3aa4768c875f1991723f28d68a8a547179bd0a2bb",
+      "is_coroutine": false,
+      "defined_at_line": 3655,
+      "source_line_count": 100,
+      "source_sha256": "db520b7ff4ad575999d6f4322717b117e9ea26192b5a47d872089ea73453c930"
+    },
+    {
+      "name": "apply_dag_code_changes",
+      "qualname": "apply_dag_code_changes",
+      "module": "server",
+      "signature": "apply_dag_code_changes(dag_id: 'str', changes: 'list[dict[str, str]]', plan_token: 'str' = '', asset_note: 'str' = '', source_digest: 'str | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "changes",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[dict[str, str]]'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "plan_token",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "asset_note",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 5,
+      "docstring": "Apply the edits previewed by plan_dag_code_changes \u2014 all of them, or none.\n\nPass back both the ``plan_token`` *and* the exact ``changes`` list that was\nplanned. The changes go in the arguments so the confirmation the user clicks\nspells out every edit it writes; the token is what proves they were planned\nagainst the source that is still on disk. When the plan returned an\n``asset_note``, repeat it verbatim too \u2014 the approval must show what the\nchange can knock over.\n\n``source_digest`` is set by the caller's permissions, not by you.",
+      "docstring_sha256": "be1d822d3b4a6574731db1a2e63cdc22accaa96a30a93712da44cf23e927dbc0",
+      "is_coroutine": false,
+      "defined_at_line": 3765,
+      "source_line_count": 133,
+      "source_sha256": "efc4526300aff3d33323a5b026ce2049a20babb606a929ceaae347e14c2916a6"
+    },
+    {
+      "name": "plan_task_instance_clear",
+      "qualname": "plan_task_instance_clear",
+      "module": "server",
+      "signature": "plan_task_instance_clear(dag_id: 'str', task_id: 'str' = '', position: 'int' = 0, dag_run_id: 'str' = 'latest', map_index: 'int | None' = None, only_failed: 'bool' = True, include_downstream: 'bool' = True, run_on_latest_version: 'bool | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "task_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "position",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'int'",
+          "default": "0",
+          "required": false
+        },
+        {
+          "name": "dag_run_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "'latest'",
+          "required": false
+        },
+        {
+          "name": "map_index",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'int | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "only_failed",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool'",
+          "default": "True",
+          "required": false
+        },
+        {
+          "name": "include_downstream",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool'",
+          "default": "True",
+          "required": false
+        },
+        {
+          "name": "run_on_latest_version",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 8,
+      "docstring": "Preview clearing a task instance that already exists, without changing anything.\n\nRead-only, and the whole recovery proposal: it reads the instance's current\nstate, quotes the evidence for what its recorded attempt did, enumerates\nevery instance the clear would touch by identity, states every flag it will\nsend with the reason, and carries the warnings the user has to see before\napproving. Clearing re-runs the *existing* instance inside its own Dag run \u2014\nit is not a new run, so never reach for rerun_dag to do it.\n\nName the task with ``task_id``. ``position`` (1-based) is only for turning a\nuser's \"the third task\" into an id, and is refused where the graph does not\nfix the order. ``dag_run_id`` defaults to the latest run and is resolved to\nan exact id here.\n\n``only_failed`` is on by default, as in Airflow's own body. An instance that\nis not failed is not a match \u2014 the request then succeeds and clears nothing \u2014\nso re-planning a *succeeded* instance needs ``only_failed=false``, and the\nrefusal says so.\n\n``include_downstream`` is on by default, as in Airflow's own clear dialog:\nclearing a task alone leaves its downstream stuck \u2014 an ``upstream_failed``\ninstance is never rescheduled, a succeeded one keeps the XCom value the\nre-run exists to replace, and one that already reported completion keeps\nsaying so. Pass ``false`` only if the user asks for that one task and\nnothing after it, and relay the warning that says what then survives.\n\n``run_on_latest_version`` is omitted by default so Airflow's own precedence\ndecides it. It never promises the run's original Dag version is preserved;\nread ``version`` for what it does and does not guarantee.\n\nShow the user ``affected``, ``warnings`` and ``recovery_evidence``, then pass\nthe ``plan_token``, the same arguments, and ``blast_radius.instances`` as\n``reviewed_instances`` to apply_task_instance_clear.",
+      "docstring_sha256": "46c51745cbec03009b780712760b11d8caf4215893ef421f9c65ac19c67a8a39",
+      "is_coroutine": false,
+      "defined_at_line": 4867,
+      "source_line_count": 257,
+      "source_sha256": "1c5c9a76f1d149af9af868f01cb5ad082f38646cb0b9f6a80d3ed2d1bb5ffa00"
+    },
+    {
+      "name": "apply_task_instance_clear",
+      "qualname": "apply_task_instance_clear",
+      "module": "server",
+      "signature": "apply_task_instance_clear(dag_id: 'str', dag_run_id: 'str', task_ids: 'list[Any]', plan_token: 'str' = '', only_failed: 'bool' = True, include_downstream: 'bool' = True, run_on_latest_version: 'bool | None' = None, reviewed_instances: 'list[str] | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "dag_run_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "task_ids",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[Any]'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "plan_token",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "only_failed",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool'",
+          "default": "True",
+          "required": false
+        },
+        {
+          "name": "include_downstream",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool'",
+          "default": "True",
+          "required": false
+        },
+        {
+          "name": "run_on_latest_version",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "reviewed_instances",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[str] | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 8,
+      "docstring": "Clear the task instances previewed by plan_task_instance_clear.\n\nRe-runs instances that already exist. It never creates a Dag run, and there\nis no fallback that does: if nothing matches, that is the answer.\n\nPass back the ``plan_token`` and the exact ``dag_run_id`` and ``task_ids``\nthat were planned, so the confirmation the user clicks names what it clears.\n\n``reviewed_instances`` is REQUIRED and must be exactly the plan's\n``blast_radius.instances``. ``task_ids`` is the seed, not the scope \u2014 with\n``include_downstream`` on it is routinely one name standing for five\ninstances \u2014 and the approval card renders these, so a card built without\nthem describes a smaller change than the one it authorizes. It is checked\nagainst the plan like every other argument.\n\nA clear that returns here has re-queued the instances and nothing more. It\nhas NOT established that anything re-ran, so this result is never the\nrecovery: follow the ``verify_with`` it hands back.",
+      "docstring_sha256": "9cb6b24b640793633fa24b27af51ddf5dfa0bc493e20be0634dd0c0be4d87b20",
+      "is_coroutine": false,
+      "defined_at_line": 5444,
+      "source_line_count": 290,
+      "source_sha256": "17e0cab70cb40d0818d02a6171bfbd3c723934c87e461ff3f3a3a534408c9dfe"
+    },
+    {
+      "name": "verify_task_instance_recovery",
+      "qualname": "verify_task_instance_recovery",
+      "module": "server",
+      "signature": "verify_task_instance_recovery(dag_id: 'str', dag_run_id: 'str', instances: 'list[Any] | None' = None, prior_attempts: 'dict[str, Any] | None' = None, target_task_id: 'str' = '', cleared_after: 'str' = '', audit_scope: 'str' = '', xcom_scope: 'str' = '') -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "dag_run_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "instances",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'list[Any] | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "prior_attempts",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'dict[str, Any] | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "target_task_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "cleared_after",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "audit_scope",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "xcom_scope",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        }
+      ],
+      "parameter_count": 8,
+      "docstring": "Establish whether a cleared task instance actually re-ran, or say why that is unsettled.\n\nRead-only, and the step that makes a clear a recovery rather than a colour\nchange. Call it after apply_task_instance_clear with the arguments that call\nhanded back in ``verify_with.args``; if the run is still going, call it\nagain rather than reporting the earlier answer.\n\nFor every instance it reports each leg separately \u2014 a new attempt exists, the\nearlier attempt survived in /tries, the state, the execution fields read\ntogether, the duration against this instance's own history, the log for the\nnew attempt, the audit transitions this API can see, and whether the\ninstance recorded output after the clear. A downstream instance is also held\nto reporting output written *after* the target's re-run finished, which is\nwhat catches a completion notice that survived from before.\n\nPass ``target_task_id``. Without it no instance is classified as the target,\nevery instance's role is ``unclassified``, and the dating leg reports \"not\nestablished\" rather than passing.\n\nIt also diffs the run's current instance set against the set THIS server\nrecorded when it redeemed the clear's plan token, so a mapped task the\nscheduler re-expanded shows up as an addition by identity rather than\nsilently. That baseline is never taken from ``instances``: where no such\nrecord exists the leg reports \"not established\" and ``verified`` stays\nfalse. ``instances`` only says which instances to read.\n\nIt never observes the external system. ``external_system_checked`` is always\nfalse and ``operator_action_required`` says what a person still has to do.\nRelay both: a verdict of ``verified`` here means Airflow's own record is\nconsistent with a real re-run, not that the work outside Airflow is correct.\n\n``audit_scope`` and ``xcom_scope`` are set by the caller's permissions, not\nby you. Neither gates the tool: without them the transitions leg and the two\noutput legs report \"not established\" and the rest of the reading stands.",
+      "docstring_sha256": "6f9c2327815b0d31c0d0be04934488121edca64a82527c9cd0da6c3f8c469d7c",
+      "is_coroutine": false,
+      "defined_at_line": 6315,
+      "source_line_count": 156,
+      "source_sha256": "1d262aa8356a8a59a21b99131714164dbd81310090a584dc6742c4955ded0d9c"
+    },
+    {
+      "name": "plan_revert_dag_code",
+      "qualname": "plan_revert_dag_code",
+      "module": "server",
+      "signature": "plan_revert_dag_code(dag_id: 'str', source_digest: 'str | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 2,
+      "docstring": "Preview reverting a Dag's source to the original Airy backed up, without\nwriting anything.\n\nRead-only. Reverting discards **every** change Airy applied \u2014 not just the\nmost recent one. Returns the diff that reverting would apply (the backup\nagainst the current file), a ``summary`` to relay, and a single-use\n``plan_token``. Show the user the diff, then pass the token *and* the same\n``diff`` to revert_dag_code.\n\n``source_digest`` is set by the caller's permissions, not by you.",
+      "docstring_sha256": "ee5ed4b138eee64fdf307c44c3377287489371b72efb760ba9c8fad614d37352",
+      "is_coroutine": false,
+      "defined_at_line": 3517,
+      "source_line_count": 56,
+      "source_sha256": "87dbc2913bc522908382f07647371d73c7a0840ee01b40fd1747a965f68ddb99"
+    },
+    {
+      "name": "revert_dag_code",
+      "qualname": "revert_dag_code",
+      "module": "server",
+      "signature": "revert_dag_code(dag_id: 'str', plan_token: 'str' = '', diff: 'str' = '', source_digest: 'str | None' = None) -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "plan_token",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "diff",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "source_digest",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str | None'",
+          "default": "None",
+          "required": false
+        }
+      ],
+      "parameter_count": 4,
+      "docstring": "Restore a Dag's source to the original, discarding **every** change Airy\napplied \u2014 not just the most recent one.\n\nPass back both the ``plan_token`` from plan_revert_dag_code *and* the exact\n``diff`` it returned. The diff goes in the arguments so the confirmation\nthe user clicks shows exactly what reverting discards; the token is what\nproves they reviewed it.\n\n``source_digest`` is set by the caller's permissions, not by you.",
+      "docstring_sha256": "1d58ae31a064ea98fd41ed83776a7f9733bf4a2257aada1cb8862c4833c21132",
+      "is_coroutine": false,
+      "defined_at_line": 3575,
+      "source_line_count": 78,
+      "source_sha256": "59b3b1ea16e7786e0f65b2b98ea91e7f4eebe9e3868a8eee9baa434da5535d91"
+    },
+    {
+      "name": "rerun_dag",
+      "qualname": "rerun_dag",
+      "module": "server",
+      "signature": "rerun_dag(dag_id: 'str', conf: 'dict[str, Any] | None' = None, note: 'str' = '', unpause: 'bool' = False, unpause_token: 'str' = '') -> 'dict[str, Any]'",
+      "return_annotation": "'dict[str, Any]'",
+      "parameters": [
+        {
+          "name": "dag_id",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": null,
+          "required": true
+        },
+        {
+          "name": "conf",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'dict[str, Any] | None'",
+          "default": "None",
+          "required": false
+        },
+        {
+          "name": "note",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        },
+        {
+          "name": "unpause",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'bool'",
+          "default": "False",
+          "required": false
+        },
+        {
+          "name": "unpause_token",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "annotation": "'str'",
+          "default": "''",
+          "required": false
+        }
+      ],
+      "parameter_count": 5,
+      "docstring": "Trigger a fresh run of a Dag on the latest code.\n\n``conf`` sets the Dag's trigger parameters and is validated against the\nDag's own params schema \u2014 unknown keys and wrong types are refused with the\nlist of what the Dag accepts. Leave it out for a Dag without parameters.\n``note`` is attached to the created run.\n\nA paused Dag will not run until it is unpaused, and unpausing also resumes\nits *scheduled* runs \u2014 a lasting change beyond this one run. So it cannot be\npart of a first proposal: calling this on a paused Dag returns a warning and\nan ``unpause_token``. Put the warning to the user in your own words, and only\nif they agree call again with ``unpause=True`` and that token.",
+      "docstring_sha256": "4e14114789a69983ad7357a862f42ca90a6c2f42ca2e14d77b5598ef99ad5245",
+      "is_coroutine": false,
+      "defined_at_line": 3991,
+      "source_line_count": 99,
+      "source_sha256": "86fc21b4c8aa595f01a6feb674c97a3b7cacd33eaa1a76680ab329fa8ca01b6a"
+    }
+  ]
+}

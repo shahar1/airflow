@@ -1,0 +1,3 @@
+319ece9be018ed6c95a53f6212c025d53058d248087ffd48bbf0fa3eb047d518  dev/airy_mcp/server.py
+b7c76a3589131f07472565e784a6c8792d74c1a91113061bac9bd37bdbbcd8c6  dev/airy_mcp/test_server.py
+06aa32d42cae5f054450f36dbef239d5d89958058f7033a9d30639628165d247  plugins/airflow-chatbot-plugin/airflow_chatbot_plugin.py

@@ -1,0 +1,53 @@
+{
+  "capture": "find_failure_clusters__720h_scoped",
+  "call": "find_failure_clusters(hours=720, dag_ids=['carrier_settlement_prep','referral_result_dispatch','tariff_reconciliation'])",
+  "status": "ok",
+  "http_calls": [
+    "POST /dags/~/dagRuns/~/taskInstances/list",
+    "GET /dags/carrier_settlement_prep/dagRuns/scheduled__2026-08-06T21%3A10%3A00%2B00%3A00/taskInstances/wait_for_manifests/logs/1",
+    "GET /dags/referral_result_dispatch/dagRuns/scheduled__2026-08-06T23%3A35%3A00%2B00%3A00/taskInstances/await_normalized_results/logs/1",
+    "GET /dags/tariff_reconciliation/dagRuns/scheduled__2026-08-06T22%3A50%3A00%2B00%3A00/taskInstances/wait_for_rated_intervals/logs/1",
+    "GET /dags/carrier_settlement_prep/dagRuns/scheduled__2026-08-07T21%3A10%3A00%2B00%3A00/taskInstances/wait_for_manifests/logs/1",
+    "GET /dags/tariff_reconciliation/dagRuns/scheduled__2026-08-07T22%3A50%3A00%2B00%3A00/taskInstances/wait_for_rated_intervals/logs/1",
+    "GET /dags/referral_result_dispatch/dagRuns/scheduled__2026-08-07T23%3A35%3A00%2B00%3A00/taskInstances/await_normalized_results/logs/1"
+  ],
+  "normalized_result": {
+    "window_hours": 720,
+    "failures_scanned": 6,
+    "failures_omitted": 0,
+    "scope": "task instances recorded state=failed only. No clusters means no FAILED task instance in the window \u2014 it does not mean the Dags are healthy. A run recorded success whose task never ran is invisible here; diagnose_dag finds those.",
+    "clusters": [
+      {
+        "error": "AirflowSensorTimeout: Sensor has timed out; run duration of N.N seconds exceeds the specified timeout of N.N.",
+        "count": 6,
+        "examples": [
+          {
+            "dag_id": "carrier_settlement_prep",
+            "task_id": "wait_for_manifests",
+            "dag_run_id": "scheduled__<TS>"
+          },
+          {
+            "dag_id": "referral_result_dispatch",
+            "task_id": "await_normalized_results",
+            "dag_run_id": "scheduled__<TS>"
+          },
+          {
+            "dag_id": "tariff_reconciliation",
+            "task_id": "wait_for_rated_intervals",
+            "dag_run_id": "scheduled__<TS>"
+          },
+          {
+            "dag_id": "carrier_settlement_prep",
+            "task_id": "wait_for_manifests",
+            "dag_run_id": "scheduled__<TS>"
+          },
+          {
+            "dag_id": "tariff_reconciliation",
+            "task_id": "wait_for_rated_intervals",
+            "dag_run_id": "scheduled__<TS>"
+          }
+        ]
+      }
+    ]
+  }
+}

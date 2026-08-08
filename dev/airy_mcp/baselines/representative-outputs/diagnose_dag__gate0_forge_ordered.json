@@ -1,0 +1,442 @@
+{
+  "capture": "diagnose_dag__gate0_forge_ordered",
+  "call": "diagnose_dag('gate0_forge_ordered', 'g0r1_ordered_001')",
+  "status": "ok",
+  "http_calls": [
+    "GET /dags/gate0_forge_ordered/dagRuns/g0r1_ordered_001",
+    "GET /dags/gate0_forge_ordered/dagRuns",
+    "GET /dags/gate0_forge_ordered/dagRuns/g0r1_ordered_001/taskInstances",
+    "GET /dags/gate0_forge_ordered/dagRuns/g0r1_ordered_001/taskInstances/remit_payment_batch/tries",
+    "GET /dags/gate0_forge_ordered/dagRuns/~/taskInstances",
+    "GET /dags/gate0_forge_ordered",
+    "GET /dagSources/gate0_forge_ordered",
+    "GET /dags/gate0_forge_ordered/tasks",
+    "GET /importErrors"
+  ],
+  "normalized_result": {
+    "dag_id": "gate0_forge_ordered",
+    "dag_run_id": "g0r1_ordered_001",
+    "run_state": "success",
+    "dag_version": 2,
+    "dag_version_limits": [
+      "`dag_version` records the version stamped on the run's task instances, not the version that executed them. On a bundle with no `bundle_version` the scheduler rewrites it forward (jobs/scheduler_job_runner.py:3047-3057, models/dagbag.py:210-216) and it can name a version the run never ran."
+    ],
+    "task_instances": [
+      {
+        "task_id": "prepare_disbursement_file",
+        "map_index": -1,
+        "state": "success",
+        "try_number": 1,
+        "max_tries": 0,
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "hostname": "<HOST>",
+        "pid": "<PID>",
+        "queued_when": "<TS>",
+        "scheduled_when": "<TS>",
+        "operator": "_PythonDecoratedOperator",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        }
+      },
+      {
+        "task_id": "remit_payment_batch",
+        "map_index": -1,
+        "state": "success",
+        "try_number": 0,
+        "max_tries": 0,
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "hostname": "<HOST>",
+        "pid": null,
+        "queued_when": null,
+        "scheduled_when": null,
+        "operator": "_PythonDecoratedOperator",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        }
+      },
+      {
+        "task_id": "notify_treasury_complete",
+        "map_index": -1,
+        "state": "success",
+        "try_number": 1,
+        "max_tries": 0,
+        "start_date": "<TS>",
+        "end_date": "<TS>",
+        "duration": "<DURATION>",
+        "hostname": "<HOST>",
+        "pid": "<PID>",
+        "queued_when": "<TS>",
+        "scheduled_when": "<TS>",
+        "operator": "_PythonDecoratedOperator",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        }
+      }
+    ],
+    "event_history": {
+      "status": "not_scoped",
+      "events_scanned": 0,
+      "total_entries": 0,
+      "events_omitted": 0,
+      "oldest_scanned_when": null,
+      "rows_rejected": 0,
+      "instances_without_attribution": 0,
+      "attribution_payload_bytes": 3252,
+      "attribution_payload_limit": 400000,
+      "attribution_reduced_for_size": 0,
+      "attribution_payload_over_limit": false,
+      "clear_with_include_flags": false,
+      "run_scoped_events": [],
+      "run_scoped_events_omitted": 0,
+      "error": "no audit scope was supplied, so the audit log was not read",
+      "query": "GET /api/v2/eventLogs?dag_id=<dag>&run_id=<run> (order_by=-when)",
+      "limits": [
+        "At most 300 event rows are read, newest first by `when`; anything older than that window was not looked at.",
+        "The query is scoped to this Dag and this run, so it cannot see a row recorded against any other Dag or any other run.",
+        "Rows with a null `dag_id` are unreachable by a dag_id-scoped query and need a separate fleet-wide audit-log permission, so this reading never covers them.",
+        "The `log` table is cleanable by `airflow db clean` (utils/db_cleanup.py:189, included when `--tables` is omitted), so an empty history can also mean retention removed the rows.",
+        "`cli_*` rows are written with NO `run_id` at all - the CLI action logger inserts only event, owner, extra, task_id, dag_id and logical_date (utils/cli_action_loggers.py:133-146, off the metrics built at utils/cli.py:210-224) - so `run_id` is null on every one of them and a run-scoped query structurally cannot return any. That includes `cli_dag_test`, the `airflow dags test --mark-success-pattern` route named in the unknowns above: a CLI-driven state change is invisible to this reading whether or not it happened.",
+        "`extra` is projected to the four keys this tool reads (`method`, `new_state`, `task_ids`, `map_index`) and only for the HEADLINE row of each task instance; every other key is named in `extra_keys` and withheld, and the context rows under `events` carry no `extra` at all. Airflow masks `extra` by key NAME only, so relaying it whole passed through anything the requester chose to call something else.",
+        "The attribution payload is bounded at runtime, not only by the per-field clamps: the serialized `last_state_change` objects are measured and, past the ceiling reported in `attribution_payload_limit`, context rows and then `extra` projections are dropped from the oldest instances first. Any row that lost content says so with `size_reduced`, and the count is in `attribution_reduced_for_size`."
+      ],
+      "unknowns_legend": {
+        "U14": "The event history was not read because the call carried no audit scope, so nothing about a recorded event is established either way."
+      }
+    },
+    "run_history": {
+      "returned": 3,
+      "total_entries": 3,
+      "runs_omitted": 0,
+      "window": "the most recent 3 run(s) of this Dag by run_after, newest first",
+      "runs": [
+        {
+          "dag_run_id": "g0r1_ordered_001",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": null,
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 2,
+          "is_diagnosed_run": true
+        },
+        {
+          "dag_run_id": "vfy_bulk_001",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": null,
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        },
+        {
+          "dag_run_id": "gate0_ordered_bulk_001",
+          "state": "success",
+          "run_type": "manual",
+          "logical_date": null,
+          "queued_at": "<TS>",
+          "start_date": "<TS>",
+          "end_date": "<TS>",
+          "duration": "<DURATION>",
+          "triggered_by": "rest_api",
+          "triggering_user_name": "admin",
+          "dag_version": 1,
+          "is_diagnosed_run": false
+        }
+      ],
+      "task_comparison": {
+        "selection": "task instances this diagnosis flagged, then failed or retrying ones, newest-first, capped at 5 task ids",
+        "task_ids_compared": [
+          "remit_payment_batch"
+        ],
+        "task_ids_omitted": 0,
+        "runs_not_covered": [],
+        "tasks": {
+          "remit_payment_batch": [
+            {
+              "dag_run_id": "g0r1_ordered_001",
+              "map_index": -1,
+              "state": "success",
+              "try_number": 0,
+              "duration": "<DURATION>",
+              "hostname": "<HOST>",
+              "pid": null,
+              "queued_when": null,
+              "scheduled_when": null,
+              "start_date": "<TS>",
+              "end_date": "<TS>",
+              "operator": "_PythonDecoratedOperator"
+            },
+            {
+              "dag_run_id": "vfy_bulk_001",
+              "map_index": -1,
+              "state": "success",
+              "try_number": 0,
+              "duration": "<DURATION>",
+              "hostname": "<HOST>",
+              "pid": null,
+              "queued_when": null,
+              "scheduled_when": null,
+              "start_date": "<TS>",
+              "end_date": "<TS>",
+              "operator": "_PythonDecoratedOperator"
+            },
+            {
+              "dag_run_id": "gate0_ordered_bulk_001",
+              "map_index": -1,
+              "state": "success",
+              "try_number": 0,
+              "duration": "<DURATION>",
+              "hostname": "<HOST>",
+              "pid": null,
+              "queued_when": null,
+              "scheduled_when": null,
+              "start_date": "<TS>",
+              "end_date": "<TS>",
+              "operator": "_PythonDecoratedOperator"
+            }
+          ]
+        },
+        "rows_omitted": {
+          "remit_payment_batch": 0
+        },
+        "error": null
+      },
+      "limits": [
+        "`dag_version` records the version stamped on the run's task instances, not the version that executed them. On a bundle with no `bundle_version` the scheduler rewrites it forward (jobs/scheduler_job_runner.py:3047-3057, models/dagbag.py:210-216) and it can name a version the run never ran.",
+        "`triggering_user_name` is the authenticated principal recorded for triggering the run. It says nothing about who changed any task instance's state."
+      ],
+      "error": null
+    },
+    "source": "\"\"\"\nDaily supplier disbursement: assemble the payment file, remit it, notify treasury.\n\nEach step hands off to the next through the shared artifact directory rather than\nthrough XCom, so the payment file, the remittance receipt and the treasury\nnotification all stay on disk for audit after the run has finished.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport re\nimport time\nfrom pathlib import Path\n\nimport pendulum\n\nfrom airflow.sdk import DAG, get_current_context, task\n\nARTIFACT_DIR = Path(\"/files/gate0_side_effects\")\nBATCH_TOTAL_CENTS = 4_812_650\nBATCH_LINE_COUNT = 1_204\nLEDGER_PAGE_COUNT = 60\nLEDGER_PAGE_THROTTLE_SECONDS = 1.0\n\n\ndef build_artifact_path(kind: str, run_id: str) -> Path:\n    return ARTIFACT_DIR / f\"{kind}__{re.sub(r'[^A-Za-z0-9._-]', '_', run_id)}.json\"\n\n\n@task\ndef prepare_disbursement_file() -> None:\n    run_id = get_current_context()[\"run_id\"]\n    pages = []\n    for page in range(LEDGER_PAGE_COUNT):\n        # The payables ledger caps reads at one page per second.\n        time.sleep(LEDGER_PAGE_THROTTLE_SECONDS)\n        pages.append({\"page\": page + 1, \"cents\": BATCH_TOTAL_CENTS // LEDGER_PAGE_COUNT})\n        if page % 10 == 0:\n            print(f\"read payables ledger page {page + 1}/{LEDGER_PAGE_COUNT}\")\n    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)\n    build_artifact_path(\"disbursement\", run_id).write_text(\n        json.dumps(\n            {\n                \"run_id\": run_id,\n                \"total_cents\": BATCH_TOTAL_CENTS,\n                \"lines\": BATCH_LINE_COUNT,\n                \"pages\": pages,\n            },\n            indent=2,\n        )\n    )\n    print(f\"disbursement file written: {BATCH_LINE_COUNT} lines, {BATCH_TOTAL_CENTS} cents\")\n\n\n@task\ndef remit_payment_batch() -> None:\n    run_id = get_current_context()[\"run_id\"]\n    batch = json.loads(build_artifact_path(\"disbursement\", run_id).read_text())\n    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)\n    build_artifact_path(\"receipt\", run_id).write_text(\n        json.dumps(\n            {\n                \"run_id\": run_id,\n                \"remitted_cents\": batch[\"total_cents\"],\n                \"lines\": batch[\"lines\"],\n                \"confirmation\": f\"REMIT-{abs(hash(run_id)) % 10**8:08d}\",\n            },\n            indent=2,\n        )\n    )\n    print(f\"remitted {batch['total_cents']} cents over {batch['lines']} lines\")\n\n\n@task\ndef notify_treasury_complete() -> None:\n    run_id = get_current_context()[\"run_id\"]\n    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)\n    build_artifact_path(\"notification\", run_id).write_text(\n        json.dumps(\n            {\n                \"run_id\": run_id,\n                \"channel\": \"treasury-ops\",\n                \"notified_at\": pendulum.now(\"UTC\").isoformat(),\n            },\n            indent=2,\n        )\n    )\n    print(\"treasury notified: disbursement run complete\")\n\n\nwith DAG(\n    dag_id=\"gate0_forge_ordered\",\n    schedule=None,\n    start_date=pendulum.datetime(2026, 1, 1, tz=\"UTC\"),\n    catchup=False,\n    tags=[\"gate0\"],\n):\n    prepare_disbursement_file() >> remit_payment_batch() >> notify_treasury_complete()\n",
+    "source_file": "/home/shahar/repos/apache/airflow/files/dags/gate0_forge_ordered.py",
+    "tasks": {
+      "order": [
+        "prepare_disbursement_file",
+        "remit_payment_batch",
+        "notify_treasury_complete"
+      ],
+      "ordering": "topological",
+      "ambiguous_positions": [],
+      "edges": {
+        "prepare_disbursement_file": [
+          "remit_payment_batch"
+        ],
+        "remit_payment_batch": [
+          "notify_treasury_complete"
+        ]
+      }
+    },
+    "checks": [
+      {
+        "kind": "success_without_attempt_dispatch_fields",
+        "detail": "`remit_payment_batch` is recorded state=success at try_number 0, and this attempt carries none of the fields a dispatched attempt writes: host=<HOST> empty, pid is null, queued_when is null and scheduled_when is null, with duration 0 and start_date equal to end_date. Only host=<HOST> pid are written by a worker, and a task instance that completes entirely inside the triggerer writes none of these fields either. Its attempt history records 1 attempt(s) and none of them carries execution fields. The event history was not read for this run because the call carried no audit scope, so nothing about a recorded event is established either way. This is not confined to this run: the same task carries no worker-written field (host=<HOST>, pid null) on 3 consecutive run(s) ending with this one, out of the 3 most recent run(s) this diagnosis compared \u2014 `g0r1_ordered_001`, `vfy_bulk_001`, `gate0_ordered_bulk_001`. Operational effect: the run is recorded success, so this finding raises no failure and fires no alert of its own, and 1 task(s) downstream of it in the task graph are recorded in this run with this attempt already marked success: `notify_treasury_complete` (success). What wrote this state is not established by this diagnosis",
+        "task_id": "remit_payment_batch",
+        "map_index": -1,
+        "operator": "_PythonDecoratedOperator",
+        "current_attempt_dispatched": false,
+        "attempt_history": "checked",
+        "attribution": "event_history_not_scoped",
+        "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+        "last_state_change": {
+          "attribution": "event_history_not_scoped",
+          "attribution_detail": "The event history was not read because the call carried no audit scope at all - no permission was refused and none was asked for. Nothing about a recorded event is established either way - neither presence nor absence.",
+          "event": null,
+          "when": null,
+          "event_log_id": null,
+          "event_owner": null,
+          "event_owner_display_name": null,
+          "recorded_principal": null,
+          "recorded_principal_kind": "not_recorded",
+          "interface": null,
+          "method": null,
+          "method_raw": null,
+          "new_state": null,
+          "new_state_raw": null,
+          "new_state_source": null,
+          "old_state": null,
+          "event_map_index": null,
+          "event_try_number": null,
+          "pins_map_index": false,
+          "pins_try_number": false,
+          "matches_recorded_attempt": null,
+          "associated_via": null,
+          "classification": null,
+          "extra": {},
+          "extra_parsed": false,
+          "extra_keys": [],
+          "extra_keys_omitted": 0,
+          "extra_truncated": false,
+          "targeting_is_request_settable": false,
+          "corroborated_association": false,
+          "size_reduced": false,
+          "events_recorded": 0,
+          "events_omitted_for_instance": 0,
+          "events": [],
+          "unknowns": [
+            "U14"
+          ]
+        },
+        "attempts_recorded": 1,
+        "earlier_attempt_executed": false
+      }
+    ],
+    "run_health": {
+      "state": "success",
+      "task_instance_states": {
+        "success": 3
+      },
+      "successes_scanned": 3,
+      "successes_with_incomplete_evidence": 0,
+      "attempt_history_checked": 1,
+      "attempt_history_unchecked": 0,
+      "successes_without_history_check": 2,
+      "successes_no_probe_needed": 2,
+      "successes_without_worker_fields": 1,
+      "successes_with_no_dispatch_field": 1,
+      "successes_without_worker_fields_named": [
+        "remit_payment_batch"
+      ],
+      "dispatch_findings_suppressed": 0,
+      "static_checks_suppressed": 0,
+      "task_instances_omitted": 0,
+      "state_change_attribution": {
+        "by_attribution": {
+          "event_history_not_scoped": 3
+        },
+        "corroborated": {},
+        "row_claimed": {},
+        "instances_attributed_by_unpinned_row": 0,
+        "distinct_event_log_ids": 0
+      },
+      "clean": false,
+      "clean_blockers": [
+        "checks_present",
+        "successes_without_worker_fields",
+        "event_history_not_scoped"
+      ]
+    },
+    "summary": "Run `g0r1_ordered_001` is recorded success, and this diagnosis still found 1 problem. (1) Success with no worker-dispatch fields for the recorded attempt: `remit_payment_batch` is recorded state=success at try_number 0, and this attempt carries none of the fields a dispatched attempt writes: host=<HOST> empty, pid is null, queued_when is null and scheduled_when is null, with duration 0 and start_date equal to end_date. Only host=<HOST> pid are written by a worker, and a task instance that completes entirely inside the triggerer writes none of these fields either. Its attempt history records 1 attempt(s) and none of them carries execution fields. The event history was not read for this run because the call carried no audit scope, so nothing about a recorded event is established either way. This is not confined to this run: the same task carries no worker-written field (host=<HOST>, pid null) on 3 consecutive run(s) ending with this one, out of the 3 most recent run(s) this diagnosis compared \u2014 `g0r1_ordered_001`, `vfy_bulk_001`, `gate0_ordered_bulk_001`. Operational effect: the run is recorded success, so this finding raises no failure and fires no alert of its own, and 1 task(s) downstream of it in the task graph are recorded in this run with this attempt already marked success: `notify_treasury_complete` (success). What wrote this state is not established by this diagnosis. Attempt history was read for 1 of 3 successful task instance(s). 2 of those needed no attempt-history read: the live row already carries dispatch fields, or try_number is past max_tries, which rules out a clear since the last attempt. 1 successful task instance(s) carry no worker-written field (host=<HOST>, pid null), so this diagnosis does not establish that a worker ran them: 0 with a scheduler or executor field set (queued_when or scheduled_when), and 1 with no dispatch field recorded at all. Named: `remit_payment_batch`.",
+    "diagnosis": "run g0r1_ordered_001 is success and no task instance in it failed, but this diagnosis found problems in it \u2014 read `summary`, not this line"
+  }
+}

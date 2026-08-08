@@ -1,0 +1,20 @@
+{
+  "capture": "get_blast_radius__incident_triage",
+  "call": "get_blast_radius('incident_triage')",
+  "status": "ok",
+  "http_calls": [
+    "GET /assets"
+  ],
+  "normalized_result": {
+    "dag_id": "incident_triage",
+    "produces_assets": [
+      "incident_report"
+    ],
+    "downstream_dags": [
+      "incident_digest"
+    ],
+    "consumes_assets": [],
+    "upstream_dags": [],
+    "scope": "asset edges only. Empty lists mean this Dag declares no asset dependency in the catalog \u2014 not that a failure in it has no consequences. Task-level impact inside a run is in diagnose_dag's task graph, not here."
+  }
+}
