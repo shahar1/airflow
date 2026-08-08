@@ -36,6 +36,7 @@ if "fastmcp" not in sys.modules:
     sys.modules["fastmcp"] = _stub
 
 import approvals
+import reading
 import server
 import transport
 
@@ -748,7 +749,7 @@ def test_diagnose_dag_skips_reference_checks_for_a_file_with_a_taskflow_dag(airf
 def _paged_task_instances(airflow, monkeypatch, total: int):
     """A run whose task instances only come back a page at a time."""
     tis = [{"task_id": f"t{i}", "try_number": 1, "state": "success"} for i in range(total)]
-    monkeypatch.setattr(server, "TASK_INSTANCE_PAGE", 2)
+    monkeypatch.setattr(reading, "TASK_INSTANCE_PAGE", 2)
 
     def paged(method, path, **kw):
         if path.endswith("/taskInstances"):
@@ -777,7 +778,7 @@ def test_diagnose_dag_says_when_a_run_is_longer_than_it_will_scan(airflow, monke
     """A silently short list would hide a failure; say what was not looked at."""
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
     _paged_task_instances(airflow, monkeypatch, total=9)
-    monkeypatch.setattr(server, "TASK_INSTANCE_SCAN_LIMIT", 4)
+    monkeypatch.setattr(reading, "TASK_INSTANCE_SCAN_LIMIT", 4)
 
     result = server.diagnose_dag(DAG_ID)
 
@@ -1368,7 +1369,7 @@ def test_plan_dag_code_changes_does_not_mistake_a_sensor_for_the_task_it_waits_o
 def test_plan_dag_code_changes_refuses_when_it_cannot_read_the_task_graph(airflow, monkeypatch):
     """ "Found no problems" and "could not look" must not be the same answer."""
     monkeypatch.setattr(
-        server,
+        reading,
         "_tasks",
         lambda dag_id: (_ for _ in ()).throw(
             httpx.HTTPStatusError(
@@ -1857,9 +1858,9 @@ def test_apply_task_instance_clear_checks_the_task_set_after_the_repeated_dry_ru
 
 def test_plan_task_instance_clear_refuses_when_it_cannot_see_the_whole_run(cleared_run, monkeypatch):
     """Half a task list cannot answer whether the latest version moves the set."""
-    real = server._run_task_instances
+    real = reading._run_task_instances
     monkeypatch.setattr(
-        server, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 4)
+        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 4)
     )
 
     plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
@@ -2756,9 +2757,9 @@ def test_an_unreadable_output_record_is_unestablished_not_absent(recovered_run):
 
 
 def test_verification_reports_a_run_it_could_not_read_whole(recovered_run, monkeypatch):
-    real = server._run_task_instances
+    real = reading._run_task_instances
     monkeypatch.setattr(
-        server, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 3)
+        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 3)
     )
 
     result = _verify()
@@ -3035,7 +3036,7 @@ def test_find_failure_clusters_scans_only_recent_failed_tis(airflow):
 
     listing = next(body for body in airflow.payloads if body and "state" in body)
     assert listing["state"] == ["failed"]
-    assert listing["page_limit"] == server.FAILURE_SCAN_LIMIT
+    assert listing["page_limit"] == reading.FAILURE_SCAN_LIMIT
     assert "start_date_gte" in listing
 
 
@@ -3070,7 +3071,7 @@ def test_find_failure_clusters_asks_for_the_mapped_instance_own_log(airflow):
 
 def test_find_failure_clusters_counts_the_failures_beyond_its_scan(airflow, monkeypatch):
     """A truncated scan must say so, or '3 clusters' means 'of the 50 I saw'."""
-    monkeypatch.setattr(server, "FAILURE_SCAN_LIMIT", 2)
+    monkeypatch.setattr(reading, "FAILURE_SCAN_LIMIT", 2)
     airflow.task_instances = [
         {"dag_id": "etl", "task_id": f"t{i}", "dag_run_id": f"r{i}", "try_number": 1} for i in range(5)
     ]
@@ -3123,7 +3124,7 @@ def test_run_backfill_creates_the_backfill(airflow):
 
 def test_plan_backfill_issues_no_token_for_a_plan_over_the_cap(airflow, monkeypatch):
     """It could never be created, and the preview is too long to have really been read."""
-    monkeypatch.setattr(server, "MAX_BACKFILL_RUNS", 5)
+    monkeypatch.setattr(reading, "MAX_BACKFILL_RUNS", 5)
     airflow.dry_run_dates = [f"2026-07-{day:02}T00:00:00Z" for day in range(1, 26)]
 
     plan = server.plan_backfill(DAG_ID, "2026-07-01", "2026-07-25")
@@ -3136,7 +3137,7 @@ def test_run_backfill_refuses_more_runs_than_the_cap(airflow, monkeypatch):
     airflow.dry_run_dates = [f"2026-07-{day:02}T00:00:00Z" for day in range(1, 26)]
     plan = server.plan_backfill(DAG_ID, "2026-07-01", "2026-07-25")
     # The cap tightens between the preview and the approval.
-    monkeypatch.setattr(server, "MAX_BACKFILL_RUNS", 5)
+    monkeypatch.setattr(reading, "MAX_BACKFILL_RUNS", 5)
 
     result = _approve(DAG_ID, "2026-07-01", "2026-07-25", plan)
 
@@ -4418,7 +4419,7 @@ def test_diagnose_does_not_call_a_partially_scanned_run_problem_free(airflow, mo
     """An instance nobody looked at could be the one holding the finding."""
     airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
     _paged_task_instances(airflow, monkeypatch, total=9)
-    monkeypatch.setattr(server, "TASK_INSTANCE_SCAN_LIMIT", 4)
+    monkeypatch.setattr(reading, "TASK_INSTANCE_SCAN_LIMIT", 4)
 
     result = server.diagnose_dag(DAG_ID)
 
@@ -4990,7 +4991,7 @@ def test_event_log_content_at_every_clamp_cannot_scale_the_result(airflow):
     # an instance so more are matched than EVENT_HISTORY_PER_INSTANCE keeps.
     rows = [
         _maximal_event(index * 10 + copy, forged[index]["task_id"])
-        for index in range(server.EVENT_SCAN_LIMIT // 4)
+        for index in range(reading.EVENT_SCAN_LIMIT // 4)
         for copy in range(4)
     ]
     benign = [_event(event_log_id=row["event_log_id"], task_id=row["task_id"]) for row in rows]
@@ -5603,8 +5604,8 @@ def test_a_truncated_scan_never_reports_absence_as_no_event_found(airflow):
 
 
 def test_the_event_scan_follows_pages_up_to_its_ceiling_and_no_further(airflow, monkeypatch):
-    monkeypatch.setattr(server, "EVENT_SCAN_PAGE", 2)
-    monkeypatch.setattr(server, "EVENT_SCAN_LIMIT", 4)
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 2)
+    monkeypatch.setattr(reading, "EVENT_SCAN_LIMIT", 4)
     airflow.event_log_pages = [
         [_event(event_log_id=index * 2), _event(event_log_id=index * 2 + 1)] for index in range(5)
     ]
@@ -5623,8 +5624,8 @@ def test_the_event_scan_stops_after_a_bounded_number_of_pages(airflow, monkeypat
     """F15: a route that answers a 100-row page with one row, forever, and keeps
     saying there are 10000, spun the loop once per row. The iteration count is
     bounded by the tool's own constants now, not by the server's arithmetic."""
-    monkeypatch.setattr(server, "EVENT_SCAN_PAGE", 100)
-    monkeypatch.setattr(server, "EVENT_SCAN_LIMIT", 300)
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 100)
+    monkeypatch.setattr(reading, "EVENT_SCAN_LIMIT", 300)
     airflow.event_log_pages = [[_event(event_log_id=index)] for index in range(500)]
     airflow.event_logs_total = 10_000
 
@@ -6804,7 +6805,7 @@ def test_the_top_level_dag_version_carries_the_same_caveat_as_the_run_rows(airfl
 
 
 def test_run_history_caps_how_many_task_ids_it_compares(airflow, monkeypatch):
-    monkeypatch.setattr(server, "TASK_COMPARISON_LIMIT", 2)
+    monkeypatch.setattr(reading, "TASK_COMPARISON_LIMIT", 2)
     forged = [{**FORGED_TI, "task_id": f"forged_{index}"} for index in range(5)]
     airflow.tries_by_task = {(ti["task_id"], -1): [dict(ti)] for ti in forged}
 
@@ -8435,7 +8436,7 @@ def test_partial_probe_coverage_refuses_the_clear(cleared_run, monkeypatch):
     )
     assert plan["blast_radius"]["mapped_tasks"] == []
     monkeypatch.setattr(
-        server,
+        reading,
         "_expandable_probe",
         lambda dag_id, run_path, task_id: None if task_id == "report" else False,
     )
@@ -8459,7 +8460,7 @@ def test_a_probe_that_answers_for_every_closure_task_still_settles_it(cleared_ru
     plan = server.plan_task_instance_clear(
         DAG_ID, task_id="summarize", only_failed=False, include_downstream=True
     )
-    monkeypatch.setattr(server, "_expandable_probe", lambda dag_id, run_path, task_id: False)
+    monkeypatch.setattr(reading, "_expandable_probe", lambda dag_id, run_path, task_id: False)
 
     result = server.apply_task_instance_clear(
         DAG_ID,
@@ -8480,9 +8481,9 @@ def test_the_expansion_probe_runs_before_the_write_and_its_answer_is_carried(map
     """Re-asking it after the write is the network call that turned a landed clear red."""
     plan = _mapped_plan()
     calls: list[bool] = []
-    real = server._expandable_probe
+    real = reading._expandable_probe
     monkeypatch.setattr(
-        server,
+        reading,
         "_expandable_probe",
         lambda *args: (calls.append(bool(mapped_run.cleared)), real(*args))[1],
     )
@@ -8597,9 +8598,9 @@ def test_a_truncated_preview_says_nothing_about_the_instances_it_did_not_read(cl
 
 def test_a_run_this_tool_cannot_read_whole_refuses_the_write(cleared_run, monkeypatch):
     plan = _gate_plan(cleared_run)
-    real = server._run_task_instances
+    real = reading._run_task_instances
     monkeypatch.setattr(
-        server, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 7)
+        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 7)
     )
 
     result = _gate_apply(plan)

@@ -58,6 +58,13 @@ from urllib.parse import quote
 
 import httpx
 
+# Wave 4 of the move-only extraction: every bounded read, and every scan, page and
+# clamp bound that bounds one, lives in ``reading.py`` now.  ``_tasks``,
+# ``_run_task_instances``, ``_expandable_probe`` and the seven bounds the suite rebinds
+# are reached through the module object and never imported by name, so the module the
+# read runs in is the one place that has to be patched for the patch to be felt.
+import reading
+
 # Wave 2 of the move-only extraction: the HTTP conversation lives in ``transport.py``
 # now.  ``_api`` and ``API_URL`` are reached through the module object and never
 # imported by name, so one binding serves every call site and the suite has exactly one
@@ -132,6 +139,36 @@ from primitives import (
     _ti_where,
 )
 
+# The reads and bounds the suite only ever reads, never rebinds, so a re-export here is
+# the same object the call sites use.  The rebound ones are absent on purpose: see the
+# ``import reading`` note above.
+from reading import (
+    _HISTORY_CLAMPED,  # noqa: F401 - re-exported for ``server._HISTORY_CLAMPED``
+    _TASK_COMPARISON_SELECTION,
+    LOG_TAIL_CHARS,  # noqa: F401 - re-exported for ``server.LOG_TAIL_CHARS``
+    RUN_HISTORY_LIMIT,
+    _attempt_history,
+    _attempt_log,
+    _attempt_reading,
+    _attempt_rows,  # noqa: F401 - re-exported for ``server._attempt_rows``
+    _audit_transitions,
+    _backfill_runs,
+    _build_asset_note,
+    _compute_asset_edges,
+    _dry_run_backfill,
+    _duration_baseline,
+    _find_import_errors,
+    _latest_version,
+    _read_is_complete,
+    _recent_runs,
+    _recorded_output,
+    _resolve_run,
+    _tail,
+    _task_comparison,
+    _tasks_reading,
+    _version_context,
+)
+
 # The four transport helpers the suite only ever reads, never patches, so a re-export
 # here is the same object the call sites use.
 from transport import (
@@ -144,20 +181,10 @@ from transport import (
 DAGS_DIR = Path(os.environ.get("AIRY_MCP_DAGS_DIR", "/files/dags"))
 
 REPARSE_TIMEOUT_S = 45.0
-FAILURE_SCAN_LIMIT = 50
-LOG_TAIL_LINES = 40
-LOG_TAIL_CHARS = 4000
-MAX_BACKFILL_RUNS = int(os.environ.get("AIRY_MCP_MAX_BACKFILL_RUNS", "50"))
 # One diagnosis now carries every failed task's log, so it needs a ceiling the
 # per-log tail does not give: a fan-out of 200 failed mapped instances would
 # otherwise return 800 KB and blow the model's context on its way through.
 DIAGNOSIS_LOG_BUDGET_CHARS = 12000
-# ``taskInstances`` pages, and a silently short list would let a diagnosis miss a
-# failure or a clear compare the wrong task set. Asking for a bigger page does
-# not help — ``[api] maximum_page_limit`` (100) clamps it — so the pages are
-# followed, up to a ceiling, and whatever is still missing is reported.
-TASK_INSTANCE_PAGE = 100
-TASK_INSTANCE_SCAN_LIMIT = 500
 # The 13-field per-instance projection is what makes a dispatch-evidence reading
 # possible at all, but a 500-instance fan-out of it is ~60 KB of context. Beyond
 # this many instances the rest fall back to the 4-field projection, and the count
@@ -183,14 +210,6 @@ DIAGNOSIS_SUMMARY_BUDGET_CHARS = 12000
 # at all so the count is checkable; capped because the population is chosen by
 # whoever wrote the states being read.
 COVERAGE_NAME_LIMIT = 5
-# ``GET /eventLogs`` clamps ``limit`` to 100 (verified live: limit=1000 returned
-# 100 rows of 1378), so asking for more does not help and the pages are followed.
-EVENT_SCAN_PAGE = 100
-# At most three HTTP calls per diagnosis whatever the Dag's size. The scan is
-# ordered ``-when``, so what a truncation drops is always the OLDEST rows and a
-# per-instance "latest event" stays correct under it — only ABSENCE becomes
-# unreliable, which is what the ``partial`` status exists to say.
-EVENT_SCAN_LIMIT = int(os.environ.get("AIRY_MCP_EVENT_SCAN_LIMIT", "300"))
 # One instance's event list. The headline attribution always describes events[0],
 # so this cap can never change the answer — only how much context comes with it.
 # It is copied into every detailed row AND into the finding that embeds the same
@@ -198,8 +217,6 @@ EVENT_SCAN_LIMIT = int(os.environ.get("AIRY_MCP_EVENT_SCAN_LIMIT", "300"))
 # in the result and is kept as small as the reading allows.
 EVENT_HISTORY_PER_INSTANCE = 2
 RUN_SCOPED_EVENT_LIMIT = 10
-RUN_HISTORY_LIMIT = int(os.environ.get("AIRY_MCP_RUN_HISTORY_LIMIT", "10"))
-TASK_COMPARISON_LIMIT = int(os.environ.get("AIRY_MCP_TASK_COMPARISON_LIMIT", "5"))
 
 mcp: FastMCP = FastMCP("airy-selfheal")
 
@@ -317,13 +334,6 @@ def _read_reviewed_file(dag_id: str, path: Path, source_digest: str | None = Non
     return on_disk
 
 
-def _latest_version(dag_id: str) -> int | None:
-    versions = transport._api(
-        "GET", _dag_url(dag_id, "/dagVersions"), params={"order_by": "-version_number", "limit": 1}
-    )["dag_versions"]
-    return versions[0]["version_number"] if versions else None
-
-
 def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -> tuple[str, int | None]:
     """Ask the Dag processor to re-read the file *now*, and wait for it to land.
 
@@ -350,54 +360,6 @@ def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -
         f"reparse requested, but the Dag version did not change within {REPARSE_TIMEOUT_S:g}s",
         previous_version,
     )
-
-
-def _tail(content: Any) -> str:
-    """Last few log lines, whatever shape the API returned them in."""
-    if isinstance(content, list):
-        lines = content[-LOG_TAIL_LINES:]
-        text = "\n".join(line if isinstance(line, str) else json.dumps(line) for line in lines)
-    else:
-        text = str(content)
-    return text[-LOG_TAIL_CHARS:]
-
-
-def _run_task_instances(dag_id: str, run_path: str) -> tuple[list[dict[str, Any]], int]:
-    """Every task instance in one run, and how many are still missing."""
-    tis: list[dict[str, Any]] = []
-    total = 0
-    while True:
-        resp = transport._api(
-            "GET",
-            _dag_url(dag_id, f"{run_path}/taskInstances"),
-            params={"limit": TASK_INSTANCE_PAGE, "offset": len(tis)},
-        )
-        page = resp["task_instances"]
-        total = resp.get("total_entries", len(page))
-        tis += page
-        # An empty page ends it whatever the count says: a total that never
-        # comes down would otherwise loop for as long as the ceiling allows.
-        if not page or len(tis) >= min(total, TASK_INSTANCE_SCAN_LIMIT):
-            break
-    return tis, max(total - len(tis), 0)
-
-
-def _tasks_reading(dag_id: str) -> tuple[list[dict[str, Any]], int]:
-    """The current tasks and their edges, with the count the route accounted for.
-
-    ``/tasks`` is the only *public* route that carries ``downstream_task_ids``;
-    the richer structure view lives under ``/ui`` and is not part of the API this
-    server is allowed to speak. The total comes back so a caller that reasons
-    about the task set being COMPLETE can say whether it read all of it.
-    """
-    resp = transport._api("GET", _dag_url(dag_id, "/tasks"))
-    rows = resp["tasks"]
-    return rows, resp.get("total_entries", len(rows))
-
-
-def _tasks(dag_id: str) -> list[dict[str, Any]]:
-    """The current tasks and their edges."""
-    return _tasks_reading(dag_id)[0]
 
 
 def _display_order(tasks: list[dict[str, Any]]) -> tuple[list[str], set[int]]:
@@ -581,63 +543,6 @@ def _static_checks(source: str, task_ids: set[str]) -> tuple[list[dict[str, str]
     return checks, suppressed
 
 
-def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
-    """Import errors for this Dag's file — the classic self-healing case.
-
-    A file that stops parsing never produces a failed run: the old Dag keeps
-    running its old code and every run-based signal looks healthy. The import
-    error list is the only place that failure shows up.
-    """
-    if not dag:
-        return []
-    names = {name for name in (dag.get("fileloc"), dag.get("relative_fileloc")) if name}
-    if not names:
-        return []
-    try:
-        resp = transport._api("GET", "/importErrors", params={"limit": 100})
-        errors = resp["import_errors"]
-    except (httpx.HTTPStatusError, KeyError):
-        return []
-    checks = []
-    dag_bundle = dag.get("bundle_name")
-    for entry in errors:
-        # The suffix match below is by file name, and two bundles can hold a
-        # file of the same name — without this, another team's stack trace
-        # would be attached to this Dag. Only enforced when both sides name
-        # their bundle; a missing name falls back to the name match alone.
-        entry_bundle = entry.get("bundle_name")
-        if dag_bundle and entry_bundle and entry_bundle != dag_bundle:
-            continue
-        filename = entry.get("filename") or ""
-        # The stored filename may be bundle-relative while the Dag reports an
-        # absolute fileloc, or the other way round; match either direction.
-        if filename in names or any(
-            filename.endswith(f"/{name}") or name.endswith(f"/{filename}") for name in names
-        ):
-            # A stack trace is text a Dag author owns end to end: it is quoted
-            # and clamped like any other value this tool did not write. The tail
-            # is what is kept, because the exception is at the end of it.
-            trace = _quoted((entry.get("stack_trace") or "").strip()[-400:], 420)
-            checks.append(
-                {
-                    "kind": "import_error",
-                    "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace}",
-                }
-            )
-    total = resp.get("total_entries", len(errors))
-    if total > len(errors):
-        checks.append(
-            {
-                "kind": "import_errors_truncated",
-                "detail": (
-                    f"only the first {len(errors)} of {total} import errors were checked, so an "
-                    f"import error for this Dag's file may be missing from this diagnosis"
-                ),
-            }
-        )
-    return checks
-
-
 # The fields the conjunction reads. A key that is ABSENT from the response is
 # never read as null: absence of the key is a different fact from a null value,
 # and inferring one from the other would manufacture the finding out of nothing
@@ -674,8 +579,6 @@ _TASK_INSTANCE_DETAIL_KEYS = (
 # Said the same way whether the budget ran out or the precondition never picked
 # the instance: both are "this was not looked at", and neither is a measurement.
 _HISTORY_NOT_CHECKED = "attempt history was not checked for this task instance"
-_HISTORY_EMPTY = "attempt history returned no attempts"
-_HISTORY_PARTIAL = "the attempt history came back truncated"
 
 
 def _is_never_dispatched_attempt(ti: dict[str, Any]) -> bool:
@@ -773,37 +676,6 @@ def _tries_probe_tier(ti: dict[str, Any]) -> str | None:
         if try_number >= 1 and max_tries >= try_number:
             return "B"
     return None
-
-
-def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str, Any]:
-    """Every recorded attempt of one task instance, or why they could not be read.
-
-    Never raises: an unreadable history downgrades what the diagnosis can
-    conclude, and must not take the whole diagnosis down with it. ``TypeError``
-    is in the net because ``_api`` returns ``None`` for an empty body, and
-    subscripting that would otherwise take the whole diagnosis down. The
-    unmapped route accepts ``map_index`` as a query parameter, so one URL serves
-    mapped and unmapped instances, and it is not paginated.
-    """
-    path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/tries")
-    try:
-        resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
-        rows = resp["task_instances"]
-        total = resp.get("total_entries", len(rows))
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        return {"status": "unavailable", "rows": [], "error": _explain_error(e)}
-    if not rows:
-        # Never read as "there were no earlier attempts" — it is the absence of
-        # an answer, not an answer of absence. ``attempts_recorded`` still comes
-        # back, because a page that carries no rows while accounting for some is
-        # a truncated read wearing the same word, and a caller deciding whether
-        # it read the whole history has to be able to tell the two apart.
-        return {"status": "empty", "rows": [], "attempts_recorded": total, "error": _HISTORY_EMPTY}
-    if total > len(rows):
-        # Presence-based conclusions survive a truncated list; absence-based
-        # ones do not.
-        return {"status": "partial", "rows": rows, "attempts_recorded": total, "error": _HISTORY_PARTIAL}
-    return {"status": "checked", "rows": rows, "attempts_recorded": total}
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +789,7 @@ _UNKNOWNS: dict[str, str] = {
 }
 
 _L1 = (
-    f"At most {EVENT_SCAN_LIMIT} event rows are read, newest first by `when`; anything older than "
+    f"At most {reading.EVENT_SCAN_LIMIT} event rows are read, newest first by `when`; anything older than "
     f"that window was not looked at."
 )
 _L2 = (
@@ -1533,7 +1405,7 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
     # Bounded by construction rather than by the server's arithmetic: the break
     # below already ends the scan, and this makes an ``offset`` the API ignores
     # or a total that never comes down cost a fixed number of calls, not a spin.
-    max_pages = max(1, -(-EVENT_SCAN_LIMIT // max(EVENT_SCAN_PAGE, 1)))
+    max_pages = max(1, -(-reading.EVENT_SCAN_LIMIT // max(reading.EVENT_SCAN_PAGE, 1)))
     try:
         for _ in range(max_pages):
             resp = transport._api(
@@ -1548,7 +1420,7 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
                     "dag_id": dag_id,
                     "run_id": run_id,
                     "order_by": "-when",
-                    "limit": EVENT_SCAN_PAGE,
+                    "limit": reading.EVENT_SCAN_PAGE,
                     "offset": len(fetched),
                 },
             )
@@ -1556,7 +1428,7 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
             total = resp.get("total_entries", len(page))
             fetched += page
             # An empty page ends it whatever the count says.
-            if not page or len(fetched) >= min(total, EVENT_SCAN_LIMIT):
+            if not page or len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT):
                 break
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         payload["status"] = "unavailable"
@@ -2180,25 +2052,6 @@ _RUN_HISTORY_KEYS = (
     "triggering_user_name",
 )
 
-_TASK_COMPARISON_KEYS = (
-    "dag_run_id",
-    "map_index",
-    "state",
-    "try_number",
-    "duration",
-    "hostname",
-    "pid",
-    "queued_when",
-    "scheduled_when",
-    "start_date",
-    "end_date",
-)
-
-_TASK_COMPARISON_SELECTION = (
-    "task instances this diagnosis flagged, then failed or retrying ones, newest-first, capped at "
-    f"{TASK_COMPARISON_LIMIT} task ids"
-)
-
 
 def _comparison_task_ids(checks: list[dict[str, Any]], tis: list[dict[str, Any]]) -> list[str]:
     """Which tasks are worth looking at across runs — chosen by the diagnosis, not the caller.
@@ -2214,66 +2067,6 @@ def _comparison_task_ids(checks: list[dict[str, Any]], tis: list[dict[str, Any]]
         if ti.get("state") in ("failed", "up_for_retry") and ti["task_id"] not in ordered:
             ordered.append(ti["task_id"])
     return ordered
-
-
-def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str]) -> dict[str, Any]:
-    """The same task's rows across the runs in the window.
-
-    One call per compared task id, and none at all when there is nothing to
-    compare. The fleet-scoped batch route is deliberately not used: it is
-    ``dag_id`` ``Literal["~"]`` AND carries ``Depends(action_logging())``, so it
-    reads outside the per-Dag boundary the plugin enforces and writes an audit
-    row into the very table this tool reads as evidence.
-    """
-    compared = task_ids[:TASK_COMPARISON_LIMIT]
-    result: dict[str, Any] = {
-        "selection": _TASK_COMPARISON_SELECTION,
-        "task_ids_compared": compared,
-        "task_ids_omitted": max(len(task_ids) - len(compared), 0),
-        "runs_not_covered": [],
-        "tasks": {},
-        # Per task id, how many rows the route said it held beyond the page that
-        # came back. Never read before, so a task with more history than
-        # RUN_HISTORY_LIMIT rows was silently reported as if the page were all
-        # of it.
-        "rows_omitted": {},
-        "error": None,
-    }
-    if not compared or not runs:
-        return result
-    window = {run["dag_run_id"] for run in runs}
-    oldest = runs[-1].get("run_after")
-    tasks: dict[str, list[dict[str, Any]]] = {}
-    omitted: dict[str, int] = {}
-    covered: set[str] = set()
-    try:
-        for task_id in compared:
-            params: dict[str, Any] = {
-                "task_id": task_id,
-                "order_by": "-run_after",
-                "limit": RUN_HISTORY_LIMIT,
-            }
-            if oldest:
-                params["run_after_gte"] = oldest
-            resp = transport._api("GET", _dag_url(dag_id, "/dagRuns/~/taskInstances"), params=params)
-            returned = resp["task_instances"]
-            omitted[task_id] = max(resp.get("total_entries", len(returned)) - len(returned), 0)
-            rows = []
-            for row in returned:
-                if row.get("dag_run_id") not in window:
-                    continue
-                covered.add(row["dag_run_id"])
-                entry = {name: row.get(name) for name in _TASK_COMPARISON_KEYS}
-                entry["operator"] = _clamped_operator(row.get("operator"))
-                rows.append(entry)
-            tasks[task_id] = rows
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        result["error"] = _explain_error(e)
-        return result
-    result["tasks"] = tasks
-    result["rows_omitted"] = omitted
-    result["runs_not_covered"] = [run["dag_run_id"] for run in runs if run["dag_run_id"] not in covered]
-    return result
 
 
 def _run_history(
@@ -2323,19 +2116,6 @@ def _run_history(
         "limits": [_R1, _R2],
         "error": error,
     }
-
-
-def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
-    """The newest runs of this Dag. Raises — the callers differ on what a failure means.
-
-    On the run-resolving path a failure must not be turned into "this Dag has
-    never run"; on the exact-run path it only costs the history field.
-    """
-    resp = transport._api(
-        "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": RUN_HISTORY_LIMIT}
-    )
-    runs = resp["dag_runs"]
-    return runs, resp.get("total_entries", len(runs))
 
 
 # How many runs a dispatch finding may name when it contrasts this attempt with
@@ -2825,7 +2605,7 @@ def diagnose_dag(
                 )
     run_path = f"/dagRuns/{quote(run['dag_run_id'], safe='')}"
 
-    tis, omitted = _run_task_instances(dag_id, run_path)
+    tis, omitted = reading._run_task_instances(dag_id, run_path)
     event_history = _event_history(dag_id, run["dag_run_id"], audit_scope)
     attribution_of = _attribution_reader(event_history)
     dispatch_checks, incomplete_evidence, coverage = _check_dispatch_evidence(
@@ -2886,7 +2666,7 @@ def diagnose_dag(
         result.setdefault("source", f"unavailable: {_explain_error(e)}")
 
     try:
-        tasks = _tasks(dag_id)
+        tasks = reading._tasks(dag_id)
     except (httpx.HTTPStatusError, KeyError):
         tasks = []
     if tasks:
@@ -3127,7 +2907,7 @@ def _change_impact(dag_id: str, source: str, patched: str) -> dict[str, Any]:
         "variable, are not visible to it"
     )
     try:
-        tasks = _tasks(dag_id)
+        tasks = reading._tasks(dag_id)
     except (httpx.HTTPStatusError, KeyError) as e:
         # Fail closed. Without the graph there is nothing to check a removal
         # against, and "found no problems" would be indistinguishable from
@@ -3200,34 +2980,11 @@ def _find_unaddressed_findings(dag_id: str, patched: str) -> list[dict[str, str]
     skipped, not that a problem remains.
     """
     try:
-        task_ids = {task["task_id"] for task in _tasks(dag_id)}
+        task_ids = {task["task_id"] for task in reading._tasks(dag_id)}
     except (httpx.HTTPStatusError, KeyError):
         return []
     checks, _ = _static_checks(patched, task_ids)
     return [check for check in checks if check["kind"] != "source_graph_disagreement"]
-
-
-def _build_asset_note(dag_id: str) -> str:
-    """The asset context an asset-touching change must carry to its approval card.
-
-    Names only this Dag's own produced/consumed assets — never other Dags' ids,
-    which only get_blast_radius is authorized to hand back.
-    """
-    try:
-        assets = transport._api("GET", "/assets", params={"limit": 100})["assets"]
-    except (httpx.HTTPStatusError, KeyError):
-        return (
-            "this change touches assets, inlets/outlets or the schedule, and the asset catalog "
-            "could not be read; call get_blast_radius and tell the user what else is affected "
-            "before applying"
-        )
-    edges = _compute_asset_edges(dag_id, assets)
-    produces = ", ".join(repr(name) for name in edges["produces"]) or "no assets"
-    consumes = ", ".join(repr(name) for name in edges["consumes"]) or "no assets"
-    return (
-        f"this change touches assets, inlets/outlets or the schedule: {dag_id} produces "
-        f"{produces} and consumes {consumes}; Dags scheduled on those assets can be affected"
-    )
 
 
 def _build_revert_diff(path: Path, current: str, original: str) -> str:
@@ -3816,51 +3573,13 @@ def rerun_dag(
     }
 
 
-def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Turn ``latest``/``previous`` into one exact run, or confirm the exact one exists."""
-    if dag_run_id in ("", "latest", "previous"):
-        wanted = 2 if dag_run_id == "previous" else 1
-        try:
-            runs = transport._api(
-                "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": wanted}
-            )["dag_runs"]
-        except httpx.HTTPStatusError as e:
-            message = _explain_unknown_dag(dag_id, e)
-            if message is None:
-                raise
-            return None, message
-        if len(runs) < wanted:
-            missing = "no previous run — it has run once at most" if wanted == 2 else "no runs"
-            return None, f"{dag_id} has {missing}"
-        return runs[wanted - 1], None
-    try:
-        return transport._api("GET", _dag_url(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")), None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 403:
-            # Collapsing this into "no such run" made an authorization failure
-            # read as a typo, and a caller that believes the run is absent looks
-            # for another one instead of reporting what happened. The Dag itself
-            # is already known to this caller by the time a run under it is
-            # fetched, so saying which of the two it was leaks nothing new.
-            return None, (
-                f"the run {dag_run_id!r} of {dag_id} could not be read (HTTP 403); this is a "
-                f"permission refusal, not evidence that the run does not exist"
-            )
-        if e.response.status_code == 404:
-            return None, (
-                f"{dag_id} has no run {dag_run_id!r}. Run ids are exact, including the UTC offset "
-                f"— pass 'latest' or 'previous' instead of composing one"
-            )
-        raise
-
-
 def _resolve_task(dag_id: str, task_id: str, position: int) -> tuple[str | None, str, str | None]:
     """The one task the request names — by id, or by where it sits in the graph.
 
     Returns ``(task_id, how_it_was_resolved, error)``. An ordinal is only
     honoured where the graph fixes the order; see ``_display_order``.
     """
-    tasks = _tasks(dag_id)
+    tasks = reading._tasks(dag_id)
     task_ids = {task["task_id"] for task in tasks}
     if task_id:
         if task_id not in task_ids:
@@ -3957,7 +3676,7 @@ def _version_drift(dag_id: str, dag_run_id: str) -> tuple[dict[str, list[str]] |
     creates instances for tasks the new version added. So the same question is
     asked regardless, and asked again at the moment of the clear.
     """
-    run_tis, omitted = _run_task_instances(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")
+    run_tis, omitted = reading._run_task_instances(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")
     if omitted:
         return None, (
             f"run {dag_run_id} has more task instances than this tool will read "
@@ -4003,17 +3722,10 @@ _RECOVERY_ROW_KEYS = (
 )
 # The four a dispatch writes. Only hostname and pid come from a worker.
 _EXECUTION_FIELDS = ("hostname", "pid", "queued_when", "scheduled_when")
-# One attempt's log, in the plan and again in the verification. Small: it is
-# carried per instance and the model reads every byte of it.
-RECOVERY_LOG_TAIL_CHARS = 600
-RECOVERY_ATTEMPT_LIMIT = 10
 # How far below its own history an attempt's duration may fall before the
 # comparison stops vouching for it. A ratio, not a constant: what "too fast"
 # means is the task's own business.
 RECOVERY_DURATION_FLOOR = 0.5
-# ``/dagVersions`` pages like everything else; one page settles whether the
-# run's own version is still listed for every Dag this demo has.
-DAG_VERSION_SCAN = 100
 
 _RECOVERY_SCOPE_NOTE = (
     "This reading describes the attempt recorded on the live row. It is not a statement about "
@@ -4024,11 +3736,6 @@ _RECOVERY_EXTERNAL_NOTE = (
     "and nothing else, so whether the external operation happened — in whole, in part, or not at "
     "all — has to be established there, by the operator, before this clear is approved."
 )
-_RECOVERY_LOG_CAVEAT = (
-    "The log route synthesises its 'no logs available' answer from try_number before it consults a "
-    "handler, so an empty log is not evidence that nothing ran."
-)
-_NO_LOGS_MARKER = "no logs available"
 
 
 def _plan_target(plan: dict[str, Any]) -> str:
@@ -4038,81 +3745,6 @@ def _plan_target(plan: dict[str, Any]) -> str:
         return ""
     marker = markers[0]
     return marker if isinstance(marker, str) else str(marker[0])
-
-
-def _attempt_log(dag_id: str, run_path: str, ti: dict[str, Any], try_number: Any) -> dict[str, Any]:
-    """The log the API holds for one attempt of one instance, clamped, never raising."""
-    entry: dict[str, Any] = {"try_number": try_number, "caveat": _RECOVERY_LOG_CAVEAT}
-    if not isinstance(try_number, int):
-        return {**entry, "status": "unavailable", "error": "the row carries no try_number to read a log for"}
-    try:
-        resp = transport._api(
-            "GET",
-            _dag_url(
-                dag_id,
-                f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/logs/{try_number}",
-            ),
-            params={"map_index": ti.get("map_index", -1)},
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        return {**entry, "status": "unavailable", "error": _explain_error(e)}
-    tail = _tail(resp.get("content") if isinstance(resp, dict) else resp)[-RECOVERY_LOG_TAIL_CHARS:]
-    stripped = tail.strip()
-    if not stripped:
-        status = "empty"
-    elif _NO_LOGS_MARKER in stripped.lower():
-        # The route's own sentence, not the task's. Reported as its own status so
-        # nothing downstream mistakes it for output the task produced.
-        status = "no_logs_reported"
-    else:
-        status = "present"
-    return {**entry, "status": status, "tail": tail}
-
-
-def _attempt_rows(history: dict[str, Any]) -> list[dict[str, Any]]:
-    """The attempts ``/tries`` returned, reduced to the fields this reading uses."""
-    return [
-        {
-            "try_number": row.get("try_number"),
-            "state": row.get("state"),
-            "hostname": row.get("hostname"),
-            "pid": row.get("pid"),
-            "duration": row.get("duration"),
-            "start_date": row.get("start_date"),
-            "end_date": row.get("end_date"),
-        }
-        for row in (history.get("rows") or [])[:RECOVERY_ATTEMPT_LIMIT]
-    ]
-
-
-_HISTORY_CLAMPED = (
-    f"the page held more attempts than this reading keeps ({RECOVERY_ATTEMPT_LIMIT}), so the "
-    f"attempts below are not the whole history and an absence among them is not an absence"
-)
-
-
-def _attempt_reading(history: dict[str, Any]) -> dict[str, Any]:
-    """The attempt history as this reading actually READ it, status included.
-
-    The local clamp is part of the read, so it has to be part of the status.
-    ``_attempt_history`` honestly reports ``checked`` over a whole page;
-    ``_attempt_rows`` then keeps at most ``RECOVERY_ATTEMPT_LIMIT`` of it, and
-    every absence-based leg downstream keys off the word ``checked``. Deriving
-    the status from what was returned rather than from what was read let those
-    legs assert hard negatives over records they never looked at.
-    """
-    rows = _attempt_rows(history)
-    status = history["status"]
-    recorded = history.get("attempts_recorded")
-    error = history.get("error")
-    if status in ("checked", "partial"):
-        returned = len(history.get("rows") or [])
-        if not isinstance(recorded, int) or recorded < returned:
-            recorded = returned
-        if len(rows) < returned:
-            status = "partial"
-            error = error or _HISTORY_CLAMPED
-    return {"status": status, "rows": rows, "attempts_recorded": recorded, "error": error}
 
 
 _PARTIAL_UNSETTLED_BY_HISTORY = (
@@ -4221,103 +3853,6 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     }
 
 
-def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bool | None) -> dict[str, Any]:
-    """What this clear can and cannot promise about which Dag version, and which code, re-runs.
-
-    Three separate things that are routinely said as one:
-
-    * the flag — what this request asks for;
-    * the binding — which version the re-queued instance ends up on, which the
-      scheduler decides, not this flag: ``_verify_integrity_if_dag_changed``
-      rebinds every unfinished instance of a re-queued run to the latest version
-      whenever that version is not already one of the run's;
-    * the code — which bytes the worker imports, which under an unversioned
-      bundle is the file on disk at re-run time and is pinned by nothing here.
-    """
-    run_versions = [v.get("version_number") for v in run.get("dag_versions") or []]
-    asked = {
-        None: (
-            "this clear does not send run_on_latest_version at all, so Airflow resolves it — the "
-            "Dag's own rerun_with_latest_version, then [core] rerun_with_latest_version, then false"
-        ),
-        False: "this clear asks Airflow not to move the instance to the latest Dag version",
-        True: "this clear asks Airflow to move the instance to the latest Dag version",
-    }[run_on_latest_version]
-    context: dict[str, Any] = {
-        "run_versions": run_versions,
-        "run_on_latest_version_sent": "omitted" if run_on_latest_version is None else run_on_latest_version,
-        "asked_for": asked,
-        "guarantee": (
-            "Not a promise that the run's original Dag version is preserved. Clearing re-queues the "
-            "instance, and the scheduler rebinds every unfinished instance of a re-queued run to the "
-            "latest version whenever that version is not already one of the run's — observed doing "
-            "exactly that with run_on_latest_version false."
-        ),
-        "code_note": (
-            "A Dag version does not pin the code either. Under an unversioned bundle the worker "
-            "imports the Dag file as it stands on disk at re-run time, so what re-runs is the "
-            "current file whatever this says about versions."
-        ),
-    }
-    try:
-        listed = transport._api(
-            "GET",
-            _dag_url(dag_id, "/dagVersions"),
-            params={"order_by": "-version_number", "limit": DAG_VERSION_SCAN},
-        )
-        known = [v.get("version_number") for v in listed["dag_versions"]]
-        total = listed.get("total_entries", len(known))
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        context["versions_status"] = "unavailable"
-        context["error"] = _explain_error(e)
-        return context
-    context["latest_version"] = known[0] if known else None
-    context["versions_status"] = "checked" if len(known) >= total else "partial"
-    if context["versions_status"] == "checked" and run_versions:
-        missing = [v for v in run_versions if v not in known]
-        context["original_version_listed"] = not missing
-        if missing:
-            context["missing_versions"] = missing
-            context["missing_version_note"] = (
-                f"the Dag no longer lists version(s) {missing} that this run recorded, so the code "
-                f"the run executed cannot be identified from here and cannot be asked for"
-            )
-    return context
-
-
-# The 404 detail ``/listMapped`` answers with when the task is genuinely not
-# expandable. Matched on, rather than on the bare status, because a 404 also
-# covers "no such task" and "no such run" — neither of which settles anything.
-_LIST_MAPPED_NOT_MAPPED = "is not mapped"
-
-
-def _expandable_probe(dag_id: str, run_path: str, task_id: str) -> bool | None:
-    """Whether Airflow itself says this task's instance set is recomputed on re-run.
-
-    ``/listMapped`` is the only public route gated on ``get_needs_expansion()``
-    — "MappedOperator **or is in a mapped task group**"
-    (``_internal/abstractoperator.py:343-354``, route at
-    ``routes/public/task_instances.py:251-253``). That is the real predicate, and
-    it is NOT what ``/tasks`` exposes as ``is_mapped``: a task inside
-    ``@task_group.expand`` reports ``is_mapped: false`` there while the scheduler
-    still recomputes its instances.
-
-    A 200 means the route accepted the task as expandable; a 404 that says so in
-    as many words means it is not. Anything else settles nothing and answers
-    ``None`` — which the callers must treat as possibly-expandable, never as no.
-    """
-    path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(task_id, safe='')}/listMapped")
-    try:
-        transport._api("GET", path, params={"limit": 1})
-        return True
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404 and _LIST_MAPPED_NOT_MAPPED in _api_detail(e.response):
-            return False
-        return None
-    except (httpx.RequestError, KeyError, TypeError, ValueError):
-        return None
-
-
 def _mapped_in_closure(dag_id: str, run_path: str, affected: list[dict[str, Any]]) -> dict[str, Any]:
     """Task ids in this closure whose instance set the scheduler recomputes on re-run.
 
@@ -4339,12 +3874,12 @@ def _mapped_in_closure(dag_id: str, run_path: str, affected: list[dict[str, Any]
     with contextlib.suppress(httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError):
         mapped |= {
             task["task_id"]
-            for task in _tasks(dag_id)
+            for task in reading._tasks(dag_id)
             if task.get("task_id") in names and task.get("is_mapped")
         }
     unprobed: list[str] = []
     for task_id in sorted(names - mapped):
-        answer = _expandable_probe(dag_id, run_path, task_id)
+        answer = reading._expandable_probe(dag_id, run_path, task_id)
         if answer is True:
             mapped.add(task_id)
         elif answer is None:
@@ -4610,7 +4145,7 @@ def plan_task_instance_clear(
     run_path = f"/dagRuns/{quote(resolved_run_id, safe='')}"
     markers: list[Any] = [[task, map_index] if map_index is not None else task]
     wanted_index = -1 if map_index is None else map_index
-    run_tis, omitted = _run_task_instances(dag_id, run_path)
+    run_tis, omitted = reading._run_task_instances(dag_id, run_path)
     target_row = next(
         (ti for ti in run_tis if ti["task_id"] == task and ti.get("map_index", -1) == wanted_index), None
     )
@@ -4837,22 +4372,6 @@ _DO_NOT_BYPASS = (
 )
 
 _NO_EXPANSION: dict[str, Any] = {"tasks": [], "settled": False, "unprobed": []}
-
-
-def _read_is_complete(kept: int, delivered: int, claimed: Any) -> bool:
-    """Whether a list read holds every record anything involved accounts for.
-
-    Three numbers, because three different things truncate a list: the route's
-    own paging (``claimed`` above ``delivered``), this tool's clamps (``kept``
-    below ``delivered``), and a source whose count is simply lower than what it
-    handed over. Completeness is what was KEPT measured against the largest
-    universe anyone claimed — the derivation ``_attempt_reading`` already makes.
-    A read that discarded rows is truncated whatever the source said its total
-    was, and a source that accounts for more than it sent is truncated whatever
-    this tool did with the rows.
-    """
-    universe = max(delivered, claimed) if isinstance(claimed, int) else delivered
-    return kept >= universe
 
 
 def _incomplete_read(dag_id: str, dag_run_id: str, read: str, route: str, why: str) -> dict[str, Any]:
@@ -5420,123 +4939,7 @@ def apply_task_instance_clear(
     return result
 
 
-_XCOM_NOT_PERMITTED = "XCom records are not readable by the signed-in user"
-_XCOM_NOT_SCOPED = "no XCom scope was supplied, so the instance's output records were not read"
 _NO_OUTPUT_AT_ALL = "this instance recorded no output at all, so its work cannot be dated from inside Airflow"
-
-
-def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope: str) -> dict[str, Any]:
-    """The XCom entries this instance has recorded, by key and timestamp only.
-
-    The key and the timestamp, never the value: the value is bytes the task
-    chose, and this reading only needs to know that an output record exists and
-    when it was written. It is the task's own report of its work — the closest
-    thing to the external artefact that stays inside the API this tool speaks —
-    and it is not an observation of the external system.
-
-    FAILS CLOSED on the scope, exactly like ``_event_history``: the read happens
-    only when the caller's permissions said so, and an empty scope is reported as
-    ``not_scoped`` rather than ``not_permitted`` because no argument arrived and
-    so no permission was refused.
-    """
-    if xcom_scope != "granted":
-        return {
-            "status": "not_permitted" if xcom_scope else "not_scoped",
-            "entries": [],
-            "total_entries": 0,
-            "error": _XCOM_NOT_PERMITTED if xcom_scope else _XCOM_NOT_SCOPED,
-        }
-    path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/xcomEntries")
-    try:
-        resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
-        rows = resp["xcom_entries"]
-        total = resp.get("total_entries", len(rows))
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        return {"status": "unavailable", "entries": [], "total_entries": 0, "error": _explain_error(e)}
-    entries = [
-        {"key": _clamped_operator(row.get("key")), "timestamp": row.get("timestamp")}
-        for row in rows[:RECOVERY_ATTEMPT_LIMIT]
-    ]
-    return {
-        # Derived from what was READ, never from what the route returned. The
-        # clamp above is this tool's own truncation and is indistinguishable, to
-        # every absence-based leg downstream, from the route's: both leave
-        # records unlooked-at. Comparing len(rows) against total called a
-        # locally-clamped read "checked" and routed it into the negative branch.
-        "status": "checked" if len(entries) >= total else "partial",
-        "entries": entries,
-        "total_entries": total,
-        "entries_omitted": max(total - len(entries), 0),
-    }
-
-
-def _audit_transitions(history: dict[str, Any], ti: dict[str, Any], after: str) -> dict[str, Any]:
-    """The ``running``/``success`` rows this API can see for one instance since the clear.
-
-    Scoped to what the reading can carry: a positive row establishes that Airflow
-    recorded the transition, never that the callable did the work it was for. And
-    the REST view of the audit log is not the audit log — rows for a Dag that no
-    longer has a row in the ``dag`` table are invisible here while still present
-    in the database — so an absence is an absence *in this view*.
-    """
-    if history["status"] not in ("checked", "partial"):
-        return {"status": history["status"], "error": history.get("error"), "events": []}
-    seen: dict[str, Any] = {}
-    for row in history.get("rows") or []:
-        if row.get("task_id") != ti["task_id"]:
-            continue
-        name = row.get("event")
-        if name not in ("running", "success") or name in seen:
-            continue
-        if after and _later_than(row.get("when"), after) is not True:
-            continue
-        seen[name] = {"event": name, "when": row.get("when"), "owner": _clamped_operator(row.get("owner"))}
-    return {
-        "status": history["status"],
-        "events": [seen[name] for name in ("running", "success") if name in seen],
-        "pair_recorded": len(seen) == 2,
-    }
-
-
-def _duration_baseline(
-    dag_id: str, dag_run_id: str, ti: dict[str, Any], rows: list[dict[str, Any]]
-) -> tuple[list[float], str]:
-    """What this task's own successful work costs, to compare one attempt against.
-
-    Only DISPATCHED attempts contribute. The attempt that made this recovery
-    necessary is exactly the one with duration 0 and no worker fields, and
-    letting it into the baseline would make "faster than nothing" a pass.
-
-    Drawn from two places, because either alone can be empty: this instance's
-    other attempts, and the same task in the Dag's other runs.
-    """
-    samples = [
-        row["duration"]
-        for row in rows
-        if row.get("try_number") != ti.get("try_number")
-        and _carries_execution_fields(row)
-        and isinstance(row.get("duration"), (int, float))
-        and row["duration"] > 0
-    ]
-    source = "this instance's other dispatched attempts"
-    try:
-        resp = transport._api(
-            "GET",
-            _dag_url(dag_id, "/dagRuns/~/taskInstances"),
-            params={"task_id": ti["task_id"], "order_by": "-run_after", "limit": RUN_HISTORY_LIMIT},
-        )
-        rest = resp["task_instances"]
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError):
-        return samples, source
-    for row in rest:
-        if row.get("dag_run_id") == dag_run_id or row.get("map_index", -1) != ti.get("map_index", -1):
-            continue
-        if not _carries_execution_fields(row):
-            continue
-        duration = row.get("duration")
-        if isinstance(duration, (int, float)) and duration > 0:
-            samples.append(duration)
-    return samples, f"{source} and the same task in this Dag's other runs"
 
 
 _DOWNSTREAM_DATING = "output_post_dates_the_task_it_reports_on"
@@ -6048,7 +5451,7 @@ def verify_task_instance_recovery(
             ),
         }
 
-    run_tis, omitted = _run_task_instances(dag_id, run_path)
+    run_tis, omitted = reading._run_task_instances(dag_id, run_path)
     by_key = {_ti_key(ti): ti for ti in run_tis}
     missing = [
         f"{task}[{index}]" if index >= 0 else task for task, index in wanted if (task, index) not in by_key
@@ -6173,7 +5576,7 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         if run is None:
             return {"dag_id": dag_id, "error": error}
         run_id = run["dag_run_id"]
-        tis, omitted = _run_task_instances(dag_id, f"/dagRuns/{quote(run_id, safe='')}")
+        tis, omitted = reading._run_task_instances(dag_id, f"/dagRuns/{quote(run_id, safe='')}")
         summaries[label] = {
             "dag_run_id": run_id,
             "state": run.get("state"),
@@ -6308,7 +5711,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     body: dict[str, Any] = {
         "state": ["failed"],
         "start_date_gte": since,
-        "page_limit": FAILURE_SCAN_LIMIT,
+        "page_limit": reading.FAILURE_SCAN_LIMIT,
     }
     if dag_ids is not None:
         body["dag_ids"] = list(dag_ids)
@@ -6360,15 +5763,6 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     }
 
 
-def _dry_run_backfill(dag_id: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
-    resp = transport._api(
-        "POST",
-        "/backfills/dry_run",
-        json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date},
-    )
-    return resp.get("backfills", [])
-
-
 def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
     """
     Preview the runs a backfill would create, without creating anything.
@@ -6396,13 +5790,13 @@ def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
             for entry in entries
         ],
     }
-    if len(entries) > MAX_BACKFILL_RUNS:
+    if len(entries) > reading.MAX_BACKFILL_RUNS:
         # No token: the plan is beyond what may be created anyway, and issuing one
         # would authorize runs this preview is too long to have really shown.
         return {
             **preview,
             "error": (
-                f"{len(entries)} runs exceeds the {MAX_BACKFILL_RUNS}-run limit for one backfill; "
+                f"{len(entries)} runs exceeds the {reading.MAX_BACKFILL_RUNS}-run limit for one backfill; "
                 f"narrow the date range before proposing it"
             ),
         }
@@ -6478,13 +5872,13 @@ def run_backfill(
                 f"({len(reviewed)} runs then, {count} now); re-plan and show the user"
             ),
         }
-    if count > MAX_BACKFILL_RUNS:
+    if count > reading.MAX_BACKFILL_RUNS:
         return {
             "created": False,
             "mutation_applied": False,
             "planned_run_count": count,
             "error": (
-                f"{count} runs exceeds the {MAX_BACKFILL_RUNS}-run limit for one backfill; "
+                f"{count} runs exceeds the {reading.MAX_BACKFILL_RUNS}-run limit for one backfill; "
                 f"narrow the date range"
             ),
         }
@@ -6515,13 +5909,6 @@ def run_backfill(
         # is what went stale.
         "ui_updates": [{"kind": "dag_run", "dag_id": dag_id}],
     }
-
-
-def _backfill_runs(backfill_id: int) -> list[dict[str, Any]]:
-    resp = transport._api(
-        "GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": MAX_BACKFILL_RUNS + 1}
-    )
-    return resp.get("backfill_dag_runs", [])
 
 
 def _abandon_backfill(
@@ -6562,38 +5949,6 @@ def _abandon_backfill(
             f"the backfill did not match the {len(planned)} runs the user approved; {aftermath}. "
             f"Tell the user to check backfill {backfill_id}."
         ),
-    }
-
-
-def _compute_asset_edges(dag_id: str, assets: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """This Dag's place in the asset graph, one hop out in both directions."""
-    produces: list[str] = []
-    consumes: list[str] = []
-    downstream: set[str] = set()
-    upstream: set[str] = set()
-    for asset in assets:
-        producers = {task.get("dag_id") for task in asset.get("producing_tasks") or []}
-        consumers = {dag.get("dag_id") for dag in asset.get("scheduled_dags") or []} | {
-            task.get("dag_id") for task in asset.get("consuming_tasks") or []
-        }
-        if dag_id in producers:
-            produces.append(asset["name"])
-            downstream |= consumers
-        # An asset this Dag produces is an output, even when a self-loop also
-        # lists the Dag as a consumer of it.
-        elif dag_id in consumers:
-            consumes.append(asset["name"])
-            upstream |= producers
-
-    for bucket in (downstream, upstream):
-        bucket.discard(dag_id)
-        bucket.discard(None)
-
-    return {
-        "produces": sorted(produces),
-        "consumes": sorted(consumes),
-        "downstream": sorted(downstream),
-        "upstream": sorted(upstream),
     }
 
 
