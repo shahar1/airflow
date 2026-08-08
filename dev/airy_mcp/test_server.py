@@ -40,6 +40,7 @@ import dagsource
 import diagnosis
 import evidence
 import reading
+import recovery
 import server
 import transport
 
@@ -7890,13 +7891,13 @@ def test_the_apply_reprobes_the_expansion_before_the_write_and_never_after(mappe
     plan = _mapped_plan()
     fake = mapped_run
     when: list[bool] = []
-    real = server._mapped_in_closure
+    real = recovery._mapped_in_closure
 
     def records_when_it_ran(*args, **kwargs):
         when.append(bool(fake.cleared))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(server, "_mapped_in_closure", records_when_it_ran)
+    monkeypatch.setattr(recovery, "_mapped_in_closure", records_when_it_ran)
 
     result = server.apply_task_instance_clear(
         DAG_ID,
