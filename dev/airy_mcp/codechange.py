@@ -431,6 +431,23 @@ def apply_dag_code_changes(
                 "mutation_applied": False,
                 "error": f"the patched file would not compile: {e}",
             }
+        # Re-asked here, immediately before the write. The digest pins the FILE,
+        # and the impact check does not rest on the file alone: it rests on the
+        # live task graph, which moves on its own and which the plan read at a
+        # different moment. A graph that has since changed — or that now comes
+        # back short — must refuse rather than ride the plan's answer in.
+        impact = _change_impact(dag_id, source, patched)
+        if impact["blocking"]:
+            return {
+                "applied": False,
+                "mutation_applied": False,
+                "impact": impact,
+                "error": (
+                    f"this change was NOT applied: the task graph no longer supports it at the "
+                    f"moment of the write ({impact['blocking']}). Nothing was written. Re-plan and "
+                    f"show the user."
+                ),
+            }
 
         try:
             backup = _backup_path(path)

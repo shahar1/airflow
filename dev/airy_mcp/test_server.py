@@ -10038,3 +10038,21 @@ def test_every_absence_leg_can_reach_all_three_answers(recovered_run, leg):
 
     assert None in unsettled, f"{leg} never reports 'not established'"
     assert measured & {True, False}, f"{leg} never reaches a measured answer"
+
+
+def test_the_code_write_re_asks_the_task_graph_it_planned_against(airflow, tmp_path):
+    """The digest pins the FILE. The impact check rests on the live task graph
+    too, and that moves on its own between the plan and the click."""
+    airflow.tasks = DEMO_TASKS
+    changes = _changes(('"ammount"}', '"amount"}'))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    assert "plan_token" in plan
+    # The graph now comes back short, so a removal cannot be checked against it.
+    airflow.tasks_total = 9
+
+    result = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+
+    assert result["applied"] is False
+    assert result["mutation_applied"] is False
+    assert "NOT applied" in result["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
