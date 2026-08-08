@@ -11107,6 +11107,52 @@ def test_the_summary_never_reports_no_failures_over_instances_nobody_read(airflo
     assert not ("No failures found" in result["summary"] and "is failed" in result["summary"])
 
 
+@pytest.mark.parametrize(
+    "caveat",
+    [
+        lambda fake: setattr(fake, "tasks_total", 900),
+        lambda fake: setattr(fake, "fail_import_errors", _http_status_error(500)),
+    ],
+    ids=["task-list-truncated", "import-errors-unreadable"],
+)
+def test_a_coverage_caveat_never_deletes_the_sentence_that_says_what_is_unread(airflow, caveat):
+    """P3. A caveat makes the picture strictly WORSE, and the no-finding
+    sentences were gated on the entry list rather than on the finding count —
+    so adding one replaced "whether an instance this diagnosis did not reach
+    failed is NOT established" with a hard count of zero problems."""
+    airflow.tasks = DEMO_TASKS
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "success"}}
+    airflow.tis_by_run = {"manual__1": [{"task_id": "extract", "state": "success", "map_index": -1}]}
+    airflow.run_tis_total = 900
+    caveat(airflow)
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert "found 0 problems" not in result["summary"]
+    assert "NO FAILURE was found" in result["summary"]
+    assert "NOT established" in result["summary"]
+    # The caveat still reaches the reader, as a numbered note under the sentence.
+    assert "(1) Note:" in result["summary"]
+    # And the two prose fields of one payload do not contradict each other.
+    assert "found problems in it" not in result["diagnosis"]
+
+
+def test_a_real_finding_beside_a_coverage_caveat_still_counts_only_the_finding(airflow):
+    """The repair may not cost the count: a genuine finding is still a problem,
+    and the caveat beside it is still not one."""
+    airflow.tasks = DEMO_TASKS
+    airflow.runs = [{"dag_run_id": "manual__1", "state": "success"}]
+    airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "success"}}
+    airflow.tis_by_run = {"manual__1": [dict(FORGED_TI)]}
+    airflow.tasks_total = 900
+
+    result = server.diagnose_dag(DAG_ID, "manual__1")
+
+    assert "still found 1 problem." in result["summary"]
+    assert "Note:" in result["summary"]
+
+
 def test_a_run_read_whole_with_nothing_failed_still_gets_the_plain_sentence(airflow):
     """The repair may not cost the honest all-clear: a whole read that finds no
     failure says so plainly."""
@@ -11149,6 +11195,39 @@ def test_a_summary_built_off_a_whole_log_makes_no_such_caveat(airflow):
 
     assert result["failures"][0]["log_tail_truncated"] is False
     assert "may not be the one that failed the task" not in result["summary"]
+
+
+def test_a_task_absent_from_one_run_is_not_a_task_that_ran_without_a_worker_field(airflow):
+    """P5. ``find`` over a filtered-to-empty set answers a vacuous ABSENT, so a
+    task merely added or removed between two Dag versions came back as
+    ``run_b_worker_field: false`` — the reader is told the rows were read and
+    none records a worker field, which is the forgery signal itself."""
+    _sweep_world(airflow)
+    airflow.tis_by_run["manual__2"] = [
+        row for row in airflow.tis_by_run["manual__2"] if row["task_id"] != "report"
+    ]
+
+    result = server.compare_dag_runs(DAG_ID, "manual__1", "manual__2")
+    row = next(entry for entry in result["task_durations"] if entry["task_id"] == "report")
+
+    assert row["run_b_worker_field"] is None
+    assert "no instance of `report` at all" in row["run_b_worker_field_note"]
+    assert "was not run there" in row["run_b_worker_field_note"]
+    # The other run does hold it, so its measured answer is untouched.
+    assert row["run_a_worker_field"] is False
+
+
+def test_a_task_present_without_a_worker_field_still_reports_a_measured_false(airflow):
+    """The repair may not cost the signal: a task that DID run and recorded no
+    worker field is still a measured false, on both runs."""
+    _sweep_world(airflow)
+
+    result = server.compare_dag_runs(DAG_ID, "manual__1", "manual__2")
+    row = next(entry for entry in result["task_durations"] if entry["task_id"] == "report")
+
+    assert row["run_a_worker_field"] is False
+    assert row["run_b_worker_field"] is False
+    assert "run_b_worker_field_note" not in row
 
 
 def test_compare_dag_runs_says_what_its_nulls_mean(airflow):

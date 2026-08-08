@@ -1539,10 +1539,12 @@ _DENIAL_MESSAGE = "The user rejected this action."
 # false}`` when the target moved. Left alone, the drawer paints those green and
 # tells the user their Dag was changed when nothing was written.
 #
-# ``mutation_applied`` is the field every write tool now reports; the rest stay
-# because reading them costs nothing and a tool that forgets the new field must
-# not thereby become un-checkable.
-_WRITE_OUTCOME_KEYS = ("mutation_applied", "applied", "reverted", "triggered", "created", "cleared")
+# ``mutation_applied`` is the field every write tool now reports, and it is read
+# on its own below because it OUTRANKS these: these say whether the write did
+# the specific thing the tool is named for, and it says whether anything at all
+# was written. The per-tool keys stay because reading them costs nothing and a
+# tool that forgets the new field must not thereby become un-checkable.
+_WRITE_OUTCOME_KEYS = ("applied", "reverted", "triggered", "created", "cleared")
 
 
 def _write_outcome(content: Any) -> str | None:
@@ -1550,10 +1552,11 @@ def _write_outcome(content: Any) -> str | None:
     Classify what a write tool's own result says became of the write — three answers, not two.
 
     ``"refused"`` — it changed nothing, and says so.
-    ``"outcome_unknown"`` — the request went out and the tool cannot say whether
-    it landed. That is neither a refusal nor a success, and painting it as a red
-    "failed" told the user their Dag was untouched on the strength of a result
-    that explicitly declines to claim it.
+    ``"outcome_unknown"`` — the request went out and the world is not as the user
+    approved it: either the tool cannot say whether the write landed, or it
+    landed and was compensated. Neither a refusal nor a success, and painting
+    either as a red "failed" told the user their Dag was untouched on the
+    strength of a result that says the opposite.
     ``None`` — nothing here says the write did not happen.
     """
     if isinstance(content, str):
@@ -1571,7 +1574,17 @@ def _write_outcome(content: Any) -> str | None:
         return None
     if content.get("mutation_outcome") == "unknown":
         return "outcome_unknown"
-    if any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS):
+    applied = content.get("mutation_applied")
+    named_outcome_refused = any(content.get(key) is False for key in _WRITE_OUTCOME_KEYS)
+    if applied is True:
+        # Something WAS written. An abandoned backfill reports ``created: false``
+        # — the runs the user approved were not created — beside
+        # ``mutation_applied: true``, because a backfill was posted, cancelled,
+        # and runs the scheduler had already picked up are still executing.
+        # Reading the per-tool key alone painted a red "Run backfill failed"
+        # over that, while the same result refreshed the view underneath it.
+        return "outcome_unknown" if named_outcome_refused else None
+    if applied is False or named_outcome_refused:
         return "refused"
     return None
 

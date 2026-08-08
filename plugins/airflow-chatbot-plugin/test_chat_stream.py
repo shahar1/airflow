@@ -224,6 +224,37 @@ def test_a_write_whose_outcome_is_unknown_is_neither_a_success_nor_a_failure():
     assert plugin._resource_changed_frame("apply_task_instance_clear", content) is None
 
 
+def test_a_write_that_landed_and_was_compensated_is_not_reported_as_nothing_happening():
+    """
+    An abandoned backfill created runs, cancelled them, and some are still going.
+
+    ``created: false`` says the runs the USER approved were not created;
+    ``mutation_applied: true`` says something was written anyway. Reading the
+    per-tool key alone painted a red "Run backfill failed" over runs that were
+    executing — while the same result fired the refresh underneath it.
+    """
+    content = {
+        "created": False,
+        "mutation_applied": True,
+        "backfill_id": 7,
+        "cancelled": True,
+        "surviving_runs": [{"dag_run_id": "backfill__1", "state": "running"}],
+        "error": "the backfill did not match the 3 runs the user approved; cancelled",
+        "ui_updates": [{"kind": "dag_run", "dag_id": "sales_summary"}],
+    }
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="run_backfill", content=content, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["failed"] is False
+    assert payload["unsettled"] is True
+    assert plugin._write_refused(content) is False
+    # The runs exist, so the views the user is looking at are stale.
+    assert plugin._resource_changed_frame("run_backfill", content) is not None
+
+
 def test_event_payload_refuses_to_call_a_conf_refusal_a_success():
     """An invalid conf is refused before the sidecar ever runs — no run was triggered."""
     refusal = (

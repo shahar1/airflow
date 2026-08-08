@@ -582,9 +582,10 @@ def _coverage_clauses(health: dict[str, Any]) -> str:
                 f"which rules out a clear since the last attempt."
             )
         if health["attempt_history_unchecked"]:
+            unchecked = health["attempt_history_unchecked"]
             clauses.append(
-                f" {health['attempt_history_unchecked']} were selected for an attempt-history read "
-                f"that did not come back."
+                f" {unchecked} {'was' if unchecked == 1 else 'were'} selected for an "
+                f"attempt-history read that did not come back."
             )
     if health["successes_without_worker_fields"]:
         total = health["successes_without_worker_fields"]
@@ -637,28 +638,6 @@ def _build_diagnosis_summary(
     """
     items = [_summarize_failure(failure) for failure in failures]
     items += [f"{_CHECK_LABELS.get(check['kind'], 'Check')}: {check['detail']}." for check in checks]
-    if not items:
-        if health["clean"]:
-            # Says what the conjunction actually tested. ``clean`` withholds this
-            # sentence unless every success reported all the fields AND carries a
-            # worker-written one, so that — and not "no forgery" — is the claim.
-            return (
-                f"No problems found: run {_fenced(run_id)} is {run_state}; all "
-                f"{health['successes_scanned']} task instances succeeded, and every one of them "
-                f"carries a worker-written dispatch field (hostname or pid) on the attempt recorded "
-                f"successful.{_coverage_clauses(health)}"
-            )
-        if nothing_failed is not None and not nothing_failed.is_present():
-            return (
-                f"NO FAILURE was found among the task instances this diagnosis READ, and that is not "
-                f"the same as no failure: run {_fenced(run_id)} is {run_state}, and its instance list "
-                f"was NOT read whole, so whether an instance this diagnosis did not reach failed is "
-                f"NOT established.{_census_clause(health)}{_coverage_clauses(health)}"
-            )
-        return (
-            f"No failures found: run {_fenced(run_id)} is {run_state}."
-            f"{_census_clause(health)}{_coverage_clauses(health)}"
-        )
     # The same ceiling the log path has, for the same reason: how many findings
     # there are is not this tool's choice, and one tool result should not be
     # 190k tokens of prose. The first entry always survives, so a run whose
@@ -681,14 +660,39 @@ def _build_diagnosis_summary(
     # counted as a problem told the reader the run holds a problem it does not.
     caveats = sum(1 for check in checks if not _is_a_problem(check))
     problems = len(items) - caveats + folded_away
-    # The run's id and state, in the branch that reports findings. The clean
-    # branch always named them; this one did not, so the sentence a model had to
-    # assemble to say "the run is green and something in it still did not run"
-    # was spread over three keys — two of which say "success" on their own.
-    head = (
-        f"Run {_fenced(run_id)} is recorded {run_state}, and this diagnosis still found "
-        f"{problems} problem{'s' if problems != 1 else ''}."
-    )
+    if problems:
+        # The run's id and state, in the branch that reports findings. The clean
+        # branch always named them; this one did not, so the sentence a model had
+        # to assemble to say "the run is green and something in it still did not
+        # run" was spread over three keys — two of which say "success" on their own.
+        head = (
+            f"Run {_fenced(run_id)} is recorded {run_state}, and this diagnosis still found "
+            f"{problems} problem{'s' if problems != 1 else ''}."
+        )
+    # The three no-finding sentences are gated on PROBLEMS, not on the presence
+    # of entries. A caveat is not a finding: adding one — a truncated task list,
+    # an unreadable import-error list — makes the picture strictly WORSE, and
+    # gating on ``items`` let it delete the sentence saying what was not
+    # established and replace it with a hard count of zero problems.
+    elif health["clean"]:
+        # Says what the conjunction actually tested. ``clean`` withholds this
+        # sentence unless every success reported all the fields AND carries a
+        # worker-written one, so that — and not "no forgery" — is the claim.
+        head = (
+            f"No problems found: run {_fenced(run_id)} is {run_state}; all "
+            f"{health['successes_scanned']} task instances succeeded, and every one of them "
+            f"carries a worker-written dispatch field (hostname or pid) on the attempt recorded "
+            f"successful."
+        )
+    elif nothing_failed is not None and not nothing_failed.is_present():
+        head = (
+            f"NO FAILURE was found among the task instances this diagnosis READ, and that is not "
+            f"the same as no failure: run {_fenced(run_id)} is {run_state}, and its instance list "
+            f"was NOT read whole, so whether an instance this diagnosis did not reach failed is "
+            f"NOT established.{_census_clause(health)}"
+        )
+    else:
+        head = f"No failures found: run {_fenced(run_id)} is {run_state}.{_census_clause(health)}"
     tail = (
         f" The logs of {logs_omitted} more failed task instance(s) were omitted for size."
         if logs_omitted
@@ -696,7 +700,8 @@ def _build_diagnosis_summary(
     )
     if unlisted:
         tail += f" {unlisted} further finding(s) were left out of this summary for size."
-    return f"{head} {' '.join(numbered)}{tail}{_coverage_clauses(health)}"
+    listed = f" {' '.join(numbered)}" if numbered else ""
+    return f"{head}{listed}{tail}{_coverage_clauses(health)}"
 
 
 def diagnose_dag(
@@ -966,8 +971,11 @@ def diagnose_dag(
             f"list was not read whole ({instances.reason}), so whether one of the instances it "
             f"did not reach failed is NOT established"
         ) + (
+            # A caveat is not a problem. Keyed on the bare list, this line said
+            # the diagnosis had found problems while ``summary`` — over the same
+            # list — said it had found none, in the same payload.
             ", but this diagnosis found problems in it — read `summary`, not this line"
-            if checks
+            if any(_is_a_problem(check) for check in checks)
             else "; see `summary` for what was and was not established"
         )
         result["no_task_instance_failed"] = nothing_failed.as_field()
@@ -1051,8 +1059,14 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
     A mapped task is aggregated per task: instance count and the longest
     instance's duration. Each row also carries ``run_a_worker_field`` /
     ``run_b_worker_field`` — whether any instance of that task on that run
-    recorded a hostname or pid. A task whose duration is unchanged at 0 on both
-    runs has NOT been stable if those flags differ, or if both are false.
+    recorded a hostname or pid. They are THREE-valued: true, false, and null.
+    null is NOT false — it means that run's rows do not settle the question,
+    either because its instance list came back incomplete or because the run
+    holds no instance of that task at all, and the accompanying
+    ``*_worker_field_note`` says which. A task whose duration is unchanged at 0
+    on both runs has NOT been stable if those flags differ, or if both are
+    false; two flags differing because one of them is null is a task that was
+    added or removed, not a task that stopped being dispatched.
     Names the Dag versions each run used, but does not
     diff them — an older version can contain a co-located Dag this caller was
     never authorized for.
@@ -1115,6 +1129,16 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         worker_fields = {
             label: _worker_field_verdict(readings[label], task_id) for label in ("run_a", "run_b")
         }
+        # A task with NO instance at all on this run did not run there, and that
+        # is not the same fact as "it ran and recorded no worker field". ``find``
+        # over the empty selection answers a vacuous ABSENT, so the second
+        # sentence is what the reader got — and since DIFFERING flags are exactly
+        # the forgery signal this comparison exists to raise, a task merely added
+        # or removed between two Dag versions manufactured it.
+        absent_here = {
+            label: info["count"] == 0 and readings[label].complete
+            for label, info in (("run_a", info_a), ("run_b", info_b))
+        }
         entry = {
             "task_id": task_id,
             "run_a": a,
@@ -1123,15 +1147,20 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
             # Named for what was observed - a worker-written field on the row -
             # and not for what ran: this says nothing about who or what wrote
             # the state.
-            "run_a_worker_field": worker_fields["run_a"].as_field(),
-            "run_b_worker_field": worker_fields["run_b"].as_field(),
+            "run_a_worker_field": None if absent_here["run_a"] else worker_fields["run_a"].as_field(),
+            "run_b_worker_field": None if absent_here["run_b"] else worker_fields["run_b"].as_field(),
         }
         # The type's OWN sentence for an unsettled answer, not a thirteenth
         # hand-written copy of it. ``Verdict.detail()`` and ``Verdict.route``
         # were dead in production while twelve call sites wrote the sentence
         # again, and two of those copies had already drifted apart.
         for label, verdict in worker_fields.items():
-            if verdict.is_unknown():
+            if absent_here[label]:
+                entry[f"{label}_worker_field_note"] = (
+                    f"{label} holds no instance of {_fenced(task_id)} at all, so it records neither "
+                    f"a worker-written field nor the absence of one — this task was not run there"
+                )
+            elif verdict.is_unknown():
                 entry[f"{label}_worker_field_note"] = verdict.detail()
         if max(info_a["count"], info_b["count"]) > 1:
             # A count over a truncated scan is the ceiling presented as the
@@ -1173,11 +1202,14 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         # the one reading these fields exist to prevent.
         "scope": (
             "`run_a_worker_field` / `run_b_worker_field` and `run_a_instances` / `run_b_instances` "
-            "are three-valued. null is NOT false: it means that run's task-instance list came back "
-            "incomplete, so an instance carrying a worker-written field — or a further mapped "
-            "instance — may be sitting past what this comparison read. false means the rows WERE "
-            "all read and none of them records one. Read `task_instances_read_whole` on each run "
-            "before treating any null here as an answer."
+            "are three-valued. null is NOT false. It means one of two things, and the row's "
+            "`*_worker_field_note` says which: that run's task-instance list came back incomplete, "
+            "so an instance carrying a worker-written field — or a further mapped instance — may "
+            "be sitting past what this comparison read; or that run holds no instance of the task "
+            "at all, so it was not run there and records neither a worker field nor the absence of "
+            "one. false means that run DOES hold instances of the task, the rows were all read, "
+            "and none of them records a worker-written field. Read `task_instances_read_whole` on "
+            "each run before treating any null here as an answer."
         ),
     }
 
