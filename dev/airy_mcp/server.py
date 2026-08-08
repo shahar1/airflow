@@ -58,6 +58,12 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+# Wave 2 of the move-only extraction: the HTTP conversation lives in ``transport.py``
+# now.  ``_api`` and ``API_URL`` are reached through the module object and never
+# imported by name, so one binding serves every call site and the suite has exactly one
+# place to patch.
+import transport
 from fastmcp import FastMCP
 
 # Wave 1 of the move-only extraction: these live in ``primitives.py`` now and are
@@ -107,9 +113,15 @@ from primitives import (
     _ti_where,
 )
 
-API_URL = os.environ.get("AIRFLOW_API_URL", "http://localhost:8080").rstrip("/")
-USERNAME = os.environ.get("AIRFLOW_USERNAME", "admin")
-PASSWORD = os.environ.get("AIRFLOW_PASSWORD", "admin")
+# The four transport helpers the suite only ever reads, never patches, so a re-export
+# here is the same object the call sites use.
+from transport import (
+    _api_detail,
+    _dag_url,
+    _explain_error,
+    _explain_unknown_dag,
+)
+
 DAGS_DIR = Path(os.environ.get("AIRY_MCP_DAGS_DIR", "/files/dags"))
 
 REPARSE_TIMEOUT_S = 45.0
@@ -172,72 +184,9 @@ TASK_COMPARISON_LIMIT = int(os.environ.get("AIRY_MCP_TASK_COMPARISON_LIMIT", "5"
 
 mcp: FastMCP = FastMCP("airy-selfheal")
 
-_token: str | None = None
-
 
 class DagFileError(ValueError):
     """Raised when a Dag file cannot be located or safely written."""
-
-
-def _login() -> str:
-    resp = httpx.post(f"{API_URL}/auth/token", json={"username": USERNAME, "password": PASSWORD}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def _api(method: str, path: str, **kwargs: Any) -> Any:
-    """Call the Airflow REST API, logging in (or re-logging in) as needed."""
-    global _token
-    if _token is None:
-        _token = _login()
-    url = f"{API_URL}/api/v2{path}"
-    resp = httpx.request(method, url, headers={"Authorization": f"Bearer {_token}"}, timeout=60, **kwargs)
-    if resp.status_code == 401:
-        _token = _login()
-        resp = httpx.request(method, url, headers={"Authorization": f"Bearer {_token}"}, timeout=60, **kwargs)
-    resp.raise_for_status()
-    return resp.json() if resp.content else None
-
-
-def _dag_url(dag_id: str, suffix: str = "") -> str:
-    """Build a /dags/... path. Ids are model-supplied, so they are always escaped."""
-    return f"/dags/{quote(dag_id, safe='')}{suffix}"
-
-
-def _explain_unknown_dag(dag_id: str, e: httpx.HTTPStatusError) -> str | None:
-    """A relayable message for a Dag the caller cannot see — or ``None`` to re-raise.
-
-    A typo'd or unauthorized dag_id is a conversation, not a traceback: the raw
-    ``httpx`` error names internal URLs and reads as a crash, and the model
-    cannot relay it. 403 gets the same words as 404 on purpose — telling an
-    unauthorized caller "it exists, you just can't see it" confirms the id.
-    """
-    if e.response.status_code in (403, 404):
-        return f"Dag {dag_id!r} does not exist or you cannot see it"
-    return None
-
-
-def _explain_error(e: Exception) -> str:
-    """An error as words a refusal can carry.
-
-    ``str()`` of an ``httpx.HTTPStatusError`` names the internal URL it hit, so
-    it must never reach a relayable string; the response body's ``detail`` is
-    the API's own words for what went wrong, and the status code is the fallback.
-    A transport error is the same hazard by another route — ``httpx`` builds its
-    message from the URL it could not reach — so only the class name is relayed.
-    """
-    if isinstance(e, httpx.RequestError):
-        return e.__class__.__name__
-    if not isinstance(e, httpx.HTTPStatusError):
-        return str(e) or e.__class__.__name__
-    detail = None
-    with suppress(ValueError, AttributeError):  # non-JSON body, or a shapeless one
-        detail = e.response.json().get("detail")
-    if isinstance(detail, str) and detail.strip():
-        return detail.strip()
-    if detail is not None:
-        return json.dumps(detail)[:400]
-    return f"HTTP {e.response.status_code}"
 
 
 def _dag_path(dag_id: str, dag: dict[str, Any] | None = None) -> Path:
@@ -246,7 +195,7 @@ def _dag_path(dag_id: str, dag: dict[str, Any] | None = None) -> Path:
     The path never comes from the caller — only the ``dag_id`` does — and the
     result is re-checked against the bundle root, so no traversal is possible.
     """
-    relative = (dag or _api("GET", _dag_url(dag_id))).get("relative_fileloc")
+    relative = (dag or transport._api("GET", _dag_url(dag_id))).get("relative_fileloc")
     if not relative:
         raise DagFileError(f"Dag {dag_id!r} has no file location")
     path = (DAGS_DIR / relative).resolve()
@@ -264,7 +213,7 @@ def _parsed_source(dag_id: str, source_digest: str | None = None) -> str:
     latest version's source in place when it changes, so the number alone does
     not name a fixed set of bytes.
     """
-    content = _api("GET", f"/dagSources/{quote(dag_id, safe='')}")["content"]
+    content = transport._api("GET", f"/dagSources/{quote(dag_id, safe='')}")["content"]
     if source_digest is not None and md5(content.encode("utf-8")).hexdigest() != source_digest:
         raise DagFileDriftError(
             f"the parsed source of {dag_id} is no longer the version this request was authorized "
@@ -350,7 +299,7 @@ def _read_reviewed_file(dag_id: str, path: Path, source_digest: str | None = Non
 
 
 def _latest_version(dag_id: str) -> int | None:
-    versions = _api(
+    versions = transport._api(
         "GET", _dag_url(dag_id, "/dagVersions"), params={"order_by": "-version_number", "limit": 1}
     )["dag_versions"]
     return versions[0]["version_number"] if versions else None
@@ -367,7 +316,7 @@ def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -
     see dev/airy_mcp/README.md.)
     """
     try:
-        _api("PUT", f"/parseDagFile/{quote(file_token, safe='')}")
+        transport._api("PUT", f"/parseDagFile/{quote(file_token, safe='')}")
     except httpx.HTTPStatusError as e:
         # 409 = a reparse for this file is already queued, which is what we want.
         if e.response.status_code != 409:
@@ -399,7 +348,7 @@ def _run_task_instances(dag_id: str, run_path: str) -> tuple[list[dict[str, Any]
     tis: list[dict[str, Any]] = []
     total = 0
     while True:
-        resp = _api(
+        resp = transport._api(
             "GET",
             _dag_url(dag_id, f"{run_path}/taskInstances"),
             params={"limit": TASK_INSTANCE_PAGE, "offset": len(tis)},
@@ -422,7 +371,7 @@ def _tasks_reading(dag_id: str) -> tuple[list[dict[str, Any]], int]:
     server is allowed to speak. The total comes back so a caller that reasons
     about the task set being COMPLETE can say whether it read all of it.
     """
-    resp = _api("GET", _dag_url(dag_id, "/tasks"))
+    resp = transport._api("GET", _dag_url(dag_id, "/tasks"))
     rows = resp["tasks"]
     return rows, resp.get("total_entries", len(rows))
 
@@ -626,7 +575,7 @@ def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
     if not names:
         return []
     try:
-        resp = _api("GET", "/importErrors", params={"limit": 100})
+        resp = transport._api("GET", "/importErrors", params={"limit": 100})
         errors = resp["import_errors"]
     except (httpx.HTTPStatusError, KeyError):
         return []
@@ -819,7 +768,7 @@ def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str
     """
     path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/tries")
     try:
-        resp = _api("GET", path, params={"map_index": ti.get("map_index", -1)})
+        resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
         rows = resp["task_instances"]
         total = resp.get("total_entries", len(rows))
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
@@ -1568,7 +1517,7 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
     max_pages = max(1, -(-EVENT_SCAN_LIMIT // max(EVENT_SCAN_PAGE, 1)))
     try:
         for _ in range(max_pages):
-            resp = _api(
+            resp = transport._api(
                 "GET",
                 "/eventLogs",
                 # Through ``params=``, never interpolated: a run_id carries
@@ -2287,7 +2236,7 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
             }
             if oldest:
                 params["run_after_gte"] = oldest
-            resp = _api("GET", _dag_url(dag_id, "/dagRuns/~/taskInstances"), params=params)
+            resp = transport._api("GET", _dag_url(dag_id, "/dagRuns/~/taskInstances"), params=params)
             returned = resp["task_instances"]
             omitted[task_id] = max(resp.get("total_entries", len(returned)) - len(returned), 0)
             rows = []
@@ -2363,7 +2312,7 @@ def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
     On the run-resolving path a failure must not be turned into "this Dag has
     never run"; on the exact-run path it only costs the history field.
     """
-    resp = _api(
+    resp = transport._api(
         "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": RUN_HISTORY_LIMIT}
     )
     runs = resp["dag_runs"]
@@ -2904,7 +2853,7 @@ def diagnose_dag(
     if omitted:
         result["task_instances_omitted"] = omitted
     try:
-        dag = _api("GET", _dag_url(dag_id))
+        dag = transport._api("GET", _dag_url(dag_id))
     except httpx.HTTPStatusError:
         dag = None
     # The *parsed* source, not the file on disk. Permission to read this file was
@@ -2991,7 +2940,7 @@ def diagnose_dag(
         if budget <= 0:
             break
         try:
-            log = _api(
+            log = transport._api(
                 "GET",
                 _dag_url(
                     dag_id,
@@ -3246,7 +3195,7 @@ def _build_asset_note(dag_id: str) -> str:
     which only get_blast_radius is authorized to hand back.
     """
     try:
-        assets = _api("GET", "/assets", params={"limit": 100})["assets"]
+        assets = transport._api("GET", "/assets", params={"limit": 100})["assets"]
     except (httpx.HTTPStatusError, KeyError):
         return (
             "this change touches assets, inlets/outlets or the schedule, and the asset catalog "
@@ -3287,7 +3236,7 @@ def plan_revert_dag_code(dag_id: str, source_digest: str | None = None) -> dict[
     ``source_digest`` is set by the caller's permissions, not by you.
     """
     try:
-        dag = _api("GET", _dag_url(dag_id))
+        dag = transport._api("GET", _dag_url(dag_id))
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
@@ -3362,7 +3311,7 @@ def revert_dag_code(
             ),
         }
     try:
-        dag = _api("GET", _dag_url(dag_id))
+        dag = transport._api("GET", _dag_url(dag_id))
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
@@ -3574,7 +3523,7 @@ def apply_dag_code_changes(
         }
 
     try:
-        dag = _api("GET", _dag_url(dag_id))
+        dag = transport._api("GET", _dag_url(dag_id))
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
@@ -3769,7 +3718,7 @@ def rerun_dag(
     if they agree call again with ``unpause=True`` and that token.
     """
     try:
-        dag = _api("GET", _dag_url(dag_id))
+        dag = transport._api("GET", _dag_url(dag_id))
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
@@ -3778,7 +3727,7 @@ def rerun_dag(
     if conf:
         # Validated before the pause flow so a bad conf cannot burn an
         # unpause_token the user's warning was already spent on.
-        details = _api("GET", _dag_url(dag_id, "/details"))
+        details = transport._api("GET", _dag_url(dag_id, "/details"))
         error = _validate_conf(dag_id, conf, details.get("params") or {})
         if error:
             return {"triggered": False, "mutation_applied": False, "error": error}
@@ -3804,12 +3753,12 @@ def rerun_dag(
                     f"call rerun_dag without unpause first and put that warning to the user"
                 ),
             }
-        _api("PATCH", _dag_url(dag_id), json={"is_paused": False})
+        transport._api("PATCH", _dag_url(dag_id), json={"is_paused": False})
         unpaused = True
     else:
         unpaused = False
     try:
-        run = _api(
+        run = transport._api(
             "POST",
             _dag_url(dag_id, "/dagRuns"),
             json={"logical_date": None, "conf": conf or {}, "note": note or "Triggered via Airy"},
@@ -3853,7 +3802,7 @@ def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, s
     if dag_run_id in ("", "latest", "previous"):
         wanted = 2 if dag_run_id == "previous" else 1
         try:
-            runs = _api(
+            runs = transport._api(
                 "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": wanted}
             )["dag_runs"]
         except httpx.HTTPStatusError as e:
@@ -3866,7 +3815,7 @@ def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, s
             return None, f"{dag_id} has {missing}"
         return runs[wanted - 1], None
     try:
-        return _api("GET", _dag_url(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")), None
+        return transport._api("GET", _dag_url(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")), None
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
             # Collapsing this into "no such run" made an authorization failure
@@ -4078,7 +4027,7 @@ def _attempt_log(dag_id: str, run_path: str, ti: dict[str, Any], try_number: Any
     if not isinstance(try_number, int):
         return {**entry, "status": "unavailable", "error": "the row carries no try_number to read a log for"}
     try:
-        resp = _api(
+        resp = transport._api(
             "GET",
             _dag_url(
                 dag_id,
@@ -4292,7 +4241,7 @@ def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bo
         ),
     }
     try:
-        listed = _api(
+        listed = transport._api(
             "GET",
             _dag_url(dag_id, "/dagVersions"),
             params={"order_by": "-version_number", "limit": DAG_VERSION_SCAN},
@@ -4340,7 +4289,7 @@ def _expandable_probe(dag_id: str, run_path: str, task_id: str) -> bool | None:
     """
     path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(task_id, safe='')}/listMapped")
     try:
-        _api("GET", path, params={"limit": 1})
+        transport._api("GET", path, params={"limit": 1})
         return True
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404 and _LIST_MAPPED_NOT_MAPPED in _api_detail(e.response):
@@ -4557,18 +4506,6 @@ _IN_REQUEST_CREATION_NOT_ESTABLISHED = (
 )
 
 
-def _api_detail(response: httpx.Response) -> str:
-    """The API's own ``detail``, or an empty string when it did not give one."""
-    try:
-        body = response.json()
-    except ValueError:
-        return ""
-    detail = body.get("detail") if isinstance(body, dict) else None
-    if detail in (None, "", [], {}):
-        return ""
-    return detail if isinstance(detail, str) else json.dumps(detail, default=str)
-
-
 def _clear_flag_error(only_failed: Any, include_downstream: Any, run_on_latest_version: Any) -> str | None:
     """Refuse a flag that is not a real bool, before anything compares it.
 
@@ -4658,7 +4595,7 @@ def plan_task_instance_clear(
     target_row = next(
         (ti for ti in run_tis if ti["task_id"] == task and ti.get("map_index", -1) == wanted_index), None
     )
-    preview = _api(
+    preview = transport._api(
         "POST",
         _dag_url(dag_id, "/clearTaskInstances"),
         json=_clear_body(
@@ -5272,7 +5209,7 @@ def apply_task_instance_clear(
     # The preview and the clear are two calls, so state can move between them:
     # a task that started running since would otherwise be killed by an approval
     # given for a failed one.
-    preview = _api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
+    preview = transport._api("POST", _dag_url(dag_id, "/clearTaskInstances"), json=body)
     now = _affected(preview)
     # Every write precondition is re-established HERE, in one place, immediately
     # before the POST, so the window where the world could move under the
@@ -5289,7 +5226,7 @@ def apply_task_instance_clear(
         return contained
     try:
         cleared = _affected(
-            _api("POST", _dag_url(dag_id, "/clearTaskInstances"), json={**body, "dry_run": False})
+            transport._api("POST", _dag_url(dag_id, "/clearTaskInstances"), json={**body, "dry_run": False})
         )
     except httpx.HTTPStatusError as e:
         # Split from the transport arm on purpose. A route that answers 4xx with
@@ -5492,7 +5429,7 @@ def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope:
         }
     path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/xcomEntries")
     try:
-        resp = _api("GET", path, params={"map_index": ti.get("map_index", -1)})
+        resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
         rows = resp["xcom_entries"]
         total = resp.get("total_entries", len(rows))
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
@@ -5564,7 +5501,7 @@ def _duration_baseline(
     ]
     source = "this instance's other dispatched attempts"
     try:
-        resp = _api(
+        resp = transport._api(
             "GET",
             _dag_url(dag_id, "/dagRuns/~/taskInstances"),
             params={"task_id": ti["task_id"], "order_by": "-run_after", "limit": RUN_HISTORY_LIMIT},
@@ -6356,7 +6293,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     }
     if dag_ids is not None:
         body["dag_ids"] = list(dag_ids)
-    resp = _api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)
+    resp = transport._api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)
     tis = resp["task_instances"]
     # What the window really held, minus the page that was read: a truncated
     # scan must say so, or "3 clusters" quietly means "of the 50 I looked at".
@@ -6369,7 +6306,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
 
     clusters: dict[str, dict[str, Any]] = {}
     for ti in tis:
-        log = _api(
+        log = transport._api(
             "GET",
             _dag_url(
                 ti["dag_id"],
@@ -6433,7 +6370,7 @@ def _same_runs(left: list[tuple[str, Any]], right: list[tuple[str, Any]]) -> boo
 
 
 def _dry_run_backfill(dag_id: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
-    resp = _api(
+    resp = transport._api(
         "POST",
         "/backfills/dry_run",
         json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date},
@@ -6648,7 +6585,9 @@ def run_backfill(
                 f"narrow the date range"
             ),
         }
-    resp = _api("POST", "/backfills", json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date})
+    resp = transport._api(
+        "POST", "/backfills", json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date}
+    )
     # The preview and the create are two REST calls, so they cannot be atomic from
     # out here: state can move between them. Check what actually got created and
     # cancel it if it is not what the user approved.
@@ -6676,7 +6615,9 @@ def run_backfill(
 
 
 def _backfill_runs(backfill_id: int) -> list[dict[str, Any]]:
-    resp = _api("GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": MAX_BACKFILL_RUNS + 1})
+    resp = transport._api(
+        "GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": MAX_BACKFILL_RUNS + 1}
+    )
     return resp.get("backfill_dag_runs", [])
 
 
@@ -6690,7 +6631,7 @@ def _abandon_backfill(
     surviving states are reported rather than implied.
     """
     try:
-        _api("PUT", f"/backfills/{backfill_id}/cancel")
+        transport._api("PUT", f"/backfills/{backfill_id}/cancel")
         cancelled = True
     except Exception:
         cancelled = False
@@ -6760,7 +6701,7 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
     the assets this Dag depends on and who produces them.
     """
     try:
-        assets = _api("GET", "/assets", params={"limit": 100})["assets"]
+        assets = transport._api("GET", "/assets", params={"limit": 100})["assets"]
     except httpx.HTTPStatusError as e:
         if e.response.status_code in (403, 404):
             return {

@@ -36,6 +36,7 @@ if "fastmcp" not in sys.modules:
     sys.modules["fastmcp"] = _stub
 
 import server
+import transport
 
 DAG_ID = "sales_summary"
 SOURCE = 'op_kwargs={"column": "ammount"}\nprint("ammount is a typo")\n'
@@ -360,7 +361,7 @@ class FakeAirflow:
 @pytest.fixture
 def airflow(monkeypatch, tmp_path):
     fake = FakeAirflow()
-    monkeypatch.setattr(server, "_api", fake)
+    monkeypatch.setattr(transport, "_api", fake)
     monkeypatch.setattr(server, "DAGS_DIR", tmp_path)
     monkeypatch.setattr(server, "REPARSE_TIMEOUT_S", 2.0)
     (tmp_path / "sales_summary.py").write_text(SOURCE)
@@ -757,7 +758,7 @@ def _paged_task_instances(airflow, monkeypatch, total: int):
             }
         return airflow(method, path, **kw)
 
-    monkeypatch.setattr(server, "_api", paged)
+    monkeypatch.setattr(transport, "_api", paged)
 
 
 def test_diagnose_dag_follows_the_pages_of_a_long_run(airflow, monkeypatch):
@@ -2720,7 +2721,7 @@ def test_verification_of_a_run_the_caller_may_not_read_is_not_a_missing_run(reco
             )
         return recovered_run(method, path, **kwargs)
 
-    monkeypatch.setattr(server, "_api", denied)
+    monkeypatch.setattr(transport, "_api", denied)
 
     result = server.verify_task_instance_recovery(DAG_ID, "manual__1", instances=["summarize"])
 
@@ -3561,7 +3562,7 @@ def test_tools_say_when_a_dag_cannot_be_seen(monkeypatch, status, call):
     def gone(method, path, **kwargs):
         raise _http_status_error(status)
 
-    monkeypatch.setattr(server, "_api", gone)
+    monkeypatch.setattr(transport, "_api", gone)
 
     result = call()
 
@@ -3572,7 +3573,7 @@ def test_tools_do_not_swallow_other_api_errors(monkeypatch):
     def broken(method, path, **kwargs):
         raise _http_status_error(500)
 
-    monkeypatch.setattr(server, "_api", broken)
+    monkeypatch.setattr(transport, "_api", broken)
 
     with pytest.raises(httpx.HTTPStatusError):
         server.diagnose_dag("nope")
@@ -3582,7 +3583,7 @@ def test_get_blast_radius_reports_an_unreadable_asset_catalog(monkeypatch):
     def forbidden(method, path, **kwargs):
         raise _http_status_error(403)
 
-    monkeypatch.setattr(server, "_api", forbidden)
+    monkeypatch.setattr(transport, "_api", forbidden)
 
     result = server.get_blast_radius(DAG_ID)
 
@@ -4623,11 +4624,11 @@ def test_the_summary_stops_at_its_character_budget(airflow, monkeypatch):
 
 
 def test_explain_error_never_relays_the_url_a_transport_error_names(monkeypatch):
-    monkeypatch.setattr(server, "API_URL", "http://internal-api:8080")
-    error = httpx.ConnectError(f"All connection attempts failed for {server.API_URL}/api/v2/dags")
+    monkeypatch.setattr(transport, "API_URL", "http://internal-api:8080")
+    error = httpx.ConnectError(f"All connection attempts failed for {transport.API_URL}/api/v2/dags")
 
     assert server._explain_error(error) == "ConnectError"
-    assert server.API_URL not in server._explain_error(error)
+    assert transport.API_URL not in server._explain_error(error)
 
 
 def test_attempt_history_survives_an_empty_body(airflow):
@@ -4644,11 +4645,11 @@ def test_attempt_history_survives_an_empty_body(airflow):
     history = server._attempt_history(DAG_ID, "/dagRuns/manual__1", FORGED_TI)
     assert history["status"] == "empty"
 
-    server._api = empty_body
+    transport._api = empty_body
     try:
         history = server._attempt_history(DAG_ID, "/dagRuns/manual__1", FORGED_TI)
     finally:
-        server._api = airflow
+        transport._api = airflow
     assert history["status"] == "unavailable"
     assert history["rows"] == []
 
@@ -6230,7 +6231,7 @@ def test_an_empty_event_body_is_caught_rather_than_crashing_the_diagnosis(airflo
     def maybe_empty(method, path, **kwargs):
         return None if path == "/eventLogs" else real(method, path, **kwargs)
 
-    monkeypatch.setattr(server, "_api", maybe_empty)
+    monkeypatch.setattr(transport, "_api", maybe_empty)
 
     result = _green_run(airflow, EXECUTED_TI, audit_scope="granted")
 
@@ -6832,11 +6833,11 @@ def test_an_unreadable_run_history_blocks_clean_and_takes_nothing_down(airflow):
             raise httpx.ConnectError("boom at http://internal-api:8080")
         return FakeAirflow.__call__(airflow, method, path, **kwargs)
 
-    server._api = fail_listing
+    transport._api = fail_listing
     try:
         result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1", audit_scope="granted")
     finally:
-        server._api = airflow
+        transport._api = airflow
 
     assert result["run_history"]["error"] == "ConnectError"
     assert result["run_history"]["runs"] == []
@@ -6867,7 +6868,7 @@ def test_a_run_list_failure_never_reads_as_this_dag_has_never_run(airflow, monke
             raise httpx.ConnectError("boom")
         return airflow(method, path, **kwargs)
 
-    monkeypatch.setattr(server, "_api", fail_listing)
+    monkeypatch.setattr(transport, "_api", fail_listing)
 
     with pytest.raises(httpx.ConnectError):
         server.diagnose_dag(DAG_ID)
@@ -7137,7 +7138,7 @@ def test_a_run_the_caller_may_not_read_is_not_reported_as_a_missing_one(airflow,
             )
         return airflow(method, path, **kwargs)
 
-    monkeypatch.setattr(server, "_api", refuse)
+    monkeypatch.setattr(transport, "_api", refuse)
 
     result = server.diagnose_dag(DAG_ID, dag_run_id="manual__1")
 
@@ -7868,7 +7869,7 @@ def test_a_read_failure_after_the_write_does_not_turn_a_landed_clear_into_a_fail
             )
         return fake(method, path, **kwargs)
 
-    monkeypatch.setattr(server, "_api", refuses_every_read_once_the_write_has_landed)
+    monkeypatch.setattr(transport, "_api", refuses_every_read_once_the_write_has_landed)
 
     result = server.apply_task_instance_clear(
         DAG_ID, plan["dag_run_id"], plan["task_ids"], plan["plan_token"], reviewed_instances=_reviewed(plan)
