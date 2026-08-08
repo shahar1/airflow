@@ -248,6 +248,27 @@ class Reading:
             return self
         return replace(self, rows=self.rows[:limit])
 
+    def clamp_last(self, limit: int) -> Reading:
+        """The same clamp from the other end, for a route that appends the live row LAST.
+
+        ``/tries`` returns oldest-first and puts the attempt now running at the
+        end, so keeping the first ten of twelve dropped exactly the attempt every
+        leg asks about — and reported "no record at try_number 11 is among them"
+        over a record the route DID return.
+        """
+        if limit >= self.kept:
+            return self
+        return replace(self, rows=self.rows[-limit:])
+
+    def reordered(self, key: Callable[[Mapping[str, Any]], Any], *, reverse: bool = False) -> Reading:
+        """The same rows in a different order. The count does not change, so completeness does not.
+
+        A clamp keeps a prefix, so which rows a clamp keeps is decided by the
+        order the route chose — and ``/xcomEntries`` orders alphabetically while
+        every question asked of it here is chronological.
+        """
+        return replace(self, rows=tuple(sorted(self.rows, key=key, reverse=reverse)))
+
     def filter(self, keep: Callable[[Mapping[str, Any]], bool]) -> Reading:
         """A discard is a method too — dropped rows reduce kept, exactly like a clamp."""
         return replace(self, rows=tuple(row for row in self.rows if keep(row)))
@@ -746,11 +767,14 @@ def flatten_comparison(comparison: dict[str, Any]) -> None:
 
 
 def comparison_rows(comparison: dict[str, Any], task_id: str) -> Reading:
-    """One compared task's rows, with the completeness of the comparison folded in.
+    """One compared task's rows, exactly as its own route call answered.
 
-    A task id the comparison never asked about is not "no rows for it": the
-    whole comparison is short by that many, so every task's reading inherits
-    the shortfall and no clause drawn over any of them can reach an absence.
+    A task id the comparison never asked about comes back as a FAILED read, so
+    no clause can be drawn over it at all. What it does NOT do is charge that
+    omission to the other tasks: the comparison used to add ``task_ids_omitted``
+    to every compared task's universe, so a task whose own call was honest at
+    three of three came back incomplete, every clause over it refused, and the
+    refusal quoted a shortfall belonging to a different task's rows entirely.
     """
     if comparison.get("error") is not None:
         return failed_read(_RUN_TASK_HISTORY_ROUTE, str(comparison["error"]))
@@ -759,8 +783,7 @@ def comparison_rows(comparison: dict[str, Any], task_id: str) -> Reading:
         return failed_read(
             _RUN_TASK_HISTORY_ROUTE, f"{task_id!r} was not among the task ids this comparison read"
         )
-    ids_omitted = comparison.get("task_ids_omitted") or 0
-    return replace(per_task, _claimed=per_task.universe + ids_omitted) if ids_omitted else per_task
+    return per_task
 
 
 _DAG_RUNS_ROUTE = "GET /dags/<dag>/dagRuns"
@@ -906,8 +929,11 @@ def _attempt_reading(history: Reading) -> Reading:
     whole page, this keeps at most ``RECOVERY_ATTEMPT_LIMIT`` of it, and every
     absence-based leg downstream would otherwise be concluding over records it
     never looked at.
+
+    From the END of the page: the route returns the attempts oldest-first and
+    the attempt this recovery is about is the last one.
     """
-    return history.clamp(RECOVERY_ATTEMPT_LIMIT).project(_attempt_shape)
+    return history.clamp_last(RECOVERY_ATTEMPT_LIMIT).project(_attempt_shape)
 
 
 NOT_CHECKED = "not_checked"
@@ -1071,8 +1097,13 @@ def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope:
     # The clamp is applied as a clamp on the reading, not as a slice beside it.
     # This tool's own truncation is indistinguishable, to every absence-based
     # leg downstream, from the route's: both leave records unlooked-at.
+    # Ordered before it is clamped. ``/xcomEntries`` sorts by
+    # (dag_id, task_id, run_id, map_index, key) — alphabetically by key — and
+    # every question asked of this reading is about WHEN a record was written,
+    # so an alphabetical prefix drops exactly the newest records.
     return (
         read_of(resp, "xcom_entries", _XCOM_ROUTE)
+        .reordered(lambda row: str(row.get("timestamp") or ""), reverse=True)
         .clamp(RECOVERY_ATTEMPT_LIMIT)
         .project(lambda row: {"key": _clamped_operator(row.get("key")), "timestamp": row.get("timestamp")})
     )
@@ -1187,17 +1218,28 @@ def _duration_baseline(
         and row.get("map_index", -1) == ti.get("map_index", -1)
         and usable(row)
     ]
-    # Two bounded reads feed one median, so the sample is complete only when
-    # both were. RUN_HISTORY_LIMIT=10 with no total read at all used to pass a
-    # clamped sample off as the task's whole history.
+    # A median is a statistic OVER A SAMPLE and does not need the population, so
+    # the sample size this tool asked for is not a shortfall: ``limit`` is
+    # RUN_HISTORY_LIMIT, and a page that comes back AT it is the sample that was
+    # requested. Charging it to the reading made the leg unanswerable for every
+    # task with more than ten runs — a permanent null, not a caution.
+    #
+    # A page that comes back UNDER the limit while the route accounts for more IS
+    # a read that fell short, and that one still counts.
+    unread = rest.omitted if rest.kept < RUN_HISTORY_LIMIT else 0
+    # Rows EXAMINED, not rows kept: ``usable()`` is this reading's own filter for
+    # what may enter a baseline, and charging its discards to the shortfall
+    # counted the tool's own judgement as unread records.
+    examined = len(attempts.rows) + len(rest.rows)
+    sampled = f"the most recent {RUN_HISTORY_LIMIT} run(s) of this task" if rest.omitted else "every run read"
     return (
         matches_of(
             samples,
-            scanned=len(samples),
-            claimed=len(samples) + attempts.omitted + rest.omitted,
+            scanned=examined,
+            claimed=examined + unread,
             route=_RUN_TASK_HISTORY_ROUTE,
         ),
-        f"{_DURATION_HISTORY_SOURCE} and the same task in this Dag's other runs",
+        f"{_DURATION_HISTORY_SOURCE} and the same task in this Dag's other runs, sampled over {sampled}",
     )
 
 

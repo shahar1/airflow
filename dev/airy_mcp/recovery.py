@@ -1148,14 +1148,25 @@ def _rule_closure_settled(ctx: _GateContext) -> dict[str, Any] | None:
 
 def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any] | None:
     """The read behind the safety reading the approval rests on: whether an
-    earlier attempt of the target already reached the outside world."""
+    earlier attempt of the target already reached the outside world.
+
+    Asked of the READ, never of the display. ``/tries`` is not paginated —
+    Airflow builds ``list(TIH) + list(TI)`` and sets ``total_entries`` to the
+    length of what it just built — so the route always hands over the whole
+    history, and the only thing that could make ``_attempt_reading`` incomplete
+    is this tool's own ten-row display clamp. Asking the clamped reading meant
+    every instance with more than ten recorded attempts was refused
+    PERMANENTLY, after the plan had already issued a token, and re-planning
+    reproduced it exactly: an ordinary sensor with ``retries >= 10`` could never
+    be recovered.
+    """
     target = _plan_target(ctx.plan)
     marker = (ctx.plan.get("task_ids") or [None])[0]
     wanted = marker[1] if isinstance(marker, (list, tuple)) and len(marker) > 1 else -1
     for ti in ctx.now:
         if ti["task_id"] != target or ti.get("map_index", -1) != wanted:
             continue
-        history = _attempt_reading(_attempt_history(ctx.dag_id, ctx.run_path, ti))
+        history = _attempt_history(ctx.dag_id, ctx.run_path, ti)
         if history.complete:
             return None
         return _incomplete_read(
@@ -1218,15 +1229,21 @@ _WRITE_PRECONDITIONS: tuple[_WritePrecondition, ...] = (
         "no task in the closure became expandable since the plan",
         _rule_no_newly_expandable_task,
     ),
+    # Both of these are declared at the GATE only, because that is where they
+    # are asked. The plan states the unsettled closure in ``blast_radius`` and
+    # warns on it rather than refusing, and it reads the attempt history for the
+    # evidence card rather than as a precondition. ``asked_at`` describes the
+    # code; it used to be checked only against itself, and every rule declaring
+    # "gate" made the subset test unfailable in both directions.
     _WritePrecondition(
         "closure_expandability_settled",
-        frozenset({"plan", "gate"}),
+        frozenset({"gate"}),
         "the expandability probe answered for every task in the closure",
         _rule_closure_settled,
     ),
     _WritePrecondition(
         "target_attempt_history_read_whole",
-        frozenset({"plan", "gate"}),
+        frozenset({"gate"}),
         "the target's attempt history was read whole",
         _rule_target_attempt_history_read_whole,
     ),

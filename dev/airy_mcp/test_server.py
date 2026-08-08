@@ -8218,7 +8218,11 @@ def _leg(entry, name):
 
 
 def test_the_only_fresh_record_sorting_past_the_clamp_is_not_read_as_an_absence(recovered_run):
-    """The live counterexample: the route orders keys alphabetically and `return_value` sorts last."""
+    """The live counterexample: the route orders keys alphabetically and
+    `return_value` sorts last, so a ten-row prefix of an alphabetical page drops
+    exactly the record this leg asks about. The reading is ordered by TIMESTAMP
+    before it is clamped, because the question is chronological — so the record
+    is read, and the leg answers from it instead of withholding."""
     recovered_run.xcoms_by_task[("summarize", -1)] = _records(14) + [
         {"key": "return_value", "timestamp": _FRESH_XCOM}
     ]
@@ -8227,18 +8231,14 @@ def test_the_only_fresh_record_sorting_past_the_clamp_is_not_read_as_an_absence(
     entry = result["instances"][0]
     leg = _leg(entry, "recorded_output_post_dates_clear")
 
-    assert leg["passed"] is None
-    assert "recorded_output_post_dates_clear" in entry["unestablished_checks"]
-    assert "10 of 15 output record(s) were read" in leg["detail"]
-    assert "an absence among them is not an absence" in leg["detail"]
-    assert result["verified"] is False
+    assert leg["passed"] is True
+    assert "recorded_output_post_dates_clear" not in entry["unestablished_checks"]
+    assert "return_value" in leg["detail"]
 
 
 def test_a_clamped_read_never_fires_the_stale_artefact_sentence(recovered_run):
     """The downstream leg's sentence is a claim about a thing that exists; a clamped read cannot make it."""
-    recovered_run.xcoms_by_task[("report", -1)] = _records(14) + [
-        {"key": "return_value", "timestamp": _FRESH_XCOM}
-    ]
+    recovered_run.xcoms_by_task[("report", -1)] = _records(14)
 
     entry = next(e for e in _verify()["instances"] if e["task_id"] == "report")
     leg = _leg(entry, "output_post_dates_the_task_it_reports_on")
@@ -8252,13 +8252,14 @@ def test_a_clamped_read_never_fires_the_stale_artefact_sentence(recovered_run):
     ("total", "fresh_index", "expected"),
     [
         (12, 0, True),  # first row of the page — well inside the clamp
-        (12, 9, True),  # the last row the clamp keeps
-        (12, 10, None),  # immediately beyond the clamp
-        (12, 11, None),  # the last row of the page, which is what the clamp drops
+        (12, 9, True),  # the last row an alphabetical clamp would have kept
+        (12, 10, True),  # past that prefix, and kept: the clamp orders by time first
+        (12, 11, True),  # the last row of the page, which the alphabetical clamp dropped
         (10, 9, True),  # exact limit: nothing is dropped, so presence holds
         (10, None, False),  # exact limit and genuinely no fresh record — a complete read
-        (11, 10, None),  # limit plus one: exactly one row dropped, and it is the one
+        (11, 10, True),  # limit plus one, and the one row dropped is not this one
         (11, 0, True),  # limit plus one, match retained — presence survives truncation
+        (14, None, None),  # clamped, and nothing that post-dates the clear among what was read
     ],
 )
 def test_the_output_leg_answers_from_the_records_it_actually_read(
@@ -8273,7 +8274,7 @@ def test_the_output_leg_answers_from_the_records_it_actually_read(
 
 def test_a_source_truncated_page_and_the_local_clamp_are_the_same_incompleteness(recovered_run):
     """Both leave records unread, and the count reported is the one that was read."""
-    recovered_run.xcoms_by_task[("summarize", -1)] = _records(12, fresh_index=11)
+    recovered_run.xcoms_by_task[("summarize", -1)] = _records(12)
     recovered_run.xcoms_total = 30
 
     leg = _leg(_verify()["instances"][0], "recorded_output_post_dates_clear")
@@ -8322,14 +8323,15 @@ def _attempts(count, *, executed_try=None):
 @pytest.mark.parametrize(
     ("attempts", "sought", "expected"),
     [
-        (12, 1, True),  # first row of the page
-        (12, 10, True),  # the last row the clamp keeps
-        (12, 11, None),  # immediately beyond the clamp
-        (12, 12, None),  # the last row of the page — the live 12-attempt case
+        (12, 3, True),  # the oldest attempt a ten-row clamp keeps
+        (12, 10, True),  # inside it either way
+        (12, 11, True),  # the attempt before the clear — the live 12-attempt case
+        (12, 12, True),  # the last row of the page, which the route appends and the clamp keeps
         (10, 10, True),  # exact limit: nothing is dropped
         (10, 99, False),  # exact limit and genuinely absent — a complete read still says no
-        (11, 11, None),  # limit plus one: one row dropped, and it is the one
-        (11, 1, True),  # limit plus one, match retained
+        (11, 11, True),  # limit plus one: the row dropped is the OLDEST, not this one
+        (11, 1, None),  # limit plus one, and the dropped row is the one sought
+        (12, 1, None),  # past the clamp, from the end the clamp now gives up
     ],
 )
 def test_the_tries_leg_answers_from_the_attempts_it_actually_read(recovered_run, attempts, sought, expected):
@@ -8343,7 +8345,7 @@ def test_the_tries_leg_answers_from_the_attempts_it_actually_read(recovered_run,
 def test_a_whole_page_this_tool_clamped_is_reported_as_a_partial_read(recovered_run):
     recovered_run.tries_by_task[("summarize", -1)] = _attempts(12)
 
-    entry = _verify(prior_attempts={"summarize": 12, "report": 1})["instances"][0]
+    entry = _verify(prior_attempts={"summarize": 1, "report": 1})["instances"][0]
     leg = _leg(entry, "prior_attempt_preserved")
 
     assert leg["passed"] is None
@@ -8357,7 +8359,7 @@ def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recover
     recovered_run.tries_total = 40
 
     leg = _leg(
-        _verify(prior_attempts={"summarize": 12, "report": 1})["instances"][0], "prior_attempt_preserved"
+        _verify(prior_attempts={"summarize": 1, "report": 1})["instances"][0], "prior_attempt_preserved"
     )
 
     assert leg["passed"] is None
@@ -8366,7 +8368,7 @@ def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recover
 
 def test_the_clamp_cannot_rule_out_an_earlier_dispatched_attempt(recovered_run):
     """`False` here suppresses the half-operation warning, so it needs a whole read."""
-    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=12)
+    recovered_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=1)
 
     evidence = server._recovery_evidence(DAG_ID, "/dagRuns/manual__1", dict(FORGED))
 
@@ -8717,10 +8719,14 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
     ("delivered", "claimed", "written"),
     [
         (10, None, True),
-        (11, None, False),
+        # The route handed over eleven of eleven. This tool DISPLAYS ten of them,
+        # and a display bound is not a read that fell short: refusing here
+        # refused every instance with more than ten recorded attempts, forever,
+        # after the plan had already issued the token.
+        (11, None, True),
         (10, 10, True),
         (10, 11, False),
-        (15, 3, False),
+        (15, 3, True),
     ],
     ids=[
         "exact-limit",
@@ -8733,7 +8739,9 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
 def test_the_target_attempt_history_must_be_read_whole_before_the_write(
     cleared_run, delivered, claimed, written
 ):
-    """RECOVERY_ATTEMPT_LIMIT is 10, and a clamp is this tool's own truncation."""
+    """The gate asks the READ, not the display. ``/tries`` is not paginated, so
+    the only thing that could make the displayed reading short is this tool's own
+    ten-row clamp — and a write refused over that is refused permanently."""
     cleared_run.tries_by_task[("summarize", -1)] = _attempts(delivered)
     cleared_run.tries_total = claimed
     plan = _gate_plan(cleared_run)
@@ -8748,14 +8756,16 @@ def test_the_target_attempt_history_must_be_read_whole_before_the_write(
 
 
 def test_a_matching_attempt_outside_the_retained_slice_refuses_rather_than_denying_it(cleared_run):
-    """The record the clamp drops is the one the safety reading would have found."""
+    """The record the READ never reached is the one the safety reading would have
+    found, so the gate refuses rather than concluding over it."""
     cleared_run.tries_by_task[("summarize", -1)] = _attempts(12, executed_try=12)
+    cleared_run.tries_total = 40
     plan = _gate_plan(cleared_run)
 
     result = _gate_apply(plan)
 
     assert result["cleared"] is False
-    assert "10 attempt(s) read of 12" in result["incomplete_read"]["detail"]
+    assert "12 attempt(s) read of 40" in result["incomplete_read"]["detail"]
     assert cleared_run.cleared == []
 
 
@@ -8869,7 +8879,9 @@ def _no_probe(fake):
 
 
 def _clamped_tries(fake):
+    # A page the ROUTE cut, not one this tool chose to display less of.
     fake.tries_by_task[("summarize", -1)] = _attempts(12)
+    fake.tries_total = 40
 
 
 def _short_task_list(fake):
@@ -10388,10 +10400,12 @@ def test_d6_a_comparison_that_reached_five_task_ids_says_so(airflow, monkeypatch
     rows = reading.comparison_rows(comparison, "report")
 
     assert comparison["task_ids_omitted"] == 1
-    assert rows.complete is False
-    # No contrast is drawn over a comparison that did not reach every task id:
-    # the clause is the one that says "this task was the only one like it".
-    assert diagnosis._contrast_clause(["manual__1"], rows, "manual__1", None, {}) == ""
+    # The comparison is short by one task id and says so — and the task it DID
+    # read is not charged with that: its own route call answered in full, so
+    # every clause over its rows may reach a measured answer. Charging it made
+    # the refusal quote row counts belonging to a different task entirely.
+    assert rows.complete is True
+    assert rows.omitted == 0
     unreached = reading.comparison_rows(comparison, "summarize")
     assert unreached.read_failed is True
 
@@ -10790,6 +10804,10 @@ _PAGINATION_TERMINATIONS = {
 # own display ceilings rather than a route's account of its rows.
 _DISPLAY_CEILINGS = {
     ("codechange", "len(entries) > reading.MAX_BACKFILL_RUNS"),
+    # "Is this the sample I asked for, or a page that fell short of it?" — the
+    # request carried ``limit=RUN_HISTORY_LIMIT``, so a page that comes back AT
+    # the limit is the sample and not a shortfall.
+    ("reading", "rest.kept < RUN_HISTORY_LIMIT"),
     ("evidence", "len(value) > EXTRA_LIST_LIMIT"),
     # Inside the type, choosing which sentence describes the shortfall it has
     # already derived.
@@ -11038,3 +11056,148 @@ def test_the_comparison_shortfall_is_stated_once_and_reads_as_a_sentence(airflow
 
     assert "and The same task" not in ". ".join(said)
     assert ". ".join(said).count("the same task's rows on the other runs were NOT read whole") == 1
+
+
+# ---------------------------------------------------------------------------
+# The other direction of the same mistake: a tool that clamps and then refuses
+# BECAUSE it clamped. A false refusal is a Phase C failure exactly as much as a
+# false negative — and unlike a false negative it is permanent, because
+# re-planning reproduces it exactly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("attempts", [11, 12, 25])
+def test_an_instance_with_more_attempts_than_the_display_shows_can_still_be_cleared(cleared_run, attempts):
+    """``/tries`` is not paginated — Airflow builds ``list(TIH) + list(TI)`` and
+    sets total_entries to the length of what it just built — so the route always
+    hands the whole history over and the only thing that could make the reading
+    short is this tool's own ten-row display clamp. Any task with retries >= 10,
+    which is ordinary for a sensor, could never be recovered."""
+    cleared_run.tries_by_task[("summarize", -1)] = _attempts(attempts)
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert len(cleared_run.cleared) == 1
+
+
+def test_a_route_that_really_did_truncate_the_history_still_refuses_the_write(cleared_run):
+    """The repair may not cost the refusal it was protecting."""
+    cleared_run.tries_by_task[("summarize", -1)] = _attempts(12)
+    cleared_run.tries_total = 40
+    plan = _gate_plan(cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["refused_precondition"] == "target_attempt_history_read_whole"
+
+
+def test_the_attempt_display_keeps_the_end_of_the_page_the_route_appends_to():
+    """``/tries`` returns oldest-first with the live attempt last, so a prefix
+    clamp dropped exactly the attempt every leg asks about."""
+    whole = _tries_reading(_attempts(12))
+
+    kept = [row["try_number"] for row in server._attempt_reading(whole).rows]
+
+    assert kept == list(range(3, 13))
+
+
+def test_a_comparison_that_stopped_at_five_task_ids_does_not_unsettle_the_five_it_read(airflow, monkeypatch):
+    """Fires on any Dag with six failing tasks: the comparison added its
+    ``task_ids_omitted`` to EVERY compared task's universe, so a task whose own
+    route call was honest at three of three came back incomplete — and the
+    refusal quoted row counts that belong to another task's rows."""
+    monkeypatch.setattr(reading, "TASK_COMPARISON_LIMIT", 1)
+    _sweep_world(airflow)
+
+    comparison = reading._task_comparison(DAG_ID, airflow.runs, ["report", "summarize", "extract"])
+    rows = reading.comparison_rows(comparison, "report")
+
+    assert comparison["task_ids_omitted"] == 2
+    assert rows.complete is True
+    assert comparison["rows_omitted"]["report"] == 0
+    # The clause over those rows reaches a measured answer rather than refusing.
+    assert reading.find(rows, lambda row: row.get("hostname"), "why").is_present()
+
+
+def test_a_duration_median_over_this_tools_own_sample_is_still_answerable(recovered_run):
+    """A median is a statistic over a SAMPLE and does not need the population.
+    RUN_HISTORY_LIMIT is the sample size this tool asks for, and charging it to
+    the reading made the leg unanswerable for every task with more than ten
+    runs — a permanent null rather than a caution."""
+    recovered_run.cross_run_tis = [
+        {
+            "task_id": "summarize",
+            "dag_run_id": f"manual__{n}",
+            "map_index": -1,
+            "duration": 2.5,
+            "hostname": "w",
+            "pid": 1,
+            "queued_when": "x",
+            "scheduled_when": "x",
+        }
+        for n in range(10)
+    ]
+    recovered_run.cross_run_total = 400
+
+    leg = _leg(_verify()["instances"][0], "duration_in_line_with_history")
+
+    assert leg["passed"] is True
+    assert "sampled over the most recent 10 run(s)" in leg["detail"]
+
+
+def test_a_page_that_fell_short_of_the_sample_this_tool_asked_for_still_settles_nothing(recovered_run):
+    """The discriminator: a page returned AT the limit is the sample; a page
+    returned UNDER it while the route accounts for more is a read that fell
+    short, and that one still withholds the leg."""
+    recovered_run.cross_run_tis = [
+        {
+            "task_id": "summarize",
+            "dag_run_id": "manual__9",
+            "map_index": -1,
+            "duration": 2.5,
+            "hostname": "w",
+            "pid": 1,
+            "queued_when": "x",
+            "scheduled_when": "x",
+        }
+    ]
+    recovered_run.cross_run_total = 400
+
+    leg = _leg(_verify()["instances"][0], "duration_in_line_with_history")
+
+    assert leg["passed"] is None
+    assert "NOT read whole" in leg["detail"]
+
+
+def test_the_duration_sample_counts_rows_examined_and_not_rows_it_chose_to_keep(recovered_run):
+    """``usable()`` is this reading's own filter for what may enter a baseline,
+    and charging its discards to the shortfall counted the tool's own judgement
+    as records nobody read."""
+    recovered_run.cross_run_tis = [
+        {
+            "task_id": "summarize",
+            "dag_run_id": "manual__9",
+            "map_index": -1,
+            # Not usable: no worker fields, so it may not enter a baseline.
+            "duration": 0.0,
+        },
+        {
+            "task_id": "summarize",
+            "dag_run_id": "manual__8",
+            "map_index": -1,
+            "duration": 2.5,
+            "hostname": "w",
+            "pid": 1,
+            "queued_when": "x",
+            "scheduled_when": "x",
+        },
+    ]
+
+    history = _tries_reading(_attempts(2))
+    baseline, _ = reading._duration_baseline(DAG_ID, "manual__1", dict(RECOVERED), history)
+
+    assert baseline.complete is True
+    assert baseline.omitted == 0
