@@ -10799,3 +10799,105 @@ def test_completeness_is_derived_in_exactly_one_place():
 def test_no_completeness_is_derived_from_a_readings_numbers_being_truthy():
     """``not scan.omitted`` is the same claim with no comparison in it."""
     assert _completeness_by_truthiness() == []
+
+
+# ---------------------------------------------------------------------------
+# The perimeter: a bare list read that yields a hard negative.
+#
+# Each of these is a closed-set claim — an enumeration the approval card renders
+# as the whole of the change, or a flat "there is none" — drawn over a page
+# whose route accounted for more.
+# ---------------------------------------------------------------------------
+
+
+def test_a_clear_plan_over_a_short_preview_enumerates_nothing_and_offers_nothing(cleared_run):
+    """The preview IS the set the write touches. A plan built over two thirds of
+    it showed the operator a closed-set enumeration that is not closed, and
+    handed out a token to authorize it."""
+    cleared_run.clear_total = 9
+
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="summarize", only_failed=False)
+
+    assert plan["planned"] is False
+    assert "plan_token" not in plan
+    assert "NOT read whole" in plan["error"]
+    # The approval card is never built over it: no closed-set claim is made.
+    assert "blast_radius" not in plan
+    assert _writes(cleared_run) == []
+
+
+def test_nothing_to_clear_is_never_said_over_a_page_the_route_accounted_past(cleared_run):
+    """A flat hard negative that used to be emitted from an empty page whose
+    route said forty — and emitted BEFORE the only completeness check on the
+    path, so nothing downstream could have caught it."""
+    cleared_run.clear_total = 40
+    cleared_run.tis_by_run["manual__1"] = [
+        {"task_id": "report", "state": "success", "map_index": -1, "try_number": 1}
+    ]
+
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
+
+    assert plan["planned"] is False
+    assert "nothing to clear" not in plan["error"]
+    assert "NOT read whole" in plan["error"]
+
+
+def test_an_instance_past_the_scan_ceiling_is_not_reported_as_not_in_the_run(recovered_run):
+    """``instances_not_found`` named instances that ARE in the run, computed off
+    the rows with no completeness guard — and the omitted sentence then
+    OVERWROTE the not-found one, so the operator kept the bare absence list and
+    lost the only reason it might not be one."""
+    recovered_run.run_tis_total = 900
+
+    result = _verify(instances=[["summarize", -1], ["nowhere", -1]])
+
+    assert result["verified"] is False
+    assert "instances_not_found" not in result
+    assert result["instances_not_located"] == ["nowhere"]
+    assert "not established" in result["error"]
+    # Both reasons survive; neither replaces the other.
+    assert "not read whole" in result["error"] or "not seen" in result["error"]
+
+
+def test_an_instance_absent_from_a_whole_run_list_is_still_reported_as_not_found(recovered_run):
+    result = _verify(instances=[["summarize", -1], ["nowhere", -1]])
+
+    assert result["instances_not_found"] == ["nowhere"]
+    assert "instances_not_located" not in result
+
+
+def test_one_unreadable_log_does_not_take_the_whole_failure_scan_down(airflow):
+    """Up to fifty logs are read here and any of them can 403. The tool already
+    carries partial coverage as three fields; a single unreadable log used to
+    raise out of the whole tool instead of joining them."""
+    _sweep_world(airflow)
+    airflow.task_instances = [
+        {**airflow.task_instances[0], "task_id": name, "try_number": 1} for name in ("report", "other")
+    ]
+    airflow.fail_log = _http_status_error(403)
+
+    result = server.find_failure_clusters(hours=24, dag_ids=[DAG_ID])
+
+    assert len(result["failures_unreadable"]) == 2
+    assert result["failures_read_whole"] is False
+    assert result["clusters"] == []
+
+
+def test_the_failure_scan_never_claims_the_window_holds_no_failure_it_did_not_read(airflow):
+    """The tool's ONLY prose asserted, unconditionally, that no clusters means no
+    FAILED task instance in the window — beside ``failures_omitted: 500``."""
+    _sweep_world(airflow)
+    airflow.task_instances = []
+    airflow.fleet_filter = False
+
+    whole = server.find_failure_clusters(hours=24, dag_ids=[DAG_ID])
+    assert "No clusters means no FAILED task instance in the window" in whole["scope"]
+
+    airflow.task_instances = [
+        {"dag_id": "elsewhere", "dag_run_id": "manual__1", "task_id": "x", "try_number": 1, "map_index": -1}
+    ]
+    short = server.find_failure_clusters(hours=24, dag_ids=[DAG_ID])
+
+    assert short["failures_omitted"] == 1
+    assert "No clusters means no FAILED task instance in the window" not in short["scope"]
+    assert "not whole" in short["scope"]

@@ -664,19 +664,28 @@ def plan_task_instance_clear(
         (ti for ti in run_scan.rows if ti["task_id"] == task and ti.get("map_index", -1) == wanted_index),
         None,
     )
-    preview = transport._api(
-        "POST",
-        _dag_url(dag_id, "/clearTaskInstances"),
-        json=_clear_body(
-            resolved_run_id,
-            markers,
-            dry_run=True,
-            only_failed=only_failed,
-            include_downstream=include_downstream,
-            run_on_latest_version=run_on_latest_version,
+    # The preview IS the set the write would touch, so it is read as a Reading
+    # here exactly as the gate reads it. Handing the raw body to ``_affected``
+    # threw ``total_entries`` away, and every enumeration below — the approval
+    # card, the mapped-task closure, the "nothing to clear" answer — was then
+    # drawn over a page that could be a third of the set.
+    preview_scan = reading.read_of(
+        transport._api(
+            "POST",
+            _dag_url(dag_id, "/clearTaskInstances"),
+            json=_clear_body(
+                resolved_run_id,
+                markers,
+                dry_run=True,
+                only_failed=only_failed,
+                include_downstream=include_downstream,
+                run_on_latest_version=run_on_latest_version,
+            ),
         ),
-    )
-    affected = _affected(preview)
+        "task_instances",
+        _CLEAR_PREVIEW_ROUTE,
+    ).project(_affected_row)
+    affected = [dict(row) for row in preview_scan.rows]
     target_state = target_row.get("state") if target_row else None
     plan: dict[str, Any] = {
         "planned": True,
@@ -696,6 +705,19 @@ def plan_task_instance_clear(
         "affected": affected,
         "creates_dag_run": False,
     }
+    # Asked BEFORE anything is concluded from the rows: "nothing to clear" is a
+    # flat hard negative and it used to be emitted straight off an empty page
+    # whose route accounted for forty, and the enumeration below is a closed-set
+    # claim the approval card renders as the whole of the change.
+    if not preview_scan.complete:
+        return {
+            **plan,
+            "planned": False,
+            "error": (
+                f"the clear preview was NOT read whole ({preview_scan.reason}), so this plan cannot "
+                f"enumerate the instances the write would touch and nothing is proposed over it"
+            ),
+        }
     if not affected:
         refusal = {
             **plan,
@@ -2142,9 +2164,25 @@ def verify_task_instance_recovery(
     run_tis = list(run_scan.rows)
     omitted = run_scan.omitted
     by_key = {_ti_key(ti): ti for ti in run_tis}
+
+    def _named(task: str, index: int) -> str:
+        return f"{task}[{index}]" if index >= 0 else task
+
+    # "This instance is not in the run" is an absence, so it is asked of the
+    # reading and not of the rows: an instance past the scan ceiling is one this
+    # read did not reach, and naming it as not found made the operator chase an
+    # instance that is sitting in the run.
+    not_located = [_named(task, index) for task, index in wanted if (task, index) not in by_key]
     missing = [
-        f"{task}[{index}]" if index >= 0 else task for task, index in wanted if (task, index) not in by_key
+        _named(task, index)
+        for task, index in wanted
+        if reading.find(
+            run_scan,
+            lambda ti, t=task, i=index: _ti_key(ti) == (t, i),
+            f"{_named(task, index)} was not among the instances this reading read",
+        ).is_absent()
     ]
+    unsettled_absence = [name for name in not_located if name not in missing]
     events = _event_history(dag_id, resolved_run_id, audit_scope)
     prior = prior_attempts or {}
 
@@ -2173,7 +2211,7 @@ def verify_task_instance_recovery(
         )
 
     instance_set = _approved_instance_set_check(_approved_set_record(dag_id, resolved_run_id), run_scan)
-    verified = bool(results) and not missing and run_scan.complete
+    verified = bool(results) and not not_located and run_scan.complete
     verified = verified and instance_set["check"]["passed"] is True
     verified = verified and all(entry["verdict"] == "verified" for entry in results)
     unverified = [entry["instance"] for entry in results if entry["verdict"] != "verified"]
@@ -2187,7 +2225,7 @@ def verify_task_instance_recovery(
     else:
         summary = (
             f"This clear is performed but NOT verified. Unverified instance(s): "
-            f"{unverified or missing or 'none'}. Report it that way and name the failing checks "
+            f"{unverified or not_located or 'none'}. Report it that way and name the failing checks "
             f"— a state of success is not a verification."
         )
         if instance_set["check"]["passed"] is not True:
@@ -2214,15 +2252,28 @@ def verify_task_instance_recovery(
             "as complete on the strength of the state alone."
         ),
     }
+    # Accumulated, never overwritten: the omitted sentence used to replace the
+    # not-found one, so the operator kept the bare list of absent instances and
+    # lost the reason it might not be one.
+    reasons = []
     if missing:
         result["instances_not_found"] = missing
-        result["error"] = (
+        reasons.append(
             f"{missing} are not in run {resolved_run_id}'s instance list, so nothing was verified for them"
+        )
+    if unsettled_absence:
+        result["instances_not_located"] = unsettled_absence
+        reasons.append(
+            f"{unsettled_absence} were not among the instance(s) this reading read, and the run's "
+            f"list was NOT read whole ({run_scan.reason}), so whether the run holds them is not "
+            f"established and nothing was verified for them"
         )
     if omitted:
         result["instances_omitted"] = omitted
-        result["error"] = (
+        reasons.append(
             f"run {resolved_run_id} has more task instances than this tool will read ({omitted} not "
             f"seen), so this reading is not complete"
         )
+    if reasons:
+        result["error"] = ". ".join(reasons)
     return result

@@ -1144,18 +1144,26 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     failures_omitted = scan.omitted
 
     clusters: dict[str, dict[str, Any]] = {}
+    unreadable: list[str] = []
     for ti in tis:
-        log = transport._api(
-            "GET",
-            _dag_url(
-                ti["dag_id"],
-                f"/dagRuns/{quote(ti['dag_run_id'], safe='')}/taskInstances/"
-                f"{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
-            ),
-            # The log route defaults to map_index=-1 — a different instance from
-            # a mapped one, whose failure would then be signed by the wrong log.
-            params={"map_index": ti.get("map_index", -1)},
-        )
+        try:
+            log = transport._api(
+                "GET",
+                _dag_url(
+                    ti["dag_id"],
+                    f"/dagRuns/{quote(ti['dag_run_id'], safe='')}/taskInstances/"
+                    f"{quote(ti['task_id'], safe='')}/logs/{ti['try_number']}",
+                ),
+                # The log route defaults to map_index=-1 — a different instance from
+                # a mapped one, whose failure would then be signed by the wrong log.
+                params={"map_index": ti.get("map_index", -1)},
+            )
+        except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+            # One 403 among fifty logs used to take the whole fleet scan down.
+            # This payload already carries partial coverage as three fields, so
+            # the unreadable log joins them instead of raising past the caller.
+            unreadable.append(f"{_ti_where(ti)} in {ti['dag_id']}/{ti['dag_run_id']} ({_explain_error(e)})")
+            continue
         signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log).text)
         cluster = clusters.setdefault(signature, {"error": signature, "count": 0, "examples": []})
         cluster["count"] += 1
@@ -1164,21 +1172,36 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
                 {"dag_id": ti["dag_id"], "task_id": ti["task_id"], "dag_run_id": ti["dag_run_id"]}
             )
 
-    return {
+    clustered = len(tis) - len(unreadable)
+    # The one prose field this tool has, and it used to assert unconditionally
+    # that no clusters means no failed instance in the window — over a scan that
+    # reports its own omissions three fields above. ``get_blast_radius`` builds
+    # its scope the same way three functions down.
+    scope = (
+        "task instances recorded state=failed only. No clusters means no FAILED task "
+        "instance in the window — it does not mean the Dags are healthy. A run recorded "
+        "success whose task never ran is invisible here; diagnose_dag finds those."
+        if scan.complete and not unreadable
+        else (
+            f"task instances recorded state=failed only, AND this scan was not whole: "
+            f"{failures_omitted} failed task instance(s) in the window were not scanned"
+            + (f" and {len(unreadable)} log(s) could not be read" if unreadable else "")
+            + ". An empty or short cluster list therefore says nothing about the failures this "
+            "scan did not reach. A run recorded success whose task never ran is invisible here "
+            "whatever the coverage; diagnose_dag finds those."
+        )
+    )
+    result = {
         "window_hours": hours,
-        "failures_scanned": len(tis),
+        "failures_scanned": clustered,
         "failures_omitted": failures_omitted,
-        "failures_read_whole": scan.complete,
-        # An empty result here is not an all-clear, and nothing else in this
-        # payload says so: the scan only ever sees task instances in state
-        # `failed`, which is exactly the state the interesting cases are not in.
-        "scope": (
-            "task instances recorded state=failed only. No clusters means no FAILED task "
-            "instance in the window — it does not mean the Dags are healthy. A run recorded "
-            "success whose task never ran is invisible here; diagnose_dag finds those."
-        ),
+        "failures_read_whole": scan.complete and not unreadable,
+        "scope": scope,
         "clusters": sorted(clusters.values(), key=lambda c: c["count"], reverse=True),
     }
+    if unreadable:
+        result["failures_unreadable"] = unreadable
+    return result
 
 
 def get_blast_radius(dag_id: str) -> dict[str, Any]:
