@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
@@ -155,8 +156,7 @@ def _comparison_task_ids(checks: list[dict[str, Any]], tis: list[dict[str, Any]]
 def _run_history(
     dag_id: str,
     diagnosed_run_id: str | None,
-    runs: list[dict[str, Any]],
-    total: int,
+    runs: reading.Reading,
     error: str | None,
     task_ids: list[str],
 ) -> dict[str, Any]:
@@ -166,7 +166,10 @@ def _run_history(
     run already under diagnosis, and the comparison set is chosen BY the
     diagnosis rather than guessed at by a caller.
     """
-    window = runs[:RUN_HISTORY_LIMIT]
+    # A clamp, not a slice: whatever this window drops is dropped from what any
+    # clause below may conclude an absence over.
+    windowed = runs.clamp(RUN_HISTORY_LIMIT)
+    window = list(windowed.rows)
     listed = []
     for run in window:
         entry = {name: run.get(name) for name in _RUN_HISTORY_KEYS}
@@ -175,8 +178,9 @@ def _run_history(
         listed.append(entry)
     return {
         "returned": len(listed),
-        "total_entries": total,
-        "runs_omitted": max(total - len(listed), 0),
+        "total_entries": windowed.universe,
+        "runs_omitted": windowed.omitted,
+        "runs_read_whole": windowed.complete,
         "window": (
             f"the most recent {len(listed)} run(s) of this Dag by run_after, newest first"
             if listed
@@ -208,35 +212,68 @@ DISPATCH_CONTRAST_RUN_LIMIT = 4
 DISPATCH_IMPACT_TASK_LIMIT = 6
 
 
-def _compared_rows_by_run(
-    comparison: dict[str, Any], task_id: str, map_index: int
-) -> dict[str, dict[str, Any]]:
-    """The compared task's newest row per run, for the one instance a finding names."""
+def _compared_rows_by_run(comparison: dict[str, Any], task_id: str, map_index: int) -> reading.Reading:
+    """The compared task's newest row per run, for the one instance a finding names.
+
+    Comes back as a reading rather than a dict: an empty one used to mean both
+    "this task has no row on any compared run" and "the comparison never got
+    that far", and both clauses below draw absences over it.
+    """
+    per_task = reading.comparison_rows(comparison, task_id)
     rows: dict[str, dict[str, Any]] = {}
-    for row in (comparison.get("tasks") or {}).get(task_id) or []:
+    for row in per_task.rows:
         run_id = row.get("dag_run_id")
         if row.get("map_index", -1) != map_index or not isinstance(run_id, str):
             continue
-        rows.setdefault(run_id, row)
-    return rows
+        rows.setdefault(run_id, dict(row))
+    return reading.selection_of(per_task, list(rows.values()))
 
 
-def _recurrence_clause(order: list[str], rows: dict[str, dict[str, Any]], run_id: str) -> str:
+def _rows_by_run(rows: reading.Reading) -> dict[str, dict[str, Any]]:
+    return {row["dag_run_id"]: dict(row) for row in rows.rows if isinstance(row.get("dag_run_id"), str)}
+
+
+_NOT_COMPARED_WHOLE = (
+    "The same task's rows on the other runs were NOT read whole, so nothing here rules that in or out"
+)
+
+
+def _recurrence_clause(order: list[str], rows: reading.Reading, run_id: str) -> str:
     """How far back this run's missing dispatch evidence goes, counted rather than implied.
 
     "1 problem found" is a statement about one run. A task that has recorded no
     worker field for four cycles is a different fact, and it is one the compared
     rows already hold — so it is stated instead of left for the reader to count.
+
+    A streak that runs off the end of what was read is not a streak that ended,
+    so a short comparison says so rather than reporting a shorter run of cycles.
     """
     if run_id not in order:
         return ""
+    by_run = _rows_by_run(rows)
     streak = []
+    ran_off_the_end = False
     for other in order[order.index(run_id) :]:
-        row = rows.get(other)
+        row = by_run.get(other)
+        if row is None:
+            ran_off_the_end = True
+            break
+        if _carries_worker_field(row):
+            break
+    else:
+        ran_off_the_end = True
+    for other in order[order.index(run_id) :]:
+        row = by_run.get(other)
         if row is None or _carries_worker_field(row):
             break
         streak.append(other)
     if len(streak) < 2:
+        if streak and ran_off_the_end and not rows.complete:
+            return (
+                f"How far back this goes is NOT established: the same task carries no worker-written "
+                f"field on the run(s) that were read ending with this one, and {_NOT_COMPARED_WHOLE} "
+                f"({rows.reason})"
+            )
         return ""
     named = streak[:DISPATCH_CONTRAST_RUN_LIMIT]
     text = (
@@ -252,7 +289,7 @@ def _recurrence_clause(order: list[str], rows: dict[str, dict[str, Any]], run_id
 
 def _contrast_clause(
     order: list[str],
-    rows: dict[str, dict[str, Any]],
+    rows: reading.Reading,
     run_id: str,
     dag_version: int | None,
     versions: dict[str, int | None],
@@ -265,9 +302,24 @@ def _contrast_clause(
     nothing. Another run of the SAME task carrying a worker field, and work, is
     what closes them — so the closing fact is written down rather than left as
     rows for a reader to compare.
+
+    An empty clause used to mean "no dispatched row elsewhere", concluded over
+    five task ids and ten rows each. It now says which of the two it is.
     """
+    by_run = _rows_by_run(rows)
+    dispatched = reading.find(
+        rows,
+        lambda row: row.get("dag_run_id") != run_id and _carries_worker_field(row),
+        "no other compared run of this task records a worker-written field",
+    )
+    if dispatched.is_unknown():
+        return (
+            f"Whether the same task IS dispatched on another run is NOT established: none of the "
+            f"rows this comparison read records a worker-written field, and {_NOT_COMPARED_WHOLE} "
+            f"({rows.reason})"
+        )
     for other in order:
-        row = rows.get(other)
+        row = by_run.get(other)
         if other == run_id or row is None or not _carries_worker_field(row):
             continue
         duration = row.get("duration")
@@ -367,6 +419,7 @@ def _augment_dispatch_findings(
     ]
     if not findings:
         return
+    runs_read_whole = run_history.get("runs_read_whole", True)
     order = [
         entry["dag_run_id"]
         for entry in run_history.get("runs") or []
@@ -386,6 +439,10 @@ def _augment_dispatch_findings(
             ti_states[ti["task_id"]].append(state)
     for check in findings:
         rows = _compared_rows_by_run(comparison, check["task_id"], check.get("map_index", -1))
+        if not runs_read_whole:
+            # The run window itself was short, so every clause drawn over it is
+            # drawn over a list that stops before the history does.
+            rows = replace(rows, _claimed=rows.universe + 1)
         clauses = [
             clause
             for clause in (
@@ -619,17 +676,18 @@ def diagnose_dag(
             return {"dag_id": dag_id, "dag_run_id": dag_run_id, "error": error}
         runs_error = None
         try:
-            recent_runs, runs_total = _recent_runs(dag_id)
+            recent_runs = _recent_runs(dag_id)
         except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-            recent_runs, runs_total, runs_error = [], 0, _explain_error(e)
+            runs_error = _explain_error(e)
+            recent_runs = reading.failed_read(reading._DAG_RUNS_ROUTE, runs_error)
     else:
         runs_error = None
         try:
             # Fetched at the run-history depth and resolved off the first five,
             # so the run list this diagnosis already needed is the one the field
             # reports rather than a second call for the same rows.
-            recent_runs, runs_total = _recent_runs(dag_id)
-            runs = recent_runs[:5]
+            recent_runs = _recent_runs(dag_id)
+            runs = list(recent_runs.clamp(5).rows)
         except httpx.HTTPStatusError as e:
             message = _explain_unknown_dag(dag_id, e)
             if message is None:
@@ -642,7 +700,7 @@ def diagnose_dag(
                 "summary": "This Dag has never run, so there is no run to diagnose.",
                 # Emitted on this path above all: it is exactly where a model
                 # with no run list in front of it invents a run id.
-                "run_history": _run_history(dag_id, None, [], runs_total, runs_error, []),
+                "run_history": _run_history(dag_id, None, recent_runs, runs_error, []),
             }
         run = next((r for r in runs if r["state"] == "failed"), runs[0])
         newest = runs[0]
@@ -673,7 +731,9 @@ def diagnose_dag(
                 )
     run_path = f"/dagRuns/{quote(run['dag_run_id'], safe='')}"
 
-    tis, omitted = reading._run_task_instances(dag_id, run_path)
+    instances = reading._run_task_instances(dag_id, run_path)
+    tis = list(instances.rows)
+    omitted = instances.omitted
     event_history = _event_history(dag_id, run["dag_run_id"], audit_scope)
     attribution_of = _attribution_reader(event_history)
     dispatch_checks, incomplete_evidence, coverage = _check_dispatch_evidence(
@@ -686,15 +746,16 @@ def diagnose_dag(
         incomplete_evidence,
         attribution_of,
     )
-    event_history.pop("rows", None)
-    event_history["instances_without_attribution"] = detail_reduced
+    # The rows come out and the reading with them: a reader that still held the
+    # scan could draw an absence from it after this point, and everything that
+    # legitimately does so has already run.
+    event_history.pop("reading", None)
     _enforce_attribution_ceiling(event_history, task_instances)
     _prune_unknowns_legend(event_history, task_instances, dispatch_checks)
     run_history = _run_history(
         dag_id,
         run["dag_run_id"],
         recent_runs,
-        runs_total,
         runs_error,
         _comparison_task_ids(dispatch_checks, tis),
     )
@@ -711,8 +772,10 @@ def diagnose_dag(
         "event_history": event_history,
         "run_history": run_history,
     }
-    if detail_reduced:
-        result["task_instance_detail_reduced"] = detail_reduced
+    # Owned by the projection that measured it, and reported at the level the
+    # projection lives at. It used to be written onto the event-history payload,
+    # where a reader attributes a projection's shortfall to the event scan.
+    result["task_instance_detail_reduced"] = detail_reduced
     if diagnosed_is_latest is not None:
         result["diagnosed_run_is_latest"] = diagnosed_is_latest
     if newest_run_info:
@@ -734,15 +797,17 @@ def diagnose_dag(
         result.setdefault("source", f"unavailable: {_explain_error(e)}")
 
     try:
-        tasks = reading._tasks(dag_id)
-    except (httpx.HTTPStatusError, KeyError):
-        tasks = []
+        task_graph = reading._tasks(dag_id)
+    except (httpx.HTTPStatusError, KeyError) as e:
+        task_graph = reading.failed_read(reading._TASKS_ROUTE, _explain_error(e))
+    tasks = list(task_graph.rows)
     if tasks:
-        order, ambiguous = _display_order(tasks)
+        order, ambiguous = _display_order(task_graph)
         result["tasks"] = {
             "order": order,
             "ordering": "topological",
             "ambiguous_positions": sorted(p + 1 for p in ambiguous),
+            "task_list_read_whole": task_graph.complete,
             "edges": {
                 task["task_id"]: sorted(task.get("downstream_task_ids") or [])
                 for task in tasks
@@ -752,10 +817,21 @@ def diagnose_dag(
     source = result.get("source")
     static_checks: list[dict[str, str]] | None = None
     if tasks and isinstance(source, str) and not source.startswith("unavailable:"):
-        static_checks, coverage["static_checks_suppressed"] = _static_checks(
-            source, {task["task_id"] for task in tasks}
-        )
-    import_checks = _find_import_errors(dag)
+        static_checks, static_suppressed = _static_checks(source, {task["task_id"] for task in tasks})
+        coverage = {**coverage, "static_checks_suppressed": static_suppressed}
+    import_errors = _find_import_errors(dag)
+    import_checks = list(import_errors.rows)
+    if not task_graph.complete:
+        import_checks = [
+            *import_checks,
+            {
+                "kind": "task_list_truncated",
+                "detail": (
+                    f"the Dag's task list was not read whole ({task_graph.reason}), so the graph, "
+                    f"the ordering and the source checks above cover only the tasks that were read"
+                ),
+            },
+        ]
     checks: list[dict[str, Any]] = (static_checks or []) + import_checks + dispatch_checks
     # After the graph and the run history are both in hand, and before the
     # summary is built off ``detail``.
@@ -768,12 +844,21 @@ def diagnose_dag(
         result.get("tasks"),
         tis,
     )
+    reading.flatten_comparison(run_history.get("task_comparison") or {})
     if static_checks is not None or checks:
         result["checks"] = checks
 
     # up_for_retry counts: the task already failed at least once, and waiting
     # for the retries to burn down before diagnosing wastes exactly the time a
     # diagnosis is for.
+    # The claim "no task instance in it failed" is an absence, so it is asked of
+    # the reading rather than of the rows: a run whose instance list stopped at
+    # the scan ceiling used to get the all-clear over instances nobody read.
+    nothing_failed = reading.none_match(
+        instances,
+        lambda ti: ti.get("state") in ("failed", "up_for_retry"),
+        f"no failed or retrying task instance appeared in the {instances.kept} instance(s) read",
+    )
     failed = [ti for ti in tis if ti.get("state") in ("failed", "up_for_retry")]
     if not failed:
         result["run_health"] = _run_health(
@@ -791,12 +876,17 @@ def diagnose_dag(
         # computation of it is a second thing to drift.
         result["diagnosis"] = (
             f"run {run['dag_run_id']} is {run['state']} and no task instance in it failed"
-            + (
-                ", but this diagnosis found problems in it — read `summary`, not this line"
-                if checks
-                else "; see `summary` for what was and was not established"
-            )
+            if nothing_failed.is_present()
+            else f"run {run['dag_run_id']} is {run['state']} and none of the "
+            f"{instances.kept} task instance(s) this diagnosis READ failed — the run's instance "
+            f"list was not read whole ({instances.reason}), so whether one of the instances it "
+            f"did not reach failed is NOT established"
+        ) + (
+            ", but this diagnosis found problems in it — read `summary`, not this line"
+            if checks
+            else "; see `summary` for what was and was not established"
         )
+        result["no_task_instance_failed"] = nothing_failed.as_field()
         if stale_note:
             result["summary"] = f"{stale_note} {result['summary']}"
         return result
@@ -823,7 +913,7 @@ def diagnose_dag(
         # From the end, like _tail itself: the exception and its traceback are
         # the last thing in the log, and keeping the first N characters of a
         # tail would spend the budget on the lines nobody needs.
-        tail = _tail(log.get("content") if isinstance(log, dict) else log)[-budget:]
+        tail = _tail(log.get("content") if isinstance(log, dict) else log).text[-budget:]
         budget -= len(tail)
         failures.append(
             {
@@ -849,6 +939,15 @@ def diagnose_dag(
     result["failed_task_id"] = failures[0]["task_id"]
     result["log_tail"] = failures[0]["log_tail"]
     return result
+
+
+def _worker_field_verdict(scan: reading.Reading, task_id: str) -> reading.Verdict:
+    """Whether any instance of this task on this run recorded a worker-written field."""
+    return reading.find(
+        scan,
+        lambda ti: ti.get("task_id") == task_id and _carries_worker_field(ti),
+        f"no instance of {task_id!r} in the part of this run that was read records a hostname or pid",
+    )
 
 
 def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | None = None) -> dict[str, Any]:
@@ -881,46 +980,48 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
         return {"dag_id": dag_id, "error": message}
     summaries: dict[str, dict[str, Any]] = {}
     instances: dict[str, dict[str, dict[str, Any]]] = {}
+    readings: dict[str, reading.Reading] = {}
     for label, requested in (("run_a", run_a), ("run_b", run_b)):
         run, error = _resolve_run(dag_id, requested)
         if run is None:
             return {"dag_id": dag_id, "error": error}
         run_id = run["dag_run_id"]
-        tis, omitted = reading._run_task_instances(dag_id, f"/dagRuns/{quote(run_id, safe='')}")
+        scan = reading._run_task_instances(dag_id, f"/dagRuns/{quote(run_id, safe='')}")
+        readings[label] = scan
         summaries[label] = {
             "dag_run_id": run_id,
             "state": run.get("state"),
             "duration": run.get("duration"),
             "version": _run_version(run),
             "conf": run.get("conf") or {},
+            "task_instances_read_whole": scan.complete,
         }
-        if omitted:
-            summaries[label]["task_instances_omitted"] = omitted
+        if scan.omitted:
+            summaries[label]["task_instances_omitted"] = scan.omitted
         # Mapped instances aggregate to one row per task — the longest instance,
         # not whichever map_index the API listed last.
         per_task: dict[str, dict[str, Any]] = {}
-        for ti in tis:
-            info = per_task.setdefault(
-                ti["task_id"], {"count": 0, "duration": None, "worker_dispatched": False}
-            )
+        for ti in scan.rows:
+            info = per_task.setdefault(ti["task_id"], {"count": 0, "duration": None, "rows": []})
             info["count"] += 1
+            info["rows"].append(ti)
             duration = ti.get("duration")
             if duration is not None and (info["duration"] is None or duration > info["duration"]):
                 info["duration"] = duration
-            # Durations alone cannot answer "was it my change?" for a task that
-            # stopped being dispatched: a task recorded success without ever
-            # running has duration 0 on BOTH runs, and this comparison then
-            # reports it as the most stable task in the Dag.
-            if _carries_worker_field(ti):
-                info["worker_dispatched"] = True
         instances[label] = per_task
 
     task_durations = []
-    empty = {"count": 0, "duration": None, "worker_dispatched": False}
+    empty: dict[str, Any] = {"count": 0, "duration": None, "rows": []}
     for task_id in sorted(set(instances["run_a"]) | set(instances["run_b"])):
         info_a = instances["run_a"].get(task_id, empty)
         info_b = instances["run_b"].get(task_id, empty)
         a, b = info_a["duration"], info_b["duration"]
+        # Durations alone cannot answer "was it my change?" for a task that
+        # stopped being dispatched: a task recorded success without ever running
+        # has duration 0 on BOTH runs, and this comparison then reports it as the
+        # most stable task in the Dag. The flag is therefore asked of the run's
+        # READING — a worker-bearing instance sitting past the scan ceiling used
+        # to come back as a measured false.
         entry = {
             "task_id": task_id,
             "run_a": a,
@@ -929,12 +1030,14 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
             # Named for what was observed - a worker-written field on the row -
             # and not for what ran: this says nothing about who or what wrote
             # the state.
-            "run_a_worker_field": info_a["worker_dispatched"],
-            "run_b_worker_field": info_b["worker_dispatched"],
+            "run_a_worker_field": _worker_field_verdict(readings["run_a"], task_id).as_field(),
+            "run_b_worker_field": _worker_field_verdict(readings["run_b"], task_id).as_field(),
         }
         if max(info_a["count"], info_b["count"]) > 1:
-            entry["run_a_instances"] = info_a["count"]
-            entry["run_b_instances"] = info_b["count"]
+            # A count over a truncated scan is the ceiling presented as the
+            # fan-out. Null says the fan-out was not read, which is what happened.
+            entry["run_a_instances"] = info_a["count"] if readings["run_a"].complete else None
+            entry["run_b_instances"] = info_b["count"] if readings["run_b"].complete else None
             entry["aggregation"] = "count of mapped instances; duration is the longest instance's"
         task_durations.append(entry)
 
@@ -1004,6 +1107,9 @@ def _error_signature(log_tail: str) -> str:
     return line[:200]
 
 
+_FAILURE_SCAN_ROUTE = "POST /dags/~/dagRuns/~/taskInstances/list"
+
+
 def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -> dict[str, Any]:
     """
     Group recent task failures by error signature.
@@ -1026,15 +1132,16 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     if dag_ids is not None:
         body["dag_ids"] = list(dag_ids)
     resp = transport._api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)
-    tis = resp["task_instances"]
-    # What the window really held, minus the page that was read: a truncated
-    # scan must say so, or "3 clusters" quietly means "of the 50 I looked at".
-    failures_omitted = max(resp.get("total_entries", len(tis)) - len(tis), 0)
+    scan = reading.read_of(resp, "task_instances", _FAILURE_SCAN_ROUTE)
     # Belt and braces: never fetch a log for a Dag outside the allowlist, whatever
-    # the API returned.
+    # the API returned. A dropped row is a row this scan did not cover, so the
+    # filter reduces what was kept — the omitted count used to be computed off
+    # the pre-filter list and so described a list nothing was concluded from.
     if dag_ids is not None:
         allowed = set(dag_ids)
-        tis = [ti for ti in tis if ti["dag_id"] in allowed]
+        scan = scan.filter(lambda ti: ti.get("dag_id") in allowed)
+    tis = list(scan.rows)
+    failures_omitted = scan.omitted
 
     clusters: dict[str, dict[str, Any]] = {}
     for ti in tis:
@@ -1049,7 +1156,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
             # a mapped one, whose failure would then be signed by the wrong log.
             params={"map_index": ti.get("map_index", -1)},
         )
-        signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log))
+        signature = _error_signature(_tail(log.get("content") if isinstance(log, dict) else log).text)
         cluster = clusters.setdefault(signature, {"error": signature, "count": 0, "examples": []})
         cluster["count"] += 1
         if len(cluster["examples"]) < 5:
@@ -1061,6 +1168,7 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
         "window_hours": hours,
         "failures_scanned": len(tis),
         "failures_omitted": failures_omitted,
+        "failures_read_whole": scan.complete,
         # An empty result here is not an all-clear, and nothing else in this
         # payload says so: the scan only ever sees task instances in state
         # `failed`, which is exactly the state the interesting cases are not in.
@@ -1080,7 +1188,8 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
     the assets this Dag depends on and who produces them.
     """
     try:
-        assets = transport._api("GET", "/assets", params={"limit": 100})["assets"]
+        resp = transport._api("GET", "/assets", params={"limit": reading.ASSET_CATALOG_LIMIT})
+        resp["assets"]
     except httpx.HTTPStatusError as e:
         if e.response.status_code in (403, 404):
             return {
@@ -1091,20 +1200,30 @@ def get_blast_radius(dag_id: str) -> dict[str, Any]:
                 ),
             }
         raise
+    catalog = reading.read_of(resp, "assets", reading.ASSET_CATALOG_ROUTE)
 
-    edges = _compute_asset_edges(dag_id, assets)
+    edges = _compute_asset_edges(dag_id, catalog)
     return {
         "dag_id": dag_id,
         "produces_assets": edges["produces"],
         "downstream_dags": edges["downstream"],
         "consumes_assets": edges["consumes"],
         "upstream_dags": edges["upstream"],
+        "asset_catalog_read_whole": catalog.complete,
         # Four empty lists read as "nothing depends on this Dag". They mean the
         # asset catalog holds no edge for it, which is the common case for a Dag
-        # that has real consequences and simply does not declare assets.
+        # that has real consequences and simply does not declare assets — and
+        # over a catalog that was not read whole they would mean neither, so
+        # they come back null instead.
         "scope": (
             "asset edges only. Empty lists mean this Dag declares no asset dependency in the "
             "catalog — not that a failure in it has no consequences. Task-level impact inside a "
             "run is in diagnose_dag's task graph, not here."
+        )
+        + (
+            ""
+            if catalog.complete
+            else f" The catalog was NOT read whole ({catalog.reason}), so a null list above means "
+            f"this reading cannot say whether an edge exists."
         ),
     }

@@ -98,7 +98,6 @@ from reading import (
     _attempt_reading,
     _audit_transitions,
     _duration_baseline,
-    _read_is_complete,
     _recorded_output,
     _resolve_run,
     _tasks_reading,
@@ -155,16 +154,20 @@ def _clear_body(
     return body
 
 
+_CLEAR_PREVIEW_ROUTE = "POST /dags/<dag>/clearTaskInstances (dry_run=true)"
+
+
+def _affected_row(ti: Any) -> dict[str, Any]:
+    return {
+        "task_id": ti["task_id"],
+        "map_index": ti.get("map_index", -1),
+        "state": ti.get("state"),
+        "try_number": ti.get("try_number"),
+    }
+
+
 def _affected(response: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "task_id": ti["task_id"],
-            "map_index": ti.get("map_index", -1),
-            "state": ti.get("state"),
-            "try_number": ti.get("try_number"),
-        }
-        for ti in response.get("task_instances") or []
-    ]
+    return [_affected_row(ti) for ti in (response or {}).get("task_instances") or []]
 
 
 def _identities(affected: list[dict[str, Any]]) -> list[tuple[str, int]]:
@@ -181,21 +184,21 @@ def _version_drift(dag_id: str, dag_run_id: str) -> tuple[dict[str, list[str]] |
     creates instances for tasks the new version added. So the same question is
     asked regardless, and asked again at the moment of the clear.
     """
-    run_tis, omitted = reading._run_task_instances(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")
-    if omitted:
+    run_scan = reading._run_task_instances(dag_id, f"/dagRuns/{quote(dag_run_id, safe='')}")
+    if not run_scan.complete:
         return None, (
             f"run {dag_run_id} has more task instances than this tool will read "
-            f"({omitted} not seen), so it cannot tell whether clearing would change the task set"
+            f"({run_scan.omitted} not seen), so it cannot tell whether clearing would change the task set"
         )
-    tasks, tasks_total = _tasks_reading(dag_id)
-    if len(tasks) < tasks_total:
+    tasks = _tasks_reading(dag_id)
+    if not tasks.complete:
         return None, (
             f"the latest version of {dag_id} lists more tasks than this tool read "
-            f"({len(tasks)} of {tasks_total}), so it cannot tell whether clearing would change "
+            f"({tasks.kept} of {tasks.universe}), so it cannot tell whether clearing would change "
             f"the task set"
         )
-    current = {ti["task_id"] for ti in run_tis}
-    latest = {task["task_id"] for task in tasks}
+    current = {ti["task_id"] for ti in run_scan.rows}
+    latest = {task["task_id"] for task in tasks.rows}
     if current == latest:
         return None, None
     return {"added": sorted(latest - current), "removed": sorted(current - latest)}, None
@@ -272,16 +275,18 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     # The reading, not the response: what this function may conclude an absence
     # from is what it read, and it reads at most RECOVERY_ATTEMPT_LIMIT rows.
     history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
-    rows = history["rows"]
+    rows = list(history.rows)
+    history_status = reading.history_status(history)
     live_executed = _carries_execution_fields(ti)
-    others = [r for r in rows if r.get("try_number") != ti.get("try_number")]
-    if history["status"] in ("checked", "partial"):
-        earlier_executed: bool | None = any(_carries_execution_fields(r) for r in others)
-        # A truncated list can only ever prove presence.
-        if history["status"] == "partial" and not earlier_executed:
-            earlier_executed = None
-    else:
-        earlier_executed = None
+    # A truncated list can only ever prove presence, and this is the one field
+    # that suppresses the half-operation warning when it comes back False.
+    earlier_executed = reading.find(
+        history
+        if history_status in ("checked", "partial")
+        else reading.failed_read(history.route, reading.attempt_error(history) or history_status),
+        lambda r: r.get("try_number") != ti.get("try_number") and _carries_execution_fields(r),
+        f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
+    ).as_field()
 
     missing = [key for key in _DISPATCH_EVIDENCE_KEYS if key not in ti]
     present = [name for name in _EXECUTION_FIELDS if ti.get(name) not in (None, "")]
@@ -290,11 +295,11 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     # earned by a history that was read whole and holds no attempt with execution
     # fields; a truncated history, an unread one, or one that does hold such an
     # attempt leaves the question open, which is ``None``, not ``False``.
-    history_rules_out_partial = history["status"] == "checked" and earlier_executed is False
+    history_rules_out_partial = history_status == "checked" and earlier_executed is False
     if _is_never_dispatched_attempt(ti):
         dispatched: bool | None = False
         partial_possible: bool | None = False if history_rules_out_partial else None
-        reading = (
+        narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} and this attempt carries none of the fields a "
             f"dispatched attempt writes: hostname is empty, pid is null, queued_when is null and "
@@ -305,7 +310,7 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     elif missing:
         dispatched = None
         partial_possible = None
-        reading = (
+        narrative = (
             f"the response for {_ti_where(ti)} did not carry {missing}, so nothing here establishes "
             f"whether this attempt was dispatched."
         )
@@ -318,7 +323,7 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         # strength of four empty fields it has no such reach over.
         dispatched = None
         partial_possible = None
-        reading = (
+        narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} with duration {_quoted(ti.get('duration'))}, and none "
             f"of hostname, pid, queued_when or scheduled_when is set — but the row does not match "
@@ -329,7 +334,7 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     else:
         dispatched = True
         partial_possible = True
-        reading = (
+        narrative = (
             f"{_ti_where(ti)} is recorded {_quoted(ti.get('state'))} at try_number "
             f"{_quoted(ti.get('try_number'))} and this attempt carries execution fields "
             f"({', '.join(present)}), duration {_quoted(ti.get('duration'))}. A row like "
@@ -341,15 +346,15 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
         "task_id": ti["task_id"],
         "map_index": ti.get("map_index", -1),
         "row": row,
-        "reading": reading,
+        "reading": narrative,
         "current_attempt_dispatched": dispatched,
         "partial_external_effect_possible": partial_possible,
         "attempt_history": {
-            "status": history["status"],
-            "attempts_recorded": history.get("attempts_recorded"),
+            "status": history_status,
+            "attempts_recorded": None if history.read_failed else history.universe,
             "attempts": rows,
             "earlier_attempt_carries_execution_fields": earlier_executed,
-            "error": history.get("error"),
+            "error": reading.attempt_error(history),
         },
         "live_row_carries_execution_fields": live_executed,
         "log_for_recorded_attempt": _tagged_log(_attempt_log(dag_id, run_path, ti, ti.get("try_number"))),
@@ -379,7 +384,7 @@ def _mapped_in_closure(dag_id: str, run_path: str, affected: list[dict[str, Any]
     with contextlib.suppress(httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError):
         mapped |= {
             task["task_id"]
-            for task in reading._tasks(dag_id)
+            for task in reading._tasks(dag_id).rows
             if task.get("task_id") in names and task.get("is_mapped")
         }
     unprobed: list[str] = []
@@ -650,9 +655,10 @@ def plan_task_instance_clear(
     run_path = f"/dagRuns/{quote(resolved_run_id, safe='')}"
     markers: list[Any] = [[task, map_index] if map_index is not None else task]
     wanted_index = -1 if map_index is None else map_index
-    run_tis, omitted = reading._run_task_instances(dag_id, run_path)
+    run_scan = reading._run_task_instances(dag_id, run_path)
     target_row = next(
-        (ti for ti in run_tis if ti["task_id"] == task and ti.get("map_index", -1) == wanted_index), None
+        (ti for ti in run_scan.rows if ti["task_id"] == task and ti.get("map_index", -1) == wanted_index),
+        None,
     )
     preview = transport._api(
         "POST",
@@ -703,13 +709,13 @@ def plan_task_instance_clear(
                 f"flag that had to change and why."
             )
         return refusal
-    if omitted:
+    if not run_scan.complete:
         return {
             **plan,
             "planned": False,
             "error": (
                 f"run {resolved_run_id} has more task instances than this tool will read "
-                f"({omitted} not seen), so it cannot enumerate what this clear would touch"
+                f"({run_scan.omitted} not seen), so it cannot enumerate what this clear would touch"
             ),
         }
     if target_state in _IN_FLIGHT_TARGET_STATES:
@@ -946,18 +952,16 @@ def _containment_gate(
     # R1 — the target set. The preview IS the set that gets written, so a preview
     # that accounted for more instances than it handed over describes a write
     # this call cannot enumerate.
-    body = preview if isinstance(preview, dict) else {}
-    delivered = len(body.get("task_instances") or [])
-    claimed = body.get("total_entries")
-    if not _read_is_complete(len(now), delivered, claimed):
-        universe = max(delivered, claimed) if isinstance(claimed, int) else delivered
+    preview_reading = reading.read_of(preview, "task_instances", _CLEAR_PREVIEW_ROUTE).project(_affected_row)
+    if not preview_reading.complete:
         return (
             _incomplete_read(
                 dag_id,
                 dag_run_id,
                 "clear preview",
-                "POST /dags/<dag>/clearTaskInstances (dry_run=true)",
-                f"{len(now)} instance(s) were read of {universe} the route accounted for",
+                _CLEAR_PREVIEW_ROUTE,
+                f"{preview_reading.kept} instance(s) were read of {preview_reading.universe} the "
+                f"route accounted for",
             ),
             _NO_EXPANSION,
         )
@@ -1090,19 +1094,17 @@ def _containment_gate(
         if ti["task_id"] != target or ti.get("map_index", -1) != wanted:
             continue
         history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
-        recorded = history.get("attempts_recorded")
-        kept = len(history["rows"])
-        if history["status"] == "checked" or (history["status"] == "empty" and not recorded):
+        if history.complete:
             break
         return (
             _incomplete_read(
                 dag_id,
                 dag_run_id,
                 f"attempt history of {_ti_where(ti)}",
-                "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/tries",
-                f"the reading came back {history['status']} — {kept} attempt(s) read of "
-                f"{recorded if isinstance(recorded, int) else 'an unknown number'} "
-                f"({_quoted(history.get('error'), 200)})",
+                history.route,
+                f"the reading came back {reading.history_status(history)} — {history.kept} attempt(s) "
+                f"read of {'an unknown number' if history.read_failed else history.universe} "
+                f"({_quoted(reading.attempt_error(history), 200)})",
             ),
             _NO_EXPANSION,
         )
@@ -1455,7 +1457,7 @@ _STALE_ARTEFACT = (
 
 
 def _downstream_dating_check(
-    output: dict[str, Any], upstream_end: str | None, *, target_resolved: bool
+    output: reading.Reading, upstream_end: str | None, *, target_resolved: bool
 ) -> dict[str, Any]:
     """Whether this instance's output was written after the target's re-run ended.
 
@@ -1480,34 +1482,39 @@ def _downstream_dating_check(
             "the target instance carries no end_date, so the moment its re-run finished is not "
             "known and this instance's output cannot be placed against it",
         )
-    if output["status"] in ("not_permitted", "not_scoped", "unavailable"):
+    if output.read_failed:
         return _check(
             _DOWNSTREAM_DATING,
             None,
-            f"the instance's output records could not be read ({_quoted(output.get('error'), 200)}), "
+            f"the instance's output records could not be read ({_quoted(output.error, 200)}), "
             f"so whether they post-date the target's re-run is not established",
         )
-    if not output.get("total_entries"):
+    if not output.universe:
         return _check(_DOWNSTREAM_DATING, None, f"{_NO_OUTPUT_AT_ALL}, and there is no record here to date")
-    consistent = any(_later_than(entry.get("timestamp"), upstream_end) for entry in output["entries"])
-    if output["status"] == "partial" and not consistent:
-        # The stale-artefact sentence is a claim about a thing that exists; a
-        # truncated read cannot support it, because the record that post-dates
-        # the target may simply be one of the ones not read.
+    seen = [entry.get("timestamp") for entry in output.rows]
+    # The stale-artefact sentence is a claim about a thing that exists; a
+    # truncated read cannot support it, because the record that post-dates the
+    # target may simply be one of the ones not read.
+    dated = reading.find(
+        output,
+        lambda entry: _later_than(entry.get("timestamp"), upstream_end) is True,
+        f"none of the output records that were read post-dates the target's re-run ({upstream_end})",
+    )
+    if dated.is_unknown():
         return _check(
             _DOWNSTREAM_DATING,
             None,
-            f"only {len(output['entries'])} of {output['total_entries']} output record(s) were read, "
-            f"so an absence among them is not an absence — none of the records that were read "
-            f"post-dates the target's re-run ({upstream_end}), and the unread ones were not looked "
-            f"at. Records seen: {[entry.get('timestamp') for entry in output['entries']]}.",
+            f"only {output.kept} of {output.universe} output record(s) were read, so an absence "
+            f"among them is not an absence — none of the records that were read post-dates the "
+            f"target's re-run ({upstream_end}), and the unread ones were not looked at. "
+            f"Records seen: {seen}.",
         )
     return _check(
         _DOWNSTREAM_DATING,
-        consistent,
+        dated.as_field(),
         f"this instance's output must be written after the target's re-run ended ({upstream_end}), "
-        + (f"{_STALE_ARTEFACT}. " if not consistent else ". ")
-        + f"Records seen: {[entry.get('timestamp') for entry in output['entries']]}.",
+        + (". " if dated.is_present() else f"{_STALE_ARTEFACT}. ")
+        + f"Records seen: {seen}.",
     )
 
 
@@ -1537,7 +1544,7 @@ def _verify_instance(
     where = _ti_where(ti)
     try_number = ti.get("try_number")
     history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
-    rows = history["rows"]
+    history_status = reading.history_status(history)
     checks = []
 
     if not isinstance(prior_try_number, int) or not isinstance(try_number, int):
@@ -1558,13 +1565,13 @@ def _verify_instance(
             )
         )
 
-    if history["status"] not in ("checked", "partial"):
+    if history_status not in ("checked", "partial"):
         checks.append(
             _check(
                 "prior_attempt_preserved",
                 None,
-                f"the attempt history could not be read ({_quoted(history.get('error'), 200)}), so "
-                f"whether the earlier attempt survived is not established",
+                f"the attempt history could not be read ({_quoted(reading.attempt_error(history), 200)}), "
+                f"so whether the earlier attempt survived is not established",
             )
         )
     elif not isinstance(prior_try_number, int):
@@ -1575,38 +1582,44 @@ def _verify_instance(
                 "no pre-clear try_number was supplied, so there is nothing to look for in /tries",
             )
         )
-    elif any(row.get("try_number") == prior_try_number for row in rows):
-        checks.append(
-            _check(
-                "prior_attempt_preserved",
-                True,
-                f"/tries holds a record at try_number {prior_try_number}; the live row has been "
-                f"overwritten either way",
-            )
-        )
-    elif history["status"] == "partial":
+    else:
         # A truncated read can only ever prove presence. Truncated by the route
         # or truncated by this tool's own clamp is the same incompleteness, so
         # the count is what was READ, never what /tries returned.
-        checks.append(
-            _check(
-                "prior_attempt_preserved",
-                None,
-                f"this reading looked at {len(rows)} of {history.get('attempts_recorded')} recorded "
-                f"attempt(s) and no record at try_number {prior_try_number} is among them, so "
-                f"whether the earlier attempt survived is not established — it may be one of the "
-                f"attempts this read did not look at ({_quoted(history.get('error'), 200)})",
-            )
+        preserved = reading.find(
+            history,
+            lambda row: row.get("try_number") == prior_try_number,
+            f"no record at try_number {prior_try_number} is among the attempts this reading read",
         )
-    else:
-        checks.append(
-            _check(
-                "prior_attempt_preserved",
-                False,
-                f"/tries does not hold a record at try_number {prior_try_number}; the live row has "
-                f"been overwritten either way",
+        if preserved.is_present():
+            checks.append(
+                _check(
+                    "prior_attempt_preserved",
+                    True,
+                    f"/tries holds a record at try_number {prior_try_number}; the live row has been "
+                    f"overwritten either way",
+                )
             )
-        )
+        elif preserved.is_unknown():
+            checks.append(
+                _check(
+                    "prior_attempt_preserved",
+                    None,
+                    f"this reading looked at {history.kept} of {history.universe} recorded "
+                    f"attempt(s) and no record at try_number {prior_try_number} is among them, so "
+                    f"whether the earlier attempt survived is not established — it may be one of the "
+                    f"attempts this read did not look at ({_quoted(reading.attempt_error(history), 200)})",
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "prior_attempt_preserved",
+                    False,
+                    f"/tries does not hold a record at try_number {prior_try_number}; the live row has "
+                    f"been overwritten either way",
+                )
+            )
 
     state = ti.get("state")
     checks.append(
@@ -1643,7 +1656,8 @@ def _verify_instance(
         )
     )
 
-    others, source = _duration_baseline(dag_id, dag_run_id, ti, rows)
+    baseline, source = _duration_baseline(dag_id, dag_run_id, ti, history)
+    others = sorted(row["duration"] for row in baseline.rows)
     if not isinstance(duration, (int, float)):
         checks.append(_check("duration_in_line_with_history", None, "the row carries no duration to compare"))
     elif not others:
@@ -1656,25 +1670,45 @@ def _verify_instance(
                 f"records a real duration too",
             )
         )
+    elif not baseline.complete:
+        # A median over a clamped sample is a median of the sample, not of the
+        # task's history, and both directions of the comparison rest on it.
+        checks.append(
+            _check(
+                "duration_in_line_with_history",
+                None,
+                f"the comparison sample was NOT read whole ({baseline.reason}), so the median of the "
+                f"{len(others)} attempt(s) it holds is not this task's history and {duration} cannot "
+                f"be placed against it. Sample read: {others} over {source}",
+            )
+        )
     else:
-        reference = sorted(others)[len(others) // 2]
+        reference = others[len(others) // 2]
         checks.append(
             _check(
                 "duration_in_line_with_history",
                 duration >= RECOVERY_DURATION_FLOOR * reference,
-                f"this attempt took {duration} against a median of {reference} over {source} "
-                f"{sorted(others)}",
+                f"this attempt took {duration} against a median of {reference} over {source} {others}",
             )
         )
 
     log = _attempt_log(dag_id, run_path, ti, try_number)
+    # Both negatives are claims about the WHOLE log, and a tail is not the log.
+    log_verdict = {"present": True, "empty": False, "no_logs_reported": False}.get(log["status"])
+    if log_verdict is False and log.get("tail_truncated"):
+        log_verdict = None
     checks.append(
         _check(
             "log_for_new_attempt",
-            {"present": True, "empty": False, "no_logs_reported": False}.get(log["status"]),
+            log_verdict,
             f"the log for try_number {_quoted(try_number)} is {log['status']}. A log that exists is "
             f"not a log that shows the work finished — an attempt killed part-way writes a real log "
-            f"too, so read its tail.",
+            f"too, so read its tail."
+            + (
+                " Only the tail of it was read, so an absence in it is not an absence in the log."
+                if log.get("tail_truncated")
+                else ""
+            ),
         )
     )
 
@@ -1687,7 +1721,7 @@ def _verify_instance(
                 f"the event log could not be read for this run ({_quoted(audit.get('error'), 200)})",
             )
         )
-    elif audit["status"] == "partial" and not audit["pair_recorded"]:
+    elif audit["pair_recorded"].is_unknown():
         # Same shape as prior_attempt_preserved: the event page stopped short, so
         # the missing transition may simply be on a page that was not read. The
         # deleted-Dag caveat is the wrong hedge to reach for here — the reason
@@ -1706,7 +1740,7 @@ def _verify_instance(
         checks.append(
             _check(
                 "audit_running_success_pair",
-                audit["pair_recorded"],
+                audit["pair_recorded"].as_field(),
                 f"events visible to this API since the clear: {audit['events']}. A positive row "
                 f"establishes that Airflow recorded the transition — not that the callable did its "
                 f"work — and rows for a deleted Dag are absent from this view while present in the "
@@ -1715,23 +1749,32 @@ def _verify_instance(
         )
 
     output = _recorded_output(dag_id, run_path, ti, xcom_scope)
-    fresh = [entry for entry in output["entries"] if _later_than(entry.get("timestamp"), cleared_after)]
+    fresh = [entry for entry in output.rows if _later_than(entry.get("timestamp"), cleared_after) is True]
+    # Presence-based conclusions survive a truncated list; absence-based ones do
+    # not. The status used to be derived from the route's claimed total against
+    # a POST-clamp row count, so a page this tool had itself cut short called
+    # itself checked and reported a hard "no output post-dates the clear" over
+    # records it never read.
+    dated = reading.find(
+        output,
+        lambda entry: _later_than(entry.get("timestamp"), cleared_after) is True,
+        "none of the output records that were read post-dates the clear",
+    )
     # Distinguished from "records exist and none of them are fresh". An instance
     # that records nothing — an EmptyOperator, a callable returning None, a task
     # with do_xcom_push off — has no output to date, and calling that a failed
     # check made ``verified`` unreachable for a whole class of correct re-runs.
-    no_output = output["status"] != "unavailable" and not output.get("total_entries")
-    if output["status"] in ("not_permitted", "not_scoped"):
-        checks.append(_check("recorded_output_post_dates_clear", None, str(output.get("error"))))
-    elif output["status"] == "unavailable":
+    if reading.output_scope_refused(output):
+        checks.append(_check("recorded_output_post_dates_clear", None, str(output.error)))
+    elif output.read_failed:
         checks.append(
             _check(
                 "recorded_output_post_dates_clear",
                 None,
-                f"the instance's output records could not be read ({_quoted(output.get('error'), 200)})",
+                f"the instance's output records could not be read ({_quoted(output.error, 200)})",
             )
         )
-    elif no_output:
+    elif not output.universe:
         checks.append(
             _check(
                 "recorded_output_post_dates_clear",
@@ -1747,29 +1790,25 @@ def _verify_instance(
                 "recorded_output_post_dates_clear",
                 None,
                 f"no reference time was supplied, so an output record cannot be told from one "
-                f"written before the clear; the instance has {output['total_entries']} record(s)",
+                f"written before the clear; the instance has {output.universe} record(s)",
             )
         )
-    elif output["status"] == "partial" and not fresh:
-        # Presence-based conclusions survive a truncated list; absence-based ones
-        # do not. Nothing consulted this status, so a page that stopped short
-        # reported a hard "no output post-dates the clear" over records it had
-        # never read.
+    elif dated.is_unknown():
         checks.append(
             _check(
                 "recorded_output_post_dates_clear",
                 None,
-                f"only {len(output['entries'])} of {output['total_entries']} output record(s) were "
-                f"read, so an absence among them is not an absence — none of the records that were "
-                f"read post-dates the clear, and the unread ones were not looked at",
+                f"only {output.kept} of {output.universe} output record(s) were read, so an absence "
+                f"among them is not an absence — none of the records that were read post-dates the "
+                f"clear, and the unread ones were not looked at",
             )
         )
     else:
         checks.append(
             _check(
                 "recorded_output_post_dates_clear",
-                bool(fresh),
-                f"{len(fresh)} of {output['total_entries']} output record(s) post-date the clear "
+                dated.as_field(),
+                f"{len(fresh)} of {output.universe} output record(s) post-date the clear "
                 f"({[entry['key'] for entry in fresh]}). This is the task's OWN report of its work, "
                 f"written by the task; it is not an observation of the external system.",
             )
@@ -1811,9 +1850,7 @@ _APPROVED_SET_NOT_ESTABLISHED = (
 )
 
 
-def _approved_instance_set_check(
-    record: dict[str, Any] | None, run_tis: list[dict[str, Any]], omitted: int
-) -> dict[str, Any]:
+def _approved_instance_set_check(record: dict[str, Any] | None, run_scan: reading.Reading) -> dict[str, Any]:
     """What the run holds now for the approved tasks, against what was approved.
 
     The baseline is the set THIS server recorded when it redeemed the plan token
@@ -1849,15 +1886,15 @@ def _approved_instance_set_check(
     wanted: list[tuple[str, int]] = list(record["approved"])
     approved = set(wanted)
     tasks = {task for task, _ in wanted}
-    present = {_ti_key(ti) for ti in run_tis if ti["task_id"] in tasks}
+    present = {_ti_key(ti) for ti in run_scan.rows if ti["task_id"] in tasks}
     added = sorted(present - approved)
     absent = sorted(approved - present)
     identities = [_ti_where({"task_id": task, "map_index": index}) for task, index in added]
     gone = [_ti_where({"task_id": task, "map_index": index}) for task, index in absent]
-    if omitted:
+    if not run_scan.complete:
         detail: str = (
-            f"run has more task instances than this tool will read ({omitted} not seen), so its "
-            f"current set cannot be compared against the approved one"
+            f"run has more task instances than this tool will read ({run_scan.omitted} not seen), so "
+            f"its current set cannot be compared against the approved one"
         )
         passed: bool | None = None
     elif added or absent:
@@ -1956,7 +1993,9 @@ def verify_task_instance_recovery(
             ),
         }
 
-    run_tis, omitted = reading._run_task_instances(dag_id, run_path)
+    run_scan = reading._run_task_instances(dag_id, run_path)
+    run_tis = list(run_scan.rows)
+    omitted = run_scan.omitted
     by_key = {_ti_key(ti): ti for ti in run_tis}
     missing = [
         f"{task}[{index}]" if index >= 0 else task for task, index in wanted if (task, index) not in by_key
@@ -1988,10 +2027,8 @@ def verify_task_instance_recovery(
             )
         )
 
-    instance_set = _approved_instance_set_check(
-        _approved_set_record(dag_id, resolved_run_id), run_tis, omitted
-    )
-    verified = bool(results) and not missing and not omitted
+    instance_set = _approved_instance_set_check(_approved_set_record(dag_id, resolved_run_id), run_scan)
+    verified = bool(results) and not missing and run_scan.complete
     verified = verified and instance_set["check"]["passed"] is True
     verified = verified and all(entry["verdict"] == "verified" for entry in results)
     unverified = [entry["instance"] for entry in results if entry["verdict"] != "verified"]

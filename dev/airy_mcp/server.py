@@ -207,7 +207,6 @@ from reading import (
     _attempt_rows,  # noqa: F401 - re-exported for ``server._attempt_rows``
     _audit_transitions,  # noqa: F401 - re-exported for ``server._audit_transitions``
     _duration_baseline,  # noqa: F401 - re-exported for ``server._duration_baseline``
-    _read_is_complete,  # noqa: F401 - re-exported for ``server._read_is_complete``
     _recorded_output,  # noqa: F401 - re-exported for ``server._recorded_output``
     _resolve_run,  # noqa: F401 - re-exported for ``server._resolve_run``
     _tail,  # noqa: F401 - re-exported for ``server._tail``

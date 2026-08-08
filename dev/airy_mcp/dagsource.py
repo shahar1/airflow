@@ -218,7 +218,7 @@ def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -
     )
 
 
-def _display_order(tasks: list[dict[str, Any]]) -> tuple[list[str], set[int]]:
+def _display_order(tasks: reading.Reading) -> tuple[list[str], set[int]]:
     """Topological order, plus the positions the graph does not pin down.
 
     The API returns tasks sorted by ``task_id``, which is *not* what the Grid
@@ -231,8 +231,15 @@ def _display_order(tasks: list[dict[str, Any]]) -> tuple[list[str], set[int]]:
     Ambiguity ends when the tie does: a diamond makes its two middle positions
     interchangeable, but the task the branches rejoin at is back to being the
     only one that can sit there.
+
+    A SHORT task list is total ambiguity, not a smaller graph: an order over a
+    subset of the tasks looks exactly as confident as one over all of them, and
+    a positional resolve against it names the wrong task without saying so.
     """
-    downstream = {task["task_id"]: sorted(task.get("downstream_task_ids") or []) for task in tasks}
+    downstream = {task["task_id"]: sorted(task.get("downstream_task_ids") or []) for task in tasks.rows}
+    if not tasks.complete:
+        partial = sorted(downstream)
+        return partial, set(range(len(partial)))
     indegree: dict[str, int] = dict.fromkeys(downstream, 0)
     for children in downstream.values():
         for child in children:
@@ -538,21 +545,27 @@ def _change_impact(dag_id: str, source: str, patched: str) -> dict[str, Any]:
         "variable, are not visible to it"
     )
     try:
-        tasks = reading._tasks(dag_id)
+        graph = reading._tasks(dag_id)
     except (httpx.HTTPStatusError, KeyError) as e:
-        # Fail closed. Without the graph there is nothing to check a removal
-        # against, and "found no problems" would be indistinguishable from
-        # "could not look" — which is how a change that orphans half a Dag gets
-        # a token.
+        graph = reading.failed_read(reading._TASKS_ROUTE, _explain_error(e))
+    if not graph.complete:
+        # Fail closed, for a short read exactly as for an unreadable one. Without
+        # the WHOLE graph there is nothing to check a removal against, and "found
+        # no problems" is indistinguishable from "could not look" — which is how
+        # a change that orphans half a Dag gets a token.
         return {
-            "removed_task_ids": [],
-            "added_task_ids": [],
+            "removed_task_ids": None,
+            "added_task_ids": sorted(_declared_task_ids(patched) - _declared_task_ids(source)),
             "limits": limits,
             "blocking": [
-                f"the task graph could not be read ({_explain_error(e)}), so this change cannot "
+                f"the task graph could not be read ({graph.error}), so this change cannot be "
+                f"checked against it"
+                if graph.read_failed
+                else f"the task graph was not read whole ({graph.reason}), so this change cannot "
                 f"be checked against it"
             ],
         }
+    tasks = list(graph.rows)
     removed = sorted(
         task["task_id"]
         for task in tasks
@@ -611,10 +624,22 @@ def _find_unaddressed_findings(dag_id: str, patched: str) -> list[dict[str, str]
     skipped, not that a problem remains.
     """
     try:
-        task_ids = {task["task_id"] for task in reading._tasks(dag_id)}
-    except (httpx.HTTPStatusError, KeyError):
-        return []
-    checks, _ = _static_checks(patched, task_ids)
+        graph = reading._tasks(dag_id)
+    except (httpx.HTTPStatusError, KeyError) as e:
+        graph = reading.failed_read(reading._TASKS_ROUTE, _explain_error(e))
+    if not graph.complete:
+        # An empty list here reads as "the patch leaves nothing unaddressed",
+        # which is a claim about findings this never got to compute.
+        return [
+            {
+                "kind": "unaddressed_findings_not_checked",
+                "detail": (
+                    f"whether the patched source still trips a deterministic finding was NOT "
+                    f"checked: the Dag's task list was not read whole ({graph.reason})"
+                ),
+            }
+        ]
+    checks, _ = _static_checks(patched, {task["task_id"] for task in graph.rows})
     return [check for check in checks if check["kind"] != "source_graph_disagreement"]
 
 
@@ -636,9 +661,22 @@ def _resolve_task(dag_id: str, task_id: str, position: int) -> tuple[str | None,
     honoured where the graph fixes the order; see ``_display_order``.
     """
     tasks = reading._tasks(dag_id)
-    task_ids = {task["task_id"] for task in tasks}
+    named = reading.find(
+        tasks,
+        lambda task: task.get("task_id") == task_id,
+        f"no task called {task_id!r} was among the tasks this reading listed",
+    )
     if task_id:
-        if task_id not in task_ids:
+        if named.is_unknown():
+            return (
+                None,
+                "",
+                (
+                    f"whether {dag_id} has a task {task_id!r} is not established: its task list was not "
+                    f"read whole ({tasks.reason})"
+                ),
+            )
+        if named.is_absent():
             return None, "", f"{dag_id} has no task {task_id!r}"
         return task_id, "named explicitly", None
     if position < 1:

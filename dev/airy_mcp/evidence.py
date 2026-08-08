@@ -744,9 +744,18 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
         return _bare_attribution(_ATTR_NOT_SCOPED, ["U14"])
     if status in ("unavailable", "not_permitted"):
         return _bare_attribution(_ATTR_UNAVAILABLE, ["U9"])
-    matched = [(row, via) for row in history["rows"] if (via := _event_association(row, ti))]
+    scan: reading.Reading = history["reading"]
+    matched = [(row, via) for row in scan.rows if (via := _event_association(row, ti))]
     if not matched:
-        if status == "partial":
+        # The only way to "no event found": a scan that covered its whole
+        # universe. A scan that paged out, or that discarded rows, cannot
+        # distinguish a row that is not there from one it never looked at.
+        verdict = reading.find(
+            scan,
+            lambda row: bool(_event_association(row, ti)),
+            f"no event-log row for {_ti_where(ti)} appeared in the scanned window",
+        )
+        if verdict.is_unknown():
             return _bare_attribution(_ATTR_TRUNCATED, ["U8"])
         absent = ["U2", "U11", "U12", "U13"]
         if history.get("clear_with_include_flags"):
@@ -952,7 +961,6 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
         "events_omitted": 0,
         "oldest_scanned_when": None,
         "rows_rejected": 0,
-        "instances_without_attribution": 0,
         "attribution_payload_bytes": 0,
         "attribution_payload_limit": ATTRIBUTION_PAYLOAD_LIMIT_CHARS,
         "attribution_reduced_for_size": 0,
@@ -964,16 +972,21 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
         "query": _EVENT_QUERY,
         "limits": [_L1, _L2, _L3, _L4, _L5, _L6, _L7],
         "unknowns_legend": _UNKNOWNS,
-        "rows": [],
+        # The rows AND how much of the scan they are. Everything downstream that
+        # concludes an absence from them reads this and nothing else.
+        "reading": reading.failed_read(_EVENT_QUERY, _AUDIT_NOT_PERMITTED),
     }
     if audit_scope == "":
         payload["status"] = "not_scoped"
         payload["error"] = _AUDIT_NOT_SCOPED
+        payload["reading"] = reading.failed_read(_EVENT_QUERY, _AUDIT_NOT_SCOPED)
         return payload
     if audit_scope != "granted":
         return payload
     fetched: list[dict[str, Any]] = []
     total = 0
+    pages = 0
+    exhausted = False
     # Bounded by construction rather than by the server's arithmetic: the break
     # below already ends the scan, and this makes an ``offset`` the API ignores
     # or a total that never comes down cost a fixed number of calls, not a spin.
@@ -999,22 +1012,36 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
             page = resp["event_logs"]
             total = resp.get("total_entries", len(page))
             fetched += page
+            pages += 1
             # An empty page ends it whatever the count says.
-            if not page or len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT):
+            if not page:
+                exhausted = True
+                break
+            if len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT):
+                exhausted = len(fetched) >= total
                 break
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         payload["status"] = "unavailable"
         payload["error"] = _explain_error(e)
+        payload["reading"] = reading.failed_read(_EVENT_QUERY, _explain_error(e))
         return payload
 
     # Defence in depth: the query is already dag_id-scoped, so a row for another
     # Dag can only be a server-side filter regression. Dropped and counted.
     # Copied rather than mutated, and the parse happens exactly once per row.
-    kept = [
-        {**row, _PARSED_EXTRA_KEY: _parsed_extra(row.get("extra"))}
-        for row in fetched
-        if isinstance(row, dict) and row.get("dag_id") == dag_id
-    ]
+    scan = reading.Reading(
+        rows=tuple({**row, _PARSED_EXTRA_KEY: _parsed_extra(row.get("extra"))} for row in fetched),
+        route=_EVENT_QUERY,
+        _delivered=len(fetched),
+        _claimed=total if isinstance(total, int) else None,
+        _pages=pages,
+        _exhausted=exhausted,
+    )
+    # A dropped row is a row this reading did not look at, exactly like a page it
+    # never fetched. Counting it only into ``rows_rejected`` let a read that
+    # discarded rows report itself as having covered the run.
+    scanned = scan.filter(lambda row: isinstance(row, dict) and row.get("dag_id") == dag_id)
+    kept = list(scanned.rows)
     run_scoped = [row for row in kept if row.get("task_id") is None]
     # A clear with an include_* flag names only its seed task ids, so the further
     # instances it swept in are named nowhere. Carried on the history rather than
@@ -1023,17 +1050,17 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
     swept = any(any(bool(_parsed_extra_of(row).get(key)) for key in _EXTRA_INCLUDE_KEYS) for row in kept)
     payload.update(
         {
-            "status": "checked" if len(fetched) >= total else "partial",
+            "status": "checked" if scanned.complete else "partial",
             "events_scanned": len(kept),
             "total_entries": total,
-            "events_omitted": max(total - len(fetched), 0),
+            "events_omitted": scanned.omitted,
             "oldest_scanned_when": kept[-1].get("when") if kept else None,
             "rows_rejected": len(fetched) - len(kept),
             "clear_with_include_flags": swept,
             "run_scoped_events": [_compact_event(row) for row in run_scoped[:RUN_SCOPED_EVENT_LIMIT]],
             "run_scoped_events_omitted": max(len(run_scoped) - RUN_SCOPED_EVENT_LIMIT, 0),
             "error": None,
-            "rows": kept,
+            "reading": scanned,
         }
     )
     return payload
@@ -1150,7 +1177,7 @@ _NOT_ESTABLISHED = "What wrote this state is not established by this diagnosis"
 
 
 def _dispatch_finding(
-    ti: dict[str, Any], history: dict[str, Any], attribution: dict[str, Any] | None = None
+    ti: dict[str, Any], history: reading.Reading | None, attribution: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
     """A success whose recorded attempt carries none of the fields a dispatch writes.
 
@@ -1170,8 +1197,8 @@ def _dispatch_finding(
     triggerer emits no execution-API row either, so an event-history reading
     would flag it exactly as the six-leg conjunction did.
     """
-    status = history["status"]
-    rows = history.get("rows") or []
+    status = reading.history_status(history)
+    rows = history.rows if history is not None else ()
     try_number = ti.get("try_number")
     never_dispatched = _is_never_dispatched_attempt(ti)
     archived_not_redispatched = (
@@ -1188,7 +1215,16 @@ def _dispatch_finding(
     # exact rather than an estimate.
     executing_rows = [row for row in rows if row.get("hostname") or row.get("pid") is not None]
     live_has_execution = bool(ti.get("hostname")) or ti.get("pid") is not None
-    executed_earlier = (len(executing_rows) - (1 if live_has_execution else 0)) >= 1
+    # The live row is in ``rows`` exactly once, so dropping one of them leaves
+    # the attempts OTHER than the one recorded success.
+    # A page that carried no rows at all is the absence of an answer, not an
+    # answer of absence, so it settles nothing here either.
+    source = (
+        history
+        if history is not None and history.rows
+        else reading.failed_read(reading._TRIES_ROUTE, _HISTORY_NOT_CHECKED)
+    )
+    others = reading.selection_of(source, executing_rows[1:] if live_has_execution else executing_rows)
     # "A different attempt" is a claim about try_number, so it is read off
     # try_number. The archived-not-redispatched disjunct fires on a DUPLICATE
     # try_number, and ``record_ti`` dedupes by try_number
@@ -1196,15 +1232,15 @@ def _dispatch_finding(
     # and its archive — saying "a different attempt" there would be false in
     # exactly the case that produced the finding.
     other_attempt_executed = any(row.get("try_number") != try_number for row in executing_rows)
-    if status == "checked":
-        earlier_attempt_executed: bool | None = executed_earlier
-    elif status == "partial" and executed_earlier:
-        earlier_attempt_executed = True
-    else:
-        earlier_attempt_executed = None
+    earlier_attempt_executed = reading.find(
+        others,
+        lambda row: True,
+        f"no attempt of {_ti_where(ti)} other than the one recorded success carries execution fields",
+    ).as_field()
 
     where = _fenced(_ti_where(ti))
-    attempts_recorded = history.get("attempts_recorded")
+    history_error = _HISTORY_NOT_CHECKED if history is None else reading.attempt_error(history)
+    attempts_recorded = None if history is None or history.read_failed else history.universe
     if never_dispatched:
         core = (
             f"{where} is recorded state=success at try_number 0, and this attempt carries none of "
@@ -1244,7 +1280,7 @@ def _dispatch_finding(
         # The reachable content here is the API's own 404 detail, which is a
         # string this tool did not write — quoted like any other.
         history_text = (
-            f"Its attempt history could not be read ({_quoted(history.get('error') or status, 240)}), "
+            f"Its attempt history could not be read ({_quoted(history_error or status, 240)}), "
             f"so whether an earlier attempt executed is not established."
         )
 
@@ -1311,10 +1347,10 @@ def _dispatch_finding(
     }
     if attempts_recorded is not None:
         finding["attempts_recorded"] = attempts_recorded
-    if status != "not_checked":
+    if status != reading.NOT_CHECKED:
         finding["earlier_attempt_executed"] = earlier_attempt_executed
-    if history.get("error"):
-        finding["tries_error"] = history["error"]
+    if history_error:
+        finding["tries_error"] = history_error
     return finding
 
 
@@ -1371,26 +1407,23 @@ def _check_dispatch_evidence(
             tiers[tier].append(ti)
     # Tier A first: those are the instances the live row already flags, so the
     # budget must never be spent elsewhere before them.
-    probed: dict[tuple[str, int], dict[str, Any]] = {}
+    probed: dict[tuple[str, int], reading.Reading | None] = {}
     checked = unchecked = 0
     for position, ti in enumerate(tiers["A"] + tiers["B"]):
-        history = (
-            _attempt_history(dag_id, run_path, ti)
-            if position < TRIES_PROBE_LIMIT
-            else {"status": "not_checked", "rows": [], "error": _HISTORY_NOT_CHECKED}
-        )
+        history = _attempt_history(dag_id, run_path, ti) if position < TRIES_PROBE_LIMIT else None
         probed[_ti_key(ti)] = history
-        if history["status"] == "checked":
+        # "Checked" is the reading's own completeness, not a second comparison:
+        # a probe that came back short covers nothing it did not look at.
+        if history is not None and history.complete and history.rows:
             checked += 1
         else:
             unchecked += 1
 
-    unprobed = {"status": "not_checked", "rows": [], "error": _HISTORY_NOT_CHECKED}
     checks = []
     for ti in successes:
         finding = _dispatch_finding(
             ti,
-            probed.get(_ti_key(ti), unprobed),
+            probed.get(_ti_key(ti)),
             attribution_of(ti) if attribution_of else None,
         )
         if finding:

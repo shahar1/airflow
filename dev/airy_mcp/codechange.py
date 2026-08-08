@@ -680,17 +680,19 @@ def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
     create is the one they reviewed.
     """
     try:
-        entries = _dry_run_backfill(dag_id, from_date, to_date)
+        preview_reading = _dry_run_backfill(dag_id, from_date, to_date)
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
             raise
         return {"dag_id": dag_id, "from_date": from_date, "to_date": to_date, "error": message}
+    entries = list(preview_reading.rows)
     preview = {
         "dag_id": dag_id,
         "from_date": from_date,
         "to_date": to_date,
         "planned_run_count": len(entries),
+        "planned_runs_read_whole": preview_reading.complete,
         # Every run, and both halves of its identity: a partitioned Dag has no
         # logical_date, so a dates-only list would show the user nothing at all.
         "planned_runs": [
@@ -698,6 +700,17 @@ def plan_backfill(dag_id: str, from_date: str, to_date: str) -> dict[str, Any]:
             for entry in entries
         ],
     }
+    if not preview_reading.complete:
+        # No token. The preview IS what the user is asked to approve, and a
+        # preview that did not list every run it would create cannot be shown.
+        return {
+            **preview,
+            "error": (
+                f"the backfill preview was not read whole ({preview_reading.reason}), so the runs "
+                f"listed here are not all of the runs this backfill would create; nothing is "
+                f"proposed until it can be shown in full"
+            ),
+        }
     if len(entries) > reading.MAX_BACKFILL_RUNS:
         # No token: the plan is beyond what may be created anyway, and issuing one
         # would authorize runs this preview is too long to have really shown.
@@ -761,12 +774,26 @@ def run_backfill(
     # Re-run the dry run at the moment of execution: schedule or state drift
     # between the preview and now would silently change what gets created.
     try:
-        entries = _dry_run_backfill(dag_id, from_date, to_date)
+        preview_reading = _dry_run_backfill(dag_id, from_date, to_date)
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
             raise
         return {"created": False, "mutation_applied": False, "error": message}
+    if not preview_reading.complete:
+        # Pre-mutation, so "not applied" is a fact rather than an inference. The
+        # identity compare below is what authorizes the write, and a compare
+        # against a list that was cut short authorizes runs nobody reviewed.
+        return {
+            "created": False,
+            "mutation_applied": False,
+            "error": (
+                f"this backfill was NOT created: the dry run taken immediately before the write was "
+                f"not read whole ({preview_reading.reason}), so the runs it would create cannot be "
+                f"compared against the ones the user approved. Nothing was created."
+            ),
+        }
+    entries = list(preview_reading.rows)
     planned = [_run_identity(entry) for entry in entries]
     reviewed = plan["planned_runs"]
     count = len(planned)
@@ -796,14 +823,19 @@ def run_backfill(
     # The preview and the create are two REST calls, so they cannot be atomic from
     # out here: state can move between them. Check what actually got created and
     # cancel it if it is not what the user approved.
-    created = _backfill_runs(resp["id"])
+    created_reading = _backfill_runs(resp["id"])
+    created = list(created_reading.rows)
     # A slot Airflow could not fill still comes back with the planned identity, and
     # carries no dag_run_id plus a reason. Matching on identity alone would call
     # that a success, so the run has to have actually been created.
     landed = [entry for entry in created if entry.get("dag_run_id") and not entry.get("exception_reason")]
     # Identity, not arity: the same number of runs can still be different runs.
-    if not _same_runs([_run_identity(entry) for entry in landed], planned):
-        return _abandon_backfill(resp["id"], planned=planned, created=created)
+    # A read that did not list every run the backfill holds cannot support either
+    # answer — a missing run reads as one that was never created.
+    if not created_reading.complete or not _same_runs([_run_identity(entry) for entry in landed], planned):
+        return _abandon_backfill(
+            resp["id"], planned=planned, created=created, read_whole=created_reading.complete
+        )
     return {
         "created": True,
         "mutation_applied": True,
@@ -820,7 +852,11 @@ def run_backfill(
 
 
 def _abandon_backfill(
-    backfill_id: int, *, planned: list[tuple[Any, Any]], created: list[dict[str, Any]]
+    backfill_id: int,
+    *,
+    planned: list[tuple[Any, Any]],
+    created: list[dict[str, Any]],
+    read_whole: bool = True,
 ) -> dict[str, Any]:
     """Undo as much of a backfill as cancelling can, and be explicit about the rest.
 
@@ -835,14 +871,26 @@ def _abandon_backfill(
         cancelled = False
     survivors = []
     try:
+        recheck = _backfill_runs(backfill_id)
         survivors = [
             {"dag_run_id": entry.get("dag_run_id"), "state": entry.get("dag_run_state")}
-            for entry in _backfill_runs(backfill_id)
+            for entry in recheck.rows
             if entry.get("dag_run_state") not in (None, "failed")
         ]
+        if not recheck.complete:
+            # An empty or short survivor list is a claim that nothing outlived
+            # the cancel, and this read cannot support one.
+            survivors.append(
+                {
+                    "dag_run_id": None,
+                    "state": f"unknown — the backfill's runs were not read whole ({recheck.reason})",
+                }
+            )
     except Exception:
         survivors = [{"dag_run_id": None, "state": "unknown — could not re-read the backfill"}]
     aftermath = "cancelled" if cancelled else "CANCELLING IT FAILED"
+    if not read_whole:
+        aftermath += ", and the created runs were not read whole, so what it created is not established"
     if survivors:
         aftermath += f", but {len(survivors)} run(s) were already past queued and are still going"
     return {

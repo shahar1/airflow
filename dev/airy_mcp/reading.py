@@ -54,6 +54,7 @@ from primitives import (
     _clamped_operator,
     _later_than,
     _quoted,
+    _ti_where,
 )
 from transport import (
     _api_detail,
@@ -103,6 +104,8 @@ _NO_LOGS_MARKER = "no logs available"
 # expandable. Matched on, rather than on the bare status, because a 404 also
 # covers "no such task" and "no such run" — neither of which settles anything.
 _LIST_MAPPED_NOT_MAPPED = "is not mapped"
+
+_DAG_VERSIONS_ROUTE = "GET /dags/<dag>/dagVersions"
 
 _XCOM_NOT_PERMITTED = "XCom records are not readable by the signed-in user"
 _XCOM_NOT_SCOPED = "no XCom scope was supplied, so the instance's output records were not read"
@@ -166,6 +169,9 @@ class Reading:
     _pages: int = 1
     _exhausted: bool = True
     error: str | None = None
+    # Set where the shortfall is better described than by the three numbers —
+    # a selection over a scan knows what the scan missed, not what it kept.
+    note: str | None = None
 
     @property
     def kept(self) -> int:
@@ -212,6 +218,8 @@ class Reading:
             return f"{self.route or 'the read'} could not be read ({self.error})"
         if self.complete:
             return ""
+        if self.note:
+            return self.note
         claimed = self._claimed
         if isinstance(claimed, int) and claimed > self._delivered:
             source = f"the route accounted for {claimed} and handed over {self._delivered}"
@@ -281,6 +289,50 @@ def read_of(
         _pages=pages,
         _exhausted=exhausted,
     )
+
+
+def matches_of(
+    matched: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    scanned: int,
+    claimed: Any,
+    route: str,
+) -> Reading:
+    """The rows that answered a question, over a scan that may not have covered everything.
+
+    Selecting the rows that answer the question is not a truncation, so the
+    matches are the whole of what was kept. What the scan did NOT look at is,
+    and every unexamined row could have matched — so the universe is raised by
+    exactly that many, and completeness comes out True only for an exhaustive
+    scan.
+    """
+    unexamined = (
+        max(claimed - scanned, 0) if isinstance(claimed, int) and not isinstance(claimed, bool) else 0
+    )
+    return Reading(
+        rows=tuple(matched),
+        route=route,
+        _delivered=len(matched),
+        _claimed=len(matched) + unexamined,
+        note=(
+            f"only the first {scanned} of {scanned + unexamined} row(s) were scanned, so any of the "
+            f"{unexamined} that were not could have matched"
+            if unexamined
+            else None
+        ),
+    )
+
+
+def selection_of(source: Reading, rows: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> Reading:
+    """Rows picked out of another reading, inheriting exactly its shortfall.
+
+    Picking the rows that answer a question is not a truncation, but the rows
+    the SOURCE never saw are one, and a conclusion drawn over the selection is
+    a conclusion over the source's universe.
+    """
+    if source.read_failed:
+        return failed_read(source.route, source.error or "")
+    return matches_of(list(rows), scanned=source.kept, claimed=source.universe, route=source.route)
 
 
 def failed_read(route: str, error: str) -> Reading:
@@ -364,6 +416,22 @@ def none_match(reading: Reading, question: Callable[[Mapping[str, Any]], bool], 
     return Verdict(Outcome.ABSENT, row=hit, route=reading.route)
 
 
+def all_of(*verdicts: Verdict, route: str = "") -> Verdict:
+    """The conjunction, as three-valued as its weakest member.
+
+    Returns one of the inputs rather than building a new negative: a definite
+    counterexample settles the conjunction whatever the rest are, and one
+    unsettled member leaves the whole thing unsettled.
+    """
+    for verdict in verdicts:
+        if verdict.is_absent():
+            return verdict
+    for verdict in verdicts:
+        if verdict.is_unknown():
+            return verdict
+    return Verdict(Outcome.PRESENT, route=route)
+
+
 @dataclass(frozen=True, slots=True)
 class Clipped:
     """Text that was cut to a size this tool chose, and whether it was cut.
@@ -386,20 +454,32 @@ def _latest_version(dag_id: str) -> int | None:
     return versions[0]["version_number"] if versions else None
 
 
-def _tail(content: Any) -> str:
-    """Last few log lines, whatever shape the API returned them in."""
+def _tail(content: Any) -> Clipped:
+    """Last few log lines, whatever shape the API returned them in.
+
+    Carries whether anything was cut. A bare ``str`` here let every consumer
+    read a truncated log as the whole of one, and an absence in a tail is not
+    an absence in the log.
+    """
     if isinstance(content, list):
         lines = content[-LOG_TAIL_LINES:]
+        cut = len(content) > LOG_TAIL_LINES
         text = "\n".join(line if isinstance(line, str) else json.dumps(line) for line in lines)
     else:
+        cut = False
         text = str(content)
-    return text[-LOG_TAIL_CHARS:]
+    return Clipped(text[-LOG_TAIL_CHARS:], cut or len(text) > LOG_TAIL_CHARS)
 
 
-def _run_task_instances(dag_id: str, run_path: str) -> tuple[list[dict[str, Any]], int]:
-    """Every task instance in one run, and how many are still missing."""
+_TASK_INSTANCES_ROUTE = "GET /dags/<dag>/dagRuns/<run>/taskInstances"
+
+
+def _run_task_instances(dag_id: str, run_path: str) -> Reading:
+    """Every task instance in one run, and whether they are all of them."""
     tis: list[dict[str, Any]] = []
     total = 0
+    pages = 0
+    exhausted = False
     while True:
         resp = transport._api(
             "GET",
@@ -409,32 +489,49 @@ def _run_task_instances(dag_id: str, run_path: str) -> tuple[list[dict[str, Any]
         page = resp["task_instances"]
         total = resp.get("total_entries", len(page))
         tis += page
+        pages += 1
         # An empty page ends it whatever the count says: a total that never
         # comes down would otherwise loop for as long as the ceiling allows.
-        if not page or len(tis) >= min(total, TASK_INSTANCE_SCAN_LIMIT):
+        if not page:
+            exhausted = True
             break
-    return tis, max(total - len(tis), 0)
+        if len(tis) >= min(total, TASK_INSTANCE_SCAN_LIMIT):
+            exhausted = len(tis) >= total
+            break
+    return Reading(
+        rows=tuple(tis),
+        route=_TASK_INSTANCES_ROUTE,
+        _delivered=len(tis),
+        _claimed=total if isinstance(total, int) else None,
+        _pages=pages,
+        _exhausted=exhausted,
+    )
 
 
-def _tasks_reading(dag_id: str) -> tuple[list[dict[str, Any]], int]:
-    """The current tasks and their edges, with the count the route accounted for.
+_TASKS_ROUTE = "GET /dags/<dag>/tasks"
+
+
+def _tasks_reading(dag_id: str) -> Reading:
+    """The current tasks and their edges, and whether they are all of them.
 
     ``/tasks`` is the only *public* route that carries ``downstream_task_ids``;
     the richer structure view lives under ``/ui`` and is not part of the API this
-    server is allowed to speak. The total comes back so a caller that reasons
-    about the task set being COMPLETE can say whether it read all of it.
+    server is allowed to speak. A caller that reasons about the task set being
+    COMPLETE — a positional resolve, a removed-task check, an expandability
+    closure — has to be able to say whether it read all of it.
     """
-    resp = transport._api("GET", _dag_url(dag_id, "/tasks"))
-    rows = resp["tasks"]
-    return rows, resp.get("total_entries", len(rows))
+    return read_of(transport._api("GET", _dag_url(dag_id, "/tasks")), "tasks", _TASKS_ROUTE)
 
 
-def _tasks(dag_id: str) -> list[dict[str, Any]]:
-    """The current tasks and their edges."""
-    return _tasks_reading(dag_id)[0]
+def _tasks(dag_id: str) -> Reading:
+    """The current tasks and their edges, with the completeness of the read attached."""
+    return _tasks_reading(dag_id)
 
 
-def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
+_IMPORT_ERRORS_ROUTE = "GET /importErrors"
+
+
+def _find_import_errors(dag: dict[str, Any] | None) -> Reading:
     """Import errors for this Dag's file — the classic self-healing case.
 
     A file that stops parsing never produces a failed run: the old Dag keeps
@@ -442,15 +539,30 @@ def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
     error list is the only place that failure shows up.
     """
     if not dag:
-        return []
+        return Reading(route=_IMPORT_ERRORS_ROUTE)
     names = {name for name in (dag.get("fileloc"), dag.get("relative_fileloc")) if name}
     if not names:
-        return []
+        return Reading(route=_IMPORT_ERRORS_ROUTE)
     try:
         resp = transport._api("GET", "/importErrors", params={"limit": 100})
         errors = resp["import_errors"]
-    except (httpx.HTTPStatusError, KeyError):
-        return []
+    except (httpx.HTTPStatusError, KeyError) as e:
+        # A bare empty list here was indistinguishable from "this Dag's file
+        # imports cleanly", which is the one thing an unreadable import-error
+        # list must never be mistaken for. The refusal travels as a check, so it
+        # reaches the summary rather than only the shape of the return value.
+        return replace(
+            failed_read(_IMPORT_ERRORS_ROUTE, _explain_error(e)),
+            rows=(
+                {
+                    "kind": "import_errors_unreadable",
+                    "detail": (
+                        f"the import-error list could not be read ({_explain_error(e)}), so whether "
+                        f"this Dag's file still imports is NOT established by this diagnosis"
+                    ),
+                },
+            ),
+        )
     checks = []
     dag_bundle = dag.get("bundle_name")
     for entry in errors:
@@ -477,21 +589,33 @@ def _find_import_errors(dag: dict[str, Any] | None) -> list[dict[str, str]]:
                     "detail": f"the Dag's file fails to import, so new code is not being loaded: {trace}",
                 }
             )
-    total = resp.get("total_entries", len(errors))
-    if total > len(errors):
-        checks.append(
+    scan = matches_of(
+        checks, scanned=len(errors), claimed=resp.get("total_entries"), route=_IMPORT_ERRORS_ROUTE
+    )
+    if scan.complete:
+        return scan
+    # The truncation travels as a check of its own, so the diagnosis that lists
+    # the findings also lists the reason its list may be short of one.
+    return replace(
+        scan,
+        rows=(
+            *scan.rows,
             {
                 "kind": "import_errors_truncated",
                 "detail": (
-                    f"only the first {len(errors)} of {total} import errors were checked, so an "
-                    f"import error for this Dag's file may be missing from this diagnosis"
+                    f"only the first {len(errors)} of {resp.get('total_entries')} import errors were "
+                    f"checked, so an import error for this Dag's file may be missing from this "
+                    f"diagnosis"
                 ),
-            }
-        )
-    return checks
+            },
+        ),
+    )
 
 
-def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str, Any]:
+_TRIES_ROUTE = "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/tries"
+
+
+def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> Reading:
     """Every recorded attempt of one task instance, or why they could not be read.
 
     Never raises: an unreadable history downgrades what the diagnosis can
@@ -500,26 +624,21 @@ def _attempt_history(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str
     subscripting that would otherwise take the whole diagnosis down. The
     unmapped route accepts ``map_index`` as a query parameter, so one URL serves
     mapped and unmapped instances, and it is not paginated.
+
+    An empty page is NOT "there were no earlier attempts" whenever the route
+    accounted for some: that is a truncated read wearing the same word, and the
+    reading keeps the two apart by construction rather than by a status string.
     """
     path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/tries")
     try:
         resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
-        rows = resp["task_instances"]
-        total = resp.get("total_entries", len(rows))
+        resp["task_instances"]
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        return {"status": "unavailable", "rows": [], "error": _explain_error(e)}
-    if not rows:
-        # Never read as "there were no earlier attempts" — it is the absence of
-        # an answer, not an answer of absence. ``attempts_recorded`` still comes
-        # back, because a page that carries no rows while accounting for some is
-        # a truncated read wearing the same word, and a caller deciding whether
-        # it read the whole history has to be able to tell the two apart.
-        return {"status": "empty", "rows": [], "attempts_recorded": total, "error": _HISTORY_EMPTY}
-    if total > len(rows):
-        # Presence-based conclusions survive a truncated list; absence-based
-        # ones do not.
-        return {"status": "partial", "rows": rows, "attempts_recorded": total, "error": _HISTORY_PARTIAL}
-    return {"status": "checked", "rows": rows, "attempts_recorded": total}
+        return failed_read(_TRIES_ROUTE, _explain_error(e))
+    return read_of(resp, "task_instances", _TRIES_ROUTE)
+
+
+_RUN_TASK_HISTORY_ROUTE = "GET /dags/<dag>/dagRuns/~/taskInstances"
 
 
 def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str]) -> dict[str, Any]:
@@ -532,16 +651,18 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
     row into the very table this tool reads as evidence.
     """
     compared = task_ids[:TASK_COMPARISON_LIMIT]
+    # The task ids this comparison did not even ask about are a truncation of
+    # the comparison itself, and every clause drawn over it has to see them.
+    ids_omitted = max(len(task_ids) - len(compared), 0)
     result: dict[str, Any] = {
         "selection": _TASK_COMPARISON_SELECTION,
         "task_ids_compared": compared,
-        "task_ids_omitted": max(len(task_ids) - len(compared), 0),
+        "task_ids_omitted": ids_omitted,
         "runs_not_covered": [],
+        # Per task id, the rows this comparison holds AND whether they are all
+        # of them. A task with more history than RUN_HISTORY_LIMIT rows used to
+        # be reported as if the page were the whole of it.
         "tasks": {},
-        # Per task id, how many rows the route said it held beyond the page that
-        # came back. Never read before, so a task with more history than
-        # RUN_HISTORY_LIMIT rows was silently reported as if the page were all
-        # of it.
         "rows_omitted": {},
         "error": None,
     }
@@ -549,7 +670,7 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
         return result
     window = {run["dag_run_id"] for run in runs}
     oldest = runs[-1].get("run_after")
-    tasks: dict[str, list[dict[str, Any]]] = {}
+    tasks: dict[str, Reading] = {}
     omitted: dict[str, int] = {}
     covered: set[str] = set()
     try:
@@ -563,7 +684,6 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
                 params["run_after_gte"] = oldest
             resp = transport._api("GET", _dag_url(dag_id, "/dagRuns/~/taskInstances"), params=params)
             returned = resp["task_instances"]
-            omitted[task_id] = max(resp.get("total_entries", len(returned)) - len(returned), 0)
             rows = []
             for row in returned:
                 if row.get("dag_run_id") not in window:
@@ -572,7 +692,14 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
                 entry = {name: row.get(name) for name in _TASK_COMPARISON_KEYS}
                 entry["operator"] = _clamped_operator(row.get("operator"))
                 rows.append(entry)
-            tasks[task_id] = rows
+            reading = matches_of(
+                rows,
+                scanned=len(returned),
+                claimed=resp.get("total_entries"),
+                route=_RUN_TASK_HISTORY_ROUTE,
+            )
+            tasks[task_id] = reading
+            omitted[task_id] = reading.omitted
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         result["error"] = _explain_error(e)
         return result
@@ -582,7 +709,44 @@ def _task_comparison(dag_id: str, runs: list[dict[str, Any]], task_ids: list[str
     return result
 
 
-def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
+def flatten_comparison(comparison: dict[str, Any]) -> None:
+    """Turn each compared task's reading back into plain rows, in place.
+
+    Called once every clause that may draw an absence has run. The readings
+    cannot survive into the payload — they do not serialize, and a reader that
+    still held one could conclude from it after the point where the tool decided
+    what it was willing to conclude.
+    """
+    tasks = comparison.get("tasks")
+    if isinstance(tasks, dict):
+        comparison["tasks"] = {
+            task_id: [dict(row) for row in per_task.rows] if isinstance(per_task, Reading) else per_task
+            for task_id, per_task in tasks.items()
+        }
+
+
+def comparison_rows(comparison: dict[str, Any], task_id: str) -> Reading:
+    """One compared task's rows, with the completeness of the comparison folded in.
+
+    A task id the comparison never asked about is not "no rows for it": the
+    whole comparison is short by that many, so every task's reading inherits
+    the shortfall and no clause drawn over any of them can reach an absence.
+    """
+    if comparison.get("error") is not None:
+        return failed_read(_RUN_TASK_HISTORY_ROUTE, str(comparison["error"]))
+    per_task = (comparison.get("tasks") or {}).get(task_id)
+    if not isinstance(per_task, Reading):
+        return failed_read(
+            _RUN_TASK_HISTORY_ROUTE, f"{task_id!r} was not among the task ids this comparison read"
+        )
+    ids_omitted = comparison.get("task_ids_omitted") or 0
+    return replace(per_task, _claimed=per_task.universe + ids_omitted) if ids_omitted else per_task
+
+
+_DAG_RUNS_ROUTE = "GET /dags/<dag>/dagRuns"
+
+
+def _recent_runs(dag_id: str) -> Reading:
     """The newest runs of this Dag. Raises — the callers differ on what a failure means.
 
     On the run-resolving path a failure must not be turned into "this Dag has
@@ -591,8 +755,8 @@ def _recent_runs(dag_id: str) -> tuple[list[dict[str, Any]], int]:
     resp = transport._api(
         "GET", _dag_url(dag_id, "/dagRuns"), params={"order_by": "-run_after", "limit": RUN_HISTORY_LIMIT}
     )
-    runs = resp["dag_runs"]
-    return runs, resp.get("total_entries", len(runs))
+    resp["dag_runs"]
+    return read_of(resp, "dag_runs", _DAG_RUNS_ROUTE)
 
 
 def _build_asset_note(dag_id: str) -> str:
@@ -601,21 +765,28 @@ def _build_asset_note(dag_id: str) -> str:
     Names only this Dag's own produced/consumed assets — never other Dags' ids,
     which only get_blast_radius is authorized to hand back.
     """
-    try:
-        assets = transport._api("GET", "/assets", params={"limit": 100})["assets"]
-    except (httpx.HTTPStatusError, KeyError):
+    catalog = read_asset_catalog()
+    if catalog.read_failed:
         return (
             "this change touches assets, inlets/outlets or the schedule, and the asset catalog "
             "could not be read; call get_blast_radius and tell the user what else is affected "
             "before applying"
         )
-    edges = _compute_asset_edges(dag_id, assets)
-    produces = ", ".join(repr(name) for name in edges["produces"]) or "no assets"
-    consumes = ", ".join(repr(name) for name in edges["consumes"]) or "no assets"
-    return (
+    edges = _compute_asset_edges(dag_id, catalog)
+    produces = ", ".join(repr(name) for name in edges["produces"] or []) or "no assets"
+    consumes = ", ".join(repr(name) for name in edges["consumes"] or []) or "no assets"
+    note = (
         f"this change touches assets, inlets/outlets or the schedule: {dag_id} produces "
         f"{produces} and consumes {consumes}; Dags scheduled on those assets can be affected"
     )
+    if not catalog.complete:
+        # "no assets" over a truncated catalog is a claim about edges nobody
+        # read, and this note is what the approval card renders.
+        note += (
+            f". The asset catalog was NOT read whole ({catalog.reason}), so an edge this Dag has "
+            f"may be missing from that sentence"
+        )
+    return note
 
 
 def _resolve_run(dag_id: str, dag_run_id: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -672,7 +843,9 @@ def _attempt_log(dag_id: str, run_path: str, ti: dict[str, Any], try_number: Any
         )
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         return {**entry, "status": "unavailable", "error": _explain_error(e)}
-    tail = _tail(resp.get("content") if isinstance(resp, dict) else resp)[-RECOVERY_LOG_TAIL_CHARS:]
+    clipped = _tail(resp.get("content") if isinstance(resp, dict) else resp)
+    tail = clipped.text[-RECOVERY_LOG_TAIL_CHARS:]
+    truncated = clipped.truncated or len(clipped.text) > RECOVERY_LOG_TAIL_CHARS
     stripped = tail.strip()
     if not stripped:
         status = "empty"
@@ -682,47 +855,67 @@ def _attempt_log(dag_id: str, run_path: str, ti: dict[str, Any], try_number: Any
         status = "no_logs_reported"
     else:
         status = "present"
-    return {**entry, "status": status, "tail": tail}
+    # A tail is not the log. Both negative statuses are claims about the whole
+    # of it, and neither may be drawn from the last few hundred characters.
+    return {**entry, "status": status, "tail": tail, "tail_truncated": truncated}
 
 
-def _attempt_rows(history: dict[str, Any]) -> list[dict[str, Any]]:
-    """The attempts ``/tries`` returned, reduced to the fields this reading uses."""
-    return [
-        {
-            "try_number": row.get("try_number"),
-            "state": row.get("state"),
-            "hostname": row.get("hostname"),
-            "pid": row.get("pid"),
-            "duration": row.get("duration"),
-            "start_date": row.get("start_date"),
-            "end_date": row.get("end_date"),
-        }
-        for row in (history.get("rows") or [])[:RECOVERY_ATTEMPT_LIMIT]
-    ]
+def _attempt_shape(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One attempt reduced to the fields this reading uses."""
+    return {
+        "try_number": row.get("try_number"),
+        "state": row.get("state"),
+        "hostname": row.get("hostname"),
+        "pid": row.get("pid"),
+        "duration": row.get("duration"),
+        "start_date": row.get("start_date"),
+        "end_date": row.get("end_date"),
+    }
 
 
-def _attempt_reading(history: dict[str, Any]) -> dict[str, Any]:
-    """The attempt history as this reading actually READ it, status included.
+def _attempt_rows(history: Reading) -> list[dict[str, Any]]:
+    """The attempts this reading kept, reduced to the fields it uses."""
+    return [_attempt_shape(row) for row in _attempt_reading(history).rows]
 
-    The local clamp is part of the read, so it has to be part of the status.
-    ``_attempt_history`` honestly reports ``checked`` over a whole page;
-    ``_attempt_rows`` then keeps at most ``RECOVERY_ATTEMPT_LIMIT`` of it, and
-    every absence-based leg downstream keys off the word ``checked``. Deriving
-    the status from what was returned rather than from what was read let those
-    legs assert hard negatives over records they never looked at.
+
+def _attempt_reading(history: Reading) -> Reading:
+    """The attempt history as this reading actually READ it.
+
+    The local clamp is part of the read, so it is applied as a clamp on the
+    reading rather than as a slice beside it: ``/tries`` honestly hands over a
+    whole page, this keeps at most ``RECOVERY_ATTEMPT_LIMIT`` of it, and every
+    absence-based leg downstream would otherwise be concluding over records it
+    never looked at.
     """
-    rows = _attempt_rows(history)
-    status = history["status"]
-    recorded = history.get("attempts_recorded")
-    error = history.get("error")
-    if status in ("checked", "partial"):
-        returned = len(history.get("rows") or [])
-        if not isinstance(recorded, int) or recorded < returned:
-            recorded = returned
-        if len(rows) < returned:
-            status = "partial"
-            error = error or _HISTORY_CLAMPED
-    return {"status": status, "rows": rows, "attempts_recorded": recorded, "error": error}
+    return history.clamp(RECOVERY_ATTEMPT_LIMIT).project(_attempt_shape)
+
+
+NOT_CHECKED = "not_checked"
+
+
+def history_status(history: Reading | None) -> str:
+    """The word this server's prose uses for how far a bounded read got.
+
+    Display only, and derived from the reading's own ``complete`` rather than
+    from a second comparison — the four incompatible longhand derivations this
+    replaces are exactly what let one site call a clamped read ``checked``.
+    """
+    if history is None:
+        return NOT_CHECKED
+    if history.read_failed:
+        return "unavailable"
+    if not history.complete:
+        return "partial"
+    return "empty" if not history.rows else "checked"
+
+
+def attempt_error(history: Reading) -> str | None:
+    """The one sentence that says why this attempt history settles nothing."""
+    if history.error is not None:
+        return history.error
+    if not history.complete:
+        return _HISTORY_CLAMPED if history.kept < history._delivered else _HISTORY_PARTIAL
+    return _HISTORY_EMPTY if not history.rows else None
 
 
 def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bool | None) -> dict[str, Any]:
@@ -769,17 +962,31 @@ def _version_context(dag_id: str, run: dict[str, Any], run_on_latest_version: bo
             _dag_url(dag_id, "/dagVersions"),
             params={"order_by": "-version_number", "limit": DAG_VERSION_SCAN},
         )
-        known = [v.get("version_number") for v in listed["dag_versions"]]
-        total = listed.get("total_entries", len(known))
+        listed["dag_versions"]
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
         context["versions_status"] = "unavailable"
         context["error"] = _explain_error(e)
         return context
+    versions = read_of(listed, "dag_versions", _DAG_VERSIONS_ROUTE)
+    known = [row.get("version_number") for row in versions.rows]
     context["latest_version"] = known[0] if known else None
-    context["versions_status"] = "checked" if len(known) >= total else "partial"
-    if context["versions_status"] == "checked" and run_versions:
-        missing = [v for v in run_versions if v not in known]
-        context["original_version_listed"] = not missing
+    context["versions_status"] = "checked" if versions.complete else "partial"
+    if run_versions:
+        # One verdict per version the run recorded: "still listed" is a presence
+        # and survives truncation, "no longer listed" is an absence and does not.
+        def listed(version: Any) -> Callable[[Mapping[str, Any]], bool]:
+            return lambda row: row.get("version_number") == version
+
+        verdicts = {
+            version: find(
+                versions,
+                listed(version),
+                f"version {version} was not among the Dag versions this reading listed",
+            )
+            for version in run_versions
+        }
+        context["original_version_listed"] = all_of(*verdicts.values(), route=versions.route).as_field()
+        missing = [version for version, verdict in verdicts.items() if verdict.is_absent()]
         if missing:
             context["missing_versions"] = missing
             context["missing_version_note"] = (
@@ -816,23 +1023,10 @@ def _expandable_probe(dag_id: str, run_path: str, task_id: str) -> bool | None:
         return None
 
 
-def _read_is_complete(kept: int, delivered: int, claimed: Any) -> bool:
-    """Whether a list read holds every record anything involved accounts for.
-
-    Three numbers, because three different things truncate a list: the route's
-    own paging (``claimed`` above ``delivered``), this tool's clamps (``kept``
-    below ``delivered``), and a source whose count is simply lower than what it
-    handed over. Completeness is what was KEPT measured against the largest
-    universe anyone claimed — the derivation ``_attempt_reading`` already makes.
-    A read that discarded rows is truncated whatever the source said its total
-    was, and a source that accounts for more than it sent is truncated whatever
-    this tool did with the rows.
-    """
-    universe = max(delivered, claimed) if isinstance(claimed, int) else delivered
-    return kept >= universe
+_XCOM_ROUTE = "GET /dags/<dag>/dagRuns/<run>/taskInstances/<task>/xcomEntries"
 
 
-def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope: str) -> dict[str, Any]:
+def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope: str) -> Reading:
     """The XCom entries this instance has recorded, by key and timestamp only.
 
     The key and the timestamp, never the value: the value is bytes the task
@@ -847,34 +1041,26 @@ def _recorded_output(dag_id: str, run_path: str, ti: dict[str, Any], xcom_scope:
     so no permission was refused.
     """
     if xcom_scope != "granted":
-        return {
-            "status": "not_permitted" if xcom_scope else "not_scoped",
-            "entries": [],
-            "total_entries": 0,
-            "error": _XCOM_NOT_PERMITTED if xcom_scope else _XCOM_NOT_SCOPED,
-        }
+        return failed_read(_XCOM_ROUTE, _XCOM_NOT_PERMITTED if xcom_scope else _XCOM_NOT_SCOPED)
     path = _dag_url(dag_id, f"{run_path}/taskInstances/{quote(ti['task_id'], safe='')}/xcomEntries")
     try:
         resp = transport._api("GET", path, params={"map_index": ti.get("map_index", -1)})
-        rows = resp["xcom_entries"]
-        total = resp.get("total_entries", len(rows))
+        resp["xcom_entries"]
     except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
-        return {"status": "unavailable", "entries": [], "total_entries": 0, "error": _explain_error(e)}
-    entries = [
-        {"key": _clamped_operator(row.get("key")), "timestamp": row.get("timestamp")}
-        for row in rows[:RECOVERY_ATTEMPT_LIMIT]
-    ]
-    return {
-        # Derived from what was READ, never from what the route returned. The
-        # clamp above is this tool's own truncation and is indistinguishable, to
-        # every absence-based leg downstream, from the route's: both leave
-        # records unlooked-at. Comparing len(rows) against total called a
-        # locally-clamped read "checked" and routed it into the negative branch.
-        "status": "checked" if len(entries) >= total else "partial",
-        "entries": entries,
-        "total_entries": total,
-        "entries_omitted": max(total - len(entries), 0),
-    }
+        return failed_read(_XCOM_ROUTE, _explain_error(e))
+    # The clamp is applied as a clamp on the reading, not as a slice beside it.
+    # This tool's own truncation is indistinguishable, to every absence-based
+    # leg downstream, from the route's: both leave records unlooked-at.
+    return (
+        read_of(resp, "xcom_entries", _XCOM_ROUTE)
+        .clamp(RECOVERY_ATTEMPT_LIMIT)
+        .project(lambda row: {"key": _clamped_operator(row.get("key")), "timestamp": row.get("timestamp")})
+    )
+
+
+def output_scope_refused(output: Reading) -> bool:
+    """Whether the output read was declined on permissions rather than attempted."""
+    return output.error in (_XCOM_NOT_PERMITTED, _XCOM_NOT_SCOPED)
 
 
 def _audit_transitions(history: dict[str, Any], ti: dict[str, Any], after: str) -> dict[str, Any]:
@@ -888,26 +1074,45 @@ def _audit_transitions(history: dict[str, Any], ti: dict[str, Any], after: str) 
     """
     if history["status"] not in ("checked", "partial"):
         return {"status": history["status"], "error": history.get("error"), "events": []}
+    events: Reading = history["reading"]
     seen: dict[str, Any] = {}
-    for row in history.get("rows") or []:
-        if row.get("task_id") != ti["task_id"]:
-            continue
-        name = row.get("event")
-        if name not in ("running", "success") or name in seen:
-            continue
-        if after and _later_than(row.get("when"), after) is not True:
-            continue
-        seen[name] = {"event": name, "when": row.get("when"), "owner": _clamped_operator(row.get("owner"))}
+    verdicts = []
+
+    def transition(name: str) -> Callable[[Mapping[str, Any]], bool]:
+        return lambda row: (
+            row.get("task_id") == ti["task_id"]
+            and row.get("event") == name
+            and (not after or _later_than(row.get("when"), after) is True)
+        )
+
+    for name in ("running", "success"):
+        hit = find(
+            events,
+            transition(name),
+            f"no {name} transition of {_ti_where(ti)} was recorded since the clear",
+        )
+        verdicts.append(hit)
+        if hit.is_present() and hit.row is not None:
+            seen[name] = {
+                "event": name,
+                "when": hit.row.get("when"),
+                "owner": _clamped_operator(hit.row.get("owner")),
+            }
     return {
         "status": history["status"],
         "events": [seen[name] for name in ("running", "success") if name in seen],
-        "pair_recorded": len(seen) == 2,
+        # PRESENT only when both transitions were found; a missing one over a
+        # scan that stopped short is UNKNOWN, never a recorded absence.
+        "pair_recorded": all_of(*verdicts, route=events.route),
     }
 
 
+_DURATION_HISTORY_SOURCE = "this instance's other dispatched attempts"
+
+
 def _duration_baseline(
-    dag_id: str, dag_run_id: str, ti: dict[str, Any], rows: list[dict[str, Any]]
-) -> tuple[list[float], str]:
+    dag_id: str, dag_run_id: str, ti: dict[str, Any], attempts: Reading
+) -> tuple[Reading, str]:
     """What this task's own successful work costs, to compare one attempt against.
 
     Only DISPATCHED attempts contribute. The attempt that made this recovery
@@ -917,58 +1122,122 @@ def _duration_baseline(
     Drawn from two places, because either alone can be empty: this instance's
     other attempts, and the same task in the Dag's other runs.
     """
+
+    def usable(row: Mapping[str, Any]) -> bool:
+        duration = row.get("duration")
+        return (
+            _carries_execution_fields(row)
+            and isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and duration > 0
+        )
+
     samples = [
-        row["duration"]
-        for row in rows
-        if row.get("try_number") != ti.get("try_number")
-        and _carries_execution_fields(row)
-        and isinstance(row.get("duration"), (int, float))
-        and row["duration"] > 0
+        {"duration": row["duration"]}
+        for row in attempts.rows
+        if row.get("try_number") != ti.get("try_number") and usable(row)
     ]
-    source = "this instance's other dispatched attempts"
     try:
         resp = transport._api(
             "GET",
             _dag_url(dag_id, "/dagRuns/~/taskInstances"),
             params={"task_id": ti["task_id"], "order_by": "-run_after", "limit": RUN_HISTORY_LIMIT},
         )
-        rest = resp["task_instances"]
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError):
-        return samples, source
-    for row in rest:
-        if row.get("dag_run_id") == dag_run_id or row.get("map_index", -1) != ti.get("map_index", -1):
-            continue
-        if not _carries_execution_fields(row):
-            continue
-        duration = row.get("duration")
-        if isinstance(duration, (int, float)) and duration > 0:
-            samples.append(duration)
-    return samples, f"{source} and the same task in this Dag's other runs"
+        resp["task_instances"]
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        # The second leg did not run, so the sample is one-legged and the source
+        # string must not name a leg that never happened. It used to.
+        return (
+            Reading(
+                rows=tuple(samples),
+                route=_RUN_TASK_HISTORY_ROUTE,
+                _delivered=len(samples),
+                # One leg ran and the other did not, so the sample is short by an
+                # unknown amount — expressed as at least one unread record.
+                _claimed=len(samples) + attempts.omitted + 1,
+            ),
+            f"{_DURATION_HISTORY_SOURCE} only — the same task's rows in this Dag's other runs "
+            f"could not be read ({_explain_error(e)})",
+        )
+    rest = read_of(resp, "task_instances", _RUN_TASK_HISTORY_ROUTE)
+    samples += [
+        {"duration": row["duration"]}
+        for row in rest.rows
+        if row.get("dag_run_id") != dag_run_id
+        and row.get("map_index", -1) == ti.get("map_index", -1)
+        and usable(row)
+    ]
+    # Two bounded reads feed one median, so the sample is complete only when
+    # both were. RUN_HISTORY_LIMIT=10 with no total read at all used to pass a
+    # clamped sample off as the task's whole history.
+    return (
+        matches_of(
+            samples,
+            scanned=len(samples),
+            claimed=len(samples) + attempts.omitted + rest.omitted,
+            route=_RUN_TASK_HISTORY_ROUTE,
+        ),
+        f"{_DURATION_HISTORY_SOURCE} and the same task in this Dag's other runs",
+    )
 
 
-def _dry_run_backfill(dag_id: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+_DRY_RUN_BACKFILL_ROUTE = "POST /backfills/dry_run"
+_BACKFILL_RUNS_ROUTE = "GET /backfills/<id>/dag_runs"
+
+
+def _dry_run_backfill(dag_id: str, from_date: str, to_date: str) -> Reading:
+    """The runs a backfill would create. The identity compare over it authorizes a write."""
     resp = transport._api(
         "POST",
         "/backfills/dry_run",
         json={"dag_id": dag_id, "from_date": from_date, "to_date": to_date},
     )
-    return resp.get("backfills", [])
+    return read_of(resp, "backfills", _DRY_RUN_BACKFILL_ROUTE)
 
 
-def _backfill_runs(backfill_id: int) -> list[dict[str, Any]]:
-    resp = transport._api(
-        "GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": MAX_BACKFILL_RUNS + 1}
-    )
-    return resp.get("backfill_dag_runs", [])
+def _backfill_runs(backfill_id: int) -> Reading:
+    """The runs a backfill created, and whether they are all of them.
+
+    The ``+1`` is an overflow sentinel: a page that comes back FULL at
+    ``MAX_BACKFILL_RUNS + 1`` means the backfill holds at least one more run
+    than this reading can see, and the identity compare that decides whether to
+    keep or abandon it would otherwise be made over a subset.
+    """
+    limit = MAX_BACKFILL_RUNS + 1
+    resp = transport._api("GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": limit})
+    reading = read_of(resp, "backfill_dag_runs", _BACKFILL_RUNS_ROUTE)
+    if reading.kept >= limit and reading._claimed is None:
+        return replace(reading, _claimed=reading.kept + 1)
+    return reading
 
 
-def _compute_asset_edges(dag_id: str, assets: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """This Dag's place in the asset graph, one hop out in both directions."""
+ASSET_CATALOG_ROUTE = "GET /assets"
+ASSET_CATALOG_LIMIT = 100
+
+
+def read_asset_catalog() -> Reading:
+    """The asset catalog, one page of it, and whether that is all of it."""
+    try:
+        resp = transport._api("GET", "/assets", params={"limit": ASSET_CATALOG_LIMIT})
+        resp["assets"]
+    except (httpx.HTTPStatusError, KeyError) as e:
+        return failed_read(ASSET_CATALOG_ROUTE, _explain_error(e))
+    return read_of(resp, "assets", ASSET_CATALOG_ROUTE)
+
+
+def _compute_asset_edges(dag_id: str, catalog: Reading) -> dict[str, list[str] | None]:
+    """This Dag's place in the asset graph, one hop out in both directions.
+
+    An empty list is a claim that the catalog holds no such edge. Over a
+    catalog that was not read whole it is not one, so it comes back ``None`` —
+    four empty lists used to mean both "no declared edge" and "catalog
+    truncated", and nothing in the payload separated them.
+    """
     produces: list[str] = []
     consumes: list[str] = []
     downstream: set[str] = set()
     upstream: set[str] = set()
-    for asset in assets:
+    for asset in catalog.rows:
         producers = {task.get("dag_id") for task in asset.get("producing_tasks") or []}
         consumers = {dag.get("dag_id") for dag in asset.get("scheduled_dags") or []} | {
             task.get("dag_id") for task in asset.get("consuming_tasks") or []
@@ -986,9 +1255,13 @@ def _compute_asset_edges(dag_id: str, assets: list[dict[str, Any]]) -> dict[str,
         bucket.discard(dag_id)
         bucket.discard(None)
 
+    def stated(names: list[str] | set[str]) -> list[str] | None:
+        found = sorted(names)
+        return found if found or catalog.complete else None
+
     return {
-        "produces": sorted(produces),
-        "consumes": sorted(consumes),
-        "downstream": sorted(downstream),
-        "upstream": sorted(upstream),
+        "produces": stated(produces),
+        "consumes": stated(consumes),
+        "downstream": stated(downstream),
+        "upstream": stated(upstream),
     }

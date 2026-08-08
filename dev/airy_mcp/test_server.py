@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sys
@@ -46,6 +47,23 @@ import transport
 
 DAG_ID = "sales_summary"
 SOURCE = 'op_kwargs={"column": "ammount"}\nprint("ammount is a typo")\n'
+
+
+def _short_by(scan, omitted):
+    """The same rows, with the route accounting for ``omitted`` more of them."""
+    return dataclasses.replace(scan, _claimed=scan.kept + omitted)
+
+
+def _task_reading(tasks, total=None):
+    """A ``/tasks`` reading over these rows, complete unless a bigger total is named."""
+    return reading.Reading(
+        rows=tuple(tasks), route=reading._TASKS_ROUTE, _delivered=len(tasks), _claimed=total
+    )
+
+
+def _tries_reading(rows, total=None):
+    """A ``/tries`` reading over these rows, complete unless a bigger total is named."""
+    return reading.Reading(rows=tuple(rows), route=reading._TRIES_ROUTE, _delivered=len(rows), _claimed=total)
 
 
 class FakeAirflow:
@@ -963,7 +981,7 @@ def test_display_order_marks_only_the_positions_a_branch_leaves_open():
         {"task_id": "right", "downstream_task_ids": ["join"]},
         {"task_id": "join", "downstream_task_ids": []},
     ]
-    order, ambiguous = server._display_order(tasks)
+    order, ambiguous = server._display_order(_task_reading(tasks))
 
     assert order == ["start", "left", "right", "join"]
     assert ambiguous == {1, 2}
@@ -978,7 +996,7 @@ def test_display_order_marks_a_branch_that_can_float_past_a_longer_one():
         {"task_id": "d", "downstream_task_ids": []},
         {"task_id": "b", "downstream_task_ids": []},
     ]
-    order, ambiguous = server._display_order(tasks)
+    order, ambiguous = server._display_order(_task_reading(tasks))
 
     assert order == ["start", "a", "b", "c", "d"]
     assert ambiguous == {1, 2, 3, 4}
@@ -990,7 +1008,7 @@ def test_display_order_marks_a_fan_out_that_never_rejoins():
         {"task_id": "a", "downstream_task_ids": []},
         {"task_id": "b", "downstream_task_ids": []},
     ]
-    order, ambiguous = server._display_order(tasks)
+    order, ambiguous = server._display_order(_task_reading(tasks))
 
     assert order == ["extract", "a", "b"]
     assert ambiguous == {1, 2}
@@ -1864,7 +1882,7 @@ def test_plan_task_instance_clear_refuses_when_it_cannot_see_the_whole_run(clear
     """Half a task list cannot answer whether the latest version moves the set."""
     real = reading._run_task_instances
     monkeypatch.setattr(
-        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 4)
+        reading, "_run_task_instances", lambda dag_id, run_path: _short_by(real(dag_id, run_path), 4)
     )
 
     plan = server.plan_task_instance_clear(DAG_ID, task_id="report")
@@ -2303,7 +2321,9 @@ def test_a_truncated_dag_version_list_never_reports_a_version_as_missing(forged_
     version = _clear_plan(only_failed=False)["version"]
 
     assert version["versions_status"] == "partial"
-    assert "original_version_listed" not in version
+    # Reported as unestablished rather than dropped: a key that vanishes is
+    # indistinguishable from one that was never at issue.
+    assert version["original_version_listed"] is None
 
 
 def test_widening_the_scope_after_the_plan_is_refused_and_says_to_re_plan(forged_run):
@@ -2763,7 +2783,7 @@ def test_an_unreadable_output_record_is_unestablished_not_absent(recovered_run):
 def test_verification_reports_a_run_it_could_not_read_whole(recovered_run, monkeypatch):
     real = reading._run_task_instances
     monkeypatch.setattr(
-        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 3)
+        reading, "_run_task_instances", lambda dag_id, run_path: _short_by(real(dag_id, run_path), 3)
     )
 
     result = _verify()
@@ -3327,6 +3347,7 @@ def test_get_blast_radius_maps_both_directions_through_assets(airflow):
         "downstream_dags": ["audit", "revenue_dashboard"],
         "consumes_assets": ["raw_events"],
         "upstream_dags": ["ingest"],
+        "asset_catalog_read_whole": True,
         "scope": result["scope"],
     }
     assert "asset edges only" in result["scope"]
@@ -3537,11 +3558,15 @@ def test_force_reparse_still_reports_other_http_errors(airflow):
     ],
 )
 def test_tail_handles_every_log_shape(content, expected):
-    assert server._tail(content) == expected
+    assert server._tail(content).text == expected
+    assert server._tail(content).truncated is False
 
 
 def test_tail_truncates_long_logs():
-    assert len(server._tail("x" * 10_000)) == server.LOG_TAIL_CHARS
+    clipped = server._tail("x" * 10_000)
+    assert len(clipped.text) == server.LOG_TAIL_CHARS
+    # A tail that lost content says so, so no consumer reads it as the whole log.
+    assert clipped.truncated is True
 
 
 def _http_status_error(status: int) -> httpx.HTTPStatusError:
@@ -4485,7 +4510,7 @@ def test_diagnose_keeps_the_full_projection_for_failed_instances(airflow, monkey
     result = server.diagnose_dag(DAG_ID)
 
     assert set(result["task_instances"][0]) == set(server._TASK_INSTANCE_DETAIL_KEYS) | {"last_state_change"}
-    assert "task_instance_detail_reduced" not in result
+    assert result["task_instance_detail_reduced"] == 0
 
 
 @pytest.mark.parametrize("limit", [1, 3], ids=["one-slot", "three-slots"])
@@ -4649,15 +4674,16 @@ def test_attempt_history_survives_an_empty_body(airflow):
         return FakeAirflow.__call__(airflow, method, path, **kwargs)
 
     history = server._attempt_history(DAG_ID, "/dagRuns/manual__1", FORGED_TI)
-    assert history["status"] == "empty"
+    assert reading.history_status(history) == "empty"
 
     transport._api = empty_body
     try:
         history = server._attempt_history(DAG_ID, "/dagRuns/manual__1", FORGED_TI)
     finally:
         transport._api = airflow
-    assert history["status"] == "unavailable"
-    assert history["rows"] == []
+    assert reading.history_status(history) == "unavailable"
+    assert history.read_failed is True
+    assert history.rows == ()
 
 
 # ---------------------------------------------------------------------------
@@ -4940,7 +4966,10 @@ def test_a_giant_operator_cannot_scale_the_size_of_the_result(airflow):
     giant_size = len(json.dumps(_green_run(airflow, *forged)))
     tiny_size = len(json.dumps(_green_run(airflow, *tiny)))
 
-    assert giant_size < 420_000
+    # The ceiling is on what THIS tool writes. It rose when the findings started
+    # saying that the cross-run comparison had reached only 5 of the flagged task
+    # ids, which is prose the tool chooses and the Dag author cannot influence.
+    assert giant_size < 430_000
     # 500 rows, but only TASK_INSTANCE_DETAIL_LIMIT of them carry an operator at
     # all, and each is clamped — so the 999 extra characters buy ~119 apiece.
     assert giant_size - tiny_size < evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
@@ -6292,7 +6321,10 @@ def test_instances_outside_the_detailed_projection_are_counted_not_guessed_at(ai
 
     result = _audited_run(airflow, *crowd, events=[SUCCESS_EVENT])
 
-    assert result["event_history"]["instances_without_attribution"] == 3
+    # Owned by the projection that measured it, never written onto the event
+    # history, where a reader attributes a projection's shortfall to the scan.
+    assert "instances_without_attribution" not in result["event_history"]
+    assert result["task_instance_detail_reduced"] == 3
     assert result["task_instance_detail_reduced"] == 3
     reduced = [ti for ti in result["task_instances"] if "last_state_change" not in ti]
     assert len(reduced) == 3
@@ -8210,10 +8242,10 @@ def test_the_output_read_reports_how_many_records_it_did_not_look_at(recovered_r
 
     output = server._recorded_output(DAG_ID, "/dagRuns/manual__1", {"task_id": "summarize"}, "granted")
 
-    assert output["status"] == "partial"
-    assert len(output["entries"]) == 10
-    assert output["total_entries"] == 14
-    assert output["entries_omitted"] == 4
+    assert output.complete is False
+    assert output.kept == 10
+    assert output.universe == 14
+    assert output.omitted == 4
 
 
 # --- The same rule on /tries -------------------------------------------------
@@ -8314,14 +8346,14 @@ def test_a_whole_read_still_proves_an_earlier_dispatched_attempt(recovered_run):
 
 
 def test_the_attempt_reading_carries_the_clamp_as_its_own_status():
-    whole = {"status": "checked", "rows": _attempts(10), "attempts_recorded": 10}
-    clamped = {"status": "checked", "rows": _attempts(11), "attempts_recorded": 11}
+    whole = _tries_reading(_attempts(10))
+    clamped = _tries_reading(_attempts(11))
 
-    assert server._attempt_reading(whole)["status"] == "checked"
-    assert server._attempt_reading(clamped)["status"] == "partial"
-    assert server._attempt_reading(clamped)["attempts_recorded"] == 11
-    assert server._attempt_reading(clamped)["error"] == server._HISTORY_CLAMPED
-    assert server._attempt_reading({"status": "empty", "rows": [], "error": "x"})["status"] == "empty"
+    assert server._attempt_reading(whole).complete is True
+    assert server._attempt_reading(clamped).complete is False
+    assert server._attempt_reading(clamped).universe == 11
+    assert reading.attempt_error(server._attempt_reading(clamped)) == server._HISTORY_CLAMPED
+    assert reading.history_status(server._attempt_reading(_tries_reading([]))) == "empty"
 
 
 def test_a_clamped_read_blocks_the_verification_from_reaching_verified(recovered_run):
@@ -8604,7 +8636,7 @@ def test_a_run_this_tool_cannot_read_whole_refuses_the_write(cleared_run, monkey
     plan = _gate_plan(cleared_run)
     real = reading._run_task_instances
     monkeypatch.setattr(
-        reading, "_run_task_instances", lambda dag_id, run_path: (real(dag_id, run_path)[0], 7)
+        reading, "_run_task_instances", lambda dag_id, run_path: _short_by(real(dag_id, run_path), 7)
     )
 
     result = _gate_apply(plan)
