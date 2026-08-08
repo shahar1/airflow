@@ -8851,3 +8851,168 @@ def test_every_read_the_gate_rests_on_is_taken_after_the_approval_is_spent(clear
     # The same token again is not "the read was incomplete"; the approval is gone.
     assert "no reviewed plan" in _gate_apply(plan)["error"]
     assert cleared_run.cleared == []
+
+
+# ---------------------------------------------------------------------------
+# The typed boundary: Reading, Verdict, and the two combinators.
+#
+# Table-driven and property-style, at the type rather than at a tool, because
+# the point of the type is that no site gets to derive completeness its own way.
+# ---------------------------------------------------------------------------
+
+
+def _reading(kept, delivered=None, claimed=None, **kwargs):
+    rows = tuple({"i": i} for i in range(kept))
+    return reading.Reading(
+        rows=rows,
+        route="GET /rows",
+        _delivered=kept if delivered is None else delivered,
+        _claimed=claimed,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kept", "delivered", "claimed", "complete"),
+    [
+        # The shape the whole redesign exists for: kept vs max(delivered, claimed).
+        (10, 20, 3, False),  # locally clamped, and the source under-counted
+        (7, 10, 10, False),  # the page was clamped after it arrived
+        (95, 100, 100, False),  # the route paged and this read stopped
+        (10, 10, 10, True),  # exact limit
+        (11, 11, 10, True),  # limit plus one: a lying total never shrinks the universe
+        (3, 3, None, True),  # the route said nothing about a total
+        (0, 0, 0, True),  # an empty universe is a complete read of it
+        (0, 0, 5, False),  # nothing came back and five were accounted for
+        (5, 5, 3, True),  # claimed below delivered: delivered wins
+    ],
+    ids=[
+        "clamped-and-under-counted",
+        "clamped-after-arrival",
+        "route-paged",
+        "exact-limit",
+        "limit-plus-one",
+        "no-total",
+        "empty-universe",
+        "nothing-of-five",
+        "inconsistent-total",
+    ],
+)
+def test_reading_completeness_is_kept_against_the_largest_claimed_universe(
+    kept, delivered, claimed, complete
+):
+    assert _reading(kept, delivered, claimed).complete is complete
+
+
+def test_a_failed_read_is_never_complete_whatever_the_numbers_say():
+    assert reading.failed_read("GET /rows", "HTTP 500").complete is False
+    assert reading.failed_read("GET /rows", "HTTP 500").read_failed is True
+    assert _reading(3).read_failed is False
+
+
+def test_clamp_recomputes_completeness_rather_than_slicing_around_it():
+    whole = _reading(10, 10, 10)
+    assert whole.complete is True
+    assert whole.clamp(4).complete is False
+    assert whole.clamp(4).kept == 4
+    # Clamping above what is held is not a truncation.
+    assert whole.clamp(99) is whole
+
+
+def test_filter_makes_a_discard_reduce_kept_exactly_like_a_clamp():
+    whole = _reading(4, 4, 4)
+    dropped = whole.filter(lambda row: row["i"] < 2)
+    assert dropped.complete is False
+    assert dropped.omitted == 2
+
+
+def test_project_reshapes_rows_without_changing_completeness():
+    whole = _reading(4, 4, 4)
+    shaped = whole.project(lambda row: {"j": row["i"]})
+    assert shaped.complete is True
+    assert [row["j"] for row in shaped.rows] == [0, 1, 2, 3]
+
+
+def test_an_incomplete_reading_says_why_and_a_complete_one_says_nothing():
+    assert _reading(10, 10, 10).reason == ""
+    assert "accounted for 99" in _reading(10, 10, 99).reason
+    assert "keeps 4" in _reading(10, 10, 10).clamp(4).reason
+    assert "could not be read" in reading.failed_read("GET /rows", "HTTP 500").reason
+
+
+def test_a_reading_names_its_route_in_the_sentence_a_refusal_carries():
+    assert "GET /rows" in _reading(1, 1, 9).describe()
+    assert "NOT read whole" in _reading(1, 1, 9).describe()
+    assert "was read whole" in _reading(1, 1, 1).describe()
+
+
+@pytest.mark.parametrize(
+    ("kept", "delivered", "claimed", "hit", "outcome"),
+    [
+        (3, 3, 3, True, reading.Outcome.PRESENT),
+        (3, 3, 3, False, reading.Outcome.ABSENT),
+        (3, 10, 10, False, reading.Outcome.UNKNOWN),
+        # Presence survives truncation: this is the direction that must NOT change.
+        (3, 10, 10, True, reading.Outcome.PRESENT),
+    ],
+    ids=["present-complete", "absent-complete", "unknown-truncated", "present-truncated"],
+)
+def test_find_never_reaches_absent_over_a_truncated_list(kept, delivered, claimed, hit, outcome):
+    verdict = reading.find(_reading(kept, delivered, claimed), lambda row: hit, "looking for a row")
+    assert verdict.outcome is outcome
+
+
+@pytest.mark.parametrize(
+    ("kept", "delivered", "claimed", "hit", "outcome"),
+    [
+        (3, 3, 3, False, reading.Outcome.PRESENT),
+        (3, 3, 3, True, reading.Outcome.ABSENT),
+        (3, 10, 10, False, reading.Outcome.UNKNOWN),
+        # A counterexample is a presence, so it settles the claim either way.
+        (3, 10, 10, True, reading.Outcome.ABSENT),
+    ],
+    ids=["none-complete", "counterexample", "unknown-truncated", "counterexample-truncated"],
+)
+def test_none_match_never_affirms_an_empty_set_over_a_truncated_list(kept, delivered, claimed, hit, outcome):
+    verdict = reading.none_match(_reading(kept, delivered, claimed), lambda row: hit, "nothing matches")
+    assert verdict.outcome is outcome
+
+
+def test_a_verdict_has_no_truthiness_at_all():
+    for outcome in reading.Outcome:
+        with pytest.raises(TypeError, match="three-valued"):
+            bool(reading.Verdict(outcome))
+
+
+def test_as_field_is_the_only_conversion_and_unknown_is_null():
+    assert reading.Verdict(reading.Outcome.PRESENT).as_field() is True
+    assert reading.Verdict(reading.Outcome.ABSENT).as_field() is False
+    assert reading.Verdict(reading.Outcome.UNKNOWN).as_field() is None
+
+
+def test_an_unknown_verdict_names_the_read_that_fell_short():
+    verdict = reading.find(_reading(1, 9, 9), lambda row: False, "looking for a worker field")
+    assert verdict.route == "GET /rows"
+    assert "GET /rows" in verdict.detail()
+    assert "absence" in verdict.detail()
+    assert reading.Verdict(reading.Outcome.ABSENT).detail() == ""
+
+
+def test_the_combinators_take_a_reading_and_not_a_sequence():
+    """Slicing ``.rows`` yields a tuple, and a tuple cannot be concluded from."""
+    with pytest.raises(AttributeError):
+        reading.find(_reading(4).rows[:2], lambda row: False, "why")
+
+
+@pytest.mark.parametrize("kept", list(range(0, 12)))
+def test_property_clamping_below_delivered_always_makes_a_reading_incomplete(kept):
+    whole = _reading(11, 11, 11)
+    clamped = whole.clamp(kept)
+    assert clamped.complete is (kept >= 11)
+    assert reading.find(clamped, lambda row: False, "why").is_absent() is (kept >= 11)
+
+
+def test_clipped_text_carries_whether_it_was_cut():
+    assert reading.Clipped("abc").truncated is False
+    assert reading.Clipped("abc", True).truncated is True
+    assert str(reading.Clipped("abc")) == "abc"

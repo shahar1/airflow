@@ -41,7 +41,10 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Any, NoReturn
 from urllib.parse import quote
 
 import httpx
@@ -127,6 +130,253 @@ _HISTORY_CLAMPED = (
     f"the page held more attempts than this reading keeps ({RECOVERY_ATTEMPT_LIMIT}), so the "
     f"attempts below are not the whole history and an absence among them is not an absence"
 )
+
+
+# ---------------------------------------------------------------------------
+# The type every bounded read hands back, and the three-valued answer that is
+# the only way from rows to a negative.
+#
+# Completeness used to survive as a bare int, a bare str, a bare bool, a tuple
+# slot and a dict key nobody read, derived longhand at nine sites in four
+# mutually incompatible forms.  There is one derivation now and it is a property
+# of the only type that carries rows, so a consumer that holds rows cannot hold
+# a second number to compare them against.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Reading:
+    """Rows that were kept, and whether they are all of them.
+
+    Three numbers, because three different things truncate a list: the route's
+    own paging (``_claimed`` above ``_delivered``), this tool's clamps (``kept``
+    below ``_delivered``), and a source whose count is lower than what it handed
+    over.  ``_pages``/``_exhausted`` are the pagination evidence — how many calls
+    were made and whether the loop reached a natural end rather than a ceiling.
+
+    ``error`` is set only when the read did not happen: a read that happened and
+    came back short is incomplete, not failed, and the two are different answers
+    to "why can nothing be concluded from this".
+    """
+
+    rows: tuple[Mapping[str, Any], ...] = ()
+    route: str = ""
+    _delivered: int = 0
+    _claimed: int | None = None
+    _pages: int = 1
+    _exhausted: bool = True
+    error: str | None = None
+
+    @property
+    def kept(self) -> int:
+        """How many rows a conclusion may be drawn over."""
+        return len(self.rows)
+
+    @property
+    def universe(self) -> int:
+        """The largest number of rows anyone involved accounted for.
+
+        A read that discarded rows is truncated whatever the source said its
+        total was, and a source that accounts for more than it sent is truncated
+        whatever this tool did with the rows.
+        """
+        claimed = self._claimed
+        return max(self._delivered, claimed) if isinstance(claimed, int) else self._delivered
+
+    @property
+    def complete(self) -> bool:
+        """Whether this reading holds every record anything involved accounts for.
+
+        THE one completeness derivation in the tree.  It is a property rather
+        than a free function so that there is no version of it a caller could
+        invoke with the wrong three numbers.
+        """
+        if self.error is not None:
+            return False
+        return self.kept >= self.universe
+
+    @property
+    def read_failed(self) -> bool:
+        """Whether the read did not happen at all, as opposed to coming back short."""
+        return self.error is not None
+
+    @property
+    def omitted(self) -> int:
+        """How many records this reading did not look at."""
+        return max(self.universe - self.kept, 0)
+
+    @property
+    def reason(self) -> str:
+        """Why nothing may be concluded from an absence here — empty when complete."""
+        if self.error is not None:
+            return f"{self.route or 'the read'} could not be read ({self.error})"
+        if self.complete:
+            return ""
+        claimed = self._claimed
+        if isinstance(claimed, int) and claimed > self._delivered:
+            source = f"the route accounted for {claimed} and handed over {self._delivered}"
+        elif self.kept < self._delivered:
+            source = f"{self._delivered} row(s) came back and this reading keeps {self.kept}"
+        else:
+            source = f"{self.kept} of {self.universe} row(s) were read"
+        pages = f"; {self._pages} page(s) were followed" if self._pages > 1 else ""
+        ceiling = "" if self._exhausted else "; the scan stopped at its own ceiling"
+        return f"{source}{pages}{ceiling}"
+
+    def describe(self) -> str:
+        """The sentence a refusal or an unestablished check carries."""
+        if self.complete:
+            return f"{self.route or 'the read'} was read whole ({self.kept} row(s))"
+        return f"{self.route or 'the read'} was NOT read whole: {self.reason}"
+
+    def clamp(self, limit: int) -> Reading:
+        """A clamp is a method, never a slice: completeness is recomputed.
+
+        Slicing ``.rows`` yields a plain tuple, which neither ``find`` nor
+        ``none_match`` accepts — so a caller that clamps by slicing loses the
+        ability to draw any conclusion at all, which is the correct incentive.
+        """
+        if limit >= self.kept:
+            return self
+        return replace(self, rows=self.rows[:limit])
+
+    def filter(self, keep: Callable[[Mapping[str, Any]], bool]) -> Reading:
+        """A discard is a method too — dropped rows reduce kept, exactly like a clamp."""
+        return replace(self, rows=tuple(row for row in self.rows if keep(row)))
+
+    def project(self, shape: Callable[[Mapping[str, Any]], Mapping[str, Any]]) -> Reading:
+        """Reshape every kept row one-for-one. Row count does not change, so completeness does not."""
+        return replace(self, rows=tuple(shape(row) for row in self.rows))
+
+    def failed(self, error: str) -> Reading:
+        """The same route, read to nothing, with the reason it could not be read."""
+        return replace(self, rows=(), _delivered=0, _claimed=None, error=error)
+
+
+def read_of(
+    resp: Any,
+    key: str,
+    route: str,
+    *,
+    pages: int = 1,
+    exhausted: bool = True,
+    delivered: int | None = None,
+) -> Reading:
+    """One list-shaped response body as a ``Reading``.
+
+    ``delivered`` is passed only by a paginating caller, which has accumulated
+    more rows than the last page holds.
+    """
+    body = resp if isinstance(resp, dict) else {}
+    rows = body.get(key) or []
+    if not isinstance(rows, list):
+        rows = []
+    kept = tuple(row for row in rows if isinstance(row, dict))
+    claimed = body.get("total_entries")
+    return Reading(
+        rows=kept,
+        route=route,
+        _delivered=len(kept) if delivered is None else delivered,
+        _claimed=claimed if isinstance(claimed, int) and not isinstance(claimed, bool) else None,
+        _pages=pages,
+        _exhausted=exhausted,
+    )
+
+
+def failed_read(route: str, error: str) -> Reading:
+    """A read that did not happen, named so a refusal can say which one."""
+    return Reading(route=route, error=error)
+
+
+class Outcome(Enum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class Verdict:
+    """A three-valued answer about one question asked of one ``Reading``.
+
+    ``UNKNOWN`` is deliberately hard to misuse: there is no truthiness, and the
+    only conversion to a JSON value returns ``None`` for it.  ``False`` is a
+    claim about the world and it has to be earned by a read that was whole.
+    """
+
+    outcome: Outcome
+    row: Mapping[str, Any] | None = None
+    route: str = ""
+    why: str = ""
+
+    def __bool__(self) -> NoReturn:
+        raise TypeError(
+            "a Verdict is three-valued; use .as_field(), .is_present()/.is_absent()/.is_unknown(), "
+            "or match on .outcome"
+        )
+
+    def as_field(self) -> bool | None:
+        """The ONLY conversion to a JSON value. UNKNOWN is None, never False."""
+        return {Outcome.PRESENT: True, Outcome.ABSENT: False}.get(self.outcome)
+
+    def is_present(self) -> bool:
+        return self.outcome is Outcome.PRESENT
+
+    def is_absent(self) -> bool:
+        return self.outcome is Outcome.ABSENT
+
+    def is_unknown(self) -> bool:
+        return self.outcome is Outcome.UNKNOWN
+
+    def detail(self) -> str:
+        """The sentence an unestablished answer carries, naming the read that fell short."""
+        if self.outcome is not Outcome.UNKNOWN:
+            return ""
+        route = self.route or "the read behind it"
+        return f"{self.why} — {route} was not read whole, so an absence among the rows read is not an absence"
+
+
+def find(reading: Reading, question: Callable[[Mapping[str, Any]], bool], why: str = "") -> Verdict:
+    """Is there a row satisfying this question?
+
+    PRESENT is returned before completeness is ever consulted: presence-based
+    conclusions survive a truncated list, absence-based ones do not.
+    """
+    hit = next((row for row in reading.rows if question(row)), None)
+    if hit is not None:
+        return Verdict(Outcome.PRESENT, row=hit, route=reading.route)
+    if not reading.complete:
+        return Verdict(Outcome.UNKNOWN, route=reading.route, why=why or reading.reason)
+    return Verdict(Outcome.ABSENT, route=reading.route)
+
+
+def none_match(reading: Reading, question: Callable[[Mapping[str, Any]], bool], why: str = "") -> Verdict:
+    """Is the matching set empty? The inverse claim, behind the same guard.
+
+    PRESENT means the claim holds and the whole universe was examined; ABSENT
+    means a counterexample row was found, which is a presence and so survives
+    truncation; UNKNOWN means nothing matched but the list was not read whole.
+    """
+    hit = next((row for row in reading.rows if question(row)), None)
+    if hit is None and not reading.complete:
+        return Verdict(Outcome.UNKNOWN, route=reading.route, why=why or reading.reason)
+    if hit is None:
+        return Verdict(Outcome.PRESENT, route=reading.route)
+    return Verdict(Outcome.ABSENT, row=hit, route=reading.route)
+
+
+@dataclass(frozen=True, slots=True)
+class Clipped:
+    """Text that was cut to a size this tool chose, and whether it was cut.
+
+    The field-level sibling of ``Reading``: a log tail that returned a bare
+    ``str`` let every consumer read a truncated log as the whole of one.
+    """
+
+    text: str
+    truncated: bool = False
+
+    def __str__(self) -> str:
+        return self.text
 
 
 def _latest_version(dag_id: str) -> int | None:
