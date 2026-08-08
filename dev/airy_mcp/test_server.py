@@ -9100,98 +9100,225 @@ def test_clipped_text_carries_whether_it_was_cut():
 # The registry-generated sweep.
 #
 # Every list the sidecar can be handed a short version of, and every tool that
-# reads one, are DERIVED from the code rather than named here: the readers from
-# an AST scan for transport calls, the truncation levers from the double's own
-# ``*_total`` knobs, the tools from server.py's registration tuple. A reader or
-# a tool added later is swept because it exists, not because somebody remembered
-# to add it to a list.
+# reads one, are DERIVED from the code rather than named here: the module list
+# from the package directory, the readers from an AST scan for transport calls,
+# the truncation levers from the double's own knobs AND from the boundary's own
+# row-count bounds, the tools from every ``mcp.tool`` registration. A module, a
+# reader or a tool added later is swept because it exists, not because somebody
+# remembered to add it to a list.
 #
-# What is deliberately outside a sweep is listed with the reason, and a test
-# asserts the exclusions are exactly those and no others.
+# What is deliberately outside a sweep is listed with the reason AND with how
+# many reads that reason excuses, so a read added inside an excluded function
+# does not inherit the excuse.
 # ---------------------------------------------------------------------------
 
-_MODULES = (
-    "primitives",
-    "transport",
-    "reading",
-    "dagsource",
-    "evidence",
-    "approvals",
-    "diagnosis",
-    "codechange",
-    "recovery",
-    "server",
-)
+
+def _package_modules():
+    """Every module of the sidecar itself, taken off the filesystem.
+
+    A hand-written tuple is a list somebody has to remember: a whole new module
+    carrying a raw transport read, a hand-spelled ABSENT and a second
+    completeness derivation was added while every scan below stayed green,
+    because none of them looked at it. The Dag files that share this directory
+    are inputs to the demo rather than parts of the server, and they are the
+    only modules here that import Airflow, so that is what separates them.
+    """
+    found = []
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        if path.stem.startswith("test_"):
+            continue
+        tree = ast.parse(path.read_text())
+        imports_airflow = any(
+            (isinstance(node, ast.Import) and any(a.name.split(".")[0] == "airflow" for a in node.names))
+            or (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "airflow")
+            for node in ast.walk(tree)
+        )
+        if not imports_airflow:
+            found.append(path.stem)
+    return tuple(found)
+
+
+_MODULES = _package_modules()
+
+
+def test_the_swept_module_list_is_the_package_on_disk():
+    """A module the scans below never open is a module every rule is off in."""
+    here = Path(__file__).parent
+    on_disk = {path.stem for path in here.glob("*.py") if not path.stem.startswith("test_")}
+    dag_files = on_disk - set(_MODULES)
+
+    assert "server" in _MODULES
+    assert set(_MODULES) <= on_disk
+    # Every file that is NOT swept has to be a Dag definition, and the only way
+    # to be one here is to import Airflow.
+    for name in dag_files:
+        assert "airflow" in here.joinpath(f"{name}.py").read_text()
 
 
 def _module_source(name):
     return ast.parse(Path(__file__).parent.joinpath(f"{name}.py").read_text())
 
 
+def _owned_nodes(tree, owner="<module>"):
+    """Every node of a module, tagged with the top-level function that holds it.
+
+    Module-level code is tagged ``<module>`` rather than skipped: a read, a
+    negative or a derivation written outside any ``def`` used to be invisible to
+    every scan here, because they all started by walking ``FunctionDef`` nodes.
+    """
+    for node in ast.iter_child_nodes(tree):
+        name = (
+            node.name
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and owner == "<module>"
+            else owner
+        )
+        yield name, node
+        yield from _owned_nodes(node, name)
+
+
+# Ways of reaching Airflow that a scan for ``transport._api(...)`` cannot see.
+# The scan is one literal AST form, so rather than teach it every indirection,
+# the indirections are forbidden and this is what forbids them.
+_HTTPX_CALLS = ("request", "get", "post", "put", "patch", "delete", "stream", "Client", "AsyncClient")
+
+
+def _transport_indirections():
+    """Every way a module could reach the API that the reader scan would miss."""
+    offenders = []
+    for module in _MODULES:
+        if module == "transport":
+            continue
+        for owner, node in _owned_nodes(_module_source(module)):
+            if isinstance(node, ast.ImportFrom) and node.module == "transport":
+                offenders += [
+                    (module, owner, f"from transport import {alias.name}")
+                    for alias in node.names
+                    if alias.name == "_api"
+                ]
+            elif isinstance(node, ast.Import):
+                offenders += [
+                    (module, owner, f"import transport as {alias.asname}")
+                    for alias in node.names
+                    if alias.name == "transport" and alias.asname
+                ]
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                if node.value.id == "transport":
+                    offenders.append((module, owner, ast.unparse(node)))
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id == "getattr" and node.args:
+                    if isinstance(node.args[0], ast.Name) and node.args[0].id == "transport":
+                        offenders.append((module, owner, ast.unparse(node)))
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "httpx"
+                    and func.attr in _HTTPX_CALLS
+                ):
+                    offenders.append((module, owner, ast.unparse(node)))
+    return sorted(set(offenders))
+
+
+def test_no_module_reaches_airflow_by_a_route_the_reader_scan_cannot_see():
+    """``from transport import _api as _call``, ``getattr(transport, "_api")``,
+    ``t = transport`` and a bare ``httpx.get`` all defeat the scan below. Every
+    feature module already imports httpx for its exception types, so the last of
+    those is one line away in any of them."""
+    assert _transport_indirections() == []
+
+
 def _functions_calling_transport():
-    """Every function in the tree that reaches the Airflow API, by module and name."""
+    """Every function in the tree that reaches the Airflow API, by module and name.
+
+    Matches the call by its attribute name alone, and walks the whole module
+    rather than only what is inside a ``def`` — the indirections that could
+    rename the module object or move the call to import time are forbidden
+    above, so the one form left is the one this looks for.
+    """
     found = []
     for module in _MODULES:
-        tree = _module_source(module)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                call = getattr(inner, "func", None)
-                if (
-                    isinstance(inner, ast.Call)
-                    and isinstance(call, ast.Attribute)
-                    and call.attr == "_api"
-                    and isinstance(call.value, ast.Name)
-                    and call.value.id == "transport"
-                ):
-                    found.append((module, node.name))
-                    break
+        for owner, node in _owned_nodes(_module_source(module)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "_api":
+                    found.append((module, owner))
     return sorted(set(found))
 
 
-# Reads that do not carry a completeness question, each with why. A read here is
-# NOT swept, so the reason has to be a property of the read and not of the
-# effort of testing it.
+# Reads that do not carry a completeness question, each with why AND with how
+# many transport calls that reason covers. A read here is NOT swept, so the
+# reason has to be a property of the read and not of the effort of testing it —
+# and the count is what stops the excuse from spreading: an exclusion used to be
+# per FUNCTION, so a list read added inside an already-excused function was
+# invisible from the moment it was written.
 _READS_WITHOUT_A_UNIVERSE = {
-    ("reading", "_latest_version"): "limit=1 by design: the newest version or none, never a sample of them",
-    (
-        "reading",
-        "_resolve_run",
-    ): "limit=1 or 2 by design: it resolves ONE run, and a short page is the answer",
-    ("reading", "_expandable_probe"): (
-        "limit=1, and already tri-state: False only on the explicit 'is not mapped' detail, None otherwise"
+    ("reading", "_latest_version"): (
+        1,
+        "limit=1 by design: the newest version or none, never a sample of them",
     ),
-    ("reading", "_attempt_log"): "one attempt's log body — a text clamp, carried as Clipped, not a list",
-    ("reading", "_version_context"): "reads /dagVersions into a Reading and answers through find()",
-    ("dagsource", "_dag_path"): "GET /dags/<id> — one object, not a list",
-    ("dagsource", "_parsed_source"): "GET /dagSources/<id> — one document, not a list",
-    ("dagsource", "_force_reparse"): "PUT /parseDagFile — a write, and a post-write one",
-    ("codechange", "rerun_dag"): "GET /dags/<id> and /details plus two writes; no list read of its own",
-    ("codechange", "revert_dag_code"): "GET /dags/<id> — one object; the revert restores a byte-exact backup",
-    ("codechange", "plan_revert_dag_code"): "GET /dags/<id> — one object",
-    ("codechange", "apply_dag_code_changes"): "GET /dags/<id> — one object",
-    ("codechange", "run_backfill"): "one write; both lists it rests on come back as Readings",
-    ("codechange", "_abandon_backfill"): "one write; the re-read comes back as a Reading",
-    ("diagnosis", "diagnose_dag"): "GET /dags/<id> and per-failure log bodies; its list reads are Readings",
-    ("diagnosis", "find_failure_clusters"): "the failure scan is wrapped in a Reading at the call site",
-    ("diagnosis", "get_blast_radius"): "the asset catalog is wrapped in a Reading at the call site",
-    (
-        "recovery",
-        "plan_task_instance_clear",
-    ): "the dry-run preview; the plan refuses on its own incompleteness",
+    ("reading", "_resolve_run"): (
+        2,
+        "limit=1 or 2 by design: it resolves ONE run, and a short page is the answer",
+    ),
+    ("reading", "_expandable_probe"): (
+        1,
+        "limit=1, and already tri-state: False only on the explicit 'is not mapped' detail, None otherwise",
+    ),
+    ("reading", "_attempt_log"): (
+        1,
+        "one attempt's log body — a text clamp, carried as Clipped, not a list",
+    ),
+    ("dagsource", "_dag_path"): (1, "GET /dags/<id> — one object, not a list"),
+    ("dagsource", "_parsed_source"): (1, "GET /dagSources/<id> — one document, not a list"),
+    ("dagsource", "_force_reparse"): (1, "PUT /parseDagFile — a write, and a post-write one"),
+    ("codechange", "rerun_dag"): (
+        4,
+        "GET /dags/<id> and /details plus two writes; no list read of its own",
+    ),
+    ("codechange", "revert_dag_code"): (
+        1,
+        "GET /dags/<id> — one object; the revert restores a byte-exact backup",
+    ),
+    ("codechange", "plan_revert_dag_code"): (1, "GET /dags/<id> — one object"),
+    ("codechange", "apply_dag_code_changes"): (1, "GET /dags/<id> — one object"),
+    ("codechange", "run_backfill"): (1, "one write; both lists it rests on come back as Readings"),
+    ("codechange", "_abandon_backfill"): (1, "one write; the re-read comes back as a Reading"),
+    ("diagnosis", "diagnose_dag"): (
+        2,
+        "GET /dags/<id> and per-failure log bodies; its list reads are Readings",
+    ),
+    ("diagnosis", "find_failure_clusters"): (
+        2,
+        "the failure scan is wrapped in a Reading at the call site, and the per-failure log is a body",
+    ),
+    ("diagnosis", "get_blast_radius"): (1, "the asset catalog is wrapped in a Reading at the call site"),
     ("recovery", "apply_task_instance_clear"): (
-        "the pre-write preview and the single mutating write; the preview becomes a Reading in the gate"
+        2,
+        "the pre-write preview and the single mutating write; the preview becomes a Reading in the gate",
     ),
 }
 
 
 # Reads whose result CARRIES readings rather than being one — a payload with a
 # reading per compared task, or a payload whose completeness key is the reading
-# it wraps. Held to a runtime check that the readings are really in there.
+# it wraps. Held to a RUNTIME check that the completeness really travels, which
+# is the difference between this table and the one above.
 _READS_CARRYING_A_READING = {
-    ("reading", "_task_comparison"): "one reading per compared task id, under ``tasks``",
-    ("evidence", "_event_history"): "the scan, under ``reading``, after the dag_id filter reduced it",
+    ("reading", "_task_comparison"): (1, "one reading per compared task id, under ``tasks``"),
+    ("evidence", "_event_history"): (
+        1,
+        "the scan, under ``reading``, after the dag_id filter reduced it",
+    ),
+    # Was excused as "answers through find()", in the table that has no runtime
+    # check — over a 100-row list read.
+    ("reading", "_version_context"): (
+        1,
+        "reads /dagVersions into a Reading and answers through find(); ``versions_status`` is that "
+        "reading's own completeness and ``original_version_listed`` is its verdict",
+    ),
+    ("recovery", "plan_task_instance_clear"): (
+        1,
+        "the dry-run preview, wrapped in a Reading before anything is enumerated over it",
+    ),
 }
 
 
@@ -9203,14 +9330,37 @@ def _typed_readers():
     ]
 
 
+def _reads_as_a_reading(function):
+    """Whether this reader's return type is a Reading the caller cannot get out of.
+
+    ``Reading | None`` used to pass: the check was ``"Reading" in str(...)``, so
+    an optional reading — a caller that has to decide for itself what a missing
+    one means, which is the decision this type exists to take away — read as a
+    typed reader. A tuple that carries one alongside its source sentence is
+    still one; anything admitting ``None`` is not.
+    """
+    annotation = str(inspect.signature(function).return_annotation)
+    return "Reading" in annotation and "None" not in annotation and "Optional" not in annotation
+
+
+def _transport_call_counts():
+    """How many transport calls each function in the tree makes."""
+    counts = {}
+    for module in _MODULES:
+        for owner, node in _owned_nodes(_module_source(module)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "_api":
+                    counts[(module, owner)] = counts.get((module, owner), 0) + 1
+    return counts
+
+
 def test_every_transport_reader_is_either_typed_or_excluded_with_a_reason():
     """A read added later is swept because it exists, not because it was listed."""
     reachers = _functions_calling_transport()
     unaccounted = [
         entry
         for entry in _typed_readers()
-        if entry[0] != "reading"
-        or "Reading" not in str(inspect.signature(getattr(reading, entry[1])).return_annotation)
+        if entry[0] != "reading" or not _reads_as_a_reading(getattr(reading, entry[1]))
     ]
 
     assert unaccounted == [], f"reads with no Reading and no recorded exclusion: {unaccounted}"
@@ -9220,6 +9370,21 @@ def test_every_transport_reader_is_either_typed_or_excluded_with_a_reason():
     assert stale == [], f"exclusions for reads that are gone: {stale}"
 
 
+def test_an_exclusion_covers_the_reads_it_was_written_for_and_no_later_ones():
+    """The excuse is per READ, not per function: a list read added inside an
+    already-excluded function used to inherit an exemption written for a
+    different call entirely."""
+    counts = _transport_call_counts()
+    declared = {**_READS_WITHOUT_A_UNIVERSE, **_READS_CARRYING_A_READING}
+    drifted = {
+        entry: (declared[entry][0], counts[entry])
+        for entry in declared
+        if counts.get(entry) != declared[entry][0]
+    }
+
+    assert drifted == {}, f"a read was added or removed under an existing exclusion: {drifted}"
+
+
 def test_every_typed_reader_returns_a_reading():
     """The boundary's own functions are annotated, so mypy sees a short read too."""
     typed = _typed_readers()
@@ -9227,33 +9392,162 @@ def test_every_typed_reader_returns_a_reading():
     for module, name in typed:
         assert module == "reading", f"{name} issues a list read outside the boundary"
         annotation = inspect.signature(getattr(reading, name)).return_annotation
-        assert "Reading" in str(annotation), f"{name} does not return a Reading: {annotation}"
+        assert _reads_as_a_reading(getattr(reading, name)), f"{name} does not return a Reading: {annotation}"
 
 
-def test_the_readers_that_carry_a_reading_really_carry_one(airflow):
-    """The two payload-shaped reads are held to their entry, not to their word."""
-    _sweep_world(airflow)
-
+def _carries_event_history(airflow):
     history = evidence._event_history(DAG_ID, "manual__1", "granted")
     assert isinstance(history["reading"], reading.Reading)
 
+
+def _carries_task_comparison(airflow):
     comparison = reading._task_comparison(DAG_ID, airflow.runs, ["report"])
     assert comparison["tasks"]
     assert all(isinstance(per_task, reading.Reading) for per_task in comparison["tasks"].values())
 
 
+def _carries_version_context(airflow):
+    airflow.versions = [1]
+    run = {"dag_run_id": "manual__1", "dag_versions": [{"version_number": 4}]}
+
+    whole = reading._version_context(DAG_ID, run, None)
+    assert whole["versions_status"] == "checked"
+    assert whole["original_version_listed"] is False
+
+    airflow.versions_total = 900
+    short = reading._version_context(DAG_ID, run, None)
+    assert short["versions_status"] == "partial"
+    assert short["original_version_listed"] is None
+
+
+def _carries_clear_preview(airflow):
+    _sweep_world(airflow)
+    airflow.clear_total = 900
+
+    plan = server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
+
+    assert plan["planned"] is False
+    assert "plan_token" not in plan
+
+
+# One runtime check per payload-shaped read, so an entry here is held to its
+# behaviour rather than to its sentence. A read excused on the word "it carries
+# a reading" and never asked to prove it is an exclusion in the other table
+# wearing a better reason.
+_READING_CARRIERS = {
+    ("evidence", "_event_history"): _carries_event_history,
+    ("reading", "_task_comparison"): _carries_task_comparison,
+    ("reading", "_version_context"): _carries_version_context,
+    ("recovery", "plan_task_instance_clear"): _carries_clear_preview,
+}
+
+
+def test_every_reader_that_claims_to_carry_a_reading_has_a_runtime_check():
+    assert set(_READING_CARRIERS) == set(_READS_CARRYING_A_READING)
+
+
+@pytest.mark.parametrize("entry", sorted(_READING_CARRIERS))
+def test_the_readers_that_carry_a_reading_really_carry_one(airflow, tmp_path, entry):
+    """The payload-shaped reads are held to their entry, not to their word."""
+    _sweep_world(airflow)
+
+    _READING_CARRIERS[entry](airflow)
+
+
 def _registered_tools():
-    """The tool names, read out of server.py's registration tuple rather than listed."""
+    """Every tool this server registers, however it registers it.
+
+    Reading only the registration tuple made a tool registered by any other
+    means — ``@mcp.tool`` on the def, a bare ``mcp.tool(f)`` beside the loop —
+    invisible to every sweep below while being a live tool of the server.
+    """
     tree = _module_source("server")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
-            return [element.id for element in node.iter.elts]
-    raise AssertionError("server.py no longer registers its tools from a tuple")
+    loops = {}
+    names = set()
+    for _, node in _owned_nodes(tree):
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+            if isinstance(node.iter, (ast.Tuple, ast.List)):
+                loops[node.target.id] = {
+                    element.id for element in node.iter.elts if isinstance(element, ast.Name)
+                }
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                if isinstance(target, ast.Attribute) and target.attr == "tool":
+                    names.add(node.name)
+    for _, node in _owned_nodes(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr != "tool":
+                continue
+            for argument in node.args:
+                if isinstance(argument, ast.Name):
+                    names |= loops.get(argument.id, {argument.id})
+    assert names, "server.py no longer registers any tool this scan can see"
+    return sorted(names)
+
+
+def _frozen_tool_count():
+    """How many tools the freeze recorded — the count is read, never retyped."""
+    frozen = json.loads(Path(__file__).parent.joinpath("baselines/tool-schemas.json").read_text())
+    return frozen["registered_tool_count"]
 
 
 def _truncation_knobs():
-    """Every list the double can make short, taken off the double itself."""
-    return sorted(name for name in vars(FakeAirflow()) if name.endswith("_total"))
+    """Every list the double can make short, taken off the double itself.
+
+    Partitioned by what the knob IS: a count knob stands in for a route that
+    accounts for more (or fewer) rows than it sent, a flag knob for a route that
+    sends no count at all. Setting a flag to ``9999`` and then to ``0`` swept it
+    in one direction and made a no-op of the other.
+    """
+    fields = vars(FakeAirflow())
+    counts = sorted(name for name in fields if name.endswith("_total") and not isinstance(fields[name], bool))
+    flags = sorted(name for name in fields if name.endswith("_total") and isinstance(fields[name], bool))
+    return counts, flags
+
+
+def _row_count_bounds():
+    """Every bound in the boundary that decides when THIS TOOL stops reading.
+
+    The other axis of the sweep, and the one every over-correction defect lived
+    on: the double's ``*_total`` knobs only ever make the SOURCE claim more than
+    it sent, so the rows delivered to the tool never shrank and the clamps —
+    ``Reading.clamp``, the scan ceilings, the comparison and history limits —
+    were never once exercised by the sweep that was supposed to cover them.
+    """
+    found = []
+    for module in (reading, evidence):
+        for name, value in vars(module).items():
+            if not name.isupper() or not isinstance(value, int) or isinstance(value, bool):
+                continue
+            # Text clamps are a different type with a different invariant: they
+            # produce a ``Clipped``, not a short list.
+            if name.endswith(("_CHARS", "_LINES", "_S")):
+                continue
+            found.append((module.__name__, name))
+    return sorted(found)
+
+
+# One lever per way a read can come back short of the whole, derived from both
+# sides of the boundary. ``apply`` is handed the double and a monkeypatch.
+_LEVER_CLAMPED_TO = 1
+
+
+def _levers():
+    counts, flags = _truncation_knobs()
+    levers = {}
+    for knob in counts:
+        levers[f"claims-more:{knob}"] = lambda fake, mp, knob=knob: setattr(fake, knob, 9_999)
+    for knob in flags:
+        levers[f"no-total:{knob}"] = lambda fake, mp, knob=knob: setattr(fake, knob, True)
+    for module_name, name in _row_count_bounds():
+        levers[f"clamped:{module_name}.{name}"] = lambda fake, mp, m=module_name, n=name: mp.setattr(
+            sys.modules[m], n, _LEVER_CLAMPED_TO
+        )
+    return levers
+
+
+_LEVERS = _levers()
 
 
 def _sweep_world(fake):
@@ -9324,11 +9618,7 @@ def _sweep_world(fake):
 # WRITES instead (below): running them here would mutate the double, and what a
 # truncated read must do to them is refuse rather than answer differently.
 _SWEPT_TOOLS = {
-    "diagnose_dag": lambda: (
-        server.diagnose_dag(DAG_ID, audit_scope="granted", xcom_scope="granted")
-        if False
-        else server.diagnose_dag(DAG_ID, audit_scope="granted")
-    ),
+    "diagnose_dag": lambda: server.diagnose_dag(DAG_ID, audit_scope="granted"),
     "compare_dag_runs": lambda: server.compare_dag_runs(DAG_ID, "manual__1", "manual__2"),
     "find_failure_clusters": lambda: server.find_failure_clusters(hours=24, dag_ids=[DAG_ID]),
     "get_blast_radius": lambda: server.get_blast_radius(DAG_ID),
@@ -9351,22 +9641,60 @@ _SWEPT_TOOLS = {
     "plan_revert_dag_code": lambda: server.plan_revert_dag_code(DAG_ID),
 }
 
-# The tools that write. Excluded from the value sweep because the answer a
-# truncated read must produce for them is a REFUSAL, which is asserted at the
-# transport instead.
-_WRITING_TOOLS = {
-    "apply_dag_code_changes",
-    "apply_task_instance_clear",
-    "run_backfill",
-    "revert_dag_code",
-    "rerun_dag",
+# The tools that write. Excluded from the VALUE sweep because the answer a
+# truncated read must produce for them is a REFUSAL — so each one is swept for
+# writes instead, and membership here BUYS an obligation rather than an
+# exemption: a tool named here has to prove, at the transport, that it makes no
+# write without a reviewed plan.
+_WRITE_REFUSALS = {
+    "apply_dag_code_changes": lambda: server.apply_dag_code_changes(
+        DAG_ID, [{"old": "ammount", "new": "amount"}], ""
+    ),
+    "apply_task_instance_clear": lambda: server.apply_task_instance_clear(
+        DAG_ID, "manual__1", ["report"], ""
+    ),
+    "run_backfill": lambda: server.run_backfill(DAG_ID, "2024-01-01", "2024-01-02", ""),
+    "revert_dag_code": lambda: server.revert_dag_code(DAG_ID, ""),
+    "rerun_dag": lambda: server.rerun_dag(DAG_ID),
 }
+
+_WRITING_TOOLS = frozenset(_WRITE_REFUSALS)
 
 
 def test_the_sweep_covers_every_registered_tool():
+    """Every registered tool is in exactly one sweep, and the count is READ off
+    the freeze rather than retyped — a literal here is a number a new tool's
+    author can bump in the same commit that hides it."""
     registered = set(_registered_tools())
+
     assert registered == set(_SWEPT_TOOLS) | _WRITING_TOOLS
-    assert len(registered) == 14
+    assert len(registered) == _frozen_tool_count()
+    assert not set(_SWEPT_TOOLS) & _WRITING_TOOLS
+
+
+@pytest.mark.parametrize("tool", sorted(_WRITE_REFUSALS))
+def test_every_writing_tool_refuses_without_a_reviewed_plan(airflow, tmp_path, tool):
+    """Naming a tool in the writing set is what excuses it from the value sweep,
+    so the set has to demand something: no write at all reaches the transport
+    without an approval, counted at the transport rather than read off prose."""
+    _sweep_world(airflow)
+
+    result = _WRITE_REFUSALS[tool]()
+
+    assert _writes(airflow) == [], f"{tool} wrote without a reviewed plan"
+    assert result.get("mutation_applied") is False, result
+
+
+@pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
+def test_no_tool_in_the_value_sweep_writes_anything(airflow, tmp_path, tool):
+    """The other half of the partition: a tool is excused from the write sweep
+    by being in the value sweep, so the value sweep has to prove it writes
+    nothing — otherwise a writing tool moved there is covered by neither."""
+    _sweep_world(airflow)
+
+    _SWEPT_TOOLS[tool]()
+
+    assert _writes(airflow) == []
 
 
 def _leaves(value, path="$"):
@@ -9382,11 +9710,17 @@ def _leaves(value, path="$"):
         yield path, value
 
 
-# Flags that report what THIS CALL did or established, not what the world holds.
+# Leaves that report what THIS CALL did or established, not what the world holds.
 # ``True -> False`` on one of these under a shorter read is the conservative
 # direction and the whole point of the gate: the tool refused, or withheld a
 # verdict, because it could not see enough. A claim ABOUT THE WORLD may never
 # make that move, which is what everything outside this set is held to.
+#
+# Every member is DECLARED. The set used to carry a suffix rule as well — any
+# leaf ending ``_complete`` or ``_read_whole``, at any depth — and a hard
+# negative only had to be spelled ``no_upstream_assets_complete`` to walk out of
+# the sweep entirely. Its identical twin ``no_upstream_assets`` was caught; the
+# suffixed one was not.
 _CONSERVATIVE_FLAGS = frozenset(
     {
         "planned",
@@ -9395,27 +9729,53 @@ _CONSERVATIVE_FLAGS = frozenset(
         "verified",
         "mutation_applied",
         "recovery_verified",
+        # A world claim, not a call claim: ``clean`` is the conjunction over the
+        # run's health, and it is here because every leg of that conjunction
+        # withholds itself under a short read rather than answering false.
         "clean",
         "mapped_tasks_settled",
         "settled",
+        # Inert as it stands — the verdict reaches the payload through
+        # ``.as_field()`` under other names — and kept because the leg exists.
         "pair_recorded",
+        # The read-coverage leaves: each one IS the completeness of one read, so
+        # ``True -> False`` on it is the sweep working rather than failing.
+        "task_instances_read_whole",
+        "task_list_read_whole",
+        "asset_catalog_read_whole",
+        "failures_read_whole",
+        "runs_read_whole",
+        "planned_runs_read_whole",
     }
 )
 
 
 def _is_conservative(path):
-    leaf = path.rsplit(".", 1)[-1]
-    return leaf in _CONSERVATIVE_FLAGS or leaf.endswith("_read_whole") or leaf.endswith("_complete")
+    return path.rsplit(".", 1)[-1] in _CONSERVATIVE_FLAGS
 
 
 def _manufactured_negatives(complete, truncated):
-    """Keys whose claim got STRONGER because a read got shorter."""
+    """Keys whose claim got STRONGER because a read got shorter.
+
+    Walks the union of both results, not just the keys the complete read
+    produced: a key that only APPEARS under truncation — ``instances_not_found``
+    is exactly one — was never examined at all by an iteration over ``before``.
+    """
     before, after = dict(_leaves(complete)), dict(_leaves(truncated))
     broken = []
-    for path, was in before.items():
-        if path not in after or _is_conservative(path):
+    for path in before.keys() | after.keys():
+        if _is_conservative(path):
             continue
-        now = after[path]
+        was, now = before.get(path, _ABSENT_LEAF), after.get(path, _ABSENT_LEAF)
+        if now is _ABSENT_LEAF:
+            continue
+        if was is _ABSENT_LEAF:
+            # A claim that did not exist over the whole read and does over the
+            # short one is manufactured by definition — unless it is a null or
+            # an empty enumeration, which claim nothing.
+            if now is False or (path.endswith("[]") and now):
+                broken.append((path, "(absent)", now))
+            continue
         if was is True and now is False:
             broken.append((path, was, now))
         elif was is not None and was is not False and now is False:
@@ -9427,13 +9787,28 @@ def _manufactured_negatives(complete, truncated):
     return broken
 
 
+class _AbsentLeaf:
+    def __repr__(self):
+        return "(absent)"
+
+
+_ABSENT_LEAF = _AbsentLeaf()
+
+
 def _over_corrections(complete, truncated):
-    """Keys that went unestablished even though nothing about the read changed."""
+    """Keys that went unestablished even though nothing about the read changed.
+
+    A key that DISAPPEARS is an over-correction too: withdrawing the field is
+    the same withdrawal as nulling it, and comparing only the paths present in
+    both let the stronger form through.
+    """
     before, after = dict(_leaves(complete)), dict(_leaves(truncated))
     return [
-        (path, before[path], after[path])
+        (path, before[path], after.get(path, _ABSENT_LEAF))
         for path in before
-        if path in after and before[path] is not None and after[path] is None
+        if before[path] is not None
+        and not _is_conservative(path)
+        and (after.get(path, _ABSENT_LEAF) is None or path not in after)
     ]
 
 
@@ -9443,23 +9818,77 @@ def _without_tokens(result):
     return re.sub(r'"plan_token": "[^"]*"', '"plan_token": "..."', text)
 
 
+def _watching_readings(monkeypatch):
+    """Record every reading that came back SHORT while the tool ran.
+
+    The instrument N5c needed and did not have: whether a tool reached a short
+    read is a fact about the run, not something to infer from two payloads being
+    unequal. ``if before == after: return`` used to excuse exactly the defect —
+    a tool that reaches the short read and swallows it answers identically.
+
+    A read that FAILED is not a short read: the two are different answers to
+    "why can nothing be concluded here", and only one of them is a truncation.
+    """
+    short_routes: list[str] = []
+    original = reading.Reading.__init__
+
+    def watched(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        if self.error is None and not reading.Reading.complete.fget(self):
+            short_routes.append(self.route)
+
+    monkeypatch.setattr(reading.Reading, "__init__", watched)
+    return short_routes
+
+
+# Leaf suffixes that carry read coverage in the payload rather than in prose.
+# A number here going UP, or a whole-ness flag going False, or a status leaving
+# ``checked``, is the shortfall reaching the reader in machine-readable form —
+# and it is measured against the SAME tool's complete answer, so unlike a bare
+# word it cannot be satisfied by something the tool always says.
+_COVERAGE_COUNTS = ("_omitted", "_reduced", "_suppressed", "_rejected", "_unchecked", "_not_covered")
+_COVERAGE_FLAGS = ("_read_whole", "_complete", "_settled")
+_COVERAGE_STATUSES = ("partial", "unavailable", "not_checked", "truncated")
+
+
+def _coverage_disclosures(complete, truncated):
+    """Every leaf that says, in the payload itself, that a read fell short."""
+    before, after = dict(_leaves(complete)), dict(_leaves(truncated))
+    disclosed = []
+    for path, now in after.items():
+        was = before.get(path)
+        leaf = path.rsplit(".", 1)[-1]
+        # Any SEGMENT, not only the last: a per-task shortfall lives under
+        # ``rows_omitted.<task_id>``, whose leaf is a task id.
+        counted = any(part.rstrip("[]").endswith(_COVERAGE_COUNTS) for part in path.split("."))
+        if counted and isinstance(now, int) and not isinstance(now, bool):
+            if now > (was if isinstance(was, int) and not isinstance(was, bool) else 0):
+                disclosed.append(path)
+        elif leaf.endswith(_COVERAGE_FLAGS) and now is False and was is not False:
+            disclosed.append(path)
+        elif isinstance(now, str) and now in _COVERAGE_STATUSES and now != was:
+            disclosed.append(path)
+    return disclosed
+
+
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
-@pytest.mark.parametrize("knob", _truncation_knobs())
-def test_truncating_any_read_never_manufactures_a_negative(airflow, tmp_path, tool, knob):
+@pytest.mark.parametrize("lever", sorted(_LEVERS))
+def test_truncating_any_read_never_manufactures_a_negative(airflow, tmp_path, monkeypatch, tool, lever):
     """N5a. Not one site is named: the sweep is the product of the tool registry
-    and the double's own truncation levers, so a tool or a read added later is
-    covered by existing."""
+    and every lever that shortens a read — the double's own ``*_total`` knobs,
+    which make the SOURCE account for more than it sent, AND the boundary's own
+    row-count bounds, which make THIS TOOL stop reading."""
     _sweep_world(airflow)
     complete = _SWEPT_TOOLS[tool]()
 
-    setattr(airflow, knob, 9_999)
+    _LEVERS[lever](airflow, monkeypatch)
     truncated = _SWEPT_TOOLS[tool]()
 
     assert _manufactured_negatives(complete, truncated) == []
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
-@pytest.mark.parametrize("knob", _truncation_knobs())
+@pytest.mark.parametrize("knob", _truncation_knobs()[0])
 def test_a_total_below_what_was_delivered_never_unsettles_a_claim(airflow, tmp_path, tool, knob):
     """N5b, the over-correction direction. A source that accounts for FEWER rows
     than it handed over has not truncated anything — the read is still complete,
@@ -9474,36 +9903,88 @@ def test_a_total_below_what_was_delivered_never_unsettles_a_claim(airflow, tmp_p
     assert _manufactured_negatives(complete, lied_to) == []
 
 
+@pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
+@pytest.mark.parametrize("bound", ["reading.RECOVERY_ATTEMPT_LIMIT", "reading.TASK_COMPARISON_LIMIT"])
+def test_this_tools_own_clamp_never_unsettles_a_claim_the_route_answered(
+    airflow, tmp_path, monkeypatch, tool, bound
+):
+    """N5b's other half, on the axis the sweep never had. A clamp this tool chose
+    is not a route that came back short: the rows it did not display were still
+    handed over, and refusing over its own display bound is a false refusal —
+    a permanent one, because re-planning reproduces it exactly."""
+    _sweep_world(airflow)
+    complete = _SWEPT_TOOLS[tool]()
+
+    _LEVERS[f"clamped:{bound}"](airflow, monkeypatch)
+    clamped = _SWEPT_TOOLS[tool]()
+
+    assert _manufactured_negatives(complete, clamped) == []
+
+
+# Phrases a tool may use to name a shortfall. Every one of them has to be a
+# phrase the COMPLETE read never produced — the test below asserts exactly that
+# — because the old vocabulary held bare words like ``omitted`` and ``partial``
+# that appear in untruncated answers, so four of nine tools could not fail N5c
+# however quietly they swallowed a short list.
 _TRUNCATION_VOCABULARY = (
     "not read whole",
+    "NOT read whole",
+    "were not scanned",
     "not seen",
-    "omitted",
-    "not established",
-    "truncated",
     "could have matched",
-    "was NOT",
-    "not_checked",
-    "partial",
+    "were read of",
+    "came back truncated",
+    "stopped at its own ceiling",
+    "may be missing",
+    "were omitted",
+    "not established by this diagnosis",
+    "more task instance(s)",
 )
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
-@pytest.mark.parametrize("knob", _truncation_knobs())
-def test_a_truncated_read_is_named_in_the_result(airflow, tmp_path, tool, knob):
+@pytest.mark.parametrize("lever", sorted(_LEVERS))
+def test_a_truncated_read_is_named_in_the_result(airflow, tmp_path, monkeypatch, tool, lever):
     """N5c. A tool that quietly answers over a short list is the whole defect;
-    the omission has to reach the reader."""
+    the omission has to reach the reader.
+
+    Whether the tool reached a short read is MEASURED — every reading that came
+    back short while it ran — rather than inferred from the two payloads
+    differing. And what counts as naming it has to be new: a route, a phrase or
+    a coverage leaf the complete answer did not already carry.
+    """
     _sweep_world(airflow)
-    before = _without_tokens(_SWEPT_TOOLS[tool]())
+    whole = _SWEPT_TOOLS[tool]()
+    before = _without_tokens(whole)
 
-    setattr(airflow, knob, 9_999)
-    after = _without_tokens(_SWEPT_TOOLS[tool]())
+    _LEVERS[lever](airflow, monkeypatch)
+    short_routes = _watching_readings(monkeypatch)
+    short = _SWEPT_TOOLS[tool]()
+    after = _without_tokens(short)
 
-    if before == after:
-        # This tool never reaches that read; nothing to name.
+    if not short_routes:
+        # Measured, not assumed: no read this tool made came back short, so
+        # there is no shortfall for it to name.
         return
-    routes = [value for name, value in vars(reading).items() if name.endswith("_ROUTE")]
-    named = any(route in after for route in routes) or any(word in after for word in _TRUNCATION_VOCABULARY)
-    assert named, f"{tool} changed under a truncated {knob} without naming the shortfall"
+    named = [route for route in set(short_routes) if route and route in after and route not in before]
+    named += [word for word in _TRUNCATION_VOCABULARY if word in after and word not in before]
+    named += _coverage_disclosures(whole, short)
+    assert named, (
+        f"{tool} reached a short read on {sorted(set(short_routes))} under {lever} "
+        f"and named no shortfall the whole read had not already named"
+    )
+
+
+def test_the_truncation_vocabulary_says_nothing_a_whole_read_says(airflow, tmp_path):
+    """A word that appears in an untruncated answer cannot witness a truncation.
+    ``omitted`` did — ``plan_task_instance_clear`` matched N5c on the request
+    flag ``{"sent": "omitted"}``, which describes no read at all."""
+    _sweep_world(airflow)
+
+    for tool, invoke in sorted(_SWEPT_TOOLS.items()):
+        whole = _without_tokens(invoke())
+        leaked = [word for word in _TRUNCATION_VOCABULARY if word in whole]
+        assert leaked == [], f"{tool} says {leaked} with every read whole"
 
 
 # ---------------------------------------------------------------------------
@@ -9512,28 +9993,65 @@ def test_a_truncated_read_is_named_in_the_result(airflow, tmp_path, tool, knob):
 
 
 def _absent_construction_sites():
-    """Every place in the tree that builds a Verdict carrying ABSENT."""
+    """Every place in the tree that could put ABSENT into a Verdict.
+
+    Guards the OUTCOME, not one call shape. The scan used to require a
+    ``Verdict(...)`` call carrying an ``Outcome.ABSENT`` attribute, inside a
+    ``def`` — so ``reading.Verdict(reading.Outcome("absent"))`` passed it, and so
+    did ``replace(verdict, outcome=Outcome.ABSENT)``, and so did any of them
+    written at module level. Every one of those is the same negative.
+    """
     sites = []
     for module in _MODULES:
-        for node in ast.walk(_module_source(module)):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                if not isinstance(inner, ast.Call):
-                    continue
-                func = inner.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                if name != "Verdict":
-                    continue
-                arguments = list(inner.args) + [kw.value for kw in inner.keywords]
-                if any(isinstance(a, ast.Attribute) and a.attr == "ABSENT" for a in arguments):
-                    sites.append((module, node.name))
+        for owner, node in _owned_nodes(_module_source(module)):
+            if isinstance(node, ast.Attribute) and node.attr == "ABSENT":
+                sites.append((module, owner))
+            elif isinstance(node, ast.Name) and node.id == "ABSENT":
+                sites.append((module, owner))
+            elif isinstance(node, ast.Constant) and node.value == "absent":
+                # ``Outcome("absent")`` reaches the same member by its value.
+                sites.append((module, owner))
     return sorted(set(sites))
 
 
 def test_absent_can_only_be_built_in_the_two_combinators():
-    """A negative that can be spelled anywhere is a negative nothing guards."""
-    assert _absent_construction_sites() == [("reading", "find"), ("reading", "none_match")]
+    """A negative that can be spelled anywhere is a negative nothing guards.
+
+    The three sites that are not constructions are the type saying what ABSENT
+    IS: the enum member at module level, and the two accessors on ``Verdict``
+    that read an outcome back out.
+    """
+    assert _absent_construction_sites() == [
+        ("reading", "<module>"),
+        ("reading", "as_field"),
+        ("reading", "find"),
+        ("reading", "is_absent"),
+        ("reading", "none_match"),
+    ]
+
+
+def _verdict_rebuilders():
+    """Every place that reshapes a Verdict rather than asking for one.
+
+    ``replace(verdict, outcome=...)`` is a second way to reach an outcome, and
+    the enum member does not have to be named at the call site for it to land
+    there — so the reshape itself is what is forbidden.
+    """
+    found = []
+    for module in _MODULES:
+        for owner, node in _owned_nodes(_module_source(module)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            if name != "replace":
+                continue
+            if any(keyword.arg == "outcome" for keyword in node.keywords):
+                found.append((module, owner, ast.unparse(node)))
+    return sorted(found)
+
+
+def test_no_verdict_is_rebuilt_with_a_different_outcome():
+    assert _verdict_rebuilders() == []
 
 
 @pytest.mark.parametrize("combinator", ["find", "none_match"])
@@ -9606,6 +10124,106 @@ def test_a_backfill_plan_that_cannot_show_every_run_is_not_offered(airflow):
 # ---------------------------------------------------------------------------
 # The write preconditions: one declared set, and the plan's members are a subset.
 # ---------------------------------------------------------------------------
+
+
+# One world per precondition, breaking exactly the fact that rule stands for.
+# The declaration ``asked_at`` used to be checked only against itself — every
+# rule declares ``gate``, so ``plan_time <= at_the_gate`` could not fail, and
+# flipping any rule's declaration in EITHER direction left the suite green. The
+# violations below are what make the declaration a claim about behaviour: each
+# one is applied to the live world and the plan and the gate are asked what they
+# do about it.
+def _violate_target_set_read_whole(fake):
+    fake.clear_total = 9_999
+
+
+def _violate_target_set_matches_approval(fake):
+    fake.tis_by_run["manual__1"].append(
+        {"task_id": "report", "state": "failed", "map_index": 0, "try_number": 1}
+    )
+
+
+def _violate_target_not_in_flight(fake):
+    for ti in fake.tis_by_run["manual__1"]:
+        if ti["task_id"] == "summarize":
+            ti["state"] = "queued"
+
+
+def _violate_target_attempt_not_moved(fake):
+    for ti in fake.tis_by_run["manual__1"]:
+        if ti["task_id"] == "summarize":
+            ti["try_number"] = (ti.get("try_number") or 0) + 5
+
+
+def _violate_run_and_task_lists_read_whole(fake):
+    fake.tasks_total = 9_999
+
+
+def _violate_task_set_unchanged(fake):
+    fake.tasks = [*fake.tasks, {"task_id": "brand_new", "downstream_task_ids": []}]
+
+
+def _violate_no_newly_expandable_task(fake):
+    fake.needs_expansion = {"summarize"}
+
+
+def _violate_closure_expandability_settled(fake):
+    fake.fail_list_mapped = _http_status_error(500)
+
+
+def _violate_target_attempt_history_read_whole(fake):
+    fake.tries_by_task[("summarize", -1)] = [{"try_number": n, "state": "failed"} for n in range(3)]
+    fake.tries_total = 9_999
+
+
+_RULE_VIOLATIONS = {
+    "target_set_read_whole": _violate_target_set_read_whole,
+    "target_set_matches_approval": _violate_target_set_matches_approval,
+    "target_not_in_flight": _violate_target_not_in_flight,
+    "target_attempt_not_moved": _violate_target_attempt_not_moved,
+    "run_and_task_lists_read_whole": _violate_run_and_task_lists_read_whole,
+    "task_set_unchanged": _violate_task_set_unchanged,
+    "no_newly_expandable_task": _violate_no_newly_expandable_task,
+    "closure_expandability_settled": _violate_closure_expandability_settled,
+    "target_attempt_history_read_whole": _violate_target_attempt_history_read_whole,
+}
+
+
+def test_every_declared_precondition_has_a_world_that_breaks_it():
+    """A rule with no violation case is a rule nothing below can ask about."""
+    assert set(_RULE_VIOLATIONS) == {rule.id for rule in recovery._WRITE_PRECONDITIONS}
+
+
+@pytest.mark.parametrize("rule_id", sorted(_RULE_VIOLATIONS))
+def test_the_gate_refuses_on_every_declared_precondition(cleared_run, rule_id):
+    """Each rule's own check is what produces its refusal — proven by breaking
+    the fact and reading back which precondition named itself. The old test
+    asserted only that the registry had been iterated, and passed with every
+    check replaced by ``lambda ctx: None``."""
+    plan = _gate_plan(cleared_run)
+    _RULE_VIOLATIONS[rule_id](cleared_run)
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is False
+    assert result["refused_precondition"] == rule_id
+    assert _writes(cleared_run) == []
+
+
+@pytest.mark.parametrize("rule_id", sorted(_RULE_VIOLATIONS))
+def test_a_rule_declared_at_plan_time_is_one_the_plan_actually_refuses_on(cleared_run, rule_id):
+    """``asked_at`` is derived on one side from what the plan DOES: break the
+    fact before planning and see whether a token comes back."""
+    declared = {rule.id: rule for rule in recovery._WRITE_PRECONDITIONS}[rule_id]
+    _RULE_VIOLATIONS[rule_id](cleared_run)
+
+    plan = _gate_plan(cleared_run)
+
+    refused = "plan_token" not in plan
+    assert refused is ("plan" in declared.asked_at), (
+        f"{rule_id} declares {sorted(declared.asked_at)} and the plan "
+        f"{'refused' if refused else 'issued a token'}"
+    )
 
 
 def test_the_gate_re_asks_every_rule_the_plan_refused_on():
@@ -9757,7 +10375,9 @@ def test_d6_a_comparison_that_reached_five_task_ids_says_so(airflow, monkeypatch
 
     assert comparison["task_ids_omitted"] == 1
     assert rows.complete is False
-    assert diagnosis._contrast_clause(["manual__1"], rows, "manual__1", None, {}) == "" or True
+    # No contrast is drawn over a comparison that did not reach every task id:
+    # the clause is the one that says "this task was the only one like it".
+    assert diagnosis._contrast_clause(["manual__1"], rows, "manual__1", None, {}) == ""
     unreached = reading.comparison_rows(comparison, "summarize")
     assert unreached.read_failed is True
 
@@ -9944,7 +10564,9 @@ def test_a_filtered_reading_is_short_by_what_it_dropped():
 def test_every_reading_producer_in_the_boundary_is_covered_by_that_shape_table():
     """The table above is one function; this is what makes it stand for all of them."""
     producers = _reading_constructors()
-    assert "read_of" not in producers or True
+    # The single constructor every reader goes through is itself a producer, so
+    # the shape table above really is asserted over the one they all share.
+    assert "read_of" in producers
     assert len(producers) >= 10, producers
     for _, name in _typed_readers():
         assert name in producers, f"{name} is annotated as returning a Reading but never builds one"
@@ -9978,8 +10600,23 @@ def _absence_consumers():
 def test_there_are_absence_consumers_and_all_of_them_are_in_the_registry():
     consumers = _absence_consumers()
     assert len(consumers) >= 8, consumers
-    # Nothing outside these modules may ask the question at all.
-    assert {module for module, _ in consumers} <= set(_MODULES)
+    # Nothing outside these modules may ask the question at all. Asserted over
+    # EVERY file in the package, not over the modules the scan already walks —
+    # that comparison could not fail, because the consumers were derived from
+    # exactly the set they were compared against.
+    here = Path(__file__).parent
+    asking = {
+        path.stem
+        for path in here.glob("*.py")
+        if not path.stem.startswith("test_")
+        and any(
+            isinstance(node, ast.Call)
+            and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", ""))
+            in ("find", "none_match", "all_of")
+            for node in ast.walk(ast.parse(path.read_text()))
+        )
+    }
+    assert asking <= set(_MODULES), f"a file outside the swept package asks an absence question: {asking}"
 
 
 def test_no_consumer_uses_a_verdict_as_a_boolean():
@@ -10058,39 +10695,91 @@ def test_the_code_write_re_asks_the_task_graph_it_planned_against(airflow, tmp_p
     assert (tmp_path / "sales_summary.py").read_text() == SOURCE
 
 
+# The words a row count is spelled with, and the words the number it is measured
+# against is spelled with. Deliberately wide on both sides: the scan used to
+# want ``>=``-family operators AND one of five nouns, so ``len(rows) ==
+# body.get("total_entries")`` was structurally excluded, ``len(rows) >=
+# expected`` carried no magic word, and both are a second derivation.
+_COUNT_WORDS = ("len(", ".kept", "_delivered", ".rows", "scanned", "count(")
+_CLAIM_WORDS = (
+    "total",
+    "_claimed",
+    "universe",
+    "recorded",
+    "omitted",
+    "expected",
+    "claimed",
+    "LIMIT",
+    "SCAN",
+    "MAX_",
+    "_PAGE",
+)
+
+
 def _completeness_comparisons():
-    """Every place in the tree that compares a count against a claimed total.
+    """Every place in the tree that measures a count against a bound or a total.
 
     The census that started this: nine sites in four mutually incompatible
     forms, of which one was correct. The target is one site and one form, and
-    the scan is what keeps it there when the tenth is written.
+    the scan is what keeps it there when the tenth is written — in whatever
+    shape the tenth is written in.
     """
     found = []
     for module in _MODULES:
-        for node in ast.walk(_module_source(module)):
+        for _, node in _owned_nodes(_module_source(module)):
             if not isinstance(node, ast.Compare):
                 continue
             text = ast.unparse(node)
-            counted = "len(" in text or ".kept" in text or "_delivered" in text
-            claimed = any(word in text for word in ("total", "_claimed", "universe", "recorded", "omitted"))
-            if (
-                counted
-                and claimed
-                and any(isinstance(op, (ast.GtE, ast.Gt, ast.LtE, ast.Lt)) for op in node.ops)
-            ):
+            if any(word in text for word in _COUNT_WORDS) and any(word in text for word in _CLAIM_WORDS):
                 found.append((module, text))
     return found
 
 
+def _completeness_by_truthiness():
+    """A Reading's own numbers used as a truth value, which no Compare holds.
+
+    ``if not scan.omitted:`` is a completeness derivation that the comparison
+    scan cannot see at all, because there is nothing being compared.
+    """
+    found = []
+    for module in _MODULES:
+        for owner, node in _owned_nodes(_module_source(module)):
+            tests = []
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                tests.append(node.operand)
+            elif isinstance(node, ast.BoolOp):
+                tests += node.values
+            for test in tests:
+                # ``not scan.omitted`` IS "the read was whole", spelled so that
+                # neither the comparison scan nor the type ever sees it. The
+                # positive form is a disclosure guard and claims nothing.
+                if isinstance(test, ast.Attribute) and test.attr == "omitted":
+                    found.append((module, owner, ast.unparse(test)))
+    return sorted(set(found))
+
+
 # The same arithmetic, doing a different job: these decide when a PAGINATION
-# LOOP stops and what to record as its exhaustion evidence. They feed a Reading
-# rather than standing in for one, and neither of them answers "may an absence
+# LOOP stops and what to record as its exhaustion evidence, or apply a display
+# clamp whose result is fed back through the one derivation. They feed a Reading
+# rather than standing in for one, and none of them answers "may an absence
 # be concluded here" — the property does that, once, for all of them.
 _PAGINATION_TERMINATIONS = {
     ("reading", "len(tis) >= min(total, TASK_INSTANCE_SCAN_LIMIT)"),
     ("reading", "len(tis) >= total"),
     ("evidence", "len(fetched) >= min(total, reading.EVENT_SCAN_LIMIT)"),
     ("evidence", "len(fetched) >= total"),
+}
+
+# Bounds that decide what to SHOW or whether to offer a plan at all. None of
+# them decides whether an absence may be concluded; each one either feeds a
+# Reading or refuses outright, and the numbers they compare are this server's
+# own display ceilings rather than a route's account of its rows.
+_DISPLAY_CEILINGS = {
+    ("codechange", "len(entries) > reading.MAX_BACKFILL_RUNS"),
+    ("evidence", "len(value) > EXTRA_LIST_LIMIT"),
+    # Inside the type, choosing which sentence describes the shortfall it has
+    # already derived.
+    ("reading", "claimed > self._delivered"),
 }
 
 _THE_ONE_DERIVATION = ("reading", "self.kept >= self.universe")
@@ -10101,7 +10790,12 @@ def test_completeness_is_derived_in_exactly_one_place():
     sites = set(_completeness_comparisons())
 
     assert _THE_ONE_DERIVATION in sites
-    unaccounted = sites - _PAGINATION_TERMINATIONS - {_THE_ONE_DERIVATION}
+    unaccounted = sites - _PAGINATION_TERMINATIONS - _DISPLAY_CEILINGS - {_THE_ONE_DERIVATION}
     assert unaccounted == set(), f"a second completeness derivation appeared: {sorted(unaccounted)}"
     # A declared exception may not outlive the loop it excused.
-    assert sites >= _PAGINATION_TERMINATIONS
+    assert sites >= _PAGINATION_TERMINATIONS | _DISPLAY_CEILINGS
+
+
+def test_no_completeness_is_derived_from_a_readings_numbers_being_truthy():
+    """``not scan.omitted`` is the same claim with no comparison in it."""
+    assert _completeness_by_truthiness() == []
