@@ -10057,14 +10057,17 @@ def _planned_code_change():
 
 
 def _planned_clear():
+    # A plan that REFUSES is the honest outcome under several levers, and the
+    # apply is still driven after one: what it answers over a spent-or-absent
+    # approval is exactly the card this sweep is about.
     plan = server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
     return server.apply_task_instance_clear(
         DAG_ID,
-        plan["dag_run_id"],
-        plan["task_ids"],
+        plan.get("dag_run_id") or "manual__1",
+        plan.get("task_ids") or ["report"],
         plan.get("plan_token", ""),
         only_failed=False,
-        reviewed_instances=plan["blast_radius"]["instances"],
+        reviewed_instances=(plan.get("blast_radius") or {}).get("instances"),
     )
 
 
@@ -10470,6 +10473,47 @@ def test_truncating_any_read_never_manufactures_a_negative(airflow, tmp_path, mo
     _LEVERS[lever](airflow, monkeypatch)
     truncated = _SWEPT_TOOLS[tool]()
 
+    assert _manufactured_negatives(complete, truncated) == []
+
+
+def _answer_on_a_fresh_world(root, monkeypatch, tool, lever):
+    """One tool's answer over a world nothing has written to yet.
+
+    The writing tools MUTATE the double — a clear that landed, a backfill that
+    was created — so calling one twice on the same double compares two answers
+    that differ for a reason which is not the lever. Each answer gets its own
+    world, which is what lets the write tools into the sweep at all.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sales_summary.py").write_text(SOURCE)
+    fake = FakeAirflow()
+    fake.dags_dir = root
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_api", fake)
+        patch.setattr(dagsource, "DAGS_DIR", root)
+        patch.setattr(dagsource, "REPARSE_TIMEOUT_S", 2.0)
+        server._issued_tokens.clear()
+        server._approved_clear_sets.clear()
+        _sweep_world(fake)
+        if lever is not None:
+            _LEVERS[lever](fake, patch)
+        return _ALL_TOOLS[tool]()
+
+
+@pytest.mark.parametrize("tool", sorted(set(_WRITE_REFUSALS) | _DELIBERATELY_UNGATED_TOOLS))
+@pytest.mark.parametrize("lever", sorted(_LEVERS))
+def test_a_write_tools_answer_never_manufactures_a_claim_under_a_shorter_read(
+    tmp_path, monkeypatch, tool, lever
+):
+    """The write tools were outside the VALUE sweep entirely — excused on the
+    grounds that what a truncated read must do to them is refuse. It is, but the
+    card they hand back after a write that DID land is read by an operator, and
+    nothing checked what a shorter read does to it. Both regressions the first
+    repair round introduced live on exactly that card."""
+    complete = _answer_on_a_fresh_world(tmp_path / "whole", monkeypatch, tool, None)
+    truncated = _answer_on_a_fresh_world(tmp_path / "short", monkeypatch, tool, lever)
+
+    assert _manufactured_positives(complete, truncated) == []
     assert _manufactured_negatives(complete, truncated) == []
 
 
