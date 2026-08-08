@@ -35,6 +35,7 @@ if "fastmcp" not in sys.modules:
     _stub.FastMCP = lambda *args, **kwargs: types.SimpleNamespace(tool=lambda fn: fn)  # type: ignore[attr-defined]
     sys.modules["fastmcp"] = _stub
 
+import approvals
 import server
 import transport
 
@@ -3279,7 +3280,7 @@ def test_run_backfill_matches_the_same_instant_across_timezones(airflow):
 
 def test_expired_tokens_are_not_redeemable(airflow, monkeypatch):
     token = server._issue_token("backfill", {"dag_id": DAG_ID})
-    monkeypatch.setattr(server, "_TOKEN_TTL_S", -1.0)
+    monkeypatch.setattr(approvals, "_TOKEN_TTL_S", -1.0)
 
     assert server._redeem_token("backfill", token) is None
 
