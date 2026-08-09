@@ -36,6 +36,17 @@
 
 # Phase B — READ / COMPLETENESS INVENTORY
 
+> ⚠️ **SUPERSEDED (2026-08-09) as a description of the surface; kept as the record of the audit.**
+> This inventory was taken against the pre-extraction monolith at `b933d63ec3`, where `server.py`
+> was one 7122-line file registering **14** MCP tools. Neither is true now: the product is split
+> across thirteen modules, and five tools (`plan_task_instance_clear`, `apply_task_instance_clear`,
+> `verify_task_instance_recovery`, `plan_backfill`, `run_backfill`) were **withdrawn** from the
+> registered surface because broad automatic discovery and clearing of arbitrary historical task
+> instances is out of scope and uncertified — **ten** tools remain. Every `server.py:NNNN` line
+> reference below is against the monolith and does not resolve in the current tree. What survives
+> is the *finding*: which reads are bounded, where completeness is calculated, and the four
+> known-open defects it located.
+
 **Analysis only.** Nothing in the repo was moved, edited, renamed, split or deleted.
 No `Reading` abstraction was implemented. No extraction was begun.
 
