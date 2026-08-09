@@ -688,15 +688,27 @@ const UNPAUSE_EFFECT: WriteEffect = {
   title: "Re-run and resume this Dag's schedule",
 };
 
-/** A write tool this build has never heard of: warn, do not guess the effect. */
-const buildUnknownEffect = (tool: string): WriteEffect => ({
+/**
+ * A confirmation naming a tool this build does not have.
+ *
+ * The server only ever suspends a registered write tool, so a card can only
+ * reach this by being restored from an older session's `sessionStorage`
+ * transcript — including one recorded when the withdrawn recovery surface was
+ * still offered.  Nothing here may name the tool: `humanizeToolName` invents a
+ * plausible title for any string, and printing "Run backfill · Runs
+ * run_backfill against your Airflow" advertises a capability this build does
+ * not have, on evidence that is only a stale transcript.  The card says what it
+ * is and nothing about what it would do, and offers no way to approve it: the
+ * nonce belongs to a suspension no longer held anywhere.
+ */
+const UNRECOGNISED_EFFECT: WriteEffect = {
   approve: "Approve",
-  badge: "Makes a lasting change",
+  badge: "Not available on this build",
   proposed: "Proposed change",
   summary: () =>
-    `Runs ${tool} against your Airflow. This build cannot describe its effect, so read the technical details before approving — the change will last.`,
-  title: humanizeToolName(tool),
-});
+    "This approval came from an older session and cannot be acted on here. Ask again if you still want the change.",
+  title: "Unrecognised approval",
+};
 
 const describeDag = (args: Record<string, unknown>): string =>
   typeof args.dag_id === "string" && args.dag_id ? `\`${args.dag_id}\`` : "the named Dag";
@@ -775,8 +787,12 @@ export const buildWriteEffect = (confirm: ConfirmRequest): WriteEffect => {
   if (confirm.tool === "rerun_dag" && parseArgs(confirm.args).unpause === true) {
     return UNPAUSE_EFFECT;
   }
-  return WRITE_EFFECTS[confirm.tool] ?? buildUnknownEffect(confirm.tool);
+  return WRITE_EFFECTS[confirm.tool] ?? UNRECOGNISED_EFFECT;
 };
+
+/** Whether any action in this batch is one this build cannot describe or run. */
+export const isUnrecognisedConfirm = (confirms: ConfirmRequest[]): boolean =>
+  confirms.some((confirm) => buildWriteEffect(confirm) === UNRECOGNISED_EFFECT);
 
 /**
  * Write tools the server refuses to run without an explicit go-ahead.
@@ -798,6 +814,9 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, isStreaming, onDecide, 
   if (first === undefined) return undefined;
   const batch = confirms.length > 1;
   const effect = buildWriteEffect(first);
+  // "Cannot be acted on here" over an Approve button is a contradiction the
+  // audience would read as a live capability. Only the dismissal is offered.
+  const unrecognised = isUnrecognisedConfirm(confirms);
   const states = confirms.map((confirm) => buildConfirmState(confirm, findTool(tools, confirm), isStreaming));
 
   if (first.resolution !== undefined) {
@@ -847,11 +866,13 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, isStreaming, onDecide, 
         <ConfirmDetail key={confirm.callId} confirm={confirm} isDark={isDark} nested={batch} />
       ))}
       <Flex gap={2} mt={2} wrap="wrap">
-        <ConfirmButton onClick={() => decide(true)} disabled={!onDecide} large primary>
-          {batch ? "Approve all" : effect.approve}
-        </ConfirmButton>
-        <ConfirmButton onClick={() => decide(false)} disabled={!onDecide} large>
-          {batch ? "Reject all" : "Reject"}
+        {!unrecognised && (
+          <ConfirmButton onClick={() => decide(true)} disabled={!onDecide} large primary>
+            {batch ? "Approve all" : effect.approve}
+          </ConfirmButton>
+        )}
+        <ConfirmButton onClick={() => decide(false)} disabled={!onDecide} large primary={unrecognised}>
+          {unrecognised ? "Dismiss" : batch ? "Reject all" : "Reject"}
         </ConfirmButton>
       </Flex>
     </Box>
@@ -1437,7 +1458,7 @@ const CodeControl: FC<CodeControlProps> = ({
  * `humanizeToolName` invents a label for any name — so the server refuses to
  * emit a frame for an unregistered tool at all.
  */
-const TOOL_LABELS: Record<string, { running: string; done: string }> = {
+const TOOL_LABELS: Record<string, { running: string; done: string; absent?: string }> = {
   apply_dag_code_changes: { done: "Edited Dag code", running: "Editing Dag code" },
   compare_dag_runs: { done: "Compared Dag runs", running: "Comparing Dag runs" },
   diagnose_dag: { done: "Diagnosed Dag", running: "Diagnosing Dag" },
@@ -1449,9 +1470,11 @@ const TOOL_LABELS: Record<string, { running: string; done: string }> = {
   revert_dag_code: { done: "Reverted Dag code", running: "Reverting Dag code" },
   // `done` is only ever reached on `occurred: true`, and even that is Airflow's
   // own record of the task's output — `external_system_checked` is always false,
-  // so neither label may say the external operation happened.  `false` and
-  // `null` arrive flagged unsettled and never reach either of these.
+  // so no label here may say the external operation happened.  `null` arrives
+  // flagged unsettled and reaches none of these; `false` takes `absent`, which
+  // says the record is missing and pointedly not that the work is.
   verify_replacement_run: {
+    absent: "Read the run's record — it recorded no output",
     done: "Verified the run recorded its output",
     running: "Checking what the run recorded",
   },
@@ -1472,6 +1495,11 @@ export const buildToolLabel = (tool: ToolCall): string => {
   }
   if (status === "unsettled") {
     return `${humanizeToolName(tool.name)} — outcome unknown`;
+  }
+  // Settled and negative. "Outcome unknown" understates a whole read of a
+  // finished run as badly as a green check overstates it.
+  if (status === "absent") {
+    return TOOL_LABELS[tool.name]?.absent ?? `${humanizeToolName(tool.name)} — nothing recorded`;
   }
   // A refusal is the guardrail working, not the system breaking. The scripted
   // stale-version refusal says "Nothing was created" in the payload while the
@@ -1531,7 +1559,16 @@ const CrossIcon: FC = () => (
   </svg>
 );
 
+/** "Read whole, and empty" — deliberately neither a tick, a cross nor a warning. */
+const EmptyRecordIcon: FC = () => (
+  <svg fill="none" height="14" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" width="14">
+    <circle cx="12" cy="12" r="9" />
+    <path d="M8 12h8" strokeLinecap="round" />
+  </svg>
+);
+
 type ToolStatus =
+  | "absent"
   | "awaiting"
   | "cancelled"
   | "denied"
@@ -1557,6 +1594,9 @@ export const buildToolStatus = (tool: ToolCall): ToolStatus => {
   // the tool result and sends `unsettled` on the frame — so nothing here has to
   // re-derive it by pattern-matching text that storage clips.
   if (tool.unsettled === true) return "unsettled";
+  // Settled the other way: the read was whole and the record is not there. It
+  // outranks nothing above it — those all say the call never got that far.
+  if (tool.absent === true) return "absent";
   if (tool.durationMs === undefined) return tool.proposed === true ? "proposed" : "running";
   // Before `failed`, and for the same reason: the tool reported back and said it
   // changed nothing.  The server sets this from the tool's own outcome key and
@@ -1576,6 +1616,9 @@ const ToolStatusIcon: FC<{ readonly status: ToolStatus }> = ({ status }) => {
     return <Spinner size="xs" color="brand.500" flexShrink={0} />;
   }
   const palette: Record<Exclude<ToolStatus, "running">, { color: string; icon: ReactNode }> = {
+    // Blue, not grey: grey is where "it never happened" lives on this row, and
+    // an absent RECORD is the one reading this result must never invite.
+    absent: { color: isDark ? "blue.300" : "blue.700", icon: <EmptyRecordIcon /> },
     awaiting: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
     cancelled: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
     denied: { color: isDark ? "gray.400" : "gray.600", icon: <CrossIcon /> },
@@ -1625,7 +1668,12 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
   const failed = status === "failed";
   // Only a call that reported back has a duration worth quoting, or anything
   // to expand.
-  const reported = status === "denied" || status === "done" || status === "refused" || failed;
+  const reported =
+    status === "absent" ||
+    status === "denied" ||
+    status === "done" ||
+    status === "refused" ||
+    failed;
   const expandable = reported && (tool.result !== undefined || failed);
   const muted = isDark ? "gray.400" : "gray.600";
 

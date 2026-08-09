@@ -196,6 +196,30 @@ describe("buildConfirmState", () => {
     ).toBe("Approved — refused, nothing was changed");
   });
 
+  it("separates a verification that read nothing from one that read no record", () => {
+    // `occurred: null` is UNKNOWN; `occurred: false` is a complete read of a
+    // finished run that holds no such record. Rendering both amber "outcome
+    // unknown" understates the settled one as badly as green overstates it.
+    const unknown = tool({ name: "verify_replacement_run", unsettled: true });
+    const absent = tool({ absent: true, name: "verify_replacement_run" });
+
+    expect(buildToolStatus(unknown)).toBe("unsettled");
+    expect(buildToolLabel(unknown)).toBe("Verify replacement run — outcome unknown");
+    expect(buildToolStatus(absent)).toBe("absent");
+    expect(buildToolLabel(absent)).toBe("Read the run's record — it recorded no output");
+  });
+
+  it("keeps an absent record off both the green and the unknown row", () => {
+    const absent = tool({ absent: true, name: "verify_replacement_run" });
+
+    expect(buildToolLabel(absent)).not.toBe("Verified the run recorded its output");
+    expect(buildToolLabel(absent)).not.toMatch(/outcome unknown/u);
+    // A tool with no `absent` label of its own still must not go green.
+    expect(buildToolLabel(tool({ absent: true, name: "some_future_check" }))).toBe(
+      "Some future check — nothing recorded",
+    );
+  });
+
   it("keeps a refusal red on a bundle that predates the flag", () => {
     // `failed` stays on the frame beside `refused`, so an older deployed bundle
     // degrades to the red row rather than to a green check.
@@ -765,40 +789,45 @@ describe("MessageList", () => {
     expect(screen.queryByText("-a")).toBeNull();
   });
 
-  it.each(["apply_task_instance_clear", "run_backfill", "plan_task_instance_clear"])(
-    "describes no withdrawn capability for %s, however the card arrives",
-    (tool) => {
-      // A stale sessionStorage transcript from a build that still offered these
-      // can hand the drawer a confirm naming one. It must not come back with
-      // the withdrawn card's own wording; the unknown-effect warning is the
-      // only thing this build is entitled to say about it.
-      show(
-        <MessageList
-          messages={[
-            assistant({
-              confirms: [
-                {
-                  args: {
-                    dag_id: "sales_summary",
-                    dag_run_id: "manual__2026-08-02",
-                    task_ids: ["report"],
-                  },
-                  callId: "c1",
-                  nonce: "n1",
-                  tool,
-                },
-              ],
-            }),
-          ]}
-        />,
-      );
+  it.each([
+    ["apply_task_instance_clear", "Apply task instance clear"],
+    ["run_backfill", "Run backfill"],
+    ["plan_task_instance_clear", "Plan task instance clear"],
+  ])("names no withdrawn capability for %s, however the card arrives", (tool, invented) => {
+    // A stale sessionStorage transcript from a build that still offered these
+    // can hand the drawer a confirm naming one. The server allowlist cannot
+    // reach a card the browser restored, and `humanizeToolName` invents a title
+    // for any string — so "Run backfill · Runs run_backfill against your
+    // Airflow" rendered a withdrawn capability as this build's own.
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: { dag_id: "sales_summary", dag_run_id: "manual__2026-08-02", task_ids: ["report"] },
+                callId: "c1",
+                nonce: "n1",
+                tool,
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
 
-      expect(screen.queryByText("Clear a task instance in an existing run")).toBeNull();
-      expect(screen.queryByText("Run the reviewed backfill")).toBeNull();
-      expect(screen.getByText("Makes a lasting change")).not.toBeNull();
-      expect(screen.getByText(new RegExp(`Runs ${tool} against your Airflow`, "u"))).not.toBeNull();
-    },
-  );
+    expect(screen.queryByText("Clear a task instance in an existing run")).toBeNull();
+    expect(screen.queryByText("Run the reviewed backfill")).toBeNull();
+    // Neither the raw name nor a title invented from it reaches the card.
+    expect(screen.queryByText(new RegExp(tool, "u"))).toBeNull();
+    expect(screen.queryByText(invented)).toBeNull();
+    expect(screen.getByText("Unrecognised approval")).not.toBeNull();
+    expect(screen.getByText("Not available on this build")).not.toBeNull();
+    expect(screen.getByText(/came from an older session and cannot be acted on here/u)).not.toBeNull();
+    // Nothing to approve: the suspension this nonce names is not held anywhere.
+    expect(screen.queryByText("Approve")).toBeNull();
+    expect(screen.getByText("Dismiss")).not.toBeNull();
+  });
 
   it("offers a copy control on fenced code blocks", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -1047,7 +1076,9 @@ describe("MessageList", () => {
     expect(screen.getByText(approve)).not.toBeNull();
   });
 
-  it("warns rather than guessing when the write tool is unknown to this build", () => {
+  it("says nothing about a write tool unknown to this build, and offers no way to run it", () => {
+    // The server suspends only registered write tools, so an unknown name here
+    // is a card restored from an older session — not a capability on offer.
     show(
       <MessageList
         messages={[
@@ -1058,9 +1089,12 @@ describe("MessageList", () => {
       />,
     );
 
-    expect(screen.getByText("Makes a lasting change")).not.toBeNull();
-    expect(screen.getByText(/cannot describe its effect/u)).not.toBeNull();
-    expect(screen.getByText("Approve")).not.toBeNull();
+    expect(screen.getByText("Unrecognised approval")).not.toBeNull();
+    expect(screen.getByText(/came from an older session and cannot be acted on here/u)).not.toBeNull();
+    expect(screen.queryByText(/delete_everything/u)).toBeNull();
+    expect(screen.queryByText("Delete everything")).toBeNull();
+    expect(screen.queryByText("Approve")).toBeNull();
+    expect(screen.getByText("Dismiss")).not.toBeNull();
   });
 
   describe("following the stream", () => {
