@@ -6979,6 +6979,128 @@ def test_run_scoped_events_are_capped_and_the_remainder_counted(airflow):
     assert history["run_scoped_events"][0]["recorded_principal"] == "admin"
 
 
+# A row with no task_id is about the RUN, and it is the shape a clear against a
+# whole run writes. The two rows below are the only distinction the leaves under
+# test make, so the cases differ by scan coverage and by nothing else.
+_TASK_SCOPED_ROW = SUCCESS_EVENT
+_RUN_SCOPED_ROW = _event(event_log_id=912)
+
+
+@pytest.mark.parametrize(
+    ("rows", "claimed", "status", "any_run_scoped", "shown", "omitted"),
+    [
+        ([], None, "checked", False, 0, 0),
+        ([], 12, "partial", None, 0, None),
+        ([_TASK_SCOPED_ROW], 12, "partial", None, 0, None),
+        ([_RUN_SCOPED_ROW], 12, "partial", True, 1, None),
+        ([_TASK_SCOPED_ROW, _RUN_SCOPED_ROW], None, "checked", True, 1, 0),
+        ([_TASK_SCOPED_ROW], None, "checked", False, 0, 0),
+        ([{**_TASK_SCOPED_ROW, "dag_id": "another_dag"}, _TASK_SCOPED_ROW], None, "partial", None, 0, None),
+        ([_TASK_SCOPED_ROW, _RUN_SCOPED_ROW], 0, "checked", True, 1, 0),
+    ],
+    ids=[
+        "0-of-0-empty-and-whole",
+        "0-of-N",
+        "1-of-N-task-scoped",
+        "1-of-N-run-scoped",
+        "N-of-N-present",
+        "N-of-N-absent",
+        "filtered",
+        "claimed-below-delivered",
+    ],
+)
+def test_only_a_whole_event_scan_answers_whether_this_run_has_a_run_scoped_event(
+    airflow, rows, claimed, status, any_run_scoped, shown, omitted
+):
+    """The rows the scan reached settle a PRESENCE and nothing else.
+
+    An absence among them is an absence only when the scan covered its whole
+    universe — which a route accounting for more, and a row this reading
+    discarded, both take away. A count of what was left out is the same claim in
+    arithmetic, so it is a number only where the verdict is one. A source that
+    accounts for FEWER rows than it sent has truncated nothing, so it unsettles
+    neither.
+    """
+    airflow.event_logs_total = claimed
+
+    history = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+
+    assert history["status"] == status
+    assert history["any_run_scoped_event"] is any_run_scoped
+    assert len(history["run_scoped_events"]) == shown
+    assert history["run_scoped_events_omitted"] == omitted
+
+
+def test_a_scan_that_stopped_at_its_own_ceiling_claims_no_run_scoped_absence(airflow, monkeypatch):
+    """The reproduction: twelve rows, the run-scoped one not on the first page.
+
+    The whole arm and the capped arm read the same twelve rows; the only thing
+    that changed is how many of them the scan was allowed to fetch. That may
+    take the answer away, and it may not turn it into an absence.
+    """
+    rows = [{**_TASK_SCOPED_ROW, "event_log_id": index} for index in range(11)] + [_RUN_SCOPED_ROW]
+
+    whole = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 2)
+    monkeypatch.setattr(reading, "EVENT_SCAN_LIMIT", 2)
+    capped = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+
+    assert (whole["status"], whole["events_scanned"], whole["events_omitted"]) == ("checked", 12, 0)
+    assert whole["any_run_scoped_event"] is True
+    assert whole["run_scoped_events_omitted"] == 0
+
+    assert (capped["status"], capped["events_scanned"], capped["events_omitted"]) == ("partial", 2, 10)
+    assert capped["total_entries"] == 12
+    assert capped["run_scoped_events"] == []
+    assert capped["any_run_scoped_event"] is None
+    assert capped["run_scoped_events_omitted"] is None
+
+
+@pytest.mark.parametrize(
+    ("claimed", "status", "expected"),
+    [(None, "checked", False), (12, "partial", None)],
+    ids=["whole", "partial"],
+)
+def test_only_a_whole_event_scan_rules_out_a_clear_that_swept_in_more_instances(
+    airflow, claimed, status, expected
+):
+    """The neighbouring leaf, computed over the same rows and read the same way.
+
+    ``False`` here is what withholds U15 from every instance that has no row of
+    its own, so a clear sitting on an unfetched page would have taken the caveat
+    with it.
+    """
+    airflow.event_logs_total = claimed
+
+    history = _audited_run(airflow, EXECUTED_TI, events=[_TASK_SCOPED_ROW])["event_history"]
+
+    assert history["status"] == status
+    assert history["clear_with_include_flags"] is expected
+
+
+@pytest.mark.parametrize(
+    ("audit_scope", "failure", "status"),
+    [
+        ("denied", None, "not_permitted"),
+        ("", None, "not_scoped"),
+        ("granted", httpx.ConnectError("no route to host"), "unavailable"),
+    ],
+    ids=["denied", "unscoped", "unavailable"],
+)
+def test_a_read_that_never_happened_settles_none_of_the_run_scoped_questions(
+    airflow, audit_scope, failure, status
+):
+    """A refused, unscoped or failed read is the limit case of a partial one."""
+    airflow.fail_event_logs = failure
+
+    history = _green_run(airflow, EXECUTED_TI, audit_scope=audit_scope)["event_history"]
+
+    assert history["status"] == status
+    assert history["any_run_scoped_event"] is None
+    assert history["clear_with_include_flags"] is None
+    assert history["run_scoped_events_omitted"] is None
+
+
 def test_instances_outside_the_detailed_projection_are_counted_not_guessed_at(airflow, monkeypatch):
     monkeypatch.setattr(evidence, "TASK_INSTANCE_DETAIL_LIMIT", 1)
     crowd = [_executed(f"t{index}") for index in range(4)]
@@ -11318,6 +11440,13 @@ _SAMPLED_ENUMERATIONS = {
         "$.instances_not_located",
         "$.instances_omitted",
     ),
+    # The run-scoped rows of the event scan, which fall short of the run's own in
+    # exactly two ways and name both: the rows the scan never reached, and the
+    # rows past the display cap.
+    "$.event_history.run_scoped_events": (
+        "$.event_history.events_omitted",
+        "$.event_history.run_scoped_events_omitted",
+    ),
 }
 
 
@@ -11805,19 +11934,12 @@ _LEVERS_THAT_MOVE_NOTHING = {
     # NOT un-exercisable — exercisable, and left inert deliberately. Giving the
     # sweep world run-scoped rows (an event row with no task_id, which is what a
     # clear against a whole run writes) makes this lever bite immediately, and
-    # what it then exposes is a defect in the PRODUCT rather than in the sweep:
-    # under any lever that makes the event scan partial, ``run_scoped_events``
-    # comes back ``[]`` beside ``run_scoped_events_omitted: 0`` — a hard claim
-    # that no run-scoped event exists and none was omitted, manufactured by a
-    # read that looked at one row out of twelve. That is a manufactured negative
-    # at ``$.event_history.run_scoped_events[]``, reproduced on all eight
-    # ``no-total`` levers, and it is out of scope to repair here. The property
-    # is asserted anyway, as a strict xfail, by
-    # ``test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event``:
-    # the day the product is fixed, that test XPASSes and this entry has to go.
+    # what it exposed when it did was a defect in the PRODUCT rather than in the
+    # sweep. That defect is repaired, and the property it broke is asserted by
+    # ``test_a_partial_event_scan_never_claims_it_omitted_no_run_scoped_event``
+    # over a world this table's own is deliberately not widened into.
     "clamped:evidence.RUN_SCOPED_EVENT_LIMIT": (
-        "the sweep world emits no run-scoped events, and giving it any exposes a manufactured "
-        "negative in the product that this round may not fix — see the note above this entry"
+        "the sweep world emits no run-scoped events, so a display cap of 1 folds none away"
     ),
     "clamped:evidence.TRIES_PROBE_LIMIT": "fewer successes need a probe than the ceiling of 1 allows",
     "clamped:reading.EVENT_SCAN_LIMIT": "the event scan reaches its natural end inside one page",
@@ -16222,26 +16344,15 @@ def test_a_test_module_of_this_directory_is_not_mistaken_for_the_server():
         assert _is_sidecar(name.removesuffix(".py")) is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PRODUCT DEFECT, reported and deliberately not repaired in an instrument-only round. "
-        "run_scoped_events and its _omitted counter are both computed over the rows the scan "
-        "actually reached, so a partial scan hands back an empty run-scoped list beside "
-        "run_scoped_events_omitted: 0 — a hard claim that none exists and none was omitted, over a "
-        "read that saw one row of twelve. Strict, so that the day the product is fixed this XPASSes "
-        "and the declaration in _LEVERS_THAT_MOVE_NOTHING has to be re-derived."
-    ),
-)
-def test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event(airflow, monkeypatch):
-    """The defect that widening the sweep world exposed, asserted as the property
-    it breaks rather than as the behaviour it has.
+def test_a_partial_event_scan_never_claims_it_omitted_no_run_scoped_event(airflow, monkeypatch):
+    """The defect that widening the sweep world exposed, now repaired.
 
-    Written this way on purpose. A test that asserted the CURRENT output would
-    certify the defect and quietly outlive it; a strict xfail asserts the
-    property the sweep holds every other enumeration to, records that the
-    product does not have it, and fails the moment that changes in either
-    direction.
+    It was a strict xfail for one round: the property the sweep holds every
+    other enumeration to, recorded as one the product did not have. The list and
+    its counter were both computed over the rows the scan reached, so a partial
+    scan handed back an empty run-scoped list beside
+    ``run_scoped_events_omitted: 0`` — none exists and none was omitted, over a
+    read that saw one row of twelve.
     """
     _sweep_world(airflow)
     airflow.event_logs = airflow.event_logs + [
@@ -16263,6 +16374,9 @@ def test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event(airflo
     short = _SWEPT_TOOLS["diagnose_dag"]()
 
     assert whole["event_history"]["run_scoped_events"], "the whole arm found no run-scoped event"
+    assert whole["event_history"]["any_run_scoped_event"] is True
+    assert short["event_history"]["any_run_scoped_event"] is None
+    assert short["event_history"]["run_scoped_events_omitted"] is None
     assert _manufactured_negatives(whole, short) == []
 
 

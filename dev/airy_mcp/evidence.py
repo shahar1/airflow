@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -937,6 +937,16 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
     }
 
 
+def _is_run_scoped(row: Mapping[str, Any]) -> bool:
+    """A row that names the whole run rather than one task instance."""
+    return row.get("task_id") is None
+
+
+def _has_include_flag(row: Mapping[str, Any]) -> bool:
+    """A clear that swept in instances its own ``task_ids`` names nowhere."""
+    return any(bool(_parsed_extra_of(row).get(key)) for key in _EXTRA_INCLUDE_KEYS)
+
+
 def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]:
     """Every event-log row for one run, or why there are none to read.
 
@@ -965,9 +975,12 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
         "attribution_payload_limit": ATTRIBUTION_PAYLOAD_LIMIT_CHARS,
         "attribution_reduced_for_size": 0,
         "attribution_payload_over_limit": False,
-        "clear_with_include_flags": False,
+        # Three-valued, and null here for the same reason they go null over a
+        # partial scan: a read that did not happen settles nothing about the run.
+        "clear_with_include_flags": None,
+        "any_run_scoped_event": None,
         "run_scoped_events": [],
-        "run_scoped_events_omitted": 0,
+        "run_scoped_events_omitted": None,
         "error": _AUDIT_NOT_PERMITTED,
         "query": _EVENT_QUERY,
         "limits": [_L1, _L2, _L3, _L4, _L5, _L6, _L7],
@@ -1049,12 +1062,17 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
     # discarded rows report itself as having covered the run.
     scanned = scan.filter(lambda row: isinstance(row, dict) and row.get("dag_id") == dag_id)
     kept = list(scanned.rows)
-    run_scoped = [row for row in kept if row.get("task_id") is None]
+    run_scoped = [row for row in kept if _is_run_scoped(row)]
+    # A page this scan never fetched could hold the row that settles either
+    # question below, so both go through a verdict: the rows it did see
+    # establish a PRESENCE, and an absence among them is the run's own absence
+    # only over a scan that was whole.
+    any_run_scoped = reading.find(scanned, _is_run_scoped)
     # A clear with an include_* flag names only its seed task ids, so the further
     # instances it swept in are named nowhere. Carried on the history rather than
     # on a row, because the instances that need the caveat are exactly the ones
     # with no row of their own.
-    swept = any(any(bool(_parsed_extra_of(row).get(key)) for key in _EXTRA_INCLUDE_KEYS) for row in kept)
+    swept = reading.find(scanned, _has_include_flag)
     payload.update(
         {
             "status": "checked" if scanned.complete else "partial",
@@ -1063,9 +1081,14 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
             "events_omitted": scanned.omitted,
             "oldest_scanned_when": kept[-1].get("when") if kept else None,
             "rows_rejected": len(fetched) - len(kept),
-            "clear_with_include_flags": swept,
+            "clear_with_include_flags": swept.as_field(),
+            "any_run_scoped_event": any_run_scoped.as_field(),
             "run_scoped_events": [_compact_event(row) for row in run_scoped[:RUN_SCOPED_EVENT_LIMIT]],
-            "run_scoped_events_omitted": max(len(run_scoped) - RUN_SCOPED_EVENT_LIMIT, 0),
+            # The same claim in arithmetic: how many were left out is a number
+            # only a scan that reached all of them has.
+            "run_scoped_events_omitted": (
+                max(len(run_scoped) - RUN_SCOPED_EVENT_LIMIT, 0) if scanned.complete else None
+            ),
             "error": None,
             "reading": scanned,
         }
