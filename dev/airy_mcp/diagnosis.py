@@ -161,6 +161,12 @@ def _widen_not_covered(
     A run outside the window is a run this comparison holds no rows for, exactly
     like a run inside it that returned none — and keeping the two apart let the
     list empty out as the window narrowed.
+
+    DEFENSIVE, not routine: the runs read are asked for at ``RUN_HISTORY_LIMIT``,
+    so a route that honours its limit hands back no more than the window and
+    ``beyond_window`` is empty. It stops being empty exactly when a route hands
+    back more than it was asked for, which is the case a clamp silently swallows
+    — so this is tested directly rather than through a tool that cannot reach it.
     """
     named = list(comparison.get("runs_not_covered") or [])
     comparison["runs_not_covered"] = named + [run for run in beyond_window if run not in named]
@@ -547,17 +553,27 @@ def _summarize_failure(failure: dict[str, Any]) -> str:
     # here only has to leave room for the quotes and the escapes it adds.
     line = _quoted(_extract_error_line(failure.get("log_tail") or "") or "no log available", 440)
     # The line is drawn from a TAIL. Where the tail is not the log, the error it
-    # names is the last one in what was kept and not necessarily the cause, so
-    # the sentence says so rather than asserting the failure was that line.
-    cut = (
-        " The log was read as a tail only, so this line is the last error in the part that was "
-        "read and may not be the one that failed the task."
-        if failure.get("log_tail_truncated")
-        else ""
-    )
+    # names is the last one in what was kept and not necessarily the cause — so
+    # the ASSERTION is withdrawn rather than a caveat appended to it. "failed
+    # with «INFO progress line 4999»" is a claim about the cause, and appending
+    # "this may not be the one that failed the task" behind it leaves the claim
+    # standing in the sentence a reader quotes.
+    cut = failure.get("log_tail_truncated")
     if failure.get("still_retrying"):
-        return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log).{cut}"
-    return f"Confirmed failure: {where} failed with {line} (see log).{cut}"
+        if cut:
+            return (
+                f"Still retrying: {where} failed and is up for retry. Its log was read as a TAIL "
+                f"only, so what failed it is not established here; the last error in the part that "
+                f"was read is {line} (see log)."
+            )
+        return f"Still retrying: {where} failed and is up for retry; last error: {line} (see log)."
+    if cut:
+        return (
+            f"Confirmed failure: {where} failed. Its log was read as a TAIL only, so what it "
+            f"failed with is NOT established here; the last error in the part that was read is "
+            f"{line} (see log)."
+        )
+    return f"Confirmed failure: {where} failed with {line} (see log)."
 
 
 def _census_clause(health: dict[str, Any]) -> str:
@@ -1090,8 +1106,10 @@ def compare_dag_runs(dag_id: str, run_a: str, run_b: str, source_digest: str | N
     holds no instance of that task at all, and the accompanying
     ``*_worker_field_note`` says which. A task whose duration is unchanged at 0
     on both runs has NOT been stable if those flags differ, or if both are
-    false; two flags differing because one of them is null is a task that was
-    added or removed, not a task that stopped being dispatched.
+    false; where one of them is null, whether it stopped being dispatched is
+    NOT established either way — read the note to see whether that run holds no
+    instance of the task (added or removed) or its instance list came back
+    short (unknown).
     Names the Dag versions each run used, but does not
     diff them — an older version can contain a co-located Dag this caller was
     never authorized for.
@@ -1363,8 +1381,17 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
         "instance in the window — it does not mean the Dags are healthy. A run recorded "
         "success whose task never ran is invisible here; diagnose_dag finds those."
         if scan.complete and not unreadable
+        # The LEAD-IN says what happened too. A complete scan with one
+        # unreadable log announced "this list is short of the window" over a
+        # list that was not short — the false clause below was removed in
+        # the last round and replaced by a false lead-in above it.
         else (
-            "task instances recorded state=failed only, and this list is short of the window: "
+            (
+                "task instances recorded state=failed only, and this list is short of the window: "
+                if not scan.complete
+                else "task instances recorded state=failed only, and every failure in the window is "
+                "in this list but not every one of them is clustered: "
+            )
             # Each shortfall named ONLY when it happened. The sentence used to
             # lead with "this scan was not whole" and then state the scan's own
             # omission count whatever it was, so a whole scan with one
@@ -1388,8 +1415,14 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
                 )
                 if clause
             )
-            + ". An empty or short cluster list therefore says nothing about the failures this "
-            "scan did not reach. A run recorded success whose task never ran is invisible here "
+            + (
+                ". An empty or short cluster list therefore says nothing about the failures this "
+                "scan did not reach. "
+                if not scan.complete
+                else ". An empty or short cluster list therefore says nothing about the failures "
+                "whose logs could not be read. "
+            )
+            + "A run recorded success whose task never ran is invisible here "
             "whatever the coverage; diagnose_dag finds those."
         )
     )

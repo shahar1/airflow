@@ -148,8 +148,20 @@ _HISTORY_CLAMPED = (
 # ---------------------------------------------------------------------------
 
 
-def _comparable(key: Callable[[Mapping[str, Any]], Any]) -> Callable[[Mapping[str, Any]], Any]:
-    """A sort key that orders timestamps by TIME, and everything else as given."""
+def _comparable(
+    key: Callable[[Mapping[str, Any]], Any], *, reverse: bool = False
+) -> Callable[[Mapping[str, Any]], Any]:
+    """A sort key that orders timestamps by TIME, and puts what has no time LAST.
+
+    A value that does not parse as a moment has no place on the axis being
+    sorted, so it goes to the END of the order the caller asked for — which
+    means its bucket flips with ``reverse``. In a fixed bucket ABOVE every real
+    timestamp it did the opposite under ``reverse=True``: a ``timestamp: null``
+    row sorted to the FRONT of a newest-first order, where a clamp keeps it and
+    drops a real newer record — the exact failure the clamp's own docstring
+    promises cannot happen.
+    """
+    last = -1 if reverse else 1
 
     def ordered(row: Mapping[str, Any]) -> Any:
         value = key(row)
@@ -157,7 +169,7 @@ def _comparable(key: Callable[[Mapping[str, Any]], Any]) -> Callable[[Mapping[st
             moment = _parse_moment(value)
             if moment is not None:
                 return (0, moment.timestamp(), "")
-            return (1, 0.0, value)
+            return (last, 0.0, value)
         return value
 
     return ordered
@@ -245,7 +257,14 @@ class Reading:
         parts = []
         if self.note:
             parts.append(self.note)
-        if isinstance(claimed, int) and claimed > self._delivered:
+        # The route clause speaks about the ROUTE's own count, and a reading
+        # that carries a note is a SELECTION whose two numbers are matched rows
+        # and matched-plus-unexamined. Printed together they contradicted each
+        # other — "only the first 900 of 1000 row(s) were scanned" beside "the
+        # route accounted for 101 and handed over 1", of a route that handed
+        # over 900 — and the second was the match count wearing the route's
+        # words. The note is that shortfall's own, truthful account.
+        elif isinstance(claimed, int) and claimed > self._delivered:
             parts.append(f"the route accounted for {claimed} and handed over {self._delivered}")
         if self.kept < self._delivered:
             parts.append(f"{self._delivered} row(s) came back and this reading keeps {self.kept}")
@@ -260,6 +279,12 @@ class Reading:
         """The sentence a refusal or an unestablished check carries."""
         if self.complete:
             return f"{self.route or 'the read'} was read whole ({self.kept} row(s))"
+        # A read that did not HAPPEN has a reason that already names the route
+        # and already says it was not read, so the prefix stuttered — "R was NOT
+        # read whole: R could not be read (E)" — and a caller that leads with
+        # "was NOT read whole" of its own said the route three times.
+        if self.error is not None:
+            return self.reason
         return f"{self.route or 'the read'} was NOT read whole: {self.reason}"
 
     def clamp(self, limit: int) -> Reading:
@@ -298,7 +323,9 @@ class Reading:
         ``Z`` and varies the fractional digits — so a clamp after a lexical sort
         can drop the newest record while reporting itself ordered by time.
         """
-        return replace(self, rows=tuple(sorted(self.rows, key=_comparable(key), reverse=reverse)))
+        return replace(
+            self, rows=tuple(sorted(self.rows, key=_comparable(key, reverse=reverse), reverse=reverse))
+        )
 
     def filter(self, keep: Callable[[Mapping[str, Any]], bool]) -> Reading:
         """A discard is a method too — dropped rows reduce kept, exactly like a clamp."""
@@ -432,8 +459,9 @@ def matches_of(
         _pages=pages,
         _exhausted=exhausted,
         note=(
-            f"only the first {scanned} of {scanned + unexamined} row(s) were scanned, so any of the "
-            f"{unexamined} that were not could have matched"
+            f"only the first {scanned} of {scanned + unexamined} row(s) were scanned, so "
+            f"{'the 1 that was' if unexamined == 1 else f'any of the {unexamined} that were'} "
+            f"not could have matched"
             if unexamined
             else None
         ),
@@ -1386,10 +1414,11 @@ def _backfill_runs(backfill_id: int) -> Reading:
     """
     limit = MAX_BACKFILL_RUNS + 1
     resp = transport._api("GET", f"/backfills/{backfill_id}/dag_runs", params={"limit": limit})
-    reading = read_of(resp, "backfill_dag_runs", _BACKFILL_RUNS_ROUTE)
-    if reading.kept >= limit and reading._claimed is None:
-        return replace(reading, _claimed=reading.kept + 1)
-    return reading
+    # Through ``limit=``, which is what buys the sentinel. This was hand-rolled
+    # here — reaching into ``_claimed`` from outside the class — after
+    # ``_accountable_total`` had been extracted as the one place a route's count
+    # is turned into a number a reading may reason with.
+    return read_of(resp, "backfill_dag_runs", _BACKFILL_RUNS_ROUTE, limit=limit)
 
 
 ASSET_CATALOG_ROUTE = "GET /assets"

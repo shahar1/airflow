@@ -130,6 +130,8 @@ class FakeAirflow:
         self.fail_cancel: Exception | None = None
         self.fail_trigger: Exception | None = None
         self.fail_unpause: Exception | None = None
+        self.fail_dag_record: Exception | None = None
+        self.fail_dry_run: Exception | None = None
         self.omit_failure_scan_total: bool = False
         self.assets: list[dict] = []
         self.bump_version_on_reparse = True
@@ -264,6 +266,8 @@ class FakeAirflow:
         if path == f"/dags/{DAG_ID}/clearTaskInstances":
             return self._clear(kwargs["json"])
         if path == "/backfills/dry_run":
+            if self.fail_dry_run:
+                raise self.fail_dry_run
             return {
                 "backfills": [{"logical_date": d} for d in self.dry_run_dates],
                 "total_entries": (
@@ -323,6 +327,8 @@ class FakeAirflow:
                     raise self.fail_unpause
                 self.is_paused = kwargs["json"]["is_paused"]
                 return {}
+            if self.fail_dag_record:
+                raise self.fail_dag_record
             return {
                 "relative_fileloc": self.relative_fileloc,
                 "file_token": "tok",
@@ -3205,6 +3211,26 @@ def test_error_signature_normalises_equivalent_failures(log_tail, expected):
     assert server._error_signature(log_tail) == expected
 
 
+def test_a_run_beyond_the_history_window_is_charged_to_the_comparisons_coverage(airflow):
+    """The guard for a route that hands back MORE than it was asked for. It
+    cannot be reached through a tool while every route honours its limit, so it
+    is exercised here — a clamp that silently drops rows is how an enumeration
+    reads "every run was covered" while covering fewer of them."""
+    runs = reading.Reading(
+        rows=tuple({"dag_run_id": f"manual__{n}"} for n in range(12)),
+        route="GET /dags/<dag>/dagRuns",
+        _delivered=12,
+        _claimed=12,
+    )
+
+    widened = diagnosis._widen_not_covered(
+        {"runs_not_covered": ["manual__0"]}, ["manual__10", "manual__11"], runs.clamp(10)
+    )
+
+    assert widened["runs_not_covered"] == ["manual__0", "manual__10", "manual__11"]
+    assert widened["runs_not_covered_read_whole"] is False
+
+
 def test_find_failure_clusters_groups_by_signature_biggest_first(airflow):
     airflow.task_instances = [
         {"dag_id": "etl", "task_id": "load", "dag_run_id": "r1", "try_number": 1},
@@ -3295,6 +3321,29 @@ def test_a_full_failure_scan_with_no_count_is_not_a_whole_read(airflow, monkeypa
     assert result["failures_read_whole"] is False
     assert result["failures_omitted"] >= 1
     assert "No clusters means no FAILED task instance" not in result["scope"]
+
+
+def test_a_complete_scan_with_an_unreadable_log_is_not_called_short_of_the_window(airflow):
+    """A false clause was removed in the last round and replaced by a false
+    LEAD-IN above it: a scan that reached every failure in the window announced
+    "this list is short of the window" because one of its logs would not open."""
+    airflow.task_instances = [
+        {"dag_id": DAG_ID, "task_id": "t0", "dag_run_id": "r0", "try_number": 1},
+    ]
+    airflow.fail_log = httpx.HTTPStatusError(
+        "gone", request=httpx.Request("GET", "/logs"), response=httpx.Response(404)
+    )
+
+    result = server.find_failure_clusters(hours=6, dag_ids=[DAG_ID])
+
+    # The scan itself reached every failure the window holds — one of their logs
+    # would not open, which is a different shortfall and is reported as one.
+    assert result["failures_omitted"] == 0
+    assert result["failures_unreadable"]
+    assert "short of the window" not in result["scope"]
+    assert "were not scanned" not in result["scope"]
+    assert "log(s) could not be read" in result["scope"]
+    assert "says nothing about the failures whose logs could not be read" in result["scope"]
 
 
 def _approve(dag_id, from_date, to_date, plan=None):
@@ -3639,6 +3688,41 @@ def test_an_unpause_that_does_not_come_back_does_not_blame_the_user_for_the_spen
     assert "already spent by this attempt" in result["error"]
     assert "needs the unpause_token from its paused-Dag warning" not in result["error"]
     assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+
+
+@pytest.mark.parametrize("status", [403, 404], ids=["forbidden", "gone"])
+def test_a_dag_record_that_vanishes_after_the_approval_says_the_approval_is_gone(airflow, status):
+    """The 403/404 arm answered "Dag X does not exist or you cannot see it" and
+    stopped there — a lookup problem, in a call that had already burnt its
+    single-use token. The retry it invites answers "no reviewed plan for this
+    change", which is not what happened."""
+    plan = server.plan_dag_code_changes(DAG_ID, [{"old": "typo", "new": "mistake"}])
+    airflow.fail_dag_record = httpx.HTTPStatusError(
+        "nope", request=httpx.Request("GET", "/dags"), response=httpx.Response(status)
+    )
+
+    result = server.apply_dag_code_changes(DAG_ID, [{"old": "typo", "new": "mistake"}], plan["plan_token"])
+
+    assert result["applied"] is False
+    assert result["mutation_applied"] is False
+    assert "does not exist or you cannot see it" in result["error"]
+    assert "approval was already spent by this attempt" in result["error"]
+
+
+def test_a_backfill_preview_that_does_not_come_back_does_not_raise_past_the_caller(airflow):
+    """``run_backfill`` re-runs its dry run between the approval and the write
+    and caught only ``HTTPStatusError``, so a dropped connection raised out of
+    the tool with the token spent — the same shape the clear path was repaired
+    for, on the third write path."""
+    plan = server.plan_backfill(DAG_ID, "2024-01-01", "2024-01-02")
+    airflow.fail_dry_run = httpx.ConnectError("boom")
+
+    result = server.run_backfill(DAG_ID, "2024-01-01", "2024-01-02", plan["plan_token"], plan["planned_runs"])
+
+    assert result["created"] is False
+    assert result["mutation_applied"] is False
+    assert "approval was already spent by this attempt" in result["error"]
+    assert ("POST", "/backfills") not in airflow.calls
 
 
 def test_rerun_dag_leaves_an_active_dag_alone(airflow):
@@ -8426,6 +8510,21 @@ def _leg(entry, name):
     return next(check for check in entry["checks"] if check["check"] == name)
 
 
+def test_a_record_with_no_readable_timestamp_does_not_evict_a_real_newer_one(recovered_run):
+    """A value that does not parse as a moment went into a bucket ABOVE every
+    real timestamp, and under ``reverse=True`` that put it at the FRONT of a
+    newest-first order — where the clamp keeps it and drops a record that has a
+    time. The clamp's own docstring promises exactly this cannot happen."""
+    recovered_run.xcoms_by_task[("summarize", -1)] = [
+        {"key": f"null{n}", "timestamp": None} for n in range(10)
+    ] + [{"key": "return_value", "timestamp": _FRESH_XCOM}]
+
+    leg = _leg(_verify()["instances"][0], "recorded_output_post_dates_clear")
+
+    assert leg["passed"] is True
+    assert "return_value" in leg["detail"]
+
+
 def test_the_only_fresh_record_sorting_past_the_clamp_is_not_read_as_an_absence(recovered_run):
     """The live counterexample: the route orders keys alphabetically and
     `return_value` sorts last, so a ten-row prefix of an alphabetical page drops
@@ -9096,6 +9195,21 @@ def test_a_preview_that_reports_no_attempt_at_all_cannot_say_the_attempt_has_not
     assert "no longer describes what would be written" not in result["error"]
     assert "name what changed" not in result["next_step"]
     assert "name the read that could not be shown complete" in result["next_step"]
+
+
+def test_an_unreadable_attempt_history_names_its_route_once(cleared_run):
+    """The refusal stuttered: "the target's attempt history was NOT read whole
+    (GET .../tries was NOT read whole: GET .../tries could not be read
+    (RequestError))" — the route three times and the verdict twice, because a
+    reading that did not HAPPEN already says both in its own reason."""
+    cleared_run.fail_tries = httpx.ConnectError("connection refused")
+
+    plan = _gate_plan(cleared_run)
+
+    assert plan["planned"] is False
+    assert plan["error"].count(reading._TRIES_ROUTE) == 1
+    assert "NOT read whole" not in plan["error"]
+    assert "could not be read (ConnectError)" in plan["error"]
 
 
 def test_an_unreadable_attempt_history_refuses_the_write(cleared_run):
@@ -12503,7 +12617,11 @@ _PAGINATION_TERMINATIONS = {
     # there rather than deciding whether the read was whole.
     ("reading", "len(page) >= TASK_INSTANCE_PAGE"),
     ("evidence", "len(page) >= reading.EVENT_SCAN_PAGE"),
-    ("reading", "reading.kept >= limit"),
+    # The backfill run list used to hand-roll the same sentinel a THIRD time,
+    # reaching into ``_claimed`` from outside the class after
+    # ``_accountable_total`` was extracted as the one place a route's count
+    # becomes a number a reading may reason with. It goes through ``limit=`` now
+    # and needs no exception here.
 }
 
 # Bounds that decide what to SHOW or whether to offer a plan at all. None of
@@ -12776,10 +12894,16 @@ def test_a_run_read_whole_with_nothing_failed_still_gets_the_plain_sentence(airf
     assert result["summary"].startswith("No failures found: run")
 
 
-def test_a_summary_built_off_a_clipped_log_says_the_line_may_not_be_the_cause(airflow):
+def test_a_summary_built_off_a_clipped_log_does_not_name_what_the_task_failed_with(airflow):
     """``Clipped`` carries whether anything was cut and the tail slice threw it
     away — so a real error at the top of a 5000-line log left the summary
-    confidently naming a progress line as the failure."""
+    confidently naming a progress line as the failure.
+
+    The ASSERTION is withdrawn, not caveated. "failed with «INFO progress line
+    4999»" is a claim about the cause, and a sentence appended behind it saying
+    the line may not be the cause leaves that claim standing in the words a
+    reader quotes.
+    """
     airflow.runs = [{"dag_run_id": "manual__1", "state": "failed"}]
     airflow.runs_by_id = {"manual__1": {"dag_run_id": "manual__1", "state": "failed"}}
     airflow.tis_by_run = {
@@ -12790,7 +12914,10 @@ def test_a_summary_built_off_a_clipped_log_says_the_line_may_not_be_the_cause(ai
     result = server.diagnose_dag(DAG_ID, "manual__1")
 
     assert result["failures"][0]["log_tail_truncated"] is True
-    assert "may not be the one that failed the task" in result["summary"]
+    assert "` failed with " not in result["summary"]
+    assert "what it failed with is NOT established here" in result["summary"]
+    assert "read as a TAIL only" in result["summary"]
+    assert "INFO progress line 4999" in result["summary"]
 
 
 def test_a_summary_built_off_a_whole_log_makes_no_such_caveat(airflow):
@@ -13185,6 +13312,29 @@ def test_a_reading_that_stopped_at_a_ceiling_is_never_complete():
 
     assert stopped.complete is False
     assert reading.find(stopped, lambda row: row.get("b"), "why").is_unknown()
+
+
+def test_a_selection_does_not_report_its_match_count_as_a_route_count():
+    """Over a ``matches_of`` reading the two numbers behind the route clause are
+    MATCHED rows and matched-plus-unexamined, so it printed "the route accounted
+    for 101 and handed over 1" of a route that handed over 900 — contradicting,
+    in the same sentence, the note that had just described the same shortfall
+    correctly."""
+    selection = reading.matches_of([{"n": 1}], scanned=900, claimed=1000, route="R")
+
+    reason = selection.reason
+
+    assert "only the first 900 of 1000 row(s) were scanned" in reason
+    assert "the route accounted for" not in reason
+
+
+def test_a_single_unscanned_row_is_described_in_the_singular():
+    """ "any of the 1 that were not could have matched" — the agreement bug the
+    dispatch census already fixed for itself, left standing here."""
+    assert (
+        "the 1 that was not could have matched"
+        in reading.matches_of([], scanned=9, claimed=10, route="R").reason
+    )
 
 
 def test_an_earlier_note_does_not_hide_a_later_clamp():

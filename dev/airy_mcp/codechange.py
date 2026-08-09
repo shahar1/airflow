@@ -195,7 +195,7 @@ def revert_dag_code(
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
             return _approval_spent_before_the_write("reverted", "the Dag record", e)
-        return {"reverted": False, "mutation_applied": False, "error": message}
+        return {"reverted": False, "mutation_applied": False, "error": message + _APPROVAL_IS_GONE}
     except _READ_FAILURES as e:
         return _approval_spent_before_the_write("reverted", "the Dag record", e)
     try:
@@ -358,6 +358,15 @@ def plan_dag_code_changes(
 _READ_FAILURES = (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError)
 
 
+# What a post-redemption refusal has to add, whatever else it says. A message
+# that names only the Dag reads as a lookup problem, and the retry it invites
+# answers "no reviewed plan for this change" — which is not what happened.
+_APPROVAL_IS_GONE = (
+    " Nothing was written. The approval was already spent by this attempt and is gone — re-plan "
+    "and show the user again."
+)
+
+
 def _approval_spent_before_the_write(outcome_key: str, which: str, error: Exception) -> dict[str, Any]:
     """The answer when a read between the approval and the write did not come back.
 
@@ -489,7 +498,7 @@ def apply_dag_code_changes(
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
             return _approval_spent_before_the_write("applied", "the Dag record", e)
-        return {"applied": False, "mutation_applied": False, "error": message}
+        return {"applied": False, "mutation_applied": False, "error": message + _APPROVAL_IS_GONE}
     except _READ_FAILURES as e:
         return _approval_spent_before_the_write("applied", "the Dag record", e)
     path = _dag_path(dag_id, dag)
@@ -906,8 +915,13 @@ def run_backfill(
     except httpx.HTTPStatusError as e:
         message = _explain_unknown_dag(dag_id, e)
         if message is None:
-            raise
-        return {"created": False, "mutation_applied": False, "error": message}
+            return _approval_spent_before_the_write("created", "the backfill preview", e)
+        return {"created": False, "mutation_applied": False, "error": message + _APPROVAL_IS_GONE}
+    except _READ_FAILURES as e:
+        # The token is redeemed above, so a preview that does not come back must
+        # not raise past the caller: the retry then answers "no reviewed plan
+        # for this backfill", which is false and reads as the user's mistake.
+        return _approval_spent_before_the_write("created", "the backfill preview", e)
     if not preview_reading.complete:
         # Pre-mutation, so "not applied" is a fact rather than an inference. The
         # identity compare below is what authorizes the write, and a compare

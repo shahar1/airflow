@@ -292,9 +292,9 @@ def _unsettled_at_plan_time(evidence: dict[str, Any], expansion: dict[str, Any])
     history = evidence.get("attempt_history") or {}
     if history.get("not_read_whole"):
         return (
-            f"the target's attempt history was NOT read whole ({history['not_read_whole']}), so "
-            f"whether an earlier attempt of this instance already reached the outside world is not "
-            f"established. No approval is offered over a safety reading that could not be taken."
+            f"the target's attempt history is not a whole reading — {history['not_read_whole']} — "
+            f"so whether an earlier attempt of this instance already reached the outside world is "
+            f"not established. No approval is offered over a safety reading that could not be taken."
         )
     return None
 
