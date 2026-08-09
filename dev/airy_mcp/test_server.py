@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -14077,6 +14078,60 @@ _DOMINANCE_SHAPES = {
     ),
     "gate-in-the-write-s-own-arguments": ("def f():\n write(gate())\n", True),
     "write-inside-a-with-after-the-gate": ("def f(l):\n gate()\n with l:\n  write()\n", True),
+    # The ``with`` family. The graph modelled the ``try`` family's exception
+    # edges deliberately and gave ``with`` only header-to-body, so a manager
+    # whose ``__exit__`` suppresses — ``contextlib.suppress`` being the obvious
+    # one — jumped past the gate to the statement after it and the write was
+    # still certified. Every case the enumeration below is required to cover:
+    # __enter__ failing, the body failing, __exit__ suppressing, an early exit
+    # from the body, nesting, and two managers in one statement.
+    "gate-in-a-with-body-write-after": ("def f(m):\n with m:\n  gate()\n write()\n", False),
+    "gate-and-write-in-one-with-body": ("def f(m):\n with m:\n  gate()\n  write()\n", True),
+    "gate-in-an-inner-with-write-after-both": (
+        "def f(a, b):\n with a:\n  with b:\n   gate()\n write()\n",
+        False,
+    ),
+    "gate-in-an-outer-with-write-in-an-inner": (
+        "def f(a, b):\n with a:\n  gate()\n  with b:\n   write()\n",
+        True,
+    ),
+    # Two managers in one statement. Reaching the code after it means the first
+    # manager entered and the second expression was evaluated, so a gate spelled
+    # as the second manager really has run on every such path.
+    "gate-as-the-second-of-two-managers": ("def f(a):\n with a, gate():\n  pass\n write()\n", True),
+    "write-in-a-with-body-gate-after": ("def f(m):\n with m:\n  write()\n gate()\n", False),
+    "gate-in-a-with-inside-a-loop-write-after": (
+        "def f(i, m):\n for x in i:\n  with m:\n   gate()\n write()\n",
+        False,
+    ),
+    "gate-in-a-with-body-that-breaks-write-after-the-loop": (
+        "def f(i, m):\n for x in i:\n  with m:\n   gate()\n   break\n write()\n",
+        False,
+    ),
+    "write-in-a-with-body-after-a-gate-that-returns": (
+        "def f(m, c):\n if c:\n  gate()\n  return\n with m:\n  write()\n",
+        False,
+    ),
+    "async-gate-in-a-with-body-write-after": (
+        "async def f(m):\n async with m:\n  gate()\n write()\n",
+        False,
+    ),
+    "async-gate-and-write-in-one-with-body": (
+        "async def f(m):\n async with m:\n  gate()\n  write()\n",
+        True,
+    ),
+    # Evaluation order inside ONE statement, where reading the columns
+    # left-to-right is not reading the order. Contrived shapes, with no
+    # instance in this tree — and answered wrongly in the certifying direction,
+    # which is the only reason they are here.
+    "gate-in-an-assignment-target-write-on-the-right": ("def f(d):\n d[gate()] = write()\n", False),
+    "gate-on-the-right-write-in-an-assignment-target": ("def f(d):\n d[write()] = gate()\n", True),
+    "chained-assignment-gate-in-a-target": ("def f(d, e):\n d[gate()] = e = write()\n", False),
+    # The augmented form loads its target first, so the same two positions
+    # answer the other way round.
+    "gate-in-an-augmented-target-write-on-the-right": ("def f(d):\n d[gate()] += write()\n", True),
+    "write-in-an-augmented-target-gate-on-the-right": ("def f(d):\n d[write()] += gate()\n", False),
+    "annotated-assignment-gate-in-the-target": ("def f(d):\n d[gate()]: int = write()\n", False),
 }
 
 
@@ -14106,8 +14161,12 @@ def test_the_gate_dominance_check_answers_every_control_flow_shape(shape):
         "def f(i):\n [gate() for x in i]\n write()\n",
         "def f():\n def inner():\n  gate()\n write()\n",
         "def f(c):\n match c:\n  case 1:\n   gate()\n write()\n",
+        # When an annotation is evaluated depends on a future import this
+        # analyser does not read, so an annotation holding either half is
+        # refused rather than ordered.
+        "def f(d):\n d[write()]: gate() = 1\n",
     ],
-    ids=["conditional", "short-circuit", "comprehension", "nested-def", "match"],
+    ids=["conditional", "short-circuit", "comprehension", "nested-def", "match", "annotation"],
 )
 def test_a_shape_the_dominance_check_cannot_model_is_refused_and_not_answered(source):
     """A conservative analyser refuses what it cannot prove. The four lazy shapes
@@ -14284,6 +14343,22 @@ def _build_statement(graph, statement, after, context):
     if isinstance(statement, (ast.With, ast.AsyncWith)):
         header = graph.node(_header_expressions(statement))
         graph.edge(header, _build_flow(graph, statement.body, after, context))
+        # THE edge this statement was missing, and the same omission the ``try``
+        # below was written to avoid. A context manager's ``__exit__`` may
+        # return truthy, which SUPPRESSES an exception raised anywhere in the
+        # body — including by the body's first expression — and resumes at the
+        # statement after the ``with``. So there is a path from here to ``after``
+        # that runs none of the body.
+        #
+        # Whether a given manager suppresses is a property of its ``__exit__``
+        # at runtime, which nothing static can decide, so every ``with`` is
+        # modelled as one that may. That is the conservative direction: it can
+        # only make this analyser refuse to certify. Without it,
+        # ``with suppress(E): gate()`` followed by ``write()`` was certified as
+        # gated — a write with no precondition evaluated on any path — and
+        # ``suppress`` is live vocabulary in transport.py, dagsource.py and
+        # recovery.py.
+        graph.edge(header, after)
         return header
     if isinstance(statement, ast.Try):
         final = _build_flow(graph, statement.finalbody, after, context) if statement.finalbody else after
@@ -14305,18 +14380,68 @@ def _build_statement(graph, statement, after, context):
     raise _UnmodelledControlFlow(f"{type(statement).__name__} is not modelled")
 
 
-def _evaluated_first(node, other):
+def _holder_of(expressions, node, other, kinds):
+    """The innermost statement of one of ``kinds`` that holds both nodes."""
+    found = None
+    for expression in expressions:
+        for held in ast.walk(expression):
+            if isinstance(held, kinds) and _holds_both(held, node, other):
+                found = held
+    return found
+
+
+def _holds_both(statement, node, other):
+    inside = list(ast.walk(statement))
+    return any(node is held for held in inside) and any(other is held for held in inside)
+
+
+def _within(part, node):
+    return part is not None and any(node is held for held in ast.walk(part))
+
+
+def _evaluated_first(expressions, node, other):
     """Whether ``node`` is evaluated before ``other`` within one statement.
 
     Arguments are evaluated before the call that holds them, so a gate nested
     inside the write's own argument list runs first. Anything whose order
     depends on a value — a conditional expression, a short-circuit, a lambda or
     a comprehension body — is refused rather than guessed at.
+
+    POSITION IS NOT ORDER. Python evaluates an assignment's right-hand side
+    before its target, so ``d[gate()] = write()`` really runs the write first,
+    while a left-to-right reading of the columns answers "the gate" — and it
+    answered it in the certifying direction. An augmented assignment goes the
+    other way round: it has to load the target before it can add to it.
     """
     if any(other is inner for inner in ast.walk(node)):
         return False
     if any(node is inner for inner in ast.walk(other)):
         return True
+    assignment = _holder_of(expressions, node, other, (ast.Assign, ast.AnnAssign))
+    if assignment is not None:
+        annotation = getattr(assignment, "annotation", None)
+        if _within(annotation, node) or _within(annotation, other):
+            # ``from __future__ import annotations`` decides whether this is
+            # evaluated at all, and this analyser does not read that far.
+            raise _UnmodelledControlFlow("an annotation's evaluation point is not modelled")
+        targets = getattr(assignment, "targets", None) or [assignment.target]
+        in_value = (_within(assignment.value, node), _within(assignment.value, other))
+        in_target = (
+            any(_within(target, node) for target in targets),
+            any(_within(target, other) for target in targets),
+        )
+        if in_value[0] and in_target[1]:
+            return True
+        if in_target[0] and in_value[1]:
+            return False
+    augmented = _holder_of(expressions, node, other, (ast.AugAssign,))
+    if augmented is not None:
+        # ``x[i] += v`` loads the target before it evaluates the value, because
+        # it needs the old value to add to.
+        if _within(augmented.target, node) and _within(augmented.value, other):
+            return True
+        if _within(augmented.value, node) and _within(augmented.target, other):
+            return False
     return (node.lineno, node.col_offset) < (other.lineno, other.col_offset)
 
 
@@ -14382,7 +14507,9 @@ def _dominates(body, gates, write):
     target = written[0]
     # One statement holding both. Whether it is gated is then a question about
     # evaluation order inside that statement rather than about paths.
-    if target in holders and not any(_evaluated_first(gate, write) for gate in held_by[target]):
+    if target in holders and not any(
+        _evaluated_first(graph.owned[target], gate, write) for gate in held_by[target]
+    ):
         holders.discard(target)
 
     reached = set()
@@ -15566,3 +15693,231 @@ def test_every_audit_event_the_observer_classifies_is_classified_exactly_once():
     for table in tables:
         for event, reason in table.items():
             assert len(reason) > 40, event
+
+
+# ---------------------------------------------------------------------------
+# The gate backdoors, driven against the REAL functions.
+#
+# Every previous round proved these by editing the product, running the suite
+# and watching it stay green. That proof dies with the round that made it. Here
+# the same edits are applied to the parsed function instead — the same
+# statements, moved and wrapped exactly as a hostile change would — so each one
+# is a permanent test that the certificate is refused, and no product file is
+# touched to run it.
+# ---------------------------------------------------------------------------
+
+
+def _is_call_to(name):
+    def predicate(node):
+        return (
+            isinstance(node, ast.Call)
+            and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", ""))
+            == name
+        )
+
+    return predicate
+
+
+def _siblings_holding_the_gate_and_the_write(function, is_gate, is_write):
+    """The DEEPEST statement list in which the gate and the write are different siblings.
+
+    Not the function's top-level body: in ``rerun_dag`` both the gate and the
+    write live inside one ``if dag['is_paused']:``, so a backdoor cut at the top
+    level wraps the two together and changes nothing about whether one
+    dominates the other — which is the analyser answering correctly, and would
+    have read here as a backdoor that could not be built.
+    """
+    found = None
+    for node in ast.walk(function):
+        for field in ("body", "orelse", "finalbody"):
+            statements = getattr(node, field, None)
+            if not isinstance(statements, list):
+                continue
+            gate_at = [i for i, held in enumerate(statements) if any(is_gate(n) for n in ast.walk(held))]
+            write_at = [i for i, held in enumerate(statements) if any(is_write(n) for n in ast.walk(held))]
+            if gate_at and write_at and gate_at[0] != write_at[0]:
+                found = (statements, gate_at[0], write_at[0])
+    return found
+
+
+def _wrap(statement, wrapper):
+    """Put one statement inside a compound one, keeping positions valid."""
+    return ast.fix_missing_locations(ast.copy_location(wrapper(statement), statement))
+
+
+def _suppress_around_the_gate(statements, gate_at, write_at):
+    held = statements[gate_at]
+    statements[gate_at] = _wrap(
+        held,
+        lambda inner: ast.With(
+            items=[
+                ast.withitem(
+                    context_expr=ast.parse("contextlib.suppress(Exception)", mode="eval").body,
+                    optional_vars=None,
+                )
+            ],
+            body=[inner],
+            type_comment=None,
+        ),
+    )
+    return statements
+
+
+def _a_flag_around_the_gate(statements, gate_at, write_at):
+    statements[gate_at] = _wrap(
+        statements[gate_at],
+        lambda inner: ast.If(
+            test=ast.parse("not plan.get('skip_gate')", mode="eval").body, body=[inner], orelse=[]
+        ),
+    )
+    return statements
+
+
+def _a_loop_around_the_gate(statements, gate_at, write_at):
+    statements[gate_at] = _wrap(
+        statements[gate_at],
+        lambda inner: ast.For(
+            target=ast.Name(id="_once", ctx=ast.Store()),
+            iter=ast.parse("()", mode="eval").body,
+            body=[inner],
+            orelse=[],
+            type_comment=None,
+        ),
+    )
+    return statements
+
+
+def _the_write_moved_above_the_gate(statements, gate_at, write_at):
+    moved = statements.pop(write_at)
+    gate_at -= write_at < gate_at
+    return statements[:gate_at] + [moved] + statements[gate_at:]
+
+
+def _the_write_in_an_except_over_the_gate(statements, gate_at, write_at):
+    moved = statements.pop(write_at)
+    gate_at -= write_at < gate_at
+    statements[gate_at] = _wrap(
+        statements[gate_at],
+        lambda inner: ast.Try(
+            body=[inner],
+            handlers=[ast.ExceptHandler(type=None, name=None, body=[moved])],
+            orelse=[],
+            finalbody=[],
+        ),
+    )
+    return statements
+
+
+def _the_write_in_a_finally_over_the_gate(statements, gate_at, write_at):
+    moved = statements.pop(write_at)
+    gate_at -= write_at < gate_at
+    statements[gate_at] = _wrap(
+        statements[gate_at],
+        lambda inner: ast.Try(body=[inner], handlers=[], orelse=[], finalbody=[moved]),
+    )
+    return statements
+
+
+# The six shapes previous rounds proved by editing the product and watching the
+# suite stay green. Three rewrite only the gate; three move the write.
+_GATE_BACKDOORS = {
+    "the gate wrapped in contextlib.suppress": _suppress_around_the_gate,
+    "the gate behind a flag on the plan": _a_flag_around_the_gate,
+    "the gate inside a loop that may not run": _a_loop_around_the_gate,
+    "the write moved above the gate": _the_write_moved_above_the_gate,
+    "the write in an except whose try holds the gate": _the_write_in_an_except_over_the_gate,
+    "the write in a finally whose try holds the gate": _the_write_in_a_finally_over_the_gate,
+}
+
+
+def _certified_after(module, owner, request, gate, backdoor):
+    """Whether the analyser still certifies this write once the backdoor is cut.
+
+    ``None`` means the analyser refused to answer, which is the other
+    acceptable outcome; ``True`` means it handed out a certificate for a write
+    the backdoor un-gated, which is the failure this section exists to catch.
+    """
+    function = copy.deepcopy(_function_body(module, owner))
+    mutating = {text for holder, held_by, text in _mutating_calls() if (holder, held_by) == (module, owner)}
+
+    def is_the_write(node):
+        return (
+            isinstance(node, ast.Call)
+            and ast.unparse(node) in mutating
+            and _same_request(request, ast.unparse(node))
+        )
+
+    siblings = _siblings_holding_the_gate_and_the_write(function, _is_call_to(gate), is_the_write)
+    assert siblings is not None, f"{module}.{owner} has no sibling gate and write to cut between"
+    statements, gate_at, write_at = siblings
+    statements[:] = _GATE_BACKDOORS[backdoor](list(statements), gate_at, write_at)
+    ast.fix_missing_locations(function)
+
+    writes = [node for node in ast.walk(function) if is_the_write(node)]
+    gates = _calls_named(function, gate)
+    assert writes, f"the {backdoor} lost the {module}.{owner} write"
+    assert gates, f"the {backdoor} lost the {module}.{owner} gate"
+    with contextlib.suppress(_UnmodelledControlFlow):
+        return _dominates(function, gates, writes[0])
+    return None
+
+
+@pytest.mark.parametrize("backdoor", sorted(_GATE_BACKDOORS))
+@pytest.mark.parametrize("entry", sorted(approvals._GATED_WRITES))
+def test_no_backdoor_cut_into_a_real_gated_write_is_still_certified(entry, backdoor):
+    """Every gated write in the tree, against every backdoor, on its real source.
+
+    The statement-tree walk this graph replaced certified six of these. The
+    ``contextlib.suppress`` one survived the graph too, until now: the graph
+    modelled the ``try`` family's exception edges on purpose and gave ``with``
+    only header-to-body, so wrapping the gate in a manager that swallows what
+    it raises left the write certified with no precondition evaluated on any
+    path.
+    """
+    module, owner, request = entry
+
+    verdict = _certified_after(module, owner, request, approvals._GATED_WRITES[entry], backdoor)
+
+    assert verdict is not True, f"{module}.{owner} still certifies {request!r} as gated with {backdoor}"
+
+
+def test_every_backdoor_really_reaches_a_gated_write_in_this_tree(capsys):
+    """A backdoor that applies to nothing proves nothing.
+
+    The test above passes vacuously for any shape that cannot be built, so the
+    number of real gated writes each backdoor actually rewrites is counted and
+    printed, and every backdoor has to reach at least one.
+    """
+    reached = {}
+    for backdoor in sorted(_GATE_BACKDOORS):
+        for entry in sorted(approvals._GATED_WRITES):
+            module, owner, request = entry
+            verdict = _certified_after(module, owner, request, approvals._GATED_WRITES[entry], backdoor)
+            if verdict is not True:
+                reached.setdefault(backdoor, []).append(f"{module}.{owner}")
+    print(
+        "\n".join(
+            f"{backdoor:48} refused on {len(reached.get(backdoor, []))} of "
+            f"{len(approvals._GATED_WRITES)} gated write(s)"
+            for backdoor in sorted(_GATE_BACKDOORS)
+        )
+    )
+
+    assert sorted(reached) == sorted(_GATE_BACKDOORS), (
+        f"a backdoor reaches nothing in this tree: {sorted(set(_GATE_BACKDOORS) - set(reached))}"
+    )
+
+
+def test_the_suppress_backdoor_is_the_one_the_graph_used_to_certify():
+    """The FATAL-adjacent finding, isolated.
+
+    ``with suppress(E): gate()`` and a write after it is the exact shape that
+    was answered ``True`` — wrongly, and in the certifying direction — by a
+    graph that had gone to the trouble of modelling ``try``'s exception edges.
+    The two shapes are the same question, and only one of them was asked.
+    """
+    modelled_as_try = "def f():\n try:\n  gate()\n except E:\n  pass\n write()\n"
+    modelled_as_with = "def f(m):\n with m:\n  gate()\n write()\n"
+
+    assert _shape_verdict(modelled_as_try) is False
+    assert _shape_verdict(modelled_as_with) is False
