@@ -5948,8 +5948,11 @@ def test_diagnose_folds_the_source_checks_past_the_limit_into_one_entry(airflow)
     assert "(1) Note: 5000 XCom pull(s)" in result["summary"]
     assert len(json.dumps(checks)) < 20_000
     # What the checks add on top of the Dag source this tool is contracted to
-    # return in full is what it controls, and that is what is bounded.
-    assert len(json.dumps(result)) - len(result["source"]) < 30_000
+    # return in full is what it controls, and that is what is bounded. The
+    # bound had three bytes of headroom left, which an unsettled per-instance
+    # count spelled ``null`` rather than ``0`` took; the checks are still ~20 KB
+    # of it, and the assertion above is what holds them there.
+    assert len(json.dumps(result)) - len(result["source"]) < 31_000
 
 
 def test_diagnose_caps_the_stranger_ids_it_names_in_one_entry(airflow):
@@ -6623,6 +6626,63 @@ def test_more_state_changes_than_the_per_instance_cap_are_counted_not_hidden(air
     assert seen["events_omitted_for_instance"] == 8 - server.EVENT_HISTORY_PER_INSTANCE
     # The headline always describes events[0], so the cap cannot change it.
     assert seen["event_log_id"] == seen["events"][0]["event_log_id"] == 100
+
+
+def test_a_shorter_scan_takes_the_per_instance_omitted_count_away_rather_than_to_zero(airflow, monkeypatch):
+    """Six rows for one instance, read whole and then read two of the six.
+
+    The number beside the shown rows is the claim "and this instance has no
+    further ones". It was arithmetic over the rows the scan happened to reach,
+    so cutting the scan to a third of the run took it from 4 to 0 — a hard,
+    instance-specific absence assembled entirely out of pages nobody fetched.
+    """
+    rows = [
+        {**PATCH_EVENT, "event_log_id": 100 + index, "when": f"2026-08-07T07:5{index}:00.000000Z"}
+        for index in range(6)
+    ]
+    _with_own_history(airflow)
+
+    whole = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 2)
+    monkeypatch.setattr(reading, "EVENT_SCAN_LIMIT", 2)
+    short = _attribution(_audited_run(airflow, FORGED_TI, events=rows), "remit_payment_batch")
+
+    # The control: a scan that reached all six still earns the count.
+    assert (whole["events_recorded"], whole["events_omitted_for_instance"]) == (6, 4)
+    # What the short scan read is a presence and survives; the absence beside it
+    # is not a presence and does not.
+    assert short["events_recorded"] == 2
+    assert short["events_omitted_for_instance"] is None
+    # And the verdict over those rows hedges exactly as much as it did before.
+    assert short["attribution"] == whole["attribution"]
+    assert short["unknowns"] == whole["unknowns"]
+
+
+@pytest.mark.parametrize(
+    ("claimed", "attribution", "omitted"),
+    [(None, "no_event_found", 0), (900, "event_history_truncated", None)],
+    ids=["whole", "truncated"],
+)
+def test_an_instance_with_no_row_says_nothing_was_left_out_only_over_a_whole_scan(
+    airflow, claimed, attribution, omitted
+):
+    """The same claim on the branch that matched no row at all.
+
+    ``0`` under a truncated scan reads as "and there was nothing further for
+    this instance" — the leaf beside an attribution that has just said the
+    opposite about itself.
+    """
+    _with_own_history(airflow)
+    airflow.event_logs = [SUCCESS_EVENT, RUNNING_EVENT]
+    airflow.event_logs_total = claimed
+
+    seen = _attribution(
+        _green_run(airflow, EXECUTED_TI, FORGED_TI, audit_scope="granted"), "remit_payment_batch"
+    )
+
+    assert seen["attribution"] == attribution
+    assert seen["events_recorded"] == 0
+    assert seen["events_omitted_for_instance"] == omitted
 
 
 def test_a_run_whose_rows_aged_out_is_indistinguishable_from_never_written_and_says_so(airflow):

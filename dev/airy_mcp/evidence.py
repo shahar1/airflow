@@ -691,7 +691,13 @@ def _classification(state: str, request_settable: bool, demoted: bool) -> str | 
 
 
 def _bare_attribution(state: str, unknowns: list[str]) -> dict[str, Any]:
-    """An attribution with no row behind it. Nulls are written out, never dropped."""
+    """An attribution with no row behind it. Nulls are written out, never dropped.
+
+    ``no_event_found`` is the ONE state here a whole scan produced — the other
+    three are a scan that was refused, that failed, or that stopped short — so
+    it is the one state that may say nothing was left out.
+    """
+    settled = state == _ATTR_NONE
     return {
         "attribution": state,
         "attribution_detail": _attribution_detail(state),
@@ -725,7 +731,7 @@ def _bare_attribution(state: str, unknowns: list[str]) -> dict[str, Any]:
         "corroborated_association": False,
         "size_reduced": False,
         "events_recorded": 0,
-        "events_omitted_for_instance": 0,
+        "events_omitted_for_instance": 0 if settled else None,
         "events": [],
         "unknowns": unknowns,
     }
@@ -930,8 +936,18 @@ def _last_state_change(ti: dict[str, Any], history: dict[str, Any]) -> dict[str,
         # Set by ``_enforce_attribution_ceiling`` when the runtime ceiling had to
         # take bulk off this object.
         "size_reduced": False,
+        # How many rows this reading MATCHED, which a shorter scan lowers and
+        # never raises: it is a presence, and it survives a truncated scan the
+        # way the rows themselves do.
         "events_recorded": len(matched),
-        "events_omitted_for_instance": max(len(matched) - EVENT_HISTORY_PER_INSTANCE, 0),
+        # The count beside it is the opposite kind of claim — "and there were no
+        # further ones" — so it is a number only over a scan that reached all of
+        # them. Computed over the scanned rows it read 0 for an instance with
+        # four more rows on pages nobody fetched. Same rule, and same shape, as
+        # ``run_scoped_events_omitted`` one layer up.
+        "events_omitted_for_instance": (
+            max(len(matched) - EVENT_HISTORY_PER_INSTANCE, 0) if scan.complete else None
+        ),
         "events": events,
         "unknowns": unknowns,
     }
@@ -1155,7 +1171,11 @@ def _strip_context_rows(attribution: dict[str, Any]) -> bool:
     """Drop the per-instance context rows, counting them as omitted."""
     if not attribution.get("events"):
         return False
-    attribution["events_omitted_for_instance"] = attribution.get("events_recorded", 0)
+    # Only where that count is a number at all. Over a scan that fell short,
+    # how many rows this instance has is unknown, and dropping the context rows
+    # is not how a reduction would come to learn it.
+    if attribution.get("events_omitted_for_instance") is not None:
+        attribution["events_omitted_for_instance"] = attribution.get("events_recorded", 0)
     attribution["events"] = []
     return True
 
