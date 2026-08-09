@@ -16264,3 +16264,469 @@ def test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event(airflo
 
     assert whole["event_history"]["run_scoped_events"], "the whole arm found no run-scoped event"
     assert _manufactured_negatives(whole, short) == []
+
+
+# ---------------------------------------------------------------------------
+# Every hand-maintained table in this instrument, and what each is allowed to
+# prove.
+#
+# The one failure this instrument has repeated is a CLOSURE CLAIM resting on an
+# enumeration smaller than the surface it names: a list of reader spellings, a
+# list of writer spellings, a predicate that became the new list. So every
+# module-level table here and in ``approvals`` is inventoried, and each is
+# allowed exactly one of six dispositions:
+#
+#   derived                   nothing is written down; it is computed at runtime
+#   closed both ways          hand-written, and a test MEASURES the real set and
+#                             compares against it in both directions, so
+#                             membership is verified rather than trusted
+#   fail-closed               hand-written, and anything absent from it makes the
+#                             instrument REFUSE rather than pass
+#   cross-check only          hand-written, explicitly NOT the guarantee; a
+#                             derived rule or a runtime observer carries closure
+#   non-exhaustive vocabulary a word list that makes an assertion STRICTER; being
+#                             short of it can only miss, never certify
+#   fixture                   test data or a probe, not a claim about the tree
+#
+# The inventory itself is derived from this file's AST, so a table added later
+# fails here until somebody decides which of the six it is.
+# ---------------------------------------------------------------------------
+
+_ENUMERATION_DISPOSITIONS = (
+    "derived",
+    "closed both ways",
+    "fail-closed",
+    "cross-check only",
+    "non-exhaustive vocabulary",
+    "fixture",
+)
+
+_ENUMERATION_INVENTORY = {
+    # The audit applies to itself, which is the only way it can claim to be
+    # complete: adding a table to dodge the inventory adds a table the inventory
+    # then fails on.
+    "_ENUMERATION_DISPOSITIONS": (
+        "fail-closed",
+        "the six dispositions; a table carrying anything else fails the audit rather than passing it",
+    ),
+    "_ENUMERATION_INVENTORY": (
+        "closed both ways",
+        "compared against the module-level tables this file's own AST finds, in both directions",
+    ),
+    "_OBSERVED_READS": (
+        "derived",
+        "a runtime record the audit hook appends to; nothing is written down in it",
+    ),
+    "_OBSERVED_WRITES": (
+        "derived",
+        "a runtime record the audit hook appends to; nothing is written down in it",
+    ),
+    "_UNCLASSIFIED_EVENTS": (
+        "derived",
+        "a runtime record of events no table classifies; it exists to be empty",
+    ),
+    "_OBSERVER_BOUNDARY": (
+        "closed both ways",
+        "every covered claim and every NOT-covered claim has a canary that drives it",
+    ),
+    "_MUTATING_EVENTS": (
+        "fail-closed",
+        "an event absent from all three event tables is recorded and FAILS the test that raised it",
+    ),
+    "_NETWORK_EVENTS": (
+        "fail-closed",
+        "an event absent from all three event tables is recorded and FAILS the test that raised it",
+    ),
+    "_INERT_EVENTS": (
+        "fail-closed",
+        "the only table here that grants silence, and only for events already known to CPython's own list",
+    ),
+    "_UNAUDITED_MUTATORS": (
+        "cross-check only",
+        "a weaker second layer for two mutators CPython raises nothing for; declared non-exhaustive in the boundary",
+    ),
+    "_REAL_HTTPX_SEND": (
+        "cross-check only",
+        "the httpx methods patched as a second layer; the audit hook, not this, is what closes the network",
+    ),
+    "_NOT_THE_SERVER": (
+        "closed both ways",
+        "the directory listing minus this has to equal the swept modules, and each excluded file must define a Dag",
+    ),
+    "_HTTPX_CALLS": (
+        "cross-check only",
+        "an AST scan for httpx verbs; the audit hook observes the socket underneath every one of them",
+    ),
+    "_TRANSPORT_SPEAKERS": (
+        "closed both ways",
+        "an AST scan finds every function of transport that speaks HTTP and compares against this",
+    ),
+    "_READS_WITHOUT_A_UNIVERSE": (
+        "closed both ways",
+        "the census asserts readers found by AST equals these exclusions plus the typed readers",
+    ),
+    "_READS_CARRYING_A_READING": (
+        "closed both ways",
+        "same census identity, and each entry additionally carries a runtime check that completeness travels",
+    ),
+    "_READING_CARRIERS": (
+        "closed both ways",
+        "asserted equal to _READS_CARRYING_A_READING, so neither can grow without the other",
+    ),
+    "_SWEPT_TOOLS": (
+        "closed both ways",
+        "registered tools observed at mcp.tool registration must equal the swept plus the writing tools",
+    ),
+    "_WRITE_REFUSALS": (
+        "closed both ways",
+        "same tool-registry identity; a tool registered and swept by neither fails the census",
+    ),
+    "_DELIBERATELY_UNGATED_TOOLS": (
+        "closed both ways",
+        "carried in the same tool-registry identity as the two tables above",
+    ),
+    "_ALL_TOOLS": (
+        "closed both ways",
+        "the swept tools plus the writing ones, held to the observed registration list",
+    ),
+    "_CONSERVATIVE_FLAGS": (
+        "closed both ways",
+        "every payload of every swept tool is scanned for a leaf wearing a declared name at an undeclared path",
+    ),
+    "_COVERAGE_DISCLOSURES": (
+        "closed both ways",
+        "held to the same undeclared-path scan as the table above",
+    ),
+    "_SAMPLED_ENUMERATIONS": (
+        "cross-check only",
+        "each entry's counter is checked to exist and to move; an enumeration NOT listed is simply held to the stricter rule",
+    ),
+    "_COVERAGE_COUNTS": (
+        "non-exhaustive vocabulary",
+        "suffixes that mark a leaf as an omission counter; a suffix missing here makes the sweep STRICTER, never laxer",
+    ),
+    "_COVERAGE_FLAGS": (
+        "non-exhaustive vocabulary",
+        "suffixes that mark a completeness flag; missing one makes the sweep stricter, never laxer",
+    ),
+    "_COVERAGE_STATUSES": (
+        "non-exhaustive vocabulary",
+        "status words a coverage leaf may carry; missing one makes the sweep stricter, never laxer",
+    ),
+    "_TWO_PHASE_WRITES": (
+        "closed both ways",
+        "measured against the levers: a tool whose apply never reads short has to be in the declared inert table",
+    ),
+    "_WRITE_CARDS_THE_SWEEP_CANNOT_REACH": (
+        "closed both ways",
+        "the sweep asserts it reaches zero landed writes, and each entry names a real transport reader",
+    ),
+    "_LEVERS_THAT_MOVE_NOTHING": (
+        "closed both ways",
+        "measured over every lever and tool, compared in both directions, so a lever going quiet fails too",
+    ),
+    "_TOOLS_THAT_MOVE_NOTHING": (
+        "closed both ways",
+        "measured the same way on the tool axis of the same matrix",
+    ),
+    "_WRITE_TOOLS_WHOSE_APPLY_CANNOT_READ_SHORT": (
+        "closed both ways",
+        "measured over the two-phase sweep and compared in both directions",
+    ),
+    "_TRUNCATION_VOCABULARY": (
+        "non-exhaustive vocabulary",
+        "words that count as naming a shortfall; a word missing here makes the disclosure test stricter",
+    ),
+    "_RULE_VIOLATIONS": (
+        "closed both ways",
+        "asserted equal to recovery._WRITE_PRECONDITIONS, which is the product's own list",
+    ),
+    "_ABSENCE_LEGS": (
+        "non-exhaustive vocabulary",
+        "spellings of a hand-written absence; missing one weakens a probe rather than certifying anything",
+    ),
+    "_COUNT_WORDS": (
+        "non-exhaustive vocabulary",
+        "words a count may be spelled with; missing one makes the arithmetic-tie rule stricter",
+    ),
+    "_CLAIM_WORDS": (
+        "non-exhaustive vocabulary",
+        "words a claim may be spelled with; missing one makes the rule stricter",
+    ),
+    "_COMPARISON_FUNCTIONS": (
+        "fail-closed",
+        "the six dunder comparisons; any other operator on a completeness pair is not matched and so not excused",
+    ),
+    "_PAGINATION_TERMINATIONS": (
+        "closed both ways",
+        "the AST finds every comparison site and asserts none is unaccounted AND that all of these still exist",
+    ),
+    "_DISPLAY_CEILINGS": (
+        "closed both ways",
+        "held to the same two-directional site scan as the table above",
+    ),
+    "_THE_ONE_DERIVATION": (
+        "closed both ways",
+        "asserted to be present among the sites the AST finds, and the only one outside the two tables",
+    ),
+    "_COMPARE_DAG_RUNS_DOCSTRING_CLAIMS": (
+        "non-exhaustive vocabulary",
+        "claims read out of one docstring; missing one leaves a claim untested rather than certifying it",
+    ),
+    "_WRITE_SPELLINGS": (
+        "cross-check only",
+        "an AST name list that is NOT the mutating surface it once claimed to be; the audit hook carries the closure",
+    ),
+    "_DRY_RUN_SPELLINGS": (
+        "closed both ways",
+        "asserted equal to the non-route entries of approvals._READ_SEARCHES",
+    ),
+    "_DOMINANCE_SHAPES": (
+        "fixture",
+        "control-flow shapes with their truths; a shape absent from it is one the analyser must still refuse or answer",
+    ),
+    "_FILE_WRITE_CALLS": (
+        "closed both ways",
+        "each declared shape must match a real call, and the N6 census fails for any write whose request matches none",
+    ),
+    "_SIMPLE_STATEMENTS": (
+        "fail-closed",
+        "a statement type absent from it raises _UnmodelledControlFlow rather than being modelled as simple",
+    ),
+    "_LAZILY_EVALUATED": (
+        "fail-closed",
+        "a lazy form absent from it cannot make a gate count; the surrounding rule refuses rather than certifies",
+    ),
+    "_GATE_BACKDOORS": (
+        "fixture",
+        "six hostile rewrites driven against every real gated write; a seventh shape is more evidence, not less",
+    ),
+    "_READ_SPELLINGS": (
+        "fixture",
+        "canary probes, not a closure claim; each is measured against the old observer to prove it is not vacuous",
+    ),
+    "_SPELLINGS_THE_HTTPX_LAYER_CANNOT_SEE": (
+        "closed both ways",
+        "measured against a counting Client.send and compared in both directions",
+    ),
+    "_CLIENT_SWALLOWED_THE_REFUSAL": (
+        "closed both ways",
+        "empty, and it stays empty only while every canary really surfaces the refusal",
+    ),
+    "_ATTEMPTS_PER_READ": (
+        "closed both ways",
+        "empty, and it stays empty only while every canary is observed exactly once",
+    ),
+    "_WRITE_SPELLING_CANARIES": (
+        "fixture",
+        "canary probes over the filesystem; a spelling absent from it is untested, never excused",
+    ),
+    "_READ_SPELLINGS_THAT_ARE_NOT_WRITES": (
+        "fixture",
+        "canary probes for the other direction, that a read is never reported as a write",
+    ),
+    "_COMPOUND_WRITES": (
+        "closed both ways",
+        "measured counts, compared exactly, so a canary changing arity fails here",
+    ),
+    "_WHY_A_WRITE_IS_COMPOUND": (
+        "closed both ways",
+        "asserted to have exactly the same keys as the measured table above",
+    ),
+    "_NOWHERE": (
+        "fixture",
+        "a loopback address nothing listens on; the observer refuses before the syscall, so it is never dialled",
+    ),
+    "_ONE_EDIT": (
+        "fixture",
+        "one reviewed edit that every code-change tool in the sweeps is driven with",
+    ),
+    "_AUDIT_MARKER": (
+        "fixture",
+        "one marker value the audit-row builders below are driven with",
+    ),
+    "_LIVE_REST_EVENT_NAMES": (
+        "fixture",
+        "event names captured from the live deployment; a name absent from it is untested, never excused",
+    ),
+    "_LIVE_CLI_EVENT_NAMES": (
+        "fixture",
+        "event names captured from the live deployment; a name absent from it is untested, never excused",
+    ),
+    "_LIVE_PLATFORM_EVENT_NAMES": (
+        "fixture",
+        "event names captured from the live deployment; a name absent from it is untested, never excused",
+    ),
+    "FORBIDDEN_PHRASES": (
+        "non-exhaustive vocabulary",
+        "prose this tool may never write; a phrase absent from it is UNCHECKED, which is the one risk this table carries",
+    ),
+    "DEMO_TASKS": (
+        "fixture",
+        "the demo Dag's task list, which every sweep world is built out of",
+    ),
+    "ASSET_FIXTURE": (
+        "fixture",
+        "asset rows the blast-radius worlds are built out of",
+    ),
+    "FORGED": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "EXECUTED": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "NOTICE": (
+        "fixture",
+        "one row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "RECOVERED": (
+        "fixture",
+        "one row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "REPORTED": (
+        "fixture",
+        "one row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "DAG_PARAMS": (
+        "fixture",
+        "Dag params the worlds below are built out of, mirroring a live Dag",
+    ),
+    "FORGED_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "EXECUTED_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "EMPTY_OPERATOR_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "MARK_SUCCESS_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "DRIFT_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "DRIFT_TI_PREDISPATCH": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "TRIGGERER_COMPLETED_TI": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "TRIGGERER_COMPLETED_TI_LIVE": (
+        "fixture",
+        "one task-instance row a world is built out of; a field it lacks is untested, not excused",
+    ),
+    "SUCCESS_EVENT": (
+        "fixture",
+        "one event-log row the audit worlds below are built out of",
+    ),
+    "PROBE_ROW_1872": (
+        "fixture",
+        "one row captured verbatim from the live deployment, used as a probe",
+    ),
+    "FORGED_GRAPH": (
+        "fixture",
+        "a task graph the blast-radius and mapped-task worlds are built out of",
+    ),
+    "MAPPED_TASKS": (
+        "fixture",
+        "a task graph the blast-radius and mapped-task worlds are built out of",
+    ),
+    "GROUP_TASKS": (
+        "fixture",
+        "a task graph the blast-radius and mapped-task worlds are built out of",
+    ),
+    "approvals._WRITE_GATES": (
+        "closed both ways",
+        "every gate named by a classified write must be one of these, and each must dominate its write",
+    ),
+    "approvals._GATED_WRITES": (
+        "closed both ways",
+        "the AST census fails for a write nothing classifies AND for a classification whose write is gone",
+    ),
+    "approvals._UNGATED_WRITES": (
+        "closed both ways",
+        "same two-directional census, plus the runtime observer rejects a mutation at a site none of these names",
+    ),
+    "approvals._NOT_A_WRITE": (
+        "closed both ways",
+        "a declaration whose call has gone fails as loudly as a call nothing declares",
+    ),
+    "approvals._READ_SEARCHES": (
+        "closed both ways",
+        "split into routes and dry-run spellings, both matched structurally and both asserted against this tuple",
+    ),
+}
+
+
+def _module_level_tables(module):
+    """Every module-level container this file or approvals declares, by name."""
+    found = []
+    for node in ast.parse(Path(__file__).parent.joinpath(f"{module}.py").read_text()).body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            name = getattr(target, "id", None)
+            if not name or name.upper() != name:
+                continue
+            value = node.value
+            if isinstance(value, (ast.Dict, ast.Tuple, ast.Set, ast.List)):
+                found.append(name)
+            elif isinstance(value, ast.Call) and getattr(value.func, "id", "") in ("frozenset", "set"):
+                found.append(name)
+    return found
+
+
+def test_every_hand_maintained_table_is_inventoried_and_dispositioned():
+    """The audit this instrument kept failing, made mechanical.
+
+    A table nobody has decided about is a table that will be read as exhaustive
+    by whoever meets it next, which is how four rounds of closure claims came to
+    rest on lists smaller than the surfaces they named.
+    """
+    declared = set(_ENUMERATION_INVENTORY)
+    here = set(_module_level_tables("test_server"))
+    theirs = {f"approvals.{name}" for name in _module_level_tables("approvals")}
+
+    assert sorted(here | theirs) == sorted(declared), (
+        "a module-level table is not in the inventory, or the inventory names one that is gone"
+    )
+    for name, (disposition, reason) in _ENUMERATION_INVENTORY.items():
+        assert disposition in _ENUMERATION_DISPOSITIONS, f"{name} carries an unknown disposition"
+        assert len(reason) > 45, name
+
+
+def test_no_closure_claim_rests_on_a_cross_check_alone(capsys):
+    """The tables that are explicitly NOT closure, and what carries it instead.
+
+    Printed rather than only asserted, because the point of the disposition is
+    that a reader of the run can see which lists are load-bearing and which are
+    a second opinion. Every cross-check here has a named runtime observer or a
+    derived rule standing behind it, and each of those is exercised by a canary.
+    """
+    by_disposition: dict[str, list[str]] = {}
+    for name, (disposition, _) in sorted(_ENUMERATION_INVENTORY.items()):
+        by_disposition.setdefault(disposition, []).append(name)
+    print(
+        "\n".join(
+            f"{disposition:26} {len(names):3}  {', '.join(names)}"
+            for disposition, names in sorted(by_disposition.items())
+        )
+    )
+
+    # The two that were the whole of the closure argument in earlier rounds, and
+    # are now second opinions behind a runtime observer.
+    assert _ENUMERATION_INVENTORY["_HTTPX_CALLS"][0] == "cross-check only"
+    assert _ENUMERATION_INVENTORY["_WRITE_SPELLINGS"][0] == "cross-check only"
+    assert set(by_disposition) <= set(_ENUMERATION_DISPOSITIONS)
+    assert "cross-check only" in capsys.readouterr().out
