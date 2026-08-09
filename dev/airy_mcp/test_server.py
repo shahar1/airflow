@@ -17112,9 +17112,10 @@ _ENUMERATION_INVENTORY = {
         "registered tools observed at mcp.tool registration must equal the swept plus the writing tools",
     ),
     "_MATRIX_IDS": (
-        "fail-closed",
-        "the seventeen preregistered acceptance cases; the ids are asserted against the frozen A1-A8 "
-        "and B1-B9 set, so a case added or renamed fails rather than quietly widening the matrix",
+        "closed both ways",
+        "the seventeen preregistered acceptance cases; the ids are compared against the "
+        "``test_matrix_*`` functions this module actually defines, in both directions, so a case "
+        "deleted, renamed or added fails rather than quietly changing what the seventeen are",
     ),
     "_SETTLED_TRIGGER_SENTENCES": (
         "non-exhaustive vocabulary",
@@ -17634,13 +17635,36 @@ def _the_four_axes(
     assert expected_status(status), f"{case}: (c) the status is not the truthful one: {status}"
 
 
+def _matrix_case_functions():
+    """The case id of every ``test_matrix_*`` function this module defines.
+
+    A list rather than a set, so two functions claiming the same case id fail
+    the count as loudly as a missing one.
+    """
+    return sorted(
+        name.split("_")[2]
+        for name, value in globals().items()
+        if name.startswith("test_matrix_") and inspect.isfunction(value)
+    )
+
+
 def test_the_acceptance_matrix_is_the_frozen_seventeen():
-    """The matrix does not grow, and the ids are the ones registered."""
-    registered = {name.split("-")[0] for name in _MATRIX_IDS}
+    """The matrix does not grow, and the ids are the cases that exist.
+
+    The registered ids are compared against the ``test_matrix_*`` functions the
+    module actually defines rather than against themselves: a hand-written tuple
+    checked only for its own shape froze nothing, and both a deleted case and an
+    eighteenth one passed under it.
+    """
+    frozen = {f"A{n}" for n in range(1, 9)} | {f"B{n}" for n in range(1, 10)}
+    registered = [name.split("-")[0] for name in _MATRIX_IDS]
+    defined = _matrix_case_functions()
 
     assert len(_MATRIX_IDS) == 17
-    assert registered == {f"A{n}" for n in range(1, 9)} | {f"B{n}" for n in range(1, 10)}
-    assert len(set(_MATRIX_IDS)) == 17
+    assert len(set(registered)) == 17
+    assert set(registered) == frozen
+    assert len(defined) == 17, f"the matrix has {len(defined)} case functions: {defined}"
+    assert set(defined) == frozen, "a matrix case was deleted, renamed, or added"
 
 
 def test_matrix_A1_an_approved_patch_over_matching_bytes_is_applied_once(airflow, tmp_path):
