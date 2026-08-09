@@ -30,6 +30,7 @@ import {
   buildPrompts,
   buildReceiptLabel,
   buildSelectionCss,
+  buildToolLabel,
   buildToolStatus,
   buildWriteEffect,
   canRetry,
@@ -157,22 +158,48 @@ describe("buildConfirmState", () => {
     expect(buildConfirmState(request, call, streaming)).toBe(expected);
   });
 
-  // Red says the write did not happen. A clear whose request went out and whose
-  // response went wrong says precisely that it does not know, so it gets the
-  // amber "may have landed" rendering the drawer already has, not the red one.
-  // The server decides that and sends it on the frame; nothing here re-derives
-  // it from a result string that storage clips.
-  const unknownOutcome = '{"cleared": false, "mutation_outcome": "unknown", "http_status": null}';
+  // Red says the write did not happen. A trigger whose request went out and
+  // whose response went wrong says precisely that it does not know, so it gets
+  // the amber "may have landed" rendering the drawer already has, not the red
+  // one. The server decides that and sends it on the frame; nothing here
+  // re-derives it from a result string that storage clips.
+  const unknownOutcome = '{"triggered": false, "mutation_outcome": "unknown", "http_status": null}';
 
   it("reads a write whose outcome is unknown as unsettled, not failed", () => {
     expect(buildToolStatus(tool({ result: unknownOutcome, unsettled: true }))).toBe("unsettled");
     expect(
       buildConfirmState(
-        confirm({ resolution: "approved", tool: "apply_task_instance_clear" }),
-        tool({ name: "apply_task_instance_clear", result: unknownOutcome, unsettled: true }),
+        confirm({ resolution: "approved", tool: "rerun_dag" }),
+        tool({ name: "rerun_dag", result: unknownOutcome, unsettled: true }),
         false,
       ),
     ).toBe("unknown");
+  });
+
+  it("reads a refusal as refused rather than as a failure", () => {
+    // The scripted stale-version refusal: "Nothing was created." Red said the
+    // run broke; the receipt said "Approved change failed".
+    const refusal = tool({
+      failed: true,
+      name: "rerun_dag",
+      refused: true,
+      result: '{"triggered": false, "error": "…Nothing was created."}',
+    });
+
+    expect(buildToolStatus(refusal)).toBe("refused");
+    expect(buildConfirmState(confirm({ resolution: "approved", tool: "rerun_dag" }), refusal, false)).toBe(
+      "refused",
+    );
+    expect(buildToolLabel(refusal)).toBe("Rerun Dag refused — nothing was changed");
+    expect(
+      buildReceiptLabel("refused", ["refused"], { callId: "c1", nonce: "n1", tool: "rerun_dag" }),
+    ).toBe("Approved — refused, nothing was changed");
+  });
+
+  it("keeps a refusal red on a bundle that predates the flag", () => {
+    // `failed` stays on the frame beside `refused`, so an older deployed bundle
+    // degrades to the red row rather than to a green check.
+    expect(buildToolStatus(tool({ failed: true, name: "rerun_dag" }))).toBe("failed");
   });
 
   it("never paints a clipped unknown-outcome result amber on its own", () => {
@@ -212,121 +239,6 @@ describe("buildGroupState", () => {
     expect(
       buildReceiptLabel("failed", states, { callId: "c1", nonce: "n1", tool: "apply_dag_code_changes" }),
     ).toBe("1 of 3 applied · 2 need attention");
-  });
-});
-
-describe("buildWriteEffect apply_task_instance_clear", () => {
-  const clear = (args: Record<string, unknown>): ConfirmRequest => ({
-    args,
-    callId: "c1",
-    nonce: "n1",
-    tool: "apply_task_instance_clear",
-  });
-  const summarize = (args: Record<string, unknown>): string => buildWriteEffect(clear(args)).summary(args);
-  const base = {
-    dag_id: "dunmore_chargeback_filing",
-    dag_run_id: "manual__1",
-    task_ids: ["seed"],
-  };
-
-  // Airflow resolves an absent `run_on_latest_version` from the Dag's own
-  // `rerun_with_latest_version`, then from `[core] rerun_with_latest_version`,
-  // then falls back to false — so the omitted case is the version the run used
-  // on any deployment that sets neither, which is the opposite of "latest".
-  // The sidecar omits the key by default, putting every default clear here.
-  it.each([
-    ["absent", base],
-    ["false", { ...base, run_on_latest_version: false }],
-  ])("never claims the latest parsed code when run_on_latest_version is %s", (_label, args) => {
-    expect(summarize(args)).not.toContain("latest parsed code");
-  });
-
-  it("names Airflow's own default rather than picking a side, when the key is absent", () => {
-    const summary = summarize(base);
-
-    expect(summary).toContain("whichever Dag version Airflow's own default selects");
-    expect(summary).toContain("the version the run used");
-    expect(summary).toContain("`[core] rerun_with_latest_version`");
-  });
-
-  it("says the run's own version when the caller chose false", () => {
-    expect(summarize({ ...base, run_on_latest_version: false })).toContain(
-      "it runs again on the version that run used",
-    );
-  });
-
-  it("says the latest parsed code only when the caller chose true", () => {
-    expect(summarize({ ...base, run_on_latest_version: true })).toContain(
-      "it runs again on the latest parsed code",
-    );
-  });
-
-  it("names every instance the clear touches instead of 'everything downstream of it'", () => {
-    const summary = summarize({
-      ...base,
-      include_downstream: true,
-      reviewed_instances: ["seed", "fan[0]", "fan[1]", "transmit", "notice"],
-    });
-
-    expect(summary).toContain("5 task instances");
-    for (const instance of ["`seed`", "`fan[0]`", "`fan[1]`", "`transmit`", "`notice`"]) {
-      expect(summary).toContain(instance);
-    }
-    expect(summary).not.toContain("everything downstream of it");
-  });
-
-  it("keeps the count exact when a wide fan-out is too long to name in full", () => {
-    const summary = summarize({
-      ...base,
-      reviewed_instances: Array.from({ length: 26 }, (_, index) => `fan[${index}]`),
-    });
-
-    expect(summary).toContain("26 task instances");
-    expect(summary).toContain("`fan[19]`");
-    expect(summary).toContain("and 6 more");
-    expect(summary).not.toContain("`fan[20]`");
-  });
-
-  it("falls back to the seed only when the reviewed set never arrived", () => {
-    expect(summarize({ ...base, include_downstream: true })).toContain("everything downstream of it");
-  });
-
-  it("states the state rule the server will use when the card carries no flag", () => {
-    // Absent is not "no behaviour": the tool's own default is only_failed=true.
-    expect(summarize(base)).toContain("Only failed and upstream_failed");
-  });
-
-  it("says when the clear reaches instances that already succeeded", () => {
-    expect(summarize({ ...base, only_failed: false })).toContain("including ones that already succeeded");
-    expect(summarize({ ...base, only_failed: true })).toContain("Only failed and upstream_failed");
-  });
-
-  it("renders the reviewed instances on the approval card", () => {
-    show(
-      <MessageList
-        messages={[
-          assistant({
-            confirms: [
-              {
-                args: {
-                  ...base,
-                  include_downstream: true,
-                  only_failed: false,
-                  reviewed_instances: ["seed", "fan[0]", "transmit"],
-                },
-                callId: "c1",
-                nonce: "n1",
-                tool: "apply_task_instance_clear",
-              },
-            ],
-            content: "",
-          }),
-        ]}
-      />,
-    );
-
-    expect(screen.getByText(/fan\[0\]/u)).toBeTruthy();
-    expect(screen.queryByText(/everything downstream of it/u)).toBeNull();
   });
 });
 
@@ -373,10 +285,52 @@ describe("buildWriteEffect rerun_dag run options", () => {
   it.each([
     ["absent", { dag_id: "incident_triage" }],
     ["empty", { conf: {}, dag_id: "incident_triage" }],
-  ])("keeps today's wording when conf is %s", (_label, args) => {
+  ])("never promises which code an unpinned run uses, when conf is %s", (_label, args) => {
+    // "using the latest parsed code" was a flat promise about bytes that the
+    // tool itself refuses to make.
     expect(buildWriteEffect(rerun(args)).summary(args)).toBe(
-      "Creates one manual run of `incident_triage` using the latest parsed code.",
+      "Creates one manual run of `incident_triage`. Nothing pins which code runs: it uses whichever version the Dag has been parsed to by then.",
     );
+  });
+
+  it("shows the identity and the version pin on the card, not only under the disclosure", () => {
+    // An identified, version-pinned trigger rendered identically to a bare one:
+    // both arguments were reachable only under *Technical details*.
+    const args = {
+      dag_id: "arden_refund_remittance",
+      expected_dag_version: 4,
+      note: "Replacement run for the unfiled remittance batch",
+      run_id: "airy_repair_20260809",
+    };
+    const summary = buildWriteEffect(rerun(args)).summary(args);
+
+    expect(summary).toContain("`run_id: \"airy_repair_20260809\"`");
+    expect(summary).toContain("`expected_dag_version: 4`");
+    expect(summary).toContain("still on Dag version 4");
+    expect(summary).toContain("pins the version number and not the bytes it holds");
+    expect(summary).not.toContain("latest parsed code");
+  });
+
+  it("renders the run identity on the approval card", () => {
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              rerun({
+                dag_id: "arden_refund_remittance",
+                expected_dag_version: 4,
+                run_id: "airy_repair_20260809",
+              }),
+            ],
+            content: "",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('run_id: "airy_repair_20260809"')).not.toBeNull();
+    expect(screen.getByText("expected_dag_version: 4")).not.toBeNull();
   });
 
   it("renders the conf pairs on the approval card", () => {
@@ -811,40 +765,40 @@ describe("MessageList", () => {
     expect(screen.queryByText("-a")).toBeNull();
   });
 
-  it("says exactly what a task clear does, and what it does not", () => {
-    show(
-      <MessageList
-        messages={[
-          assistant({
-            confirms: [
-              {
-                args: {
-                  dag_id: "sales_summary",
-                  dag_run_id: "manual__2026-08-02",
-                  run_on_latest_version: true,
-                  task_ids: ["report"],
+  it.each(["apply_task_instance_clear", "run_backfill", "plan_task_instance_clear"])(
+    "describes no withdrawn capability for %s, however the card arrives",
+    (tool) => {
+      // A stale sessionStorage transcript from a build that still offered these
+      // can hand the drawer a confirm naming one. It must not come back with
+      // the withdrawn card's own wording; the unknown-effect warning is the
+      // only thing this build is entitled to say about it.
+      show(
+        <MessageList
+          messages={[
+            assistant({
+              confirms: [
+                {
+                  args: {
+                    dag_id: "sales_summary",
+                    dag_run_id: "manual__2026-08-02",
+                    task_ids: ["report"],
+                  },
+                  callId: "c1",
+                  nonce: "n1",
+                  tool,
                 },
-                callId: "c1",
-                nonce: "n1",
-                tool: "apply_task_instance_clear",
-              },
-            ],
-          }),
-        ]}
-      />,
-    );
+              ],
+            }),
+          ]}
+        />,
+      );
 
-    expect(screen.getByText("Clear a task instance in an existing run")).not.toBeNull();
-    expect(screen.getByText("Re-runs an existing task · creates no Dag run")).not.toBeNull();
-    const summary = screen.getByText(/Clears/u).textContent ?? "";
-
-    expect(summary).toContain("report");
-    expect(summary).toContain("manual__2026-08-02");
-    expect(summary).toContain("latest parsed code");
-    expect(summary).toContain("no new Dag run is created");
-    // The clear takes the downstream with it — the card has to say which way.
-    expect(summary).toContain("everything downstream of it");
-  });
+      expect(screen.queryByText("Clear a task instance in an existing run")).toBeNull();
+      expect(screen.queryByText("Run the reviewed backfill")).toBeNull();
+      expect(screen.getByText("Makes a lasting change")).not.toBeNull();
+      expect(screen.getByText(new RegExp(`Runs ${tool} against your Airflow`, "u"))).not.toBeNull();
+    },
+  );
 
   it("offers a copy control on fenced code blocks", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -1077,12 +1031,7 @@ describe("MessageList", () => {
 
   it.each([
     ["revert_dag_code", {}, "Restore original Dag source", "Restore original source"],
-    [
-      "run_backfill",
-      { from_date: "2026-01-01", to_date: "2026-01-05" },
-      "Run the reviewed backfill",
-      "Run backfill",
-    ],
+    ["rerun_dag", {}, "Trigger a new Dag run", "Re-run Dag"],
   ])("states what %s does before it is approved", (tool, extra, title, approve) => {
     show(
       <MessageList

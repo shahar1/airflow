@@ -660,20 +660,12 @@ const WRITE_EFFECTS: Record<string, WriteEffect> = {
       `Applies ${describeChangeCount(args)} to the source file containing ${describeDag(args)} on the Airflow host, all together, and reparses it straight away — there is no review step after this.`,
     title: "Proposed Dag source change",
   },
-  apply_task_instance_clear: {
-    approve: "Clear task instance",
-    badge: "Re-runs an existing task · creates no Dag run",
-    proposed: "Proposed task clear",
-    summary: (args) =>
-      `Clears ${describeClearedInstances(args)} in run ${describeArg(args.dag_run_id)} of ${describeDag(args)} so ${describeClearVersion(args)}.${describeOnlyFailed(args)} The existing task instances are re-queued — no new Dag run is created.`,
-    title: "Clear a task instance in an existing run",
-  },
   rerun_dag: {
     approve: "Re-run Dag",
     badge: "Creates a Dag run",
     proposed: "Proposed Dag run",
     summary: (args) =>
-      `Creates one manual run of ${describeDag(args)} using the latest parsed code.${describeRunExtras(args)}`,
+      `Creates one manual run of ${describeDag(args)}. ${describeRunVersion(args)}${describeRunExtras(args)}`,
     title: "Trigger a new Dag run",
   },
   revert_dag_code: {
@@ -684,15 +676,6 @@ const WRITE_EFFECTS: Record<string, WriteEffect> = {
       `Restores the one-time Airy backup for the source file containing ${describeDag(args)}, discards every Airy fix since that backup, and reparses immediately.`,
     title: "Restore original Dag source",
   },
-  run_backfill: {
-    approve: "Run backfill",
-    badge: "Creates Dag runs",
-    proposed: "Proposed backfill",
-    // No count: the number of runs is not in the confirmation arguments.
-    summary: (args) =>
-      `Creates the reviewed backfill runs for ${describeDag(args)} from ${describeArg(args.from_date)} through ${describeArg(args.to_date)}.`,
-    title: "Run the reviewed backfill",
-  },
 };
 
 /** `rerun_dag --unpause` resumes the schedule for good; that is a different card. */
@@ -701,7 +684,7 @@ const UNPAUSE_EFFECT: WriteEffect = {
   badge: "Unpauses Dag · resumes scheduled runs",
   proposed: "Proposed Dag run",
   summary: (args) =>
-    `Unpauses ${describeDag(args)}, resumes its future scheduled runs, and creates one manual run now.${describeRunExtras(args)}`,
+    `Unpauses ${describeDag(args)}, resumes its future scheduled runs, and creates one manual run now. ${describeRunVersion(args)}${describeRunExtras(args)}`,
   title: "Re-run and resume this Dag's schedule",
 };
 
@@ -723,85 +706,21 @@ const describeChangeCount = (args: Record<string, unknown>): string => {
   return count === 1 ? "1 change" : `${count} changes`;
 };
 
-/** `["report"]`, or `[["report", 3]]` for one map index of a mapped task. */
-const describeTaskIds = (args: Record<string, unknown>): string => {
-  if (!Array.isArray(args.task_ids) || args.task_ids.length === 0) return "the named task";
-  return args.task_ids
-    .map((marker) =>
-      Array.isArray(marker)
-        ? `\`${String(marker[0])}\` (map index ${String(marker[1])})`
-        : `\`${String(marker)}\``,
-    )
-    .join(", ");
-};
-
 /**
- * The instances the clear actually touches, named one by one.
+ * Which code the triggered run is tied to — and what that does not establish.
  *
- * `task_ids` is the SEED, not the scope: with `include_downstream` on, one name
- * routinely stands for five instances, and "and everything downstream of it"
- * asked the user to approve a set the card never showed them.  The planner
- * enumerates that set and the apply carries it back as `reviewed_instances`, so
- * the list on the card and the list that gets cleared are the same object.
- *
- * Falls back to the seed only when the argument is missing — an older sidecar,
- * or a call the server is about to refuse for exactly that reason.
+ * "using the latest parsed code" was a flat promise about bytes, on a card whose
+ * own tool refuses to make one.  `expected_dag_version` is re-read immediately
+ * before the trigger, so a Dag that moved since the run was agreed is refused
+ * rather than run — but it pins a version NUMBER: a version's recorded source is
+ * rewritten in place when the file changes, so identical numbers can be
+ * different bytes.  With no pin there is not even a number, and the card must
+ * not imply there is.
  */
-const CARD_INSTANCE_LIMIT = 20;
-
-const describeClearedInstances = (args: Record<string, unknown>): string => {
-  const reviewed = Array.isArray(args.reviewed_instances)
-    ? args.reviewed_instances.filter((entry): entry is string => typeof entry === "string" && entry !== "")
-    : [];
-  if (reviewed.length > 0) {
-    const shown = reviewed.slice(0, CARD_INSTANCE_LIMIT).map((entry) => `\`${entry}\``);
-    // The count is always exact; only the naming is capped, and the card says so
-    // rather than letting a wide fan-out read as the whole of the change.
-    const rest = reviewed.length - shown.length;
-    const named = rest > 0 ? `${shown.join(", ")}, and ${rest} more` : shown.join(", ");
-    return `${reviewed.length} task instance${reviewed.length === 1 ? "" : "s"} — ${named}`;
-  }
-  return `${describeTaskIds(args)}${
-    args.include_downstream === false ? " (that task only)" : " and everything downstream of it"
-  }`;
-};
-
-/**
- * Which code the re-run uses — three answers, because the argument has three
- * values and only two of them were being told apart.
- *
- * An OMITTED `run_on_latest_version` is not "latest".  Airflow resolves an
- * absent value from the Dag's own `rerun_with_latest_version`, then from
- * `[core] rerun_with_latest_version`, then falls back to false — so on a
- * deployment that sets neither, the omitted case runs the version the run used,
- * which is the exact opposite of what the card used to say.  The sidecar now
- * omits the key by default, which put every default clear on that wrong branch.
- *
- * The neutral answer stays neutral: it must not harden into a promise about
- * code either, because under an unversioned bundle the worker imports the Dag
- * file as it stands on disk whatever the version says.
- */
-const describeClearVersion = (args: Record<string, unknown>): string => {
-  if (args.run_on_latest_version === false) return "it runs again on the version that run used";
-  if (args.run_on_latest_version === true) return "it runs again on the latest parsed code";
-  return "it runs again on whichever Dag version Airflow's own default selects — for a clear that is the version the run used, unless this Dag or `[core] rerun_with_latest_version` says otherwise";
-};
-
-/** `only_failed` off reaches instances that already succeeded; the card has to say so. */
-/**
- * What the clear will do about state, including when the card carries no flag.
- *
- * An absent `only_failed` is not an absent behaviour: the tool's own default is
- * `true`, so saying nothing described a narrower clear than the one the button
- * authorizes.  The card states the value the server will use.
- */
-const describeOnlyFailed = (args: Record<string, unknown>): string =>
-  args.only_failed === false
-    ? " This clears instances whatever state they are in, including ones that already succeeded."
-    : " Only failed and upstream_failed instances are cleared; anything else is left alone.";
-
-const describeArg = (value: unknown): string =>
-  typeof value === "string" && value ? `\`${value}\`` : "the requested date";
+const describeRunVersion = (args: Record<string, unknown>): string =>
+  typeof args.expected_dag_version === "number"
+    ? `The trigger is refused unless ${describeDag(args)} is still on Dag version ${args.expected_dag_version} at that moment, which pins the version number and not the bytes it holds.`
+    : "Nothing pins which code runs: it uses whichever version the Dag has been parsed to by then.";
 
 /** Inline-code span that survives content containing backticks. */
 const wrapCodeSpan = (text: string): string =>
@@ -816,8 +735,13 @@ const formatConfValue = (value: unknown): string => {
 };
 
 /**
- * The conf and note a `rerun_dag` approval would apply, one code line each.
+ * The arguments a `rerun_dag` approval would apply, one code line each.
  * They change what the approved run does, so the card has to show them.
+ *
+ * `run_id` and `expected_dag_version` lead, because they are what makes the run
+ * *identified*: without them the card for a pinned, named trigger read exactly
+ * like the card for a bare one, and the audience was asked to take the identity
+ * on the presenter's word. They were reachable only under *Technical details*.
  */
 const describeRunExtras = (args: Record<string, unknown>): string => {
   const conf =
@@ -825,7 +749,11 @@ const describeRunExtras = (args: Record<string, unknown>): string => {
       ? Object.entries(args.conf as Record<string, unknown>)
       : [];
   const note = typeof args.note === "string" && args.note !== "" ? args.note : undefined;
+  const runId = typeof args.run_id === "string" && args.run_id !== "" ? args.run_id : undefined;
+  const version = typeof args.expected_dag_version === "number" ? args.expected_dag_version : undefined;
   const lines = [
+    ...(runId === undefined ? [] : [wrapCodeSpan(`run_id: ${formatConfValue(runId)}`)]),
+    ...(version === undefined ? [] : [wrapCodeSpan(`expected_dag_version: ${version}`)]),
     ...conf.map(([key, value]) => wrapCodeSpan(`${key}: ${formatConfValue(value)}`)),
     ...(note === undefined ? [] : [wrapCodeSpan(`note: ${formatConfValue(note)}`)]),
   ];
@@ -939,7 +867,14 @@ const findTool = (tools: ToolCall[], confirm: ConfirmRequest): ToolCall | undefi
   tools.find((tool) => tool.id === confirm.callId);
 
 /** What became of one decided confirmation — the user's verdict is only half of it. */
-export type ConfirmState = "applied" | "applying" | "failed" | "pending" | "rejected" | "unknown";
+export type ConfirmState =
+  | "applied"
+  | "applying"
+  | "failed"
+  | "pending"
+  | "refused"
+  | "rejected"
+  | "unknown";
 
 /**
  * The user's decision does not say whether the write landed; the matching tool
@@ -961,7 +896,10 @@ export const buildConfirmState = (
   if (isStreaming) return "applying";
   const status = tool === undefined ? undefined : buildToolStatus(tool);
   // A call that reported an error answered the question; anything else that is
-  // not demonstrably done leaves it open.
+  // not demonstrably done leaves it open.  A refusal answered it too — the
+  // approval was spent and the tool declined — and "Approved change failed" over
+  // a result whose own words are "Nothing was created" reads as an outage.
+  if (status === "refused") return "refused";
   if (status === "failed") return "failed";
   if (confirm.outcomeUnknown === true || status !== "done") return "unknown";
   return "applied";
@@ -969,12 +907,13 @@ export const buildConfirmState = (
 
 /** Worst-first: a group is only as settled as its least settled action. */
 const STATE_RANK: Record<ConfirmState, number> = {
-  applied: 5,
-  applying: 3,
+  applied: 6,
+  applying: 4,
   failed: 1,
   pending: 0,
-  rejected: 4,
-  unknown: 2,
+  refused: 2,
+  rejected: 5,
+  unknown: 3,
 };
 
 export const buildGroupState = (states: ConfirmState[]): ConfirmState =>
@@ -989,6 +928,7 @@ const RECEIPT_ICONS: Record<ConfirmState, ToolStatus> = {
   applying: "running",
   failed: "failed",
   pending: "awaiting",
+  refused: "refused",
   rejected: "denied",
   unknown: "unsettled",
 };
@@ -1024,6 +964,10 @@ export const buildReceiptLabel = (
     // own words; the receipt's job is to record whose decision it was.
     case "failed":
       return "Approved change failed";
+    // The approval was spent and the tool declined it. Not a failure, and not
+    // the user's rejection either — the receipt has to say which.
+    case "refused":
+      return "Approved — refused, nothing was changed";
     case "rejected":
       return "Rejected by you";
     default:
@@ -1485,20 +1429,32 @@ const CodeControl: FC<CodeControlProps> = ({
   </Box>
 );
 
-/** Human labels for the tools Airy ships with; anything else gets humanized. */
+/**
+ * Human labels for the tools Airy ships with; anything else gets humanized.
+ *
+ * One entry per *registered* tool and no more.  The withdrawn recovery surface
+ * is gone from here, but deleting the entries is not what closes the hole —
+ * `humanizeToolName` invents a label for any name — so the server refuses to
+ * emit a frame for an unregistered tool at all.
+ */
 const TOOL_LABELS: Record<string, { running: string; done: string }> = {
   apply_dag_code_changes: { done: "Edited Dag code", running: "Editing Dag code" },
-  apply_task_instance_clear: { done: "Cleared task instance", running: "Clearing task instance" },
   compare_dag_runs: { done: "Compared Dag runs", running: "Comparing Dag runs" },
   diagnose_dag: { done: "Diagnosed Dag", running: "Diagnosing Dag" },
   find_failure_clusters: { done: "Scanned for failure clusters", running: "Scanning for failure clusters" },
   get_blast_radius: { done: "Checked downstream impact", running: "Checking downstream impact" },
-  plan_backfill: { done: "Planned backfill", running: "Planning backfill" },
   plan_dag_code_changes: { done: "Planned Dag code change", running: "Planning Dag code change" },
-  plan_task_instance_clear: { done: "Planned task clear", running: "Planning task clear" },
+  plan_revert_dag_code: { done: "Planned source restore", running: "Planning source restore" },
   rerun_dag: { done: "Re-ran Dag", running: "Re-running Dag" },
   revert_dag_code: { done: "Reverted Dag code", running: "Reverting Dag code" },
-  run_backfill: { done: "Ran backfill", running: "Running backfill" },
+  // `done` is only ever reached on `occurred: true`, and even that is Airflow's
+  // own record of the task's output — `external_system_checked` is always false,
+  // so neither label may say the external operation happened.  `false` and
+  // `null` arrive flagged unsettled and never reach either of these.
+  verify_replacement_run: {
+    done: "Verified the run recorded its output",
+    running: "Checking what the run recorded",
+  },
 };
 
 const humanizeToolName = (name: string): string => {
@@ -1516,6 +1472,12 @@ export const buildToolLabel = (tool: ToolCall): string => {
   }
   if (status === "unsettled") {
     return `${humanizeToolName(tool.name)} — outcome unknown`;
+  }
+  // A refusal is the guardrail working, not the system breaking. The scripted
+  // stale-version refusal says "Nothing was created" in the payload while the
+  // row said "Rerun Dag failed", which reads as an outage.
+  if (status === "refused") {
+    return `${humanizeToolName(tool.name)} refused — nothing was changed`;
   }
   if (status === "failed") {
     return `${humanizeToolName(tool.name)} failed`;
@@ -1576,6 +1538,7 @@ type ToolStatus =
   | "done"
   | "failed"
   | "proposed"
+  | "refused"
   | "running"
   | "unsettled";
 
@@ -1595,6 +1558,11 @@ export const buildToolStatus = (tool: ToolCall): ToolStatus => {
   // re-derive it by pattern-matching text that storage clips.
   if (tool.unsettled === true) return "unsettled";
   if (tool.durationMs === undefined) return tool.proposed === true ? "proposed" : "running";
+  // Before `failed`, and for the same reason: the tool reported back and said it
+  // changed nothing.  The server sets this from the tool's own outcome key and
+  // still sets `failed`, so a bundle that predates this flag stays red rather
+  // than going green.
+  if (tool.refused === true) return "refused";
   if (tool.failed === true) return "failed";
   if (tool.denied === true) return "denied";
   return "done";
@@ -1615,6 +1583,9 @@ const ToolStatusIcon: FC<{ readonly status: ToolStatus }> = ({ status }) => {
     // Red is reserved for a reported failure; amber stays with the unverifiable.
     failed: { color: isDark ? "red.300" : "red.600", icon: <WarnIcon /> },
     proposed: { color: isDark ? "orange.300" : "orange.600", icon: <ClockIcon /> },
+    // A cross, not a warning triangle: nothing happened and nothing is in doubt.
+    // Amber rather than red, because the system did not break.
+    refused: { color: isDark ? "orange.300" : "orange.600", icon: <CrossIcon /> },
     unsettled: { color: isDark ? "orange.300" : "orange.600", icon: <WarnIcon /> },
   };
   return (
@@ -1654,7 +1625,7 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
   const failed = status === "failed";
   // Only a call that reported back has a duration worth quoting, or anything
   // to expand.
-  const reported = status === "denied" || status === "done" || failed;
+  const reported = status === "denied" || status === "done" || status === "refused" || failed;
   const expandable = reported && (tool.result !== undefined || failed);
   const muted = isDark ? "gray.400" : "gray.600";
 

@@ -238,6 +238,11 @@ export const applyEvent = (
                 denied: event.denied === true,
                 durationMs: tool.durationMs ?? now - tool.startedAt,
                 failed: event.failed === true,
+                // A refusal is not a failure: the tool ran and declined. The
+                // server decides it from the tool's own outcome key and the
+                // drawer prefers it over `failed`, which stays set so an older
+                // bundle degrades to red rather than to a green check.
+                refused: event.refused === true,
                 result: typeof event.result === "string" ? event.result : undefined,
                 // The server already decided this from the tool's own result;
                 // forwarding it is what lets the drawer paint amber without

@@ -44,6 +44,8 @@ export interface ToolCall {
   cancelled?: boolean;
   /** An approved write whose run died before it reported back: it may have landed. */
   unsettled?: boolean;
+  /** The tool ran, declined, and changed nothing — not a system failure. */
+  refused?: boolean;
 }
 
 /** A write tool call the server suspended, waiting for the user's verdict. */
