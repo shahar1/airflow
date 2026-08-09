@@ -28,9 +28,12 @@ AIP-91 phase 1 (read-only) to show where the value ends up.
 What this server is certified to do is exactly that workflow and nothing wider:
 diagnose a green run whose expected work never executed, propose an exact source
 correction, obtain explicit human approval, apply it safely, trigger a
-specifically identified replacement run, and verify that the expected external
-operation occurred.  Broad automatic discovery and clearing of arbitrary
-historical task instances is OUT OF SCOPE and uncertified; the tools that did it
+specifically identified replacement run, and check what that run actually
+recorded.  Nothing here observes the external system: ``occurred: true`` is the
+presence of an output record in Airflow, and ``external_system_checked`` is
+always false, so the claim stops at the record.  Broad automatic discovery and
+clearing of arbitrary historical task instances is OUT OF SCOPE and
+uncertified; the tools that did it
 (``plan_task_instance_clear``, ``apply_task_instance_clear``,
 ``verify_task_instance_recovery``, ``plan_backfill``, ``run_backfill``) are
 WITHDRAWN from the registered surface below and are not reachable from the demo.
