@@ -1445,13 +1445,19 @@ def _abandon_backfill(
 # which is not an absence at all.
 _RUN_STILL_GOING = ("queued", "running", "restarting", "scheduled", None)
 
-# What a positive answer here IS, said in the payload because that is where a
-# small model meets it. The XCom record is the task's own report of its work -
-# the closest thing to the external artefact that stays inside the API this
-# server speaks - and it is not an observation of the external system.
+# What each answer here IS, said in the payload because that is where a small
+# model meets it. The XCom record is the task's own report of its work - the
+# closest thing to the external artefact that stays inside the API this server
+# speaks - and it is not an observation of the external system. ``false`` is
+# defined here too: the field is named for the operation, but what it is
+# measured over is the RECORD, and a task can finish successfully having written
+# nothing down.
 _VERIFY_SCOPE = (
     "`occurred: true` means this run's own record shows the task executed and recorded the "
-    "expected output. Nothing here observed the external system directly. `occurred: null` means "
+    "expected output. Nothing here observed the external system directly. `occurred: false` means "
+    "this run's own record holds no such output. That is a statement about the RECORD, not about "
+    "the world: a task whose own `task_state` is success DID run, so read false beside it as "
+    '"it recorded nothing", never as "the work did not happen". `occurred: null` means '
     "UNKNOWN - the run is unfinished, a read did not come back, or the evidence covered less than "
     'the answer needs - and is NEVER to be relayed as "it did not happen".'
 )
@@ -1504,7 +1510,10 @@ def verify_replacement_run(
       shows the work happened. Positive evidence, so a read that was cut short
       does not weaken it.
     * ``false`` — the run has finished, every relevant record was read whole,
-      and the output is not there. Only ever returned on a complete read.
+      and the output is not there. Only ever returned on a complete read. It is
+      an absence of the RECORD, not of the work: a task whose own ``task_state``
+      is success ran, and relaying false there as "it did not happen" is the
+      overclaim the field's name invites.
     * ``null`` — UNKNOWN. The run is still going, a read did not come back or
       timed out, permission for the output records was not granted, or the
       evidence was not read whole. Say "not established", never "it did not
@@ -1662,10 +1671,24 @@ def verify_replacement_run(
             evidence_read_whole=False,
             **common,
         )
+    # The one place ``occurred: false`` and the task's own state disagree, said
+    # in the answer rather than left to the reader: the field is named for the
+    # operation, and a model handed a bare false beside a task that succeeded
+    # will relay it as work that did not happen.
+    ran = common.get("task_state") == "success"
     return _verification(
         False,
         f"the run has finished, every output record was read, and {task_id} recorded no "
-        f"output" + (f" keyed {output_key!r}" if output_key else "") + f". Records seen: {seen}.",
+        f"output"
+        + (f" keyed {output_key!r}" if output_key else "")
+        + f". Records seen: {seen}."
+        + (
+            f" {task_id} itself finished in state 'success', so it DID run: what is absent is the "
+            f"output RECORD, not necessarily the work. Say it recorded nothing, not that it did "
+            f"not happen."
+            if ran
+            else ""
+        ),
         scan,
         output,
         evidence_read_whole=True,

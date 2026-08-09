@@ -3725,6 +3725,37 @@ def test_verify_replacement_run_answers_for_the_named_key_and_not_for_any_output
     assert "recorded no output keyed 'return_value'" in result["reason"]
 
 
+def test_a_false_beside_a_succeeded_task_reconciles_itself_in_the_answer(airflow):
+    """``occurred`` is named for the operation and measured over the record.
+
+    A task that ran, succeeded, and wrote nothing down is a truthful ``false``
+    and a false "it did not happen" to a small model reading the field name. The
+    two are made to disagree in words, in the answer, rather than only in a
+    ``task_state`` field further down the payload.
+    """
+    _replacement_world(airflow, task_state="success")
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is False
+    assert result["task_state"] == "success"
+    assert "so it DID run" in result["reason"]
+    assert "not necessarily the work" in result["reason"]
+    assert 'never as "the work did not happen"' in result["scope"]
+
+
+def test_a_false_over_a_task_that_did_not_succeed_says_nothing_about_running(airflow):
+    """The reconciliation is about a disagreement. A task that failed and
+    recorded nothing is not one, and claiming it ran would be the overclaim
+    mirrored."""
+    _replacement_world(airflow, task_state="failed")
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is False
+    assert "DID run" not in result["reason"]
+
+
 def test_verify_replacement_run_calls_an_absence_absent_only_on_a_whole_read(airflow):
     """B9. An absence drawn over a read that did not cover everything is not an
     absence, and answering false there is the defect this is for."""
@@ -17691,7 +17722,10 @@ def test_the_fixed_scope_sentences_are_pinned_to_their_bytes():
     """
     assert codechange._VERIFY_SCOPE == (
         "`occurred: true` means this run's own record shows the task executed and recorded the "
-        "expected output. Nothing here observed the external system directly. `occurred: null` means "
+        "expected output. Nothing here observed the external system directly. `occurred: false` means "
+        "this run's own record holds no such output. That is a statement about the RECORD, not about "
+        "the world: a task whose own `task_state` is success DID run, so read false beside it as "
+        '"it recorded nothing", never as "the work did not happen". `occurred: null` means '
         "UNKNOWN - the run is unfinished, a read did not come back, or the evidence covered less than "
         'the answer needs - and is NEVER to be relayed as "it did not happen".'
     )
