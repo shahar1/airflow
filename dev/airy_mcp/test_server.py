@@ -17648,6 +17648,36 @@ def _matrix_case_functions():
     )
 
 
+def test_the_fixed_scope_sentences_are_pinned_to_their_bytes():
+    """The instructions the model is told to trust, held to their exact text.
+
+    These are the sentences that tell a reader what ``true``, ``false`` and
+    ``null`` MEAN and what an identity buys, and they are the one part of a
+    payload the (d) axis deliberately does not read: it asks what a call
+    CLAIMS, and the fixed scope quotes the very phrases a claim may not use. So
+    the scope has to be pinned somewhere, or a sentence planted in it — "the
+    external system is correct" in the middle of ``_VERIFY_SCOPE`` — ships to
+    the model with nothing in the way.
+
+    Byte-for-byte, deliberately. A reworded caveat is a different instruction to
+    a small model, and it should be read and re-pinned rather than drift.
+    """
+    assert codechange._VERIFY_SCOPE == (
+        "`occurred: true` means this run's own record shows the task executed and recorded the "
+        "expected output. Nothing here observed the external system directly. `occurred: null` means "
+        "UNKNOWN - the run is unfinished, a read did not come back, or the evidence covered less than "
+        'the answer needs - and is NEVER to be relayed as "it did not happen".'
+    )
+    assert codechange._IDENTITY_SCOPE == (
+        "This prevents a duplicate under this exact run identity only. It establishes nothing about "
+        "whether a semantically equivalent run exists under a different id, in this Dag or elsewhere."
+    )
+    assert codechange._NO_IDENTITY_SUPPLIED == (
+        "No run_id was supplied, so Airflow minted this run's identity and nothing here is idempotent: "
+        "calling again with the same arguments creates a SECOND run."
+    )
+
+
 def test_the_acceptance_matrix_is_the_frozen_seventeen():
     """The matrix does not grow, and the ids are the cases that exist.
 
@@ -17975,7 +18005,14 @@ def test_matrix_B7_a_confirmed_operation_is_read_off_the_runs_own_record(airflow
         expected_count=0,
         status=result,
         expected_status=lambda r: r["evidence_read_whole"] is True,
-        must_say=("Nothing here observed the external system directly",),
+        # The first sentence is this OUTCOME's own: it exists only because a
+        # record was found in this run, so an answer that settles nothing cannot
+        # carry it. The second is fixed boilerplate and proves only that the
+        # scope still travels — its bytes are pinned in
+        # ``test_the_fixed_scope_sentences_are_pinned_to_their_bytes``, because
+        # (d) reads the claims without the scope and a forbidden sentence
+        # planted in the boilerplate would otherwise go unseen.
+        must_say=("recorded output in this run", "Nothing here observed the external system directly"),
         must_not_say=("the external system is correct",),
     )
     assert result["external_system_checked"] is False
