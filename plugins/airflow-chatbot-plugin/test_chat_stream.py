@@ -118,6 +118,7 @@ def test_event_payload_reports_a_tool_result():
         "id": "c1",
         "name": "diagnose_dag",
         "failed": False,
+        "refused": False,
         "denied": False,
         "unsettled": False,
         "result": "ok",
@@ -309,6 +310,138 @@ def test_event_payload_marks_a_refused_plan_as_failed(content, expected_failed):
     payload = plugin._event_payload(event)
 
     assert payload["failed"] is expected_failed
+
+
+# The three verification payloads captured against the live fixture: one per
+# value of ``occurred``. All three rendered as the same green check, on the row
+# that carries the last clause of the demo's claim.
+_VERIFY_OCCURRED_TRUE = {  # captures/07-verify-replacement.json
+    "occurred": True,
+    "reason": "post_remittance recorded output in this run keyed 'return_value'.",
+    "external_system_checked": False,
+    "task_state": "success",
+}
+_VERIFY_OCCURRED_NULL = {  # captures/21-chat-trigger-then-verify-live-plugin.txt
+    "occurred": None,
+    "reason": "the instance has recorded no matching output yet and the run is still running.",
+    "external_system_checked": False,
+}
+_VERIFY_OCCURRED_FALSE = {  # captures/23-chat-settled-verification.txt
+    "occurred": False,
+    "reason": "the run has finished, every output record was read, and post_remittance recorded no output.",
+    "external_system_checked": False,
+    "task_state": "success",
+}
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_unsettled"),
+    [
+        (_VERIFY_OCCURRED_TRUE, False),
+        (_VERIFY_OCCURRED_NULL, True),
+        (_VERIFY_OCCURRED_FALSE, True),
+        (json.dumps(_VERIFY_OCCURRED_FALSE), True),
+    ],
+    ids=["occurred_true", "occurred_null", "occurred_false", "json_string"],
+)
+def test_only_a_recorded_output_lets_a_verification_row_go_green(content, expected_unsettled):
+    """
+    ``occurred`` is three-valued and only ``true`` is an answer.
+
+    The tool is read-only, so nothing classified it: ``false`` (an absence of
+    the RECORD) and ``null`` (UNKNOWN) painted the same green check as ``true``,
+    and the row said "verified" over a run that recorded nothing.
+    """
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="verify_replacement_run", content=content, tool_call_id="c1")
+    )
+
+    payload = plugin._event_payload(event)
+
+    assert payload["unsettled"] is expected_unsettled
+    # Never red either: neither value says the check or the run broke.
+    assert payload["failed"] is False
+    assert payload["refused"] is False
+
+
+def test_a_verification_that_answered_nothing_at_all_is_left_alone():
+    """A payload with no ``occurred`` key is not a three-valued answer to grade."""
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(
+            tool_name="verify_replacement_run", content={"error": "not readable"}, tool_call_id="c1"
+        )
+    )
+
+    assert plugin._event_payload(event)["unsettled"] is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "content"),
+    [
+        ("rerun_dag", {"triggered": False, "error": "…Nothing was created."}),
+        ("apply_dag_code_changes", {"applied": False, "error": "the source changed since it was planned"}),
+        ("plan_dag_code_changes", {"planned": False, "error": "already planned"}),
+    ],
+    ids=["trigger_refused", "write_refused", "plan_refused"],
+)
+def test_a_refusal_is_reported_as_its_own_outcome_and_not_only_as_a_failure(tool, content):
+    """
+    A refusal is the guardrail working; red says the system broke.
+
+    The scripted stale-version refusal says "Nothing was created" in its own
+    payload while the row read "Rerun Dag failed" and the receipt read "Approved
+    change failed". ``failed`` stays set beside it so a deployed bundle that
+    predates the flag degrades to red rather than to a green check.
+    """
+    event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
+
+    payload = plugin._event_payload(event)
+
+    assert payload["refused"] is True
+    assert payload["failed"] is True
+
+
+@pytest.mark.parametrize(
+    ("tool", "content"),
+    [
+        ("apply_dag_code_changes", {"applied": True, "mutation_applied": True}),
+        ("rerun_dag", {"triggered": False, "mutation_outcome": "unknown"}),
+        ("diagnose_dag", {"summary": "no failures found"}),
+    ],
+    ids=["applied", "outcome_unknown", "read_tool"],
+)
+def test_nothing_that_is_not_a_refusal_is_reported_as_one(tool, content):
+    event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
+
+    assert plugin._event_payload(event)["refused"] is False
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["run_backfill", "apply_task_instance_clear", "plan_backfill", "verify_task_instance_recovery"],
+)
+def test_a_withdrawn_tool_the_model_names_never_reaches_the_screen(tool):
+    """
+    The call frame is emitted before the call is authorized.
+
+    A model that hallucinates one of these — and the system prompt itself primes
+    "backfill" — painted a spinner labelled with the withdrawn capability,
+    announced to screen readers, before anything refused it. Deleting the label
+    does not close it: an unknown name is humanized into one.
+    """
+    call = FunctionToolCallEvent(part=ToolCallPart(tool_name=tool, args={}, tool_call_id="c1"))
+    result = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content="{}", tool_call_id="c1"))
+
+    assert plugin._event_payload(call) is None
+    assert plugin._event_payload(result) is None
+
+
+def test_every_registered_tool_still_reaches_the_screen():
+    """The allowlist is the registration, so a tool added later is not silenced."""
+    for tool in plugin.TOOL_POLICY:
+        call = FunctionToolCallEvent(part=ToolCallPart(tool_name=tool, args={}, tool_call_id="c1"))
+
+        assert plugin._event_payload(call)["name"] == tool
 
 
 def test_event_payload_marks_a_failed_tool_call():
@@ -2257,7 +2390,7 @@ def test_an_unknown_clear_outcome_never_refreshes_a_view_into_saying_it_landed()
 
 
 @pytest.mark.asyncio
-async def test_a_rejected_clear_executes_nothing_and_is_reported_as_denied(monkeypatch, pending_store):
+async def test_a_rejected_write_executes_nothing_and_is_reported_as_denied(monkeypatch, pending_store):
     """The user cancelling the approval card is a decision, and it settles the run."""
     from pydantic_ai.messages import FunctionToolResultEvent, ToolReturnPart
 
@@ -2268,7 +2401,7 @@ async def test_a_rejected_clear_executes_nothing_and_is_reported_as_denied(monke
         yield plugin._event_payload(
             FunctionToolResultEvent(
                 part=ToolReturnPart(
-                    tool_name="apply_task_instance_clear",
+                    tool_name="apply_dag_code_changes",
                     content=plugin._DENIAL_MESSAGE,
                     tool_call_id="c1",
                 )

@@ -1627,6 +1627,27 @@ def _write_unsettled(content: Any) -> bool:
     return _write_outcome(content) == "outcome_unknown"
 
 
+VERIFY_TOOLS = frozenset({"verify_replacement_run"})
+
+
+def _verification_unsettled(content: Any) -> bool:
+    """
+    Whether a verification declines to say the work was recorded.
+
+    ``occurred`` is three-valued and only ``true`` is an answer: ``false`` is an
+    absence of the RECORD and ``null`` is UNKNOWN. The tool is read-only, so it
+    never reaches ``_write_outcome`` and every one of the three rendered as the
+    same green check — the row that carries the last clause of the demo's claim
+    saying "verified" over a run that recorded nothing.
+    """
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return False
+    return isinstance(content, dict) and "occurred" in content and content["occurred"] is not True
+
+
 def _plan_refused(content: Any) -> bool:
     """
     Whether a plan tool's result says no plan was issued.
@@ -1708,6 +1729,15 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
             return {"type": "text", "delta": part.content}
         return None
     if kind == "function_tool_call":
+        # Only a tool this build registers ever reaches the screen. The frame is
+        # emitted before the call is authorized, so a model that hallucinates a
+        # withdrawn name — and the system prompt itself primes "backfill" —
+        # painted a spinner labelled with a capability this build does not have,
+        # announced to screen readers, before anything refused it. Deleting the
+        # label does not close it: an unknown name is humanized into one. The
+        # allowlist does, and it survives every later edit to the labels.
+        if event.part.tool_name not in TOOL_POLICY:
+            return None
         payload = {
             "type": "tool",
             "id": event.part.tool_call_id,
@@ -1724,6 +1754,11 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
         return payload
     if kind == "function_tool_result":
         part = event.part
+        # Same allowlist as the call frame: a result for a name no row was ever
+        # opened for has nothing to update, and painting one would put the
+        # withdrawn name on screen by the back door.
+        if part.tool_name not in TOOL_POLICY:
+            return None
         # A RetryPromptPart here means the tool call itself failed (bad args,
         # MCP error); its content is the error the model is asked to recover from.
         failed = getattr(part, "part_kind", None) == "retry-prompt"
@@ -1736,12 +1771,29 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
         # reported as a failure the user can treat as "nothing happened". The
         # drawer already has an amber "may have landed" rendering for exactly
         # this, so the frame says so rather than borrowing the red one.
-        unsettled = refused and _write_unsettled(part.content)
+        #
+        # A verification that did not come back `occurred: true` joins it. It is
+        # read-only, so nothing above classifies it, and true/false/null all
+        # rendered as the same green check on the row the demo's last claim
+        # rests on.
+        unsettled = (refused and _write_unsettled(part.content)) or (
+            not failed
+            and not denied
+            and part.tool_name in VERIFY_TOOLS
+            and _verification_unsettled(part.content)
+        )
+        # A refusal is neither a system failure nor a rejection: the tool ran,
+        # declined, and changed nothing. Red said the run broke, over a result
+        # whose own words are "Nothing was created". `failed` stays set so an
+        # older bundle that has never heard of this flag still degrades to red
+        # rather than to a green check; the drawer prefers `refused`.
+        write_refused = refused and _write_refused(part.content)
         return {
             "type": "tool_result",
             "id": part.tool_call_id,
             "name": part.tool_name,
-            "failed": failed or (refused and _write_refused(part.content)) or plan_refused,
+            "failed": failed or write_refused or plan_refused,
+            "refused": write_refused or plan_refused,
             "denied": denied,
             "unsettled": unsettled,
             "result": _clip_result(part.model_response() if failed else part.content),
