@@ -12711,14 +12711,75 @@ def test_an_abandoned_backfill_does_not_count_its_own_truncation_as_a_survivor(a
 # ---------------------------------------------------------------------------
 
 
-def _mutating_calls():
-    """Every call in the tree that could change something, by module and function."""
+# Every spelling in this tree that could change something outside this process.
+# Enumerated over the mutating surface of ``os``, ``shutil``, ``tempfile`` and
+# ``pathlib.Path`` rather than over the four names a previous scan happened to
+# list — which left ``os.replace``, the atomic Dag-file write ITSELF, and the
+# ``os.chmod`` beside it unclassified, in a tree whose own registry says every
+# call that could change something is classified there.
+_WRITE_SPELLINGS = frozenset(
+    {
+        "_write_if_unchanged",
+        "chmod",
+        "chown",
+        "copy",
+        "copy2",
+        "copyfile",
+        "copytree",
+        "fdopen",
+        "hardlink_to",
+        "link",
+        "makedirs",
+        "mkdir",
+        "mkdtemp",
+        "mkstemp",
+        "move",
+        "open",
+        "remove",
+        "removedirs",
+        "rename",
+        "renames",
+        "replace",
+        "rmdir",
+        "rmtree",
+        "symlink_to",
+        "touch",
+        "truncate",
+        "unlink",
+        "utime",
+        "write",
+        "write_bytes",
+        "write_text",
+        "writelines",
+    }
+)
+
+
+def _rebuild_names(tree):
+    """Names this module bound to ``dataclasses.replace``.
+
+    Resolved off the module's own imports rather than declared one call at a
+    time: rebuilding a frozen row is not a filesystem write, and it shares a
+    spelling with the one that is.
+    """
+    names = set()
+    for _, node in _owned_nodes(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+            names |= {alias.asname or alias.name for alias in node.names if alias.name == "replace"}
+    return names
+
+
+def _write_spelled_calls():
+    """Every call in the tree spelled like a mutation, declared or not."""
     found = []
     for module in _MODULES:
-        for owner, node in _owned_nodes(_module_source(module)):
+        tree = _module_source(module)
+        rebuilds = _rebuild_names(tree)
+        for owner, node in _owned_nodes(tree):
             if not isinstance(node, ast.Call):
                 continue
-            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
             text = ast.unparse(node)
             if name == "_api":
                 method = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
@@ -12727,9 +12788,63 @@ def _mutating_calls():
                 if any(search in text for search in approvals._READ_SEARCHES):
                     continue
                 found.append((module, owner, text))
-            elif name in ("_write_if_unchanged", "unlink", "write_text", "write_bytes"):
+            elif name in _WRITE_SPELLINGS and not (isinstance(func, ast.Name) and name in rebuilds):
                 found.append((module, owner, text))
     return found
+
+
+def _mutating_calls():
+    """Every call in the tree that could change something, by module and function."""
+    return [entry for entry in _write_spelled_calls() if entry not in approvals._NOT_A_WRITE]
+
+
+def test_every_call_spelled_like_a_write_is_a_write_or_is_declared_not_to_be():
+    """The census is closed in both directions: a declaration that outlives its
+    call is an exemption waiting for the next call of that spelling, and a
+    spelling nothing declares is a write nothing classifies."""
+    spelled = {entry for entry in _write_spelled_calls()}
+
+    stale = sorted(set(approvals._NOT_A_WRITE) - spelled)
+    assert stale == [], f"a 'not a write' declaration for a call that is gone: {stale}"
+    for entry, reason in approvals._NOT_A_WRITE.items():
+        assert len(reason) > 60, entry
+
+
+def test_the_atomic_file_write_is_reached_only_from_the_tools_that_redeem_a_token():
+    """The reason the atomic replace is declared ungated is that its CALL SITE is
+    gated, so the set of call sites is checked rather than recited. A third
+    caller would make the reason false without changing a word of it."""
+    callers = {
+        (module, owner)
+        for module, owner, text in _write_spelled_calls()
+        if text.startswith("_write_if_unchanged(")
+    }
+    gated = {
+        (module, owner)
+        for module, owner, request in approvals._GATED_WRITES
+        if request == "WRITE the Dag file"
+    }
+
+    assert callers == gated == {("codechange", "apply_dag_code_changes"), ("codechange", "revert_dag_code")}
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["os.replace(tmp, path)", "os.remove(path)", "shutil.rmtree(path)", "path.rename(other)"],
+    ids=["os.replace", "os.remove", "shutil.rmtree", "Path.rename"],
+)
+def test_a_write_spelled_outside_the_four_names_the_old_scan_knew_is_still_enumerated(call):
+    """``os.replace`` — the line that makes the reviewed bytes the Dag's source —
+    escaped the write census entirely, together with ``os.remove``,
+    ``shutil.rmtree`` and ``Path.rename``."""
+    tree = ast.parse(f"def _evade():\n    {call}\n")
+    names = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+
+    assert names & _WRITE_SPELLINGS
 
 
 def test_every_write_in_the_tree_is_either_gated_or_declared_ungated():
@@ -12889,6 +13004,11 @@ _FILE_WRITE_CALLS = {
     "WRITE the Dag file's backup": ("backup.write_text(",),
     "DELETE the Dag file's backup": ("backup.unlink(",),
     "os.unlink of its own temp file": ("os.unlink(",),
+    "CREATE its own temp file": ("tempfile.mkstemp(",),
+    "OPEN its own temp file for writing": ("os.fdopen(",),
+    "WRITE its own temp file": ("handle.write(",),
+    "CHMOD its own temp file": ("os.chmod(",),
+    "REPLACE the Dag file with its own temp file": ("os.replace(",),
 }
 
 

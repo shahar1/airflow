@@ -238,9 +238,61 @@ _UNGATED_WRITES = {
         "the Dag file itself is written by the two tools above, each of which has redeemed its token "
         "before it reaches here"
     ),
+    # The five steps of the atomic replace, each its own call and each its own
+    # entry. They were unclassified while the registry above said every call
+    # that could change something is classified here — including the ``os.replace``
+    # that IS the Dag-file write, which a four-name scan could not see.
+    ("dagsource", "_write_if_unchanged", "CREATE its own temp file"): (
+        "mkstemp beside the target so the move stays on one filesystem; the file it creates is this "
+        "helper's own scratch space, named with a leading dot and a .tmp suffix, and no Dag file "
+        "exists at that path for it to overwrite"
+    ),
+    ("dagsource", "_write_if_unchanged", "OPEN its own temp file for writing"): (
+        "wrapping the descriptor mkstemp just returned, so that the bytes can be written through a "
+        "text handle with an explicit encoding; it opens no path of its own and reaches nothing the "
+        "line above did not already create"
+    ),
+    ("dagsource", "_write_if_unchanged", "WRITE its own temp file"): (
+        "the reviewed bytes going into this helper's own scratch file, not into the Dag file; what "
+        "makes them the Dag's source is the replace below, and both are reached only from the two "
+        "tools above, each of which has redeemed its token first"
+    ),
+    ("dagsource", "_write_if_unchanged", "CHMOD its own temp file"): (
+        "carrying the target's existing mode onto the scratch file so the replace does not change "
+        "the Dag file's permissions; it is the temp file's mode that is set, and the mode it is set "
+        "to is the one already on disk"
+    ),
+    ("dagsource", "_write_if_unchanged", "REPLACE the Dag file with its own temp file"): (
+        "THE Dag-file write, and the reason this helper exists: an atomic rename over the target so "
+        "the Dag processor, which takes no lock, can never read a torn file. It is gated at its "
+        "CALL SITE — the two tools that call this helper each redeem a token first, and each carries "
+        "the 'WRITE the Dag file' classification for that call — so gating it a second time here "
+        "would be a second approval for one reviewed diff"
+    ),
     ("dagsource", "_force_reparse", "PUT /parseDagFile/<token>"): (
         "a post-write call, reached only from a tool that has already redeemed its token, that asks "
         "Airflow to re-read the file that write just changed"
+    ),
+}
+
+# Calls that carry a mutator's SPELLING and change nothing. The census of
+# writes is closed by these two directions together: every call spelled like a
+# mutation is either classified above or declared here, so a real ``os.replace``
+# cannot pass for the ``str.replace`` beside it. Each reason is about THIS call.
+_NOT_A_WRITE = {
+    ("approvals", "_run_identity", "str(raw).replace('Z', '+00:00')"): (
+        "str.replace over a timestamp string, normalising the Zulu spelling before it is parsed"
+    ),
+    ("dagsource", "_exclusive", "path.open('r+', encoding='utf-8')"): (
+        "opened only to hold an flock over the whole read-check-write; not one byte is written "
+        "through this handle, and the mode is r+ because flock needs a writable descriptor"
+    ),
+    ("dagsource", "_patch", "patched.replace(old, new)"): (
+        "str.replace over the source buffer in memory; these bytes reach the file only through "
+        "_write_if_unchanged, which is classified above"
+    ),
+    ("primitives", "_parse_moment", "when.replace('Z', '+00:00')"): (
+        "str.replace over a timestamp string, normalising the Zulu spelling before it is parsed"
     ),
 }
 
