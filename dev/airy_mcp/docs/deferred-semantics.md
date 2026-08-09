@@ -28,6 +28,7 @@
   - [Why these are deferred rather than fixed now](#why-these-are-deferred-rather-than-fixed-now)
   - [Where D1-D15 stand after the typed completeness layer](#where-d1-d15-stand-after-the-typed-completeness-layer)
   - [Keys the completeness layer added](#keys-the-completeness-layer-added)
+  - [The one public schema change, declared](#the-one-public-schema-change-declared)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -135,3 +136,50 @@ therefore explained in the payload rather than in the docstring: `compare_dag_ru
 `run_a_worker_field` / `run_b_worker_field` and `run_a_instances` /
 `run_b_instances` (see its `scope`), and `diagnose_dag`'s
 `no_task_instance_failed`.
+
+## The one public schema change, declared
+
+The frozen tool schemas in [`baselines/tool-schemas.json`](../baselines/tool-schemas.json) are the
+record of what this server's API looked like before the typed completeness redesign. **The baseline
+is not edited.** One tool's public surface has diverged from it, and this section is that
+divergence written down, because the authorising instruction requires any public change to be
+explicit, minimal, tested and documented.
+
+**`compare_dag_runs`, docstring only.** Nothing else about the tool moved: the name, the four
+parameters, their kinds, their annotations, their defaults and the return annotation are all
+byte-identical to the freeze. `source_sha256` moved because the body changed; only the docstring is
+a change to what a *caller* is told.
+
+| | frozen | now |
+| --- | --- | --- |
+| `docstring_sha256` | `cc8194f12dd1d2d64c0936efa3dbd2bd791a15da98cfcc56f77ee4ecb89ad9dd` | `cedadf3171501531ebbe07a1dbebbca5f025e6225443b06fc214fd6000dd828d` |
+| length | 853 | 1371 |
+
+**What was added, and why it is essential rather than cosmetic.** `run_a_worker_field` /
+`run_b_worker_field` became three-valued (commit `951992da15`): `null` now means "that run's rows do
+not settle the question", which is a different answer from `false` ("no instance of that task on
+that run recorded a hostname or pid"). The frozen docstring defines only true and false. A model
+handed a `null` under a two-valued contract reads it as false — which is precisely the reading these
+fields exist to prevent, and the reason the completeness layer made them three-valued at all. A
+value a caller cannot interpret is not a smaller change than a documented one; it is the same change
+with the documentation missing.
+
+**What the added text says**, and what the test below pins:
+
+* the two flags are THREE-valued: true, false and null;
+* `null` is NOT false;
+* the two reasons a run does not settle it — an incomplete instance list, or no instance of that
+  task at all — and that `*_worker_field_note` says which;
+* that where one flag is null, whether the task stopped being dispatched is **not established
+  either way**, rather than resolved as "added or removed". (The closing sentence originally
+  resolved it that way, which is false for the truncation cause; the `scope` string beside it was
+  already correct.)
+
+**Held to it:** `test_the_compare_dag_runs_docstring_declares_its_three_valued_contract` in
+`test_server.py` recomputes `docstring_sha256` the same way the freeze did, asserts it equals the
+value in the table above and differs from the frozen one, and asserts each claim above appears in
+the text. A silent drift in either direction — the docstring changing again, or the three-valued
+contract being written back to two — fails that test.
+
+**No other tool's docstring, signature or schema has diverged from the freeze**, which is asserted
+by the schema tests that read `baselines/tool-schemas.json` directly.

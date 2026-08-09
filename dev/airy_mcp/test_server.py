@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import hashlib
 import inspect
 import json
 import re
@@ -5277,13 +5278,18 @@ def test_a_giant_operator_cannot_scale_the_size_of_the_result(airflow):
     giant_size = len(json.dumps(_green_run(airflow, *forged)))
     tiny_size = len(json.dumps(_green_run(airflow, *tiny)))
 
-    # The ceiling is on what THIS tool writes. It rose when the findings started
-    # saying that the cross-run comparison had reached only 5 of the flagged task
-    # ids, which is prose the tool chooses and the Dag author cannot influence.
-    assert giant_size < 430_000
+    # THE guard: the difference between a 1000-char operator and a 1-char one.
     # 500 rows, but only TASK_INSTANCE_DETAIL_LIMIT of them carry an operator at
     # all, and each is clamped — so the 999 extra characters buy ~119 apiece.
     assert giant_size - tiny_size < evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
+    # A sanity bound on the absolute size, and it is NOT what this test rests on:
+    # it has been raised twice by prose the tool chooses, which is exactly the
+    # thing a Dag author cannot influence. Asserted as slack over the guard above
+    # so that raising it is a decision about headroom rather than a number
+    # nudged until it passes.
+    assert giant_size < tiny_size + 2 * (
+        evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
+    )
 
 
 # The size of the result must not be a function of what the event log holds.
@@ -6636,7 +6642,6 @@ def test_instances_outside_the_detailed_projection_are_counted_not_guessed_at(ai
     # history, where a reader attributes a projection's shortfall to the scan.
     assert "instances_without_attribution" not in result["event_history"]
     assert result["task_instance_detail_reduced"] == 3
-    assert result["task_instance_detail_reduced"] == 3
     reduced = [ti for ti in result["task_instances"] if "last_state_change" not in ti]
     assert len(reduced) == 3
 
@@ -7605,6 +7610,65 @@ def mapped_run(airflow):
 
 def _mapped_plan(**kwargs):
     return server.plan_task_instance_clear(DAG_ID, task_id="seed", only_failed=False, **kwargs)
+
+
+def test_a_probe_that_declines_names_the_task_it_could_not_settle(mapped_run):
+    """``expansion_unprobed_tasks`` is the enumeration of what the expandability
+    probe could not answer for, and every assertion about a NON-EMPTY one was
+    lost — only ``== []`` was left, over three sites that still populate it. An
+    empty list here is the strongest claim this payload makes about mapped
+    creation, so what fills it has to be held to a test."""
+    mapped_run.fail_list_mapped = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("GET", "/listMapped"), response=httpx.Response(500)
+    )
+
+    plan = _mapped_plan()
+
+    assert plan["planned"] is False
+    assert plan["blast_radius"]["expansion_unprobed_tasks"] == ["seed", "transmit"]
+    assert plan["blast_radius"]["mapped_tasks_settled"] is False
+    assert "did not answer for ['seed', 'transmit']" in plan["error"]
+    assert "plan_token" not in plan
+
+
+def test_a_probe_that_declines_at_the_write_names_the_task_in_the_refusal(mapped_run):
+    """The same enumeration on the other side of the approval: settled when the
+    plan was shown, unsettled at the moment of the write."""
+    plan = _mapped_plan()
+    mapped_run.fail_list_mapped = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("GET", "/listMapped"), response=httpx.Response(500)
+    )
+
+    result = server.apply_task_instance_clear(
+        DAG_ID,
+        plan["dag_run_id"],
+        plan["task_ids"],
+        plan["plan_token"],
+        only_failed=False,
+        reviewed_instances=_reviewed(plan),
+    )
+
+    assert result["cleared"] is False
+    assert result["refused_precondition"] == "closure_expandability_settled"
+    assert "seed" in result["error"]
+    assert "transmit" in result["error"]
+    assert mapped_run.cleared == []
+
+
+def test_the_closure_reports_every_task_its_probe_could_not_answer_for(mapped_run):
+    """The derivation itself: ``settled`` is exactly "nothing went unprobed", and
+    the two are published as separate fields that must never disagree."""
+    mapped_run.fail_list_mapped = httpx.ConnectError("boom")
+
+    closure = recovery._mapped_in_closure(
+        DAG_ID,
+        "/dagRuns/manual__1",
+        [{"task_id": "seed", "map_index": -1}, {"task_id": "fan", "map_index": 0}],
+    )
+
+    assert closure["unprobed"] == ["seed"]
+    assert closure["settled"] is False
+    assert closure["tasks"] == ["fan"]
 
 
 def test_a_plan_over_a_mapped_task_says_the_enumerated_set_is_not_closed(mapped_run):
@@ -9097,9 +9161,11 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
 
     assert result["cleared"] is False
     assert result["mutation_applied"] is False
-    assert "lists more tasks than this tool read (3 of 5" in result["error"]
-    # The refusal names the READ, so a reader can tell which one fell short.
-    assert reading._TASKS_ROUTE in result["error"]
+    # The whole clause, not a prefix of it: the closing paren went missing and
+    # left this matching any sentence that merely STARTS this way, so the route
+    # it names — the half of the sentence that says which read fell short —
+    # stopped being asserted here at all.
+    assert f"lists more tasks than this tool read (3 of 5 on {reading._TASKS_ROUTE})" in result["error"]
     assert cleared_run.cleared == []
 
 
@@ -9123,13 +9189,17 @@ def test_a_task_list_this_tool_cannot_read_whole_refuses_the_write(cleared_run):
         # And the discard on its own, with the route silent about the count.
         (25, None, True),
     ],
+    # The OUTCOME is part of the id, because a case flipping from refusal to
+    # permit is otherwise invisible: node-id diffing sees the same six names and
+    # a review reads the same six lines. Two of these were flipped in one round
+    # without anything in the test's shape changing.
     ids=[
-        "exact-limit",
-        "limit-plus-one",
-        "exact-limit-source-agrees",
-        "source-accounts-for-one-more",
-        "source-claims-complete-while-rows-are-discarded",
-        "source-says-nothing-while-rows-are-discarded",
+        "exact-limit-writes",
+        "limit-plus-one-writes",
+        "exact-limit-source-agrees-writes",
+        "source-accounts-for-one-more-refuses",
+        "source-claims-complete-while-rows-are-discarded-writes",
+        "source-says-nothing-while-rows-are-discarded-writes",
     ],
 )
 def test_the_target_attempt_history_must_be_read_whole_before_the_write(
@@ -12967,10 +13037,61 @@ def test_a_task_present_without_a_worker_field_still_reports_a_measured_false(ai
     assert "run_b_worker_field_note" not in row
 
 
+# THE one public surface that has diverged from ``baselines/tool-schemas.json``,
+# with the divergence written down in ``docs/deferred-semantics.md`` rather than
+# edited into the freeze. Recomputed here the way the freeze computed it, so the
+# declaration is a checked fact and not a note.
+_COMPARE_DAG_RUNS_DOCSTRING_SHA = "cedadf3171501531ebbe07a1dbebbca5f025e6225443b06fc214fd6000dd828d"
+
+_COMPARE_DAG_RUNS_DOCSTRING_CLAIMS = (
+    "THREE-valued: true, false, and null",
+    "null is NOT false",
+    "its instance list came back incomplete",
+    "holds no instance of that task at all",
+    "``*_worker_field_note`` says which",
+    "whether it stopped being dispatched is\nNOT established either way",
+)
+
+
+def test_the_compare_dag_runs_docstring_declares_its_three_valued_contract():
+    """A public change has to be explicit, minimal, tested and documented, and
+    the freeze is not edited to hide it.
+
+    Only the docstring moved: the signature, the four parameters and the return
+    annotation are byte-identical to the freeze, and this asserts that too. What
+    the added text buys is the difference between a null a caller can read and a
+    null it reads as false — which is the one reading these fields were made
+    three-valued to prevent.
+    """
+    frozen = next(
+        tool
+        for tool in json.loads(Path(__file__).parent.joinpath("baselines/tool-schemas.json").read_text())[
+            "tools"
+        ]
+        if tool["name"] == "compare_dag_runs"
+    )
+    doc = inspect.getdoc(server.compare_dag_runs)
+    digest = hashlib.sha256(doc.encode()).hexdigest()
+
+    assert digest != frozen["docstring_sha256"], "the declared divergence is gone"
+    assert digest == _COMPARE_DAG_RUNS_DOCSTRING_SHA, (
+        "the public docstring moved again and docs/deferred-semantics.md still records the old one"
+    )
+    # Minimal: nothing but the prose changed.
+    assert f"compare_dag_runs{inspect.signature(server.compare_dag_runs)}" == frozen["signature"]
+    assert [entry["name"] for entry in frozen["parameters"]] == list(
+        inspect.signature(server.compare_dag_runs).parameters
+    )
+    for claim in _COMPARE_DAG_RUNS_DOCSTRING_CLAIMS:
+        assert claim in doc, claim
+
+
 def test_compare_dag_runs_says_what_its_nulls_mean(airflow):
-    """The docstring is frozen and defines only true and false. A small model
-    handed a null under a two-valued contract reads it as false, which is the
-    one reading these fields exist to prevent."""
+    """The docstring carries the three-valued contract now (see
+    ``docs/deferred-semantics.md``), and the payload says the same thing where a
+    model that never reads a docstring will meet it. A small model handed a null
+    under a two-valued contract reads it as false, which is the one reading these
+    fields exist to prevent."""
     _sweep_world(airflow)
 
     result = server.compare_dag_runs(DAG_ID, "manual__1", "manual__2")
