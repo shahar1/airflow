@@ -483,6 +483,49 @@ def fresh_token_store():
     server._approved_clear_sets.clear()
 
 
+# Every read this test session observed at the HTTP wire itself, cleared per
+# test by the fixture below. Module-global rather than a fixture return value
+# because the observation point is installed for EVERY test, not only the ones
+# that ask for it: a read that never touches ``transport`` is exactly the read
+# an instrument watching ``transport`` cannot see.
+_OBSERVED_READS: list[tuple[tuple[str, str], str, str]] = []
+
+
+class _UnobservedWire(RuntimeError):
+    """A test put bytes on a real socket."""
+
+
+@pytest.fixture(autouse=True)
+def wire_is_never_reached_unobserved(monkeypatch):
+    """THE observation point: ``httpx``'s own send, under every spelling.
+
+    ``transport._api`` is where the double is installed, not where the bytes
+    go. A module that writes ``import httpx as _hx`` and calls ``_hx.get(...)``
+    reaches Airflow without passing ``transport`` at all — the reader registry
+    saw nothing, the AST guard beside it matched only the literal name
+    ``httpx``, and a hard negative published over the failed read left the whole
+    suite green.
+
+    Everything httpx sends — ``httpx.get``, ``httpx.request``, ``httpx.stream``,
+    a ``Client`` built by hand, an ``AsyncClient`` — funnels through
+    ``Client.send``, so patching that one method observes the call however it
+    was spelled, under whatever alias, through however many indirections. It is
+    recorded AND refused: no test in this file may reach a real socket.
+    """
+    _OBSERVED_READS.clear()
+
+    def refuse(self, request, *args, **kwargs):
+        site = _reading_site()
+        _OBSERVED_READS.append((site, request.method, str(request.url)))
+        raise _UnobservedWire(
+            f"{site[0]}.{site[1]} put bytes on a real socket ({request.method} {request.url}) "
+            f"without passing the boundary — every read has to go through transport._api"
+        )
+
+    monkeypatch.setattr(httpx.Client, "send", refuse)
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse)
+
+
 def _parses(airflow, tmp_path):
     """Let Airflow catch up with the file, as the Dag processor would."""
     airflow.parsed_source = (tmp_path / "sales_summary.py").read_text()
@@ -9402,9 +9445,15 @@ def _owned_nodes(tree, owner="<module>"):
 # ``_transport_indirections`` skips ``transport``, so it never sees the new
 # entry point; ``_functions_calling_transport`` matches on the attribute name,
 # so it never sees the callers. The registry went to zero and the suite stayed
-# green. What follows watches the boundary while the tools RUN, attributes each
-# read to the first frame outside ``transport``, and holds that site to the
-# registry — through any number of indirections, under any alias.
+# green.
+#
+# Watching ``transport._api`` was not enough either, and the gap was FATAL: it
+# is the boundary's front door, not the wire. ``import httpx as _hx`` in any
+# swept module reaches Airflow without passing it, and the AST guard beside it
+# matched ``httpx.get`` by the literal name while checking aliases only for
+# ``transport``. There are now TWO observation points — ``transport._api`` for
+# attribution and ``httpx.Client.send`` for everything that never reached it —
+# so a read is seen through any number of indirections, under any alias.
 # ---------------------------------------------------------------------------
 
 _SIDECAR_DIR = Path(__file__).parent
@@ -9425,16 +9474,19 @@ def _reading_site():
 
 
 def _watch_reads(monkeypatch):
-    """Record every call that actually reaches Airflow, by the site that made it."""
-    seen: list[tuple[tuple[str, str], str, str]] = []
+    """Record every call that reaches Airflow, by the site that made it.
+
+    Returns the SAME list the wire observer appends to, so a read that walked
+    past ``transport`` entirely arrives here beside the ones that did not.
+    """
     real = transport._api
 
     def watched(method, path, **kwargs):
-        seen.append((_reading_site(), method, path))
+        _OBSERVED_READS.append((_reading_site(), method, path))
         return real(method, path, **kwargs)
 
     monkeypatch.setattr(transport, "_api", watched)
-    return seen
+    return _OBSERVED_READS
 
 
 def _unregistered_reads(seen):
@@ -9460,7 +9512,20 @@ def _unregistered_reads(seen):
 # Ways of reaching Airflow that a scan for ``transport._api(...)`` cannot see.
 # The scan is one literal AST form, so rather than teach it every indirection,
 # the indirections are forbidden and this is what forbids them.
-_HTTPX_CALLS = ("request", "get", "post", "put", "patch", "delete", "stream", "Client", "AsyncClient")
+_HTTPX_CALLS = (
+    "request",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "options",
+    "stream",
+    "send",
+    "Client",
+    "AsyncClient",
+)
 
 # The only two functions of the boundary that may speak HTTP, and the only two
 # that may reach ``_api``. A third — ``def _fetch(path): return _api(...)`` — is
@@ -9471,14 +9536,16 @@ _TRANSPORT_SPEAKERS = ("_api", "_login")
 def _second_entry_points():
     """Anything inside ``transport`` that reaches httpx or ``_api`` and is not declared."""
     offenders = []
-    for owner, node in _owned_nodes(_module_source("transport")):
+    tree = _module_source("transport")
+    names = _httpx_names(tree)
+    for owner, node in _owned_nodes(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         reaches_httpx = (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
-            and func.value.id == "httpx"
+            and func.value.id in names
             and func.attr in _HTTPX_CALLS
         )
         reaches_api = getattr(func, "id", None) == "_api" or getattr(func, "attr", None) == "_api"
@@ -9494,40 +9561,83 @@ def test_the_boundary_has_exactly_the_entry_points_it_declares():
     assert _second_entry_points() == []
 
 
+def _httpx_names(tree):
+    """Every name this module has bound to the httpx module object.
+
+    Collected in one pass before the call scan, so a rebinding below its first
+    use is still seen. ``httpx`` itself is always in the set: the plain import
+    is allowed, and its VERBS never are.
+    """
+    aliases = {"httpx"}
+    for _, node in _owned_nodes(tree):
+        if isinstance(node, ast.Import):
+            aliases |= {alias.asname for alias in node.names if alias.name == "httpx" and alias.asname}
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            if node.value.id in aliases:
+                aliases |= {target.id for target in node.targets if isinstance(target, ast.Name)}
+    return aliases
+
+
+def _module_indirections(module, tree):
+    """Every way THIS module could reach the API that the reader scan would miss.
+
+    Symmetric in the two names that can carry a read. ``transport`` was checked
+    for aliases, re-imports and rebinding, and ``httpx`` was checked for one
+    literal spelling of one attribute — so ``import httpx as _hx`` followed by
+    ``_hx.get(...)`` was invisible to every rule in this file, which is the
+    FATAL hole this pair closes.
+    """
+    offenders = []
+    names = _httpx_names(tree)
+
+    def is_httpx(node):
+        return isinstance(node, ast.Name) and node.id in names
+
+    for owner, node in _owned_nodes(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "transport":
+            offenders += [
+                (module, owner, f"from transport import {alias.name}")
+                for alias in node.names
+                if alias.name == "_api"
+            ]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "httpx":
+            # ``from httpx import get`` puts a verb in the module namespace under
+            # a name no scan for ``httpx.<verb>`` can match.
+            offenders.append((module, owner, ast.unparse(node)))
+        elif isinstance(node, ast.Import):
+            offenders += [
+                (module, owner, f"import transport as {alias.asname}")
+                for alias in node.names
+                if alias.name == "transport" and alias.asname
+            ]
+            offenders += [
+                (module, owner, ast.unparse(node))
+                for alias in node.names
+                if alias.name.split(".")[0] == "httpx" and (alias.asname or "." in alias.name)
+            ]
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            if node.value.id == "transport" or is_httpx(node.value):
+                offenders.append((module, owner, ast.unparse(node)))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in ("getattr", "__import__") and node.args:
+                first = node.args[0]
+                named = isinstance(first, ast.Name) and first.id == "transport"
+                literal = isinstance(first, ast.Constant) and first.value in ("httpx", "transport")
+                if named or is_httpx(first) or literal:
+                    offenders.append((module, owner, ast.unparse(node)))
+            if isinstance(func, ast.Attribute) and is_httpx(func.value) and func.attr in _HTTPX_CALLS:
+                offenders.append((module, owner, ast.unparse(node)))
+    return offenders
+
+
 def _transport_indirections():
     """Every way a module could reach the API that the reader scan would miss."""
     offenders = []
     for module in _MODULES:
         if module == "transport":
             continue
-        for owner, node in _owned_nodes(_module_source(module)):
-            if isinstance(node, ast.ImportFrom) and node.module == "transport":
-                offenders += [
-                    (module, owner, f"from transport import {alias.name}")
-                    for alias in node.names
-                    if alias.name == "_api"
-                ]
-            elif isinstance(node, ast.Import):
-                offenders += [
-                    (module, owner, f"import transport as {alias.asname}")
-                    for alias in node.names
-                    if alias.name == "transport" and alias.asname
-                ]
-            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
-                if node.value.id == "transport":
-                    offenders.append((module, owner, ast.unparse(node)))
-            elif isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name) and func.id == "getattr" and node.args:
-                    if isinstance(node.args[0], ast.Name) and node.args[0].id == "transport":
-                        offenders.append((module, owner, ast.unparse(node)))
-                if (
-                    isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "httpx"
-                    and func.attr in _HTTPX_CALLS
-                ):
-                    offenders.append((module, owner, ast.unparse(node)))
+        offenders += _module_indirections(module, _module_source(module))
     return sorted(set(offenders))
 
 
@@ -9537,6 +9647,49 @@ def test_no_module_reaches_airflow_by_a_route_the_reader_scan_cannot_see():
     feature module already imports httpx for its exception types, so the last of
     those is one line away in any of them."""
     assert _transport_indirections() == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import httpx as _hx\ndef read():\n    return _hx.get('/x')\n",
+        "import httpx\n_hx = httpx\ndef read():\n    return _hx.request('GET', '/x')\n",
+        "from httpx import get\ndef read():\n    return get('/x')\n",
+        "import httpx\ndef read():\n    return getattr(httpx, 'get')('/x')\n",
+        "def read():\n    return __import__('httpx').get('/x')\n",
+        "import httpx._client as c\ndef read():\n    return c.Client().get('/x')\n",
+    ],
+    ids=["aliased-import", "rebound", "from-import", "getattr", "dunder-import", "submodule"],
+)
+def test_the_indirection_scan_checks_httpx_aliases_exactly_as_it_checks_transports(source):
+    """The FATAL asymmetry, stated as a test. ``transport`` was checked for an
+    alias, a re-import and a rebinding; ``httpx`` was checked for one literal
+    spelling — so ``import httpx as _hx`` and a list read was a reader no rule
+    in this file could see, and a hard negative published over it left the suite
+    green."""
+    assert _module_indirections("evidence", ast.parse(source)) != []
+
+
+def test_a_read_that_never_reaches_the_boundary_is_still_observed_and_attributed():
+    """The runtime half of the same hole, and the load-bearing one: a static scan
+    can be walked around, so the wire itself is watched. A read spelled entirely
+    outside ``transport`` is recorded at ``httpx.Client.send``, attributed to the
+    sidecar frame that made it, and reported as a site nothing declares."""
+    evasion = compile(
+        "def _read_the_pools():\n"
+        "    import httpx as _hx\n"
+        "    return _hx.get('http://127.0.0.1:1/pools', timeout=0.5)\n",
+        str(_SIDECAR_DIR / "evidence.py"),
+        "exec",
+    )
+    namespace: dict = {}
+    exec(evasion, namespace)
+
+    with pytest.raises(_UnobservedWire):
+        namespace["_read_the_pools"]()
+
+    assert [site for site, _, _ in _OBSERVED_READS] == [("evidence", "_read_the_pools")]
+    assert _unregistered_reads(_OBSERVED_READS) == [("evidence", "_read_the_pools")]
 
 
 def _functions_calling_transport():
