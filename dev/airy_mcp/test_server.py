@@ -16730,3 +16730,44 @@ def test_no_closure_claim_rests_on_a_cross_check_alone(capsys):
     assert _ENUMERATION_INVENTORY["_WRITE_SPELLINGS"][0] == "cross-check only"
     assert set(by_disposition) <= set(_ENUMERATION_DISPOSITIONS)
     assert "cross-check only" in capsys.readouterr().out
+
+
+def test_a_read_made_at_import_time_is_observed_and_attributed(httpx_layer_lifted):
+    """A read outside any ``def``, which every scan that walks FunctionDef nodes
+    is blind to and which runs before any tool is ever called.
+
+    The audit hook does not care: the frame is module-level code of a sidecar
+    module, and the site is reported as such.
+    """
+    module = compile(
+        f"import socket\n_s = socket.socket()\n_s.settimeout(0.5)\n_s.connect({_NOWHERE!r})\n",
+        str(_SIDECAR_DIR / "evidence.py"),
+        "exec",
+    )
+    _OBSERVED_READS.clear()
+
+    with pytest.raises(_UnobservedWire):
+        exec(module, {})
+
+    assert [site for site, _, _ in _OBSERVED_READS] == [("evidence", "<module>")]
+    assert _unregistered_reads(_OBSERVED_READS) == [("evidence", "<module>")]
+
+
+def test_a_read_through_requests_is_observed_like_every_other_client(httpx_layer_lifted):
+    """``requests`` is a third HTTP stack, imported and aliased long before this
+    fixture ran, and no layer of this instrument has ever been on its call path.
+
+    It reaches a socket like everything else, which is the whole argument for
+    observing there rather than inside one client.
+    """
+    pytest.importorskip("requests")
+    reader = _as_sidecar_code(
+        f"import requests\nreturn requests.get({_NOWHERE_URL!r}, timeout=0.5)", name="_reach_out"
+    )
+    _OBSERVED_READS.clear()
+
+    with pytest.raises(BaseException):  # noqa: PT011, B017
+        reader()
+
+    assert [site for site, _, _ in _OBSERVED_READS] == [("evidence", "_reach_out")]
+    assert _unregistered_reads(_OBSERVED_READS) == [("evidence", "_reach_out")]
