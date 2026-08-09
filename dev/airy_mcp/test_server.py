@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -12813,6 +12814,74 @@ def test_every_gated_write_really_passes_through_the_gate_it_names():
             )
 
 
+# Every control-flow shape a gate and a write can stand in, with the truth about
+# whether the gate dominates the write. Eight of these were answered WRONG by
+# the statement-tree walk that preceded the graph — all eight in the direction
+# that certifies an ungated write — and none of them was a contrived shape:
+# wrapping the gate in ``if not plan.get("skip_gate")`` was enough to land a
+# clear with no precondition evaluated at all, certified as gated.
+_DOMINANCE_SHAPES = {
+    "straight-line": ("def f():\n gate()\n write()\n", True),
+    "gate-after-the-write": ("def f():\n write()\n gate()\n", False),
+    "gate-in-one-arm-write-after": ("def f(c):\n if c:\n  gate()\n write()\n", False),
+    "gate-in-one-arm-write-in-the-other": ("def f(c):\n if c:\n  gate()\n else:\n  write()\n", False),
+    "gate-in-both-arms": ("def f(c):\n if c:\n  gate()\n else:\n  gate()\n write()\n", True),
+    "write-returns-before-the-gate": ("def f(c):\n if c:\n  write()\n  return\n gate()\n", False),
+    "gate-in-a-for-that-may-not-run": ("def f(i):\n for x in i:\n  gate()\n write()\n", False),
+    "gate-in-a-while-that-may-not-run": ("def f(c):\n while c:\n  gate()\n write()\n", False),
+    "write-in-the-loop-after-the-gate": ("def f(i):\n gate()\n for x in i:\n  write()\n", True),
+    "write-in-except-gate-in-try": ("def f():\n try:\n  gate()\n except E:\n  write()\n", False),
+    "write-in-finally-gate-in-try": ("def f():\n try:\n  gate()\n finally:\n  write()\n", False),
+    "gate-before-the-try-write-in-except": (
+        "def f():\n gate()\n try:\n  pass\n except E:\n  write()\n",
+        True,
+    ),
+    "gate-in-the-write-s-own-arguments": ("def f():\n write(gate())\n", True),
+    "write-inside-a-with-after-the-gate": ("def f(l):\n gate()\n with l:\n  write()\n", True),
+}
+
+
+def _shape_verdict(source):
+    tree = ast.parse(source)
+    body = tree.body[0]
+    return _dominates(body, _calls_named(body, "gate"), _calls_named(body, "write")[0])
+
+
+@pytest.mark.parametrize("shape", sorted(_DOMINANCE_SHAPES))
+def test_the_gate_dominance_check_answers_every_control_flow_shape(shape):
+    """Dominance is a question about PATHS, and the walk this replaces asked a
+    question about nesting: it set ``gated`` from ``ast.walk`` over the whole
+    compound statement and then tested the write on that same statement, so any
+    statement containing both was declared dominated whatever the branch or the
+    order."""
+    source, dominated = _DOMINANCE_SHAPES[shape]
+
+    assert _shape_verdict(source) is dominated
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(c):\n gate() if c else None\n write()\n",
+        "def f(c):\n write(c or gate())\n",
+        "def f(i):\n [gate() for x in i]\n write()\n",
+        "def f():\n def inner():\n  gate()\n write()\n",
+        "def f(c):\n match c:\n  case 1:\n   gate()\n write()\n",
+    ],
+    ids=["conditional", "short-circuit", "comprehension", "nested-def", "match"],
+)
+def test_a_shape_the_dominance_check_cannot_model_is_refused_and_not_answered(source):
+    """A conservative analyser refuses what it cannot prove. The four lazy shapes
+    here evaluate the gate only for some values, and the fifth is a statement
+    this graph does not model — answering any of them would be a certificate
+    nothing computed."""
+    verdict = None
+    with contextlib.suppress(_UnmodelledControlFlow):
+        verdict = _shape_verdict(source)
+
+    assert verdict is not True, "a shape that was not modelled was certified as gated"
+
+
 # What each declared request looks like in the source, when the declaration is
 # prose rather than an HTTP line. A file write has no method and no path.
 _FILE_WRITE_CALLS = {
@@ -12849,50 +12918,240 @@ def _same_request(declared, text):
     return path.split("<")[0] in text
 
 
-def _dominates(body, gates, write):
-    """Whether every path from the function's entry to ``write`` passes a gate call.
+class _UnmodelledControlFlow(RuntimeError):
+    """A shape this analyser cannot prove anything about.
 
-    Walked over the statement tree rather than a real CFG, which is enough for
-    the one shape that matters here: a write is dominated when a gate call is
-    made at the same nesting level BEFORE it, at every level from the function
-    body down to the block that holds it. A gate inside one arm of an ``if`` does
-    not dominate a write in the other arm, and a gate after the write dominates
-    nothing.
+    Raised rather than answered. An analyser that refuses to certify what it
+    cannot prove is a conservative instrument; one that certifies what it cannot
+    prove is a false certificate, which is what the statement-tree walk this
+    replaces produced for eight of fourteen shapes.
     """
-    lines = {node.lineno for node in gates}
 
-    def reaches(block):
-        gated = False
-        for statement in block:
-            if any(gate is node for gate in gates for node in ast.walk(statement)):
-                gated = True
-            if any(write is node for node in ast.walk(statement)):
-                if gated:
-                    return True
-                # Not gated at this level: the write has to be gated inside its
-                # own nested block, on every branch of it.
-                return all(
-                    reaches(nested)
-                    for nested in _blocks_of(statement)
-                    if any(write is node for stmt in nested for node in ast.walk(stmt))
-                ) and any(_blocks_of(statement))
+
+class _ControlFlowGraph:
+    """The function's real control flow, one node per evaluated expression group.
+
+    Edges are deliberately OVER-approximated: an edge that does not exist in the
+    real flow can only make this analyser refuse to certify, while a missing one
+    would let it certify a path it never modelled. Exceptions are the case that
+    matters — a ``try`` body may raise before its first statement completes, so
+    every handler and every ``finally`` is reachable without any of the body
+    having run.
+    """
+
+    def __init__(self):
+        self.successors: dict[int, set[int]] = {}
+        self.owned: dict[int, list[ast.AST]] = {}
+        self.exit = self.node([])
+
+    def node(self, expressions):
+        identity = len(self.successors)
+        self.successors[identity] = set()
+        self.owned[identity] = list(expressions)
+        return identity
+
+    def edge(self, source, target):
+        self.successors[source].add(target)
+
+    def holds(self, identity, call):
+        return any(call is node for expression in self.owned[identity] for node in ast.walk(expression))
+
+
+# The expressions a compound statement evaluates ITSELF, as opposed to the
+# blocks it holds. Attributing a whole compound statement to one node is exactly
+# the defect being repaired: it declared any statement syntactically containing
+# both a gate and a write to be a gated write, whatever the branch or the order.
+def _header_expressions(statement):
+    if isinstance(statement, (ast.If, ast.While)):
+        return [statement.test]
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return [statement.iter]
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return [item.context_expr for item in statement.items]
+    if isinstance(statement, ast.Try):
+        return []
+    return [statement]
+
+
+_SIMPLE_STATEMENTS = (
+    ast.Expr,
+    ast.Assign,
+    ast.AugAssign,
+    ast.AnnAssign,
+    ast.Delete,
+    ast.Pass,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Global,
+    ast.Nonlocal,
+    ast.Assert,
+    ast.Return,
+    ast.Raise,
+    ast.Break,
+    ast.Continue,
+)
+
+
+def _build_flow(graph, statements, after, context):
+    """Wire one statement list into the graph and hand back the node it starts at."""
+    entry = after
+    for statement in reversed(statements):
+        entry = _build_statement(graph, statement, entry, context)
+    return entry
+
+
+def _build_statement(graph, statement, after, context):
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        # A definition is not an execution. A gate or a write hiding inside one
+        # is a shape this analyser will not guess about.
+        identity = graph.node([])
+        graph.edge(identity, after)
+        return identity
+    if isinstance(statement, ast.Match):
+        raise _UnmodelledControlFlow("match statements are not modelled")
+    if isinstance(statement, _SIMPLE_STATEMENTS):
+        identity = graph.node(_header_expressions(statement))
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            for target in context["escapes"] or [graph.exit]:
+                graph.edge(identity, target)
+        elif isinstance(statement, ast.Break):
+            graph.edge(identity, context["loop_exit"] if context["loop_exit"] is not None else graph.exit)
+        elif isinstance(statement, ast.Continue):
+            graph.edge(identity, context["loop_head"] if context["loop_head"] is not None else graph.exit)
+        else:
+            graph.edge(identity, after)
+        return identity
+    if isinstance(statement, ast.If):
+        header = graph.node(_header_expressions(statement))
+        graph.edge(header, _build_flow(graph, statement.body, after, context))
+        graph.edge(
+            header, _build_flow(graph, statement.orelse, after, context) if statement.orelse else after
+        )
+        return header
+    if isinstance(statement, (ast.While, ast.For, ast.AsyncFor)):
+        header = graph.node(_header_expressions(statement))
+        leaves = _build_flow(graph, statement.orelse, after, context) if statement.orelse else after
+        inner = {**context, "loop_head": header, "loop_exit": leaves}
+        graph.edge(header, _build_flow(graph, statement.body, header, inner))
+        # A loop may run zero times, which is the whole of why a gate inside one
+        # dominates nothing after it.
+        graph.edge(header, leaves)
+        return header
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        header = graph.node(_header_expressions(statement))
+        graph.edge(header, _build_flow(graph, statement.body, after, context))
+        return header
+    if isinstance(statement, ast.Try):
+        final = _build_flow(graph, statement.finalbody, after, context) if statement.finalbody else after
+        # ``return`` inside the try body still runs the finally on its way out.
+        inner = {**context, "escapes": [final] if statement.finalbody else context["escapes"]}
+        handlers = [_build_flow(graph, handler.body, final, inner) for handler in statement.handlers]
+        orelse = _build_flow(graph, statement.orelse, final, inner) if statement.orelse else final
+        body = _build_flow(graph, statement.body, orelse, inner)
+        # THE edge that makes a gate in the try body dominate nothing in the
+        # handlers or the finally: the exception can be raised by the first
+        # thing the body evaluates, including the gate call itself.
+        header = graph.node([])
+        graph.edge(header, body)
+        for handler in handlers:
+            graph.edge(header, handler)
+        if statement.finalbody:
+            graph.edge(header, final)
+        return header
+    raise _UnmodelledControlFlow(f"{type(statement).__name__} is not modelled")
+
+
+def _evaluated_first(node, other):
+    """Whether ``node`` is evaluated before ``other`` within one statement.
+
+    Arguments are evaluated before the call that holds them, so a gate nested
+    inside the write's own argument list runs first. Anything whose order
+    depends on a value — a conditional expression, a short-circuit, a lambda or
+    a comprehension body — is refused rather than guessed at.
+    """
+    if any(other is inner for inner in ast.walk(node)):
         return False
+    if any(node is inner for inner in ast.walk(other)):
+        return True
+    return (node.lineno, node.col_offset) < (other.lineno, other.col_offset)
 
-    return bool(lines) and reaches(body.body)
+
+_LAZILY_EVALUATED = (
+    ast.IfExp,
+    ast.BoolOp,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
 
 
-def _blocks_of(statement):
-    """Every statement list this statement holds — one per branch."""
-    blocks = []
-    for field in ("body", "orelse", "finalbody", "handlers"):
-        value = getattr(statement, field, None)
-        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
-            blocks.append(value)
-        elif isinstance(value, list):
-            for handler in value:
-                if isinstance(handler, ast.ExceptHandler):
-                    blocks.append(handler.body)
-    return blocks
+def _evaluated_unconditionally(expressions, call):
+    """Whether reaching this node is enough to have evaluated ``call``.
+
+    A gate inside a conditional expression, a short-circuit, a lambda or a
+    comprehension runs only for some values, so a node holding one is not a
+    gate at all. ``gate() if flag else None`` and ``[gate() for x in items]``
+    are the same evasion as ``if flag: gate()`` written as an expression.
+    """
+    for expression in expressions:
+        for node in ast.walk(expression):
+            if isinstance(node, _LAZILY_EVALUATED) and any(held is call for held in ast.walk(node)):
+                return False
+    return True
+
+
+def _dominates(body, gates, write):
+    """Whether EVERY path from the function's entry to ``write`` evaluates a gate first.
+
+    Must-dominance over a real control-flow graph, computed the standard way:
+    delete the nodes that evaluate a gate, and ask whether the write is still
+    reachable from the entry. Anything the graph cannot model raises rather than
+    answers.
+
+    Its predecessor walked the statement TREE and set ``gated`` from
+    ``ast.walk`` over the whole compound statement, so any statement
+    syntactically containing both was declared dominated regardless of branch or
+    order. It certified all six of: a gate in one arm of an ``if`` against a
+    write in the other; a gate in an ``if`` against a write after it; a write
+    that returns before the gate is reached; a gate in a loop that may not run;
+    a write in an ``except`` whose gate is the thing that raised; and a write in
+    a ``finally``.
+    """
+    if not gates:
+        return False
+    graph = _ControlFlowGraph()
+    entry = _build_flow(graph, body.body, graph.exit, {"escapes": [], "loop_head": None, "loop_exit": None})
+    held_by = {
+        identity: [
+            gate
+            for gate in gates
+            if graph.holds(identity, gate) and _evaluated_unconditionally(graph.owned[identity], gate)
+        ]
+        for identity in graph.successors
+    }
+    holders = {identity for identity, held in held_by.items() if held}
+    written = [identity for identity in graph.successors if graph.holds(identity, write)]
+    if len(written) != 1:
+        raise _UnmodelledControlFlow(f"the write is evaluated by {len(written)} nodes, not one")
+    target = written[0]
+    # One statement holding both. Whether it is gated is then a question about
+    # evaluation order inside that statement rather than about paths.
+    if target in holders and not any(_evaluated_first(gate, write) for gate in held_by[target]):
+        holders.discard(target)
+
+    reached = set()
+    frontier = [entry]
+    while frontier:
+        identity = frontier.pop()
+        if identity in reached:
+            continue
+        reached.add(identity)
+        if identity in holders:
+            continue
+        frontier += [successor for successor in graph.successors[identity]]
+    return target not in reached or target in holders
 
 
 def test_the_declared_ungated_writes_each_carry_a_reason_about_the_write():
