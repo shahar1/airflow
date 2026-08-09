@@ -345,15 +345,20 @@ source.  Propose them one at a time and let the user answer each.
    Dag run and is not an implementation of clearing.
 3. **A replacement run is a separate decision, triggered once, by name.**  After
    a fix the user approved, offer to trigger a replacement run — do not trigger
-   on your own.  An approved patch is never permission to run anything.  Pass a
-   `run_id` you choose, and repeat it **verbatim** on any retry: that is what
-   makes a retry find the run it already created instead of creating a second
-   one.  Pass `expected_dag_version` — the version the fix produced — so a Dag
-   that moved since the user agreed is refused rather than run.  `conf` is
-   validated against the Dag's `params` schema: turn what the user asked for
-   into typed conf keys, and pass no conf at all for a Dag without params.  A
-   refusal lists the valid params with their types and defaults — relay that
-   list instead of guessing again.  When the result says the outcome is
+   on your own.  An approved patch is never permission to run anything.
+   `apply_dag_code_changes` hands back a `replacement_run` block whose `args`
+   already hold the `run_id`, the `expected_dag_version` and — where the change
+   named one — the `verify_task_id`: **pass those arguments exactly as given**
+   instead of composing your own, and repeat the `run_id` **verbatim** on any
+   retry, which is what makes a retry find the run it already created instead of
+   creating a second one.  `expected_dag_version` is the version the fix
+   produced, so a Dag that moved since the user agreed is refused rather than
+   run.  **All of these are arguments of `rerun_dag` itself and go beside
+   `dag_id`; not one of them is a `conf` key.**  `conf` carries the Dag's own
+   trigger parameters and nothing else, validated against its `params` schema:
+   turn what the user asked for into typed conf keys, and pass no conf at all
+   for a Dag without params.  A refusal lists the valid params with their types
+   and defaults — relay that list instead of guessing again.  When the result says the outcome is
    `unknown`, say exactly that: do not report the run as created, do not report
    it as not created, and retry with the same `run_id`.  Relay the
    `idempotency` sentence rather than improving on it — the key prevents a
@@ -1002,6 +1007,45 @@ def _describe_params(dag_id: str, params: Any) -> str:
     return f"Valid params for Dag {dag_id!r}:\n" + "\n".join(lines)
 
 
+# ``rerun_dag``'s own arguments. A model that wants an identified run reaches for
+# ``run_id`` and ``expected_dag_version`` and posts them inside ``conf``; the
+# params refusal that answered it — "this Dag takes no conf" — is true and tells
+# it nothing about where they belong, so it dropped them and triggered
+# unidentified instead. Mirrors ``codechange._RERUN_OWN_ARGS``, which refuses the
+# same mistake for a caller that does not come through this plugin.
+RERUN_OWN_ARGS = (
+    "run_id",
+    "expected_dag_version",
+    "note",
+    "unpause",
+    "unpause_token",
+    "verify_task_id",
+)
+
+
+def _misplaced_rerun_args(dag_id: str, conf: dict[str, Any]) -> str | None:
+    """
+    Return the refusal for a conf carrying ``rerun_dag``'s own arguments, or ``None``.
+
+    The refusal spells the corrected call out rather than describing it: the
+    values are already in hand, and a model that has to reassemble them is the
+    model that dropped them the first time.
+    """
+    misplaced = [name for name in RERUN_OWN_ARGS if name in conf]
+    if not misplaced:
+        return None
+    named = ", ".join(repr(name) for name in misplaced)
+    corrected = ", ".join(f"{name}={repr(conf[name])[:120]}" for name in misplaced)
+    survivors = sorted(set(conf) - set(misplaced))
+    return (
+        f"{_INVALID_CONF}{named} {'is' if len(misplaced) == 1 else 'are'} rerun_dag's OWN "
+        f"argument(s), not conf key(s): conf carries Dag {dag_id!r}'s trigger parameters and "
+        f"nothing else. Do not drop them — call rerun_dag again with {corrected} passed at the "
+        f"TOP LEVEL beside dag_id, and with "
+        + (f"conf holding only {survivors}." if survivors else "no conf at all.")
+    )
+
+
 def _validate_rerun_conf(dag_id: str, conf: dict[str, Any]) -> str | None:
     """
     Return the refusal for a conf the Dag's params would reject, or ``None`` to proceed.
@@ -1011,6 +1055,11 @@ def _validate_rerun_conf(dag_id: str, conf: dict[str, Any]) -> str | None:
     suspends for approval, or the user is asked to approve a card that can only
     fail.
     """
+    # Asked before the Dag's params are read at all: an argument in the wrong
+    # place is not a params problem, and every params answer to it is a true
+    # sentence that loses the value the model was trying to pass.
+    if misplaced := _misplaced_rerun_args(dag_id, conf):
+        return misplaced
     params = _get_serialized_params(dag_id)
     if params is None:
         return (

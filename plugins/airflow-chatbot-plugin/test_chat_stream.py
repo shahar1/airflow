@@ -692,12 +692,21 @@ def test_write_prompt_tells_the_model_to_name_the_run_and_reuse_the_name():
     """The idempotency key is worth nothing if the model invents a new one on retry."""
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
 
-    assert "Pass a `run_id` you choose" in normalized
-    assert "repeat it **verbatim** on any retry" in normalized
+    assert "pass those arguments exactly as given" in normalized
+    assert "repeat the `run_id` **verbatim** on any retry" in normalized
     assert "`expected_dag_version`" in normalized
     assert "do not report the run as created, do not report it as not created" in normalized
     # The non-claim has to survive the relay.
     assert "says nothing about any other run" in normalized
+
+
+def test_write_prompt_says_the_runs_identity_is_an_argument_and_not_a_conf_key():
+    """The live failure: asked for an identified run, the model put it in `conf`."""
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "`replacement_run` block whose `args` already hold" in normalized
+    assert "not one of them is a `conf` key" in normalized
+    assert "`conf` carries the Dag's own trigger parameters and nothing else" in normalized
 
 
 def test_write_prompt_makes_the_triggered_run_the_middle_of_the_repair_not_the_end():
@@ -1844,6 +1853,44 @@ def test_a_valid_conf_reaches_the_tool_untouched(rerun_granted, monkeypatch):
 
     assert plugin._authorize_tool_call(FakeUser(), "rerun_dag", args) is None
     assert args == {"dag_id": "sales_summary", "conf": {"severity_threshold": "high", "retries": 2}}
+
+
+def test_rerun_arguments_posted_as_conf_are_sent_back_to_the_top_level(rerun_granted, monkeypatch):
+    """
+    The live failure: the identity was offered, refused as conf, and dropped.
+
+    ``sales_summary`` defines no params here, so the answer the model got —
+    "takes no conf" — was true, said nothing about ``run_id``, and the retry
+    came back with no identity at all.
+    """
+    monkeypatch.setattr(
+        plugin,
+        "_get_serialized_params",
+        lambda dag_id: pytest.fail("a misplaced argument is not a params question"),
+    )
+    conf = {"run_id": "airy_repair_1", "expected_dag_version": 5}
+
+    refusal = plugin._authorize_tool_call(FakeUser(), "rerun_dag", {"dag_id": "sales_summary", "conf": conf})
+
+    assert refusal.startswith(plugin._INVALID_CONF)
+    assert "takes no conf" not in refusal
+    assert "rerun_dag's OWN argument(s), not conf key(s)" in refusal
+    assert "Do not drop them" in refusal
+    assert "run_id='airy_repair_1'" in refusal
+    assert "expected_dag_version=5" in refusal
+    assert "no conf at all" in refusal
+
+
+def test_a_misplaced_rerun_argument_leaves_the_dags_own_params_in_conf(rerun_granted, monkeypatch):
+    monkeypatch.setattr(plugin, "_get_serialized_params", lambda dag_id: _demo_params())
+
+    refusal = plugin._authorize_tool_call(
+        FakeUser(),
+        "rerun_dag",
+        {"dag_id": "sales_summary", "conf": {"note": "replacement", "severity_threshold": "low"}},
+    )
+
+    assert "conf holding only ['severity_threshold']" in refusal
 
 
 def test_conf_for_a_dag_without_params_is_refused(rerun_granted, monkeypatch):

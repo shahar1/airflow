@@ -335,6 +335,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _now_stamp() -> str:
+    """The same clock as ``_now_iso``, compact enough to sit inside an identifier."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def _carries_execution_fields(row: dict[str, Any]) -> bool:
     return bool(row.get("hostname")) or row.get("pid") is not None
 

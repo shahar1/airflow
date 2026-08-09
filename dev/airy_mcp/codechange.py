@@ -93,7 +93,7 @@ from dagsource import (
     _patch,
     _write_if_unchanged,
 )
-from primitives import _quoted, _ti_key
+from primitives import _now_stamp, _quoted, _ti_key
 from reading import (
     _backfill_runs,
     _build_asset_note,
@@ -442,6 +442,28 @@ _REPLAN_STEER = (
 )
 
 
+def _replacement_run_call(
+    dag_id: str, version_after: int | None, pairs: list[tuple[str, str]]
+) -> dict[str, Any]:
+    """The trigger this repair makes available, with its arguments already chosen.
+
+    Asked for a run identity and a version pin, a small model supplied neither:
+    it triggered unidentified every time, and once tried to pass both through
+    ``conf``. Both values exist at this point, so they are minted here and handed
+    over ready to copy rather than left to be assembled by the caller.
+    """
+    args: dict[str, Any] = {"dag_id": dag_id, "run_id": f"airy_repair_{_now_stamp()}"}
+    if version_after is not None:
+        args["expected_dag_version"] = version_after
+    # The literal scan the plan's impact already uses, over the lines this change
+    # WROTE. One name is a target; several is a guess, and a guessed verification
+    # target is worse than none.
+    written = sorted(dagsource._declared_task_ids("\n".join(new for _, new in pairs)))
+    if len(written) == 1:
+        args["verify_task_id"] = written[0]
+    return args
+
+
 def apply_dag_code_changes(
     dag_id: str,
     changes: list[dict[str, str]],
@@ -624,6 +646,7 @@ def apply_dag_code_changes(
             reparse=reparse,
             checks=checks,
         )
+    replacement = _replacement_run_call(dag_id, version_after, pairs)
     return {
         "applied": True,
         "mutation_applied": True,
@@ -633,6 +656,23 @@ def apply_dag_code_changes(
         "reparse": reparse,
         "post_write_checks": checks["checks"],
         "post_write_checks_unread": checks["unread"],
+        # The identity and the version pin the next call needs, chosen here
+        # because here is where both are known. Offering them is not proposing
+        # the run: the trigger is a separate decision the user makes.
+        "replacement_run": {"tool": "rerun_dag", "args": replacement},
+        "next_step": (
+            f"the source is changed. NO run was triggered and nothing was re-run. If the user asks "
+            f"for a replacement run, call rerun_dag with EXACTLY these arguments: {replacement} — "
+            f"run_id is what makes a retry find the run it already created instead of making a "
+            f"second one, expected_dag_version refuses the trigger if the Dag moves again before it "
+            f"goes out, and every one of them is a top-level argument rather than a conf key."
+            + (
+                " verify_task_id is the task id this change wrote; replace it if the work you will "
+                "verify belongs to a different task."
+                if "verify_task_id" in replacement
+                else ""
+            )
+        ),
         **({"warning": backup_failure} if backup_failure else {}),
         **_definition_updates(dag_id, version_before_write, version_after),
     }
@@ -807,6 +847,38 @@ def _describe_params(params: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+# ``rerun_dag``'s own arguments, named here so a conf carrying one can be told
+# where it belongs. A model reaching for an identified run puts ``run_id`` and
+# ``expected_dag_version`` inside ``conf``, and "this Dag takes no conf" — true,
+# and the answer it used to get — sends it back having dropped the identity it
+# was trying to supply. That is how every drawer-driven trigger ended up
+# unidentified.
+_RERUN_OWN_ARGS = (
+    "run_id",
+    "expected_dag_version",
+    "note",
+    "unpause",
+    "unpause_token",
+    "verify_task_id",
+)
+
+
+def _misplaced_rerun_args(dag_id: str, conf: dict[str, Any]) -> str | None:
+    """The refusal for a conf carrying this tool's own arguments, with the call to make instead."""
+    misplaced = [name for name in _RERUN_OWN_ARGS if name in conf]
+    if not misplaced:
+        return None
+    named = ", ".join(repr(name) for name in misplaced)
+    corrected = ", ".join(f"{name}={_quoted(conf[name], 120)}" for name in misplaced)
+    survivors = sorted(set(conf) - set(misplaced))
+    return (
+        f"{named} {'is' if len(misplaced) == 1 else 'are'} rerun_dag's OWN argument(s), not conf "
+        f"key(s): conf carries {dag_id}'s trigger parameters and nothing else. Do not drop them — "
+        f"call rerun_dag again with {corrected} passed at the TOP LEVEL beside dag_id, and with "
+        + (f"conf holding only {survivors}." if survivors else "no conf at all.")
+    )
+
+
 def _validate_conf(dag_id: str, conf: Any, params: dict[str, Any]) -> str | None:
     """Why this conf cannot trigger this Dag — or ``None`` when it can.
 
@@ -816,6 +888,10 @@ def _validate_conf(dag_id: str, conf: Any, params: dict[str, Any]) -> str | None
     """
     if not isinstance(conf, dict):
         return "conf must be an object of parameter values"
+    # Before the params checks, both of which are true of a misplaced argument
+    # and neither of which says where it should have gone.
+    if misplaced := _misplaced_rerun_args(dag_id, conf):
+        return misplaced
     if not params:
         return f"{dag_id} takes no trigger parameters, so conf must be empty"
     unknown = sorted(set(conf) - set(params))

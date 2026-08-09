@@ -1553,6 +1553,41 @@ def test_apply_dag_code_changes_patches_backs_up_and_reparses(airflow, tmp_path)
     assert result["ui_updates"] == [{"kind": "dag_definition", "dag_id": DAG_ID, "version_number": 2}]
 
 
+def test_apply_dag_code_changes_hands_back_the_identified_trigger_it_makes_available(airflow, tmp_path):
+    """The identity and the version pin, minted where both are known.
+
+    Asked to choose a run identity and to repeat the version the fix produced,
+    the model supplied neither and triggered unidentified. Both values exist at
+    this point, so the repair hands the whole call over ready to copy.
+    """
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    call = result["replacement_run"]
+    assert call["tool"] == "rerun_dag"
+    assert call["args"]["dag_id"] == DAG_ID
+    assert call["args"]["run_id"].startswith("airy_repair_")
+    assert call["args"]["expected_dag_version"] == result["ui_updates"][0]["version_number"]
+    assert str(call["args"]) in result["next_step"]
+    assert "NO run was triggered" in result["next_step"]
+    assert "top-level argument rather than a conf key" in result["next_step"]
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ('post = Op(task_id="post_remittance")', "post_remittance"),
+        ('a = Op(task_id="one")\nb = Op(task_id="two")', None),
+        ('op_kwargs={"column": "amount"}', None),
+    ],
+    ids=["one-task", "two-tasks", "no-task"],
+)
+def test_the_repair_names_a_verification_target_only_when_the_change_wrote_one(written, expected):
+    """One name is a target; several is a guess, and a guessed target is worse than none."""
+    args = codechange._replacement_run_call(DAG_ID, 4, [("old", written)])
+
+    assert args.get("verify_task_id") == expected
+
+
 def test_apply_dag_code_changes_writes_two_edits_as_one_version(airflow, tmp_path):
     """Two proposals against one source cannot both be right; one write can."""
     result = _apply(
@@ -4725,6 +4760,35 @@ def test_rerun_dag_refuses_conf_for_a_dag_without_params(airflow):
     assert result["triggered"] is False
     assert "takes no trigger parameters" in result["error"]
     assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+
+
+def test_rerun_dag_says_where_its_own_arguments_belong_instead_of_calling_them_conf(airflow):
+    """The live failure: the identity was offered, refused as conf, and dropped.
+
+    ``sales_summary`` has no params here, so the old answer — "takes no trigger
+    parameters" — was true, said nothing about ``run_id``, and the retry came
+    back with no identity at all.
+    """
+    result = server.rerun_dag(DAG_ID, conf={"run_id": "airy_repair_1", "expected_dag_version": 5})
+
+    assert result["triggered"] is False
+    assert result["mutation_applied"] is False
+    assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
+    assert "takes no trigger parameters" not in result["error"]
+    assert "rerun_dag's OWN argument(s), not conf key(s)" in result["error"]
+    assert "Do not drop them" in result["error"]
+    # The corrected call, with the values the caller already chose.
+    assert 'run_id="airy_repair_1"' in result["error"]
+    assert "expected_dag_version=5" in result["error"]
+    assert "no conf at all" in result["error"]
+
+
+def test_rerun_dag_keeps_the_dags_own_params_when_it_moves_its_arguments_out_of_conf(airflow):
+    airflow.dag_params = DAG_PARAMS
+
+    error = server.rerun_dag(DAG_ID, conf={"run_id": "r1", "skip_invalid": True})["error"]
+
+    assert "conf holding only ['skip_invalid']" in error
 
 
 def test_rerun_dag_validates_conf_before_spending_the_unpause_token(airflow):
