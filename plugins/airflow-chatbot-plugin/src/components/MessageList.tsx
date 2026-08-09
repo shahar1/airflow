@@ -819,7 +819,12 @@ const ConfirmPanel: FC<ConfirmPanelProps> = ({ confirms, isStreaming, onDecide, 
   const unrecognised = isUnrecognisedConfirm(confirms);
   const states = confirms.map((confirm) => buildConfirmState(confirm, findTool(tools, confirm), isStreaming));
 
-  if (first.resolution !== undefined) {
+  // A restored card that was already decided in the older session has no
+  // truthful receipt to show: "Run backfill · approved by you" under a green
+  // check asserts the withdrawn capability harder than the card it replaces,
+  // and the decision it records was taken against a build that is gone. The
+  // disclaimer outranks the record, so the check comes before the receipt.
+  if (first.resolution !== undefined && !unrecognised) {
     return (
       <ConfirmReceipt
         confirms={confirms}
@@ -975,7 +980,10 @@ export const buildReceiptLabel = (
     return `${applied} of ${total} applied · ${open} need${open === 1 ? "s" : ""} attention`;
   }
   const known = TOOL_LABELS[confirm.tool];
-  const name = humanizeToolName(confirm.tool);
+  // A decided card for a tool this build does not have is held back from the
+  // receipt entirely; naming it here too costs one word and stops that
+  // guarantee depending on where a return statement sits.
+  const name = describeTool(confirm.tool);
   switch (state) {
     case "applying":
       return `Approved · ${known?.running ?? name}…`;
@@ -1139,6 +1147,9 @@ interface ConfirmDetailProps {
 const ConfirmDetail: FC<ConfirmDetailProps> = ({ confirm, isDark, nested }) => {
   const effect = buildWriteEffect(confirm);
   const args = parseArgs(confirm.args);
+  // The card withholds the name of a tool this build does not have; printing it
+  // one click away, under a heading that invites the click, withholds nothing.
+  const named = effect !== UNRECOGNISED_EFFECT;
   const diff = confirm.tool === "apply_dag_code_changes" ? buildDiffLines(args) : undefined;
   const diffUnavailable = confirm.tool === "apply_dag_code_changes" && diff === undefined;
   const [diffOpen, setDiffOpen] = useState(true);
@@ -1196,7 +1207,7 @@ const ConfirmDetail: FC<ConfirmDetailProps> = ({ confirm, isDark, nested }) => {
           maxHeight="240px"
           overflowY="auto"
         >
-          {`${confirm.tool}: ${formatArgsFull(confirm.args) || "(no arguments)"}`}
+          {`${named ? `${confirm.tool}: ` : ""}${formatArgsFull(confirm.args) || "(no arguments)"}`}
         </Box>
       )}
       <Flex gap={2} mt={2} wrap="wrap">
@@ -1451,12 +1462,17 @@ const CodeControl: FC<CodeControlProps> = ({
 );
 
 /**
- * Human labels for the tools Airy ships with; anything else gets humanized.
+ * Human labels for the tools Airy ships with — and this build's own list of
+ * which tools those are.
  *
- * One entry per *registered* tool and no more.  The withdrawn recovery surface
- * is gone from here, but deleting the entries is not what closes the hole —
- * `humanizeToolName` invents a label for any name — so the server refuses to
- * emit a frame for an unregistered tool at all.
+ * One entry per *registered* tool and no more: the keys mirror the server's
+ * `TOOL_POLICY` exactly.  The server refuses to emit a frame for any other
+ * name, which closes the live path and only the live path — a transcript
+ * restored from `sessionStorage` reaches the drawer without ever passing the
+ * allowlist, carrying whatever the session that recorded it was offered,
+ * including the withdrawn recovery surface.  So these keys are also the test
+ * for a name this build cannot describe, and `humanizeToolName` — which
+ * invents a plausible label for any string — is never reached for one.
  */
 const TOOL_LABELS: Record<string, { running: string; done: string; absent?: string }> = {
   apply_dag_code_changes: { done: "Edited Dag code", running: "Editing Dag code" },
@@ -1485,33 +1501,47 @@ const humanizeToolName = (name: string): string => {
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
 
+/** Whether this build has the tool, and may therefore name it. */
+const isRegisteredTool = (name: string): boolean => Object.hasOwn(TOOL_LABELS, name);
+
+/**
+ * What to call a tool in a row that reports on it.
+ *
+ * A restored row can name a tool this build withdrew, and "Run backfill" beside
+ * a green check advertises a capability it does not have on the evidence of a
+ * stale transcript alone.  The row's own status is real and stays; the name and
+ * the title invented from it do not.
+ */
+const describeTool = (name: string): string =>
+  isRegisteredTool(name) ? humanizeToolName(name) : "Unrecognised action";
+
 export const buildToolLabel = (tool: ToolCall): string => {
   const status = buildToolStatus(tool);
   if (status === "proposed") {
     return WRITE_EFFECTS[tool.name]?.proposed ?? "Proposed change";
   }
   if (status === "cancelled") {
-    return `${humanizeToolName(tool.name)} cancelled`;
+    return `${describeTool(tool.name)} cancelled`;
   }
   if (status === "unsettled") {
-    return `${humanizeToolName(tool.name)} — outcome unknown`;
+    return `${describeTool(tool.name)} — outcome unknown`;
   }
   // Settled and negative. "Outcome unknown" understates a whole read of a
   // finished run as badly as a green check overstates it.
   if (status === "absent") {
-    return TOOL_LABELS[tool.name]?.absent ?? `${humanizeToolName(tool.name)} — nothing recorded`;
+    return TOOL_LABELS[tool.name]?.absent ?? `${describeTool(tool.name)} — nothing recorded`;
   }
   // A refusal is the guardrail working, not the system breaking. The scripted
   // stale-version refusal says "Nothing was created" in the payload while the
   // row said "Rerun Dag failed", which reads as an outage.
   if (status === "refused") {
-    return `${humanizeToolName(tool.name)} refused — nothing was changed`;
+    return `${describeTool(tool.name)} refused — nothing was changed`;
   }
   if (status === "failed") {
-    return `${humanizeToolName(tool.name)} failed`;
+    return `${describeTool(tool.name)} failed`;
   }
   if (status === "denied") {
-    return `${humanizeToolName(tool.name)} rejected`;
+    return `${describeTool(tool.name)} rejected`;
   }
   const known = TOOL_LABELS[tool.name];
   if (known) {
@@ -1519,7 +1549,7 @@ export const buildToolLabel = (tool: ToolCall): string => {
     // running form so the row never claims "Edited" before the user says yes.
     return status === "done" ? known.done : known.running;
   }
-  return humanizeToolName(tool.name);
+  return describeTool(tool.name);
 };
 
 const CheckIcon: FC = () => (
@@ -1715,7 +1745,10 @@ const ToolRow: FC<ToolRowProps> = ({ tool }) => {
             )}
           </Flex>
           <Text fontSize="xs" fontFamily="mono" color={muted} truncate>
-            {tool.name} {formatArgs(tool.args)}
+            {/* The label above withholds a withdrawn tool's name; the mono line
+                under it printed the name raw, which withheld nothing. */}
+            {isRegisteredTool(tool.name) ? `${tool.name} ` : ""}
+            {formatArgs(tool.args)}
           </Text>
         </Box>
         {expandable && (

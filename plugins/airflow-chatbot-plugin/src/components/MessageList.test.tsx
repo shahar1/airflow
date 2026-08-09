@@ -214,10 +214,52 @@ describe("buildConfirmState", () => {
 
     expect(buildToolLabel(absent)).not.toBe("Verified the run recorded its output");
     expect(buildToolLabel(absent)).not.toMatch(/outcome unknown/u);
-    // A tool with no `absent` label of its own still must not go green.
-    expect(buildToolLabel(tool({ absent: true, name: "some_future_check" }))).toBe(
-      "Some future check — nothing recorded",
+    // A registered tool with no `absent` label of its own still must not go green.
+    expect(buildToolLabel(tool({ absent: true, name: "diagnose_dag" }))).toBe(
+      "Diagnose Dag — nothing recorded",
     );
+  });
+
+  it.each([
+    [{ absent: true }, "Unrecognised action — nothing recorded"],
+    [{ cancelled: true }, "Unrecognised action cancelled"],
+    [{ denied: true }, "Unrecognised action rejected"],
+    [{ failed: true }, "Unrecognised action failed"],
+    [{ refused: true }, "Unrecognised action refused — nothing was changed"],
+    [{ unsettled: true }, "Unrecognised action — outcome unknown"],
+    [{}, "Unrecognised action"],
+  ])("names no withdrawn capability on a restored %o row", (flags, expected) => {
+    // The server emits no frame for an unregistered name, so a row carrying one
+    // was restored from an older session's transcript — where the withdrawn
+    // recovery surface was still on offer. `humanizeToolName` turns any string
+    // into a plausible title, so the row read "Run backfill" beside the status
+    // of a call this build cannot make.
+    const restored = tool({ name: "run_backfill", ...flags });
+
+    expect(buildToolLabel(restored)).toBe(expected);
+    expect(buildToolLabel(restored)).not.toMatch(/backfill/iu);
+  });
+
+  it("keeps every registered tool naming itself", () => {
+    // The name-free label is for what this build does not have. A registry that
+    // drifts from the server's `TOOL_POLICY` would blank a live tool's row.
+    expect(buildToolLabel(tool({ name: "rerun_dag", refused: true }))).toBe(
+      "Rerun Dag refused — nothing was changed",
+    );
+    expect(buildReceiptLabel("applied", ["applied"], { callId: "c1", nonce: "n1", tool: "rerun_dag" })).toBe(
+      "Re-ran Dag · approved by you",
+    );
+  });
+
+  it("keeps a withdrawn tool out of the receipt line too", () => {
+    // ConfirmPanel holds these back from the receipt entirely; the label must
+    // not be the only thing standing between a restored card and a green
+    // "Run backfill · approved by you".
+    const restored = { callId: "c1", nonce: "n1", tool: "run_backfill" };
+
+    for (const state of ["applied", "applying"] as ConfirmState[]) {
+      expect(buildReceiptLabel(state, [state], restored)).not.toMatch(/backfill/iu);
+    }
   });
 
   it("keeps a refusal red on a bundle that predates the flag", () => {
@@ -1093,6 +1135,67 @@ describe("MessageList", () => {
     expect(screen.getByText(/came from an older session and cannot be acted on here/u)).not.toBeNull();
     expect(screen.queryByText(/delete_everything/u)).toBeNull();
     expect(screen.queryByText("Delete everything")).toBeNull();
+    expect(screen.queryByText("Approve")).toBeNull();
+    expect(screen.getByText("Dismiss")).not.toBeNull();
+  });
+
+  it("does not name the withdrawn tool under Technical details either", () => {
+    // The panel withholds the name; the details block printed it raw, one click
+    // away under a heading that invites the click — and again inside a receipt.
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              { args: { dag_id: "arden_refund_remittance" }, callId: "c1", nonce: "n1", tool: "run_backfill" },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Technical details"));
+
+    expect(screen.queryByText(/run_backfill/u)).toBeNull();
+    expect(screen.getByText(/arden_refund_remittance/u)).not.toBeNull();
+  });
+
+  it("keeps a restored card that was already decided on the disclaimer, not a receipt", () => {
+    // The receipt branch ran first, so an approval taken in the older session
+    // rendered "Run backfill · approved by you" under a green check with no
+    // disclaimer at all — the withdrawn capability asserted harder than by the
+    // card this guard replaced.
+    show(
+      <MessageList
+        messages={[
+          assistant({
+            confirms: [
+              {
+                args: { dag_id: "arden_refund_remittance" },
+                callId: "c1",
+                nonce: "n1",
+                resolution: "approved",
+                tool: "run_backfill",
+              },
+            ],
+            tools: [
+              {
+                durationMs: 500,
+                id: "c1",
+                name: "run_backfill",
+                startedAt: 0,
+              },
+            ],
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Unrecognised approval")).not.toBeNull();
+    expect(screen.getByText(/came from an older session and cannot be acted on here/u)).not.toBeNull();
+    expect(screen.queryByText(/approved by you/u)).toBeNull();
+    expect(screen.queryByText(/run_backfill/u)).toBeNull();
+    expect(screen.queryByText("Run backfill")).toBeNull();
     expect(screen.queryByText("Approve")).toBeNull();
     expect(screen.getByText("Dismiss")).not.toBeNull();
   });
