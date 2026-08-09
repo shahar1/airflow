@@ -234,6 +234,10 @@ export const applyEvent = (
           tool.id === event.id && (tool.durationMs === undefined || tool.awaitingConfirm === true)
             ? {
                 ...tool,
+                // A verification that read the whole thing and found no such
+                // record. Settled, so it takes neither the green check nor the
+                // amber doubt; the server is what tells false from null.
+                absent: event.absent === true,
                 awaitingConfirm: undefined,
                 denied: event.denied === true,
                 durationMs: tool.durationMs ?? now - tool.startedAt,

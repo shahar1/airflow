@@ -46,6 +46,11 @@ export interface ToolCall {
   unsettled?: boolean;
   /** The tool ran, declined, and changed nothing — not a system failure. */
   refused?: boolean;
+  /**
+   * A verification that read the whole thing and found no such record. A
+   * settled answer, so neither the green check nor the amber doubt fits it.
+   */
+  absent?: boolean;
 }
 
 /** A write tool call the server suspended, waiting for the user's verdict. */

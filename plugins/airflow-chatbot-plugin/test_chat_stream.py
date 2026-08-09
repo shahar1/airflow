@@ -121,6 +121,7 @@ def test_event_payload_reports_a_tool_result():
         "refused": False,
         "denied": False,
         "unsettled": False,
+        "absent": False,
         "result": "ok",
     }
 
@@ -334,23 +335,33 @@ _VERIFY_OCCURRED_FALSE = {  # captures/23-chat-settled-verification.txt
 }
 
 
-@pytest.mark.parametrize(
-    ("content", "expected_unsettled"),
-    [
-        (_VERIFY_OCCURRED_TRUE, False),
-        (_VERIFY_OCCURRED_NULL, True),
-        (_VERIFY_OCCURRED_FALSE, True),
-        (json.dumps(_VERIFY_OCCURRED_FALSE), True),
-    ],
-    ids=["occurred_true", "occurred_null", "occurred_false", "json_string"],
+_VERIFY_DENIED = (  # the per-Dag authorization wrapper answering instead of the tool
+    f"{plugin._ACCESS_DENIED}verify_replacement_run needs GET on XComs for Dag 'other', "
+    f"which the signed-in user does not have. Tell the user this; do not retry."
 )
-def test_only_a_recorded_output_lets_a_verification_row_go_green(content, expected_unsettled):
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_unsettled", "expected_absent"),
+    [
+        (_VERIFY_OCCURRED_TRUE, False, False),
+        (_VERIFY_OCCURRED_NULL, True, False),
+        (_VERIFY_OCCURRED_FALSE, False, True),
+        (json.dumps(_VERIFY_OCCURRED_FALSE), False, True),
+        (_VERIFY_DENIED, True, False),
+    ],
+    ids=["occurred_true", "occurred_null", "occurred_false", "json_string", "access_denied"],
+)
+def test_a_verification_row_grades_all_three_answers_apart(content, expected_unsettled, expected_absent):
     """
-    ``occurred`` is three-valued and only ``true`` is an answer.
+    ``occurred`` is three-valued and each value is a different answer.
 
     The tool is read-only, so nothing classified it: ``false`` (an absence of
     the RECORD) and ``null`` (UNKNOWN) painted the same green check as ``true``,
-    and the row said "verified" over a run that recorded nothing.
+    and the row said "verified" over a run that recorded nothing. ``false`` is
+    then not UNKNOWN either — it is only ever returned on a complete read of a
+    finished run — so amber understates it and it gets its own settled row. A
+    denial is not an answer at all: nothing was read.
     """
     event = FunctionToolResultEvent(
         part=ToolReturnPart(tool_name="verify_replacement_run", content=content, tool_call_id="c1")
@@ -359,7 +370,8 @@ def test_only_a_recorded_output_lets_a_verification_row_go_green(content, expect
     payload = plugin._event_payload(event)
 
     assert payload["unsettled"] is expected_unsettled
-    # Never red either: neither value says the check or the run broke.
+    assert payload["absent"] is expected_absent
+    # Never red either: no value here says the check or the run broke.
     assert payload["failed"] is False
     assert payload["refused"] is False
 
@@ -372,7 +384,19 @@ def test_a_verification_that_answered_nothing_at_all_is_left_alone():
         )
     )
 
-    assert plugin._event_payload(event)["unsettled"] is False
+    payload = plugin._event_payload(event)
+
+    assert payload["unsettled"] is False
+    assert payload["absent"] is False
+
+
+def test_only_a_verification_is_ever_graded_absent():
+    """``occurred`` on some other tool's result is not this grading's to read."""
+    event = FunctionToolResultEvent(
+        part=ToolReturnPart(tool_name="diagnose_dag", content=_VERIFY_OCCURRED_FALSE, tool_call_id="c1")
+    )
+
+    assert plugin._event_payload(event)["absent"] is False
 
 
 @pytest.mark.parametrize(

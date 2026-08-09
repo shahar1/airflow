@@ -300,7 +300,7 @@ successful.
 
 _WRITE_PROMPT = """\
 
-**Self-healing.**  Airy repairs ONE thing: a Dag whose source is wrong.  A
+**Dag source repair.**  Airy repairs ONE thing: a Dag whose source is wrong.  A
 *source* change is planned first and written second — the planning tools are
 read-only and hand back a `plan_token`, and the source write tools refuse
 without it.  Triggering a run is not planned that way and carries no
@@ -1630,22 +1630,56 @@ def _write_unsettled(content: Any) -> bool:
 VERIFY_TOOLS = frozenset({"verify_replacement_run"})
 
 
-def _verification_unsettled(content: Any) -> bool:
-    """
-    Whether a verification declines to say the work was recorded.
-
-    ``occurred`` is three-valued and only ``true`` is an answer: ``false`` is an
-    absence of the RECORD and ``null`` is UNKNOWN. The tool is read-only, so it
-    never reaches ``_write_outcome`` and every one of the three rendered as the
-    same green check — the row that carries the last clause of the demo's claim
-    saying "verified" over a run that recorded nothing.
-    """
+def _verification_payload(content: Any) -> dict[str, Any] | None:
+    """Return a verification's own result, or ``None`` when it never produced one."""
     if isinstance(content, str):
         try:
             content = json.loads(content)
         except ValueError:
-            return False
-    return isinstance(content, dict) and "occurred" in content and content["occurred"] is not True
+            return None
+    return content if isinstance(content, dict) and "occurred" in content else None
+
+
+def _verification_denied(content: Any) -> bool:
+    """
+    Whether the authorization wrapper answered instead of the verification.
+
+    It replies with a plain sentence, not a payload, so nothing below sees an
+    ``occurred`` key at all and the row went green under "Verified the run
+    recorded its output" — over a read that never happened.
+    """
+    return isinstance(content, str) and content.startswith((_ACCESS_DENIED, _INVALID_CONF))
+
+
+def _verification_unsettled(content: Any) -> bool:
+    """
+    Whether a verification declines to say anything about what the run recorded.
+
+    ``occurred`` is three-valued and only ``null`` is UNKNOWN: the run is still
+    going, a read did not come back, or the evidence was not read whole. The
+    tool is read-only, so it never reaches ``_write_outcome`` and all three
+    values rendered as the same green check — the row that carries the last
+    clause of the demo's claim saying "verified" over a run that recorded
+    nothing. A denied read is unknown too: nothing was read.
+    """
+    if _verification_denied(content):
+        return True
+    payload = _verification_payload(content)
+    return payload is not None and payload["occurred"] is None
+
+
+def _verification_absent(content: Any) -> bool:
+    """
+    Whether a verification settled that the run recorded no such output.
+
+    ``occurred: false`` is returned only on a COMPLETE read of a FINISHED run,
+    so it is an answer, not a doubt: amber "outcome unknown" understates it as
+    badly as a green check overstates it. It is an absence of the RECORD and
+    never of the work — the label carries that, because the field's name invites
+    the opposite reading.
+    """
+    payload = _verification_payload(content)
+    return payload is not None and payload["occurred"] is False
 
 
 def _plan_refused(content: Any) -> bool:
@@ -1772,16 +1806,17 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
         # drawer already has an amber "may have landed" rendering for exactly
         # this, so the frame says so rather than borrowing the red one.
         #
-        # A verification that did not come back `occurred: true` joins it. It is
+        # A verification that came back `occurred: null` joins it. It is
         # read-only, so nothing above classifies it, and true/false/null all
         # rendered as the same green check on the row the demo's last claim
         # rests on.
+        verifying = not failed and not denied and part.tool_name in VERIFY_TOOLS
         unsettled = (refused and _write_unsettled(part.content)) or (
-            not failed
-            and not denied
-            and part.tool_name in VERIFY_TOOLS
-            and _verification_unsettled(part.content)
+            verifying and _verification_unsettled(part.content)
         )
+        # `occurred: false` is neither: a complete read of a finished run that
+        # holds no such record. Amber "outcome unknown" is as wrong as green.
+        absent = verifying and _verification_absent(part.content)
         # A refusal is neither a system failure nor a rejection: the tool ran,
         # declined, and changed nothing. Red said the run broke, over a result
         # whose own words are "Nothing was created". `failed` stays set so an
@@ -1796,6 +1831,7 @@ def _event_payload(event: Any) -> dict[str, Any] | None:
             "refused": write_refused or plan_refused,
             "denied": denied,
             "unsettled": unsettled,
+            "absent": absent,
             "result": _clip_result(part.model_response() if failed else part.content),
         }
     if kind == "part_delta":
