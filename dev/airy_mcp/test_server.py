@@ -523,10 +523,23 @@ def fresh_token_store():
 _SIDECAR_DIR = Path(__file__).parent
 _SIDECAR_PREFIX = f"{_SIDECAR_DIR}{os.sep}"
 
-# Frames that are the harness or the boundary rather than a sidecar function
-# asking for something. ``transport`` IS the boundary, and this file is the
-# instrument.
-_NOT_A_SIDECAR_CALLER = ("transport", "test_server")
+# ``transport`` is the boundary itself rather than a function asking for
+# something, so a read attributed to it names the door instead of the caller.
+# Everything else that counts as sidecar code is DERIVED — see ``_is_sidecar``.
+_THE_BOUNDARY_ITSELF = "transport"
+
+
+def _is_sidecar(stem):
+    """Whether a module of this directory is the SERVER, rather than a test of it.
+
+    Off ``_package_modules()`` — the directory listing minus the named
+    non-server files — instead of a hand list of what to skip. The hand list
+    said ``transport`` and ``test_server``, which made every OTHER test module
+    in this directory count as product code: a write made by
+    ``test_incident_triage`` would have been attributed to it and rejected by
+    the write census as a mutation from an undeclared site.
+    """
+    return stem in _MODULES and stem != _THE_BOUNDARY_ITSELF
 
 
 def _frame_site():
@@ -540,9 +553,9 @@ def _frame_site():
     frame = sys._getframe(1)
     while frame is not None:
         filename = frame.f_code.co_filename
-        if filename.startswith(_SIDECAR_PREFIX):
+        if filename.startswith(_SIDECAR_PREFIX) and filename.endswith(".py"):
             stem = filename[len(_SIDECAR_PREFIX) : -3]
-            if filename.endswith(".py") and os.sep not in stem and stem not in _NOT_A_SIDECAR_CALLER:
+            if os.sep not in stem and _is_sidecar(stem):
                 return (stem, frame.f_code.co_name)
         frame = frame.f_back
     return None
@@ -10761,6 +10774,19 @@ def _sweep_world(fake):
             "event": "running" if n % 2 else "success",
             "owner": "airflow",
             "map_index": -1,
+            # A fat ``extra``, so the two clamps over relayed extras have
+            # something to clamp. Both were declared inert on the strength of
+            # THIS WORLD holding no extras — which is a fact about the fixture,
+            # not about the tool, and it read as coverage across every case.
+            "extra": json.dumps(
+                {
+                    # Relayed, and longer than the list ceiling.
+                    "task_ids": [f"t{index}" for index in range(_SWEEP_ROWS)],
+                    # Withheld: a dict is named, never relayed, so each of these
+                    # is a key the withheld-key ceiling has to choose between.
+                    **{f"withheld_{index}": {"nested": index} for index in range(_SWEEP_ROWS)},
+                }
+            ),
         }
         for task_id in ("report", "summarize")
         for n in range(_SWEEP_ROWS)
@@ -11162,6 +11188,12 @@ _CONSERVATIVE_FLAGS = {
     "events_read_whole": ("$.audit_read.events_read_whole",),
     "planned_runs_read_whole": ("$.planned_runs_read_whole",),
     "surviving_runs_read_whole": ("$.surviving_runs_read_whole",),
+    # Reached for the first time by a sweep world that carries event extras.
+    # ``extra_truncated`` says THIS relay was cut by this tool's own ceiling, so
+    # it going True under a tighter ceiling is the disclosure working. It is
+    # bound to the one path it reaches, like everything else here, so the same
+    # name appearing somewhere else still has to be declared.
+    "extra_truncated": ("$.task_instances[].last_state_change.extra_truncated",),
 }
 
 # Leaves that report what a read did NOT cover. A key that appears only under a
@@ -11640,20 +11672,110 @@ def test_the_write_sweep_reaches_a_short_read_in_the_apply_phase(tmp_path, monke
     195 write cases reached zero apply-phase short reads: every one of the
     fifteen it counted was a plan-phase read the value sweep already had. A
     sweep whose subject cannot be constructed certifies its own silence.
+
+    Every number here is now DERIVED and printed beside the raw case count,
+    because a raw count is the one number that grows without the sweep
+    discriminating any more than it did. Distinct scenarios, distinct routes and
+    how many of the short cases ended with a write that actually LANDED are the
+    numbers that say what this sweep is worth.
     """
-    reached = {}
+    reached: dict[str, set] = {}
+    scenarios = set()
     cases = 0
+    landed = 0
     for tool in sorted(_TWO_PHASE_WRITES):
         for lever in sorted(_LEVERS):
             root = tmp_path / f"{tool}-{lever}".replace(".", "_").replace(":", "_")
-            _, short_reads = _write_answer_in_two_phases(root, monkeypatch, tool, lever)
-            if short_reads:
-                cases += 1
-                reached.setdefault(tool, set()).update(route for route, _, _ in short_reads)
-    print(f"{cases} of {len(_TWO_PHASE_WRITES) * len(_LEVERS)} write cases read short in the APPLY phase")
-    print("\n".join(f"{tool}: {sorted(routes)}" for tool, routes in sorted(reached.items())))
+            card, short_reads = _write_answer_in_two_phases(root, monkeypatch, tool, lever)
+            if not short_reads:
+                continue
+            cases += 1
+            routes = {route for route, _, _ in short_reads}
+            reached.setdefault(tool, set()).update(routes)
+            scenarios.add((tool, tuple(sorted(routes))))
+            landed += bool(isinstance(card, dict) and card.get("mutation_applied"))
+    routes_reached = sorted({route for routes in reached.values() for route in routes})
+    print(
+        f"\nwrite sweep: {len(_TWO_PHASE_WRITES) * len(_LEVERS)} raw cases, {cases} reaching a short "
+        f"read in the APPLY phase, {len(scenarios)} distinct (tool, short-route-set) scenarios, "
+        f"{len(routes_reached)} distinct route(s), {landed} of them over a write that LANDED\n"
+        + "\n".join(f"  {tool}: {sorted(routes)}" for tool, routes in sorted(reached.items()))
+    )
 
     assert reached, "no lever makes a write tool's APPLY read short, so this sweep proves nothing"
+    assert len(routes_reached) == len(set(routes_reached))
+    assert landed == 0, (
+        "the write sweep now reaches a LANDED write over a short read, which is the card "
+        "_WRITE_CARDS_THE_SWEEP_CANNOT_REACH says it cannot construct — re-derive that table"
+    )
+
+
+# The one card this sweep exists for and cannot build, NAMED with why and with
+# what stands in for it. Every apply-phase short read the sweep reaches ends in
+# a refusal, so ``mutation_applied`` is False in all of them — and "a write
+# landed AND a read was short" is the state an operator is most likely to act
+# wrongly on. It is not unreachable in the product; it is unreachable from a
+# world that never enters the compensating path.
+_WRITE_CARDS_THE_SWEEP_CANNOT_REACH = {
+    ("codechange", "_abandon_backfill", "GET /backfills/<id>/dag_runs"): (
+        "the post-write re-read on run_backfill's COMPENSATING path, reached only after the backfill "
+        "POST has already gone out and what came back does not match what the user approved. Two "
+        "writes have landed by then, so its card carries mutation_applied: True beside "
+        "surviving_runs_read_whole — the only place in this tree where a landed write and a short "
+        "read meet. The sweep drives run_backfill over a double that creates what was asked for, so "
+        "it never enters that branch; the card is held to the sweep's own predicates directly, in "
+        "test_the_card_a_landed_write_hands_back_over_a_short_read_is_honest"
+    ),
+}
+
+
+def test_the_write_cards_the_sweep_cannot_reach_are_declared_and_stood_in_for():
+    """A window the sweep cannot construct is not a window that does not exist.
+
+    It was in neither inert table: not a lever that moves nothing, not a tool
+    whose apply cannot read short — just absent, which reads as covered.
+    """
+    for entry, reason in _WRITE_CARDS_THE_SWEEP_CANNOT_REACH.items():
+        assert len(reason) > 200, entry
+        module, owner, _ = entry
+        assert (module, owner) in {
+            (holder, function) for holder, function in _functions_calling_transport()
+        }, f"{entry} names a function that reaches Airflow nowhere"
+
+
+def test_the_card_a_landed_write_hands_back_over_a_short_read_is_honest(airflow, monkeypatch):
+    """The state the two-phase sweep exists for, constructed by hand because the
+    sweep world cannot enter the branch that produces it.
+
+    Held to the sweep's OWN predicates — no manufactured positive, no
+    manufactured negative, and every short read named on the card — so this is
+    the sweep's contract applied to the one card it cannot reach rather than a
+    weaker test written beside it.
+    """
+    airflow.created_dates = [f"2024-01-{n:02d}T00:00:00+00:00" for n in range(1, 4)]
+    whole = server._abandon_backfill(7, dag_id=DAG_ID, planned=[("a", "b")], created=[{}])
+
+    with monkeypatch.context() as patch:
+        patch.setattr(reading, "MAX_BACKFILL_RUNS", 2)
+        airflow.omit_backfill_total = True
+        short_reads = _watching_readings(patch)
+        short = server._abandon_backfill(7, dag_id=DAG_ID, planned=[("a", "b")], created=[{}])
+
+    # The window really is the one that was missing: the write landed on BOTH
+    # arms, and only the second one read short.
+    assert whole["mutation_applied"] is True
+    assert short["mutation_applied"] is True
+    assert whole["surviving_runs_read_whole"] is True
+    assert short["surviving_runs_read_whole"] is False
+    assert short_reads, "the short arm did not reach a short read, so this proves nothing"
+    assert _manufactured_positives(whole, short) == []
+    assert _manufactured_negatives(whole, short) == []
+    assert (
+        _routes_whose_shortfall_is_unnamed(
+            short_reads, whole, short, _without_tokens(whole), _without_tokens(short)
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
@@ -11680,9 +11802,23 @@ def test_truncating_any_read_never_manufactures_a_positive(airflow, tmp_path, mo
 _LEVERS_THAT_MOVE_NOTHING = {
     "clamped:evidence.COVERAGE_NAME_LIMIT": "names instances the sweep world has none of to name",
     "clamped:evidence.DISPATCH_FINDING_LIMIT": "one dispatch finding at most, so a ceiling of 1 folds none",
-    "clamped:evidence.EXTRA_KEY_LIMIT": "the double's rows carry no extra keys to clamp",
-    "clamped:evidence.EXTRA_LIST_LIMIT": "the double's rows carry no extra lists to clamp",
-    "clamped:evidence.RUN_SCOPED_EVENT_LIMIT": "the double emits no run-scoped events",
+    # NOT un-exercisable — exercisable, and left inert deliberately. Giving the
+    # sweep world run-scoped rows (an event row with no task_id, which is what a
+    # clear against a whole run writes) makes this lever bite immediately, and
+    # what it then exposes is a defect in the PRODUCT rather than in the sweep:
+    # under any lever that makes the event scan partial, ``run_scoped_events``
+    # comes back ``[]`` beside ``run_scoped_events_omitted: 0`` — a hard claim
+    # that no run-scoped event exists and none was omitted, manufactured by a
+    # read that looked at one row out of twelve. That is a manufactured negative
+    # at ``$.event_history.run_scoped_events[]``, reproduced on all eight
+    # ``no-total`` levers, and it is out of scope to repair here. The property
+    # is asserted anyway, as a strict xfail, by
+    # ``test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event``:
+    # the day the product is fixed, that test XPASSes and this entry has to go.
+    "clamped:evidence.RUN_SCOPED_EVENT_LIMIT": (
+        "the sweep world emits no run-scoped events, and giving it any exposes a manufactured "
+        "negative in the product that this round may not fix — see the note above this entry"
+    ),
     "clamped:evidence.TRIES_PROBE_LIMIT": "fewer successes need a probe than the ceiling of 1 allows",
     "clamped:reading.EVENT_SCAN_LIMIT": "the event scan reaches its natural end inside one page",
     "clamped:reading.EVENT_SCAN_PAGE": "paging is not truncation; the loop follows the pages",
@@ -16032,3 +16168,99 @@ def test_the_suppress_backdoor_is_the_one_the_graph_used_to_certify():
 
     assert _shape_verdict(modelled_as_try) is False
     assert _shape_verdict(modelled_as_with) is False
+
+
+def test_the_runtime_write_census_really_sees_this_tree_s_own_writes(airflow, tmp_path):
+    """The census is armed for every test; this is what proves it is not empty.
+
+    An observer that records nothing passes its own census at every step, which
+    is indistinguishable from a clean tree until something writes. Driving the
+    one tool that really rewrites the Dag file has to put the atomic-replace
+    helper's own steps into the record, attributed to the function the approval
+    registry names them under.
+    """
+    _sweep_world(airflow)
+    _OBSERVED_WRITES.clear()
+
+    _planned_code_change()
+
+    seen = {(site, event) for site, event, _ in _OBSERVED_WRITES}
+    sites = {site for site, _ in seen}
+
+    assert ("dagsource", "_write_if_unchanged") in sites, (
+        f"the Dag-file write was not observed at all; the census saw {sorted(sites)}"
+    )
+    assert ("codechange", "apply_dag_code_changes") in sites, "the backup write was not observed"
+    # Four of the five steps of the atomic replace, each declared separately in
+    # approvals._UNGATED_WRITES and each raising its own event. The fifth — the
+    # unlink of the temp file — runs only when the replace did not happen, so a
+    # successful write is exactly the case that does not reach it.
+    assert {"tempfile.mkstemp", "open", "os.chmod", "os.rename"} <= {
+        event for site, event in seen if site == ("dagsource", "_write_if_unchanged")
+    }
+    assert sites <= _classified_write_sites(), (
+        f"a real write of this tree is attributed to a site nothing classifies: "
+        f"{sorted(sites - _classified_write_sites())}"
+    )
+
+
+def test_a_test_module_of_this_directory_is_not_mistaken_for_the_server():
+    """The observer's own attribution rule, checked against the package.
+
+    It skipped ``transport`` and ``test_server`` by name, so every other test
+    module in this directory — ``test_incident_triage`` today, any file added
+    tomorrow — counted as product code, and a write made from one of them would
+    have been reported as a mutation from an undeclared site.
+    """
+    here = Path(__file__).parent
+
+    assert _is_sidecar("recovery") is True
+    assert _is_sidecar("transport") is False
+    for path in here.glob("test_*.py"):
+        assert _is_sidecar(path.stem) is False, f"{path.name} is being read as part of the server"
+    for name in _NOT_THE_SERVER:
+        assert _is_sidecar(name.removesuffix(".py")) is False
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "PRODUCT DEFECT, reported and deliberately not repaired in an instrument-only round. "
+        "run_scoped_events and its _omitted counter are both computed over the rows the scan "
+        "actually reached, so a partial scan hands back an empty run-scoped list beside "
+        "run_scoped_events_omitted: 0 — a hard claim that none exists and none was omitted, over a "
+        "read that saw one row of twelve. Strict, so that the day the product is fixed this XPASSes "
+        "and the declaration in _LEVERS_THAT_MOVE_NOTHING has to be re-derived."
+    ),
+)
+def test_a_partial_event_scan_still_claims_it_omitted_no_run_scoped_event(airflow, monkeypatch):
+    """The defect that widening the sweep world exposed, asserted as the property
+    it breaks rather than as the behaviour it has.
+
+    Written this way on purpose. A test that asserted the CURRENT output would
+    certify the defect and quietly outlive it; a strict xfail asserts the
+    property the sweep holds every other enumeration to, records that the
+    product does not have it, and fails the moment that changes in either
+    direction.
+    """
+    _sweep_world(airflow)
+    airflow.event_logs = airflow.event_logs + [
+        {
+            "event_log_id": 100 + n,
+            "dag_id": DAG_ID,
+            "task_id": None,
+            "run_id": "manual__1",
+            "when": f"2024-01-01T00:01:0{n}+00:00",
+            "event": "clear_task_instances",
+            "owner": "airflow",
+            "map_index": None,
+        }
+        for n in range(_SWEEP_ROWS)
+    ]
+    whole = _SWEPT_TOOLS["diagnose_dag"]()
+
+    _LEVERS["no-total:omit_dag_runs_total"](airflow, monkeypatch)
+    short = _SWEPT_TOOLS["diagnose_dag"]()
+
+    assert whole["event_history"]["run_scoped_events"], "the whole arm found no run-scoped event"
+    assert _manufactured_negatives(whole, short) == []
