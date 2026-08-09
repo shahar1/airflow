@@ -864,6 +864,17 @@ _IDENTITY_SCOPE = (
     "whether a semantically equivalent run exists under a different id, in this Dag or elsewhere."
 )
 
+# The non-claim that travels with a version-pinned trigger. Refusing a version
+# that MOVED reads as a promise that a version that matched is the approved
+# code, and it is not one: a Dag version is a number, not a set of bytes.
+_VERSION_PIN_SCOPE = (
+    "The Dag was still on the version this run was agreed against, which is why the trigger was "
+    "not refused. That pins the version NUMBER and nothing else. It establishes nothing about the "
+    "code that will run: under an unversioned bundle the worker imports the Dag file as it stands "
+    "on disk when the task starts, and a version's recorded source is rewritten in place when the "
+    "file changes, so identical version numbers can be different bytes."
+)
+
 
 def _version_precondition(dag_id: str, expected: int) -> dict[str, Any] | None:
     """Refuse unless the Dag is still on the version this run was agreed against."""
@@ -979,7 +990,9 @@ def rerun_dag(
 
     ``expected_dag_version`` is the Dag version the run was agreed against. When
     given, it is re-read immediately before the trigger and a Dag that has moved
-    since is refused rather than run.
+    since is refused rather than run. **A version that still matches pins the
+    version number and not the code** — the result says so in ``version_pin``,
+    and the converse of the refusal is not something to tell the user.
 
     Triggering is approved on its own. It redeems no plan token from a source
     change, and an approved source change is not an approval to run.
@@ -1068,6 +1081,11 @@ def rerun_dag(
         "state": run["state"],
         "unpaused": unpaused,
         **({"idempotency": _IDENTITY_SCOPE} if run_id else {"idempotency": _NO_IDENTITY_SUPPLIED}),
+        **(
+            {"expected_dag_version": expected_dag_version, "version_pin": _VERSION_PIN_SCOPE}
+            if expected_dag_version is not None
+            else {}
+        ),
         # A model that diagnoses right after triggering gets served the *old*
         # failed run by the fallback and reports "it failed again"; the result
         # itself has to say the outcome is not in yet.

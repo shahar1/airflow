@@ -3627,6 +3627,33 @@ def test_a_pinned_version_that_still_matches_lets_the_trigger_through(airflow):
     assert len(_triggers(airflow)) == 1
 
 
+def test_a_version_that_still_matches_says_what_the_pin_does_not_establish(airflow):
+    """The converse of the refusal, which an operator will otherwise infer.
+
+    A trigger refused because the version MOVED reads as a promise that a
+    version that still matches is the approved code. It is not — the number is
+    not the bytes — and it was the one non-claim on this surface that the
+    payload did not carry.
+    """
+    airflow.version = 4
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, expected_dag_version=4)
+
+    assert result["expected_dag_version"] == 4
+    assert "pins the version NUMBER and nothing else" in result["version_pin"]
+    assert "imports the Dag file as it stands on disk" in result["version_pin"]
+
+
+def test_a_trigger_that_pinned_no_version_makes_no_version_claim(airflow):
+    """The sentence is about a check that ran. Shipping it where none did would
+    be the overclaim it exists to prevent."""
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert result["triggered"] is True
+    assert "version_pin" not in result
+    assert "expected_dag_version" not in result
+
+
 def test_a_version_pin_that_cannot_be_read_refuses_rather_than_riding_through(airflow):
     airflow.fail_versions = httpx.ConnectError("boom")
 
@@ -17675,6 +17702,13 @@ def test_the_fixed_scope_sentences_are_pinned_to_their_bytes():
     assert codechange._NO_IDENTITY_SUPPLIED == (
         "No run_id was supplied, so Airflow minted this run's identity and nothing here is idempotent: "
         "calling again with the same arguments creates a SECOND run."
+    )
+    assert codechange._VERSION_PIN_SCOPE == (
+        "The Dag was still on the version this run was agreed against, which is why the trigger was "
+        "not refused. That pins the version NUMBER and nothing else. It establishes nothing about the "
+        "code that will run: under an unversioned bundle the worker imports the Dag file as it stands "
+        "on disk when the task starts, and a version's recorded source is rewritten in place when the "
+        "file changes, so identical version numbers can be different bytes."
     )
 
 
