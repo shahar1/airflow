@@ -5613,13 +5613,16 @@ def test_a_giant_operator_cannot_scale_the_size_of_the_result(airflow):
     # 500 rows, but only TASK_INSTANCE_DETAIL_LIMIT of them carry an operator at
     # all, and each is clamped — so the 999 extra characters buy ~119 apiece.
     assert giant_size - tiny_size < evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
-    # A sanity bound on the absolute size, and it is NOT what this test rests on:
-    # it has been raised twice by prose the tool chooses, which is exactly the
-    # thing a Dag author cannot influence. Asserted as slack over the guard above
-    # so that raising it is a decision about headroom rather than a number
-    # nudged until it passes.
-    assert giant_size < tiny_size + 2 * (
-        evidence.TASK_INSTANCE_DETAIL_LIMIT * server.OPERATOR_CLAMP_CHARS * 2
+    # A REAL absolute ceiling on the whole payload. The form this replaces —
+    # ``giant_size < tiny_size + 2 * X`` under a ``giant_size - tiny_size < X``
+    # above it — is implied by that line and therefore constrains nothing at
+    # all, so the payload's absolute size was unguarded while a comment said it
+    # was bounded. Measured at 422,285 characters here; the ceiling is a flat
+    # number well above that, and raising it has to be an explicit decision
+    # about what this tool is allowed to hand back rather than a nudge.
+    assert giant_size < 500_000, (
+        f"diagnose_dag's whole payload is {giant_size} characters; the tool's own constants are the "
+        f"only thing that may scale it, and they now scale it past this ceiling"
     )
 
 
@@ -13327,7 +13330,10 @@ def test_a_summary_built_off_a_whole_log_makes_no_such_caveat(airflow):
     result = server.diagnose_dag(DAG_ID, "manual__1")
 
     assert result["failures"][0]["log_tail_truncated"] is False
-    assert "may not be the one that failed the task" not in result["summary"]
+    # The sentence the tool really writes when a log WAS clipped. The string
+    # this replaces left the tree with the prose that carried it, so half of
+    # this test was asserting the absence of something that could not appear.
+    assert "read as a TAIL only" not in result["summary"]
 
 
 def test_a_task_absent_from_one_run_is_not_a_task_that_ran_without_a_worker_field(airflow):
@@ -13863,6 +13869,111 @@ _WRITE_SPELLINGS = frozenset(
 )
 
 
+# The two spellings ``approvals._READ_SEARCHES`` uses for the dry-run flag. The
+# routes in that tuple are matched against the PATH; these are matched against
+# the argument that carries them, and the split is asserted below so the
+# declaration and this matcher cannot drift apart.
+_DRY_RUN_SPELLINGS = ("dry_run=True", "'dry_run': True")
+
+
+def _asks_for_a_dry_run(value):
+    """Whether this argument really sets ``dry_run`` to True, rather than spelling it.
+
+    Structural, because the check it replaces was a SUBSTRING search over the
+    whole unparsed call: any write whose text happened to contain
+    ``'dry_run': True`` anywhere — in a nested body, in a header, in a note —
+    was dropped from the write census before anything classified it.
+    """
+    if isinstance(value, ast.Dict):
+        return any(
+            isinstance(key, ast.Constant)
+            and key.value == "dry_run"
+            and isinstance(item, ast.Constant)
+            and item.value is True
+            for key, item in zip(value.keys, value.values)
+        )
+    if isinstance(value, ast.Call):
+        # ``json=_clear_body(..., dry_run=True, ...)`` — the flag is a keyword
+        # of the builder rather than a key of a literal.
+        return any(
+            keyword.arg == "dry_run"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in value.keywords
+        )
+    return False
+
+
+def _reads_despite_its_verb(node):
+    """Whether a POST/PUT/PATCH/DELETE ``_api`` call is one of the declared reads.
+
+    The declaration is still ``approvals._READ_SEARCHES``; what changed is that
+    a route is now matched against the PATH ARGUMENT and the dry-run flag
+    against the argument that sets it, rather than both against the text of the
+    whole call.
+    """
+    routes = [search for search in approvals._READ_SEARCHES if search.startswith("/")]
+    path = ast.unparse(node.args[1]) if len(node.args) > 1 else ""
+    if any(route in path for route in routes):
+        return True
+    return any(
+        keyword.arg in ("json", "params", "data") and _asks_for_a_dry_run(keyword.value)
+        for keyword in node.keywords
+    )
+
+
+def test_the_read_searches_are_matched_where_they_mean_something(capsys):
+    """The declaration is split into the two halves this matcher uses, and both
+    are checked against it, so a third kind of search added to the product's
+    tuple fails here rather than being silently ignored."""
+    routes = [search for search in approvals._READ_SEARCHES if search.startswith("/")]
+    flags = [search for search in approvals._READ_SEARCHES if not search.startswith("/")]
+
+    assert sorted(flags) == sorted(_DRY_RUN_SPELLINGS), (
+        "a read-search that is neither a route nor a known dry-run spelling is matched by nothing"
+    )
+    assert routes, "the read searches name no route at all"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "transport._api('DELETE', '/dagRuns/EVIL', json={'note': \"'dry_run': True\"})",
+        "transport._api('DELETE', '/dagRuns/EVIL', json={'body': {'dry_run': True}})",
+        "transport._api('POST', _dag_url(dag_id, '/clearTaskInstances'), json={**body, 'dry_run': False})",
+        "transport._api('POST', '/backfills', json={'note': '/backfills/dry_run'})",
+        "transport._api('DELETE', '/dagRuns/EVIL', headers={'x': 'dry_run=True'})",
+    ],
+    ids=["in-a-note", "one-level-down", "the-real-write", "route-in-a-value", "in-a-header"],
+)
+def test_a_write_is_not_excused_by_a_read_search_that_merely_appears_in_its_text(source):
+    """The substring allowlist, stated as the hole it was.
+
+    ``any(search in text ...)`` over the unparsed call meant a write escaped the
+    census entirely if its source happened to contain ``'dry_run': True``
+    anywhere at all — including one level down inside its own body, where it
+    says nothing about what the request does.
+    """
+    assert _reads_despite_its_verb(ast.parse(source).body[0].value) is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "transport._api('POST', '/dags/~/dagRuns/~/taskInstances/list', json=body)",
+        "transport._api('POST', '/backfills/dry_run', json={'dag_id': dag_id})",
+        "transport._api('POST', _dag_url(dag_id, '/clearTaskInstances'), json={**body, 'dry_run': True})",
+        "transport._api('POST', _dag_url(dag_id, '/x'), json=_clear_body(run, markers, dry_run=True))",
+    ],
+    ids=["list-route", "backfill-dry-run-route", "dry-run-literal", "dry-run-keyword"],
+)
+def test_the_reads_that_wear_a_mutating_verb_are_still_recognised(source):
+    """The other direction: tightening the matcher must not push the four real
+    reads of this tree into the write census, where they would each need a
+    classification for a request that changes nothing."""
+    assert _reads_despite_its_verb(ast.parse(source).body[0].value) is True
+
+
 def _rebuild_names(tree):
     """Names this module bound to ``dataclasses.replace``.
 
@@ -13893,7 +14004,7 @@ def _write_spelled_calls():
                 method = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
                 if method not in ("POST", "PUT", "PATCH", "DELETE"):
                     continue
-                if any(search in text for search in approvals._READ_SEARCHES):
+                if _reads_despite_its_verb(node):
                     continue
                 found.append((module, owner, text))
             elif name in _WRITE_SPELLINGS and not (isinstance(func, ast.Name) and name in rebuilds):
