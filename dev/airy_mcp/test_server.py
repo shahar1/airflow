@@ -53,6 +53,7 @@ if "fastmcp" not in sys.modules:
     sys.modules["fastmcp"] = _stub
 
 import approvals
+import codechange
 import dagsource
 import diagnosis
 import evidence
@@ -1594,6 +1595,112 @@ def test_plan_dag_code_changes_checks_uniqueness_after_the_earlier_edits(airflow
 
     assert result["planned"] is False
     assert "at the point it is applied" in result["error"]
+
+
+def _import_error_after_the_reparse(airflow, tmp_path):
+    """The Dag processor's verdict on the bytes that were just written.
+
+    The double bumps the version on reparse and re-reads the file; the import
+    error is what Airflow records for a file it cannot import, and it is the
+    only place that failure ever shows up.
+    """
+    airflow.import_errors = [
+        {"filename": "sales_summary.py", "stack_trace": "NameError: name 'undefined_helper'"}
+    ]
+
+
+def test_a_change_that_stops_the_file_importing_is_put_back(airflow, tmp_path):
+    """A5, A7. Compiling in memory says the bytes are Python; it says nothing
+    about whether Airflow can import them. That question can only be asked after
+    the write, so the answer has to be able to undo one."""
+    _import_error_after_the_reparse(airflow, tmp_path)
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    assert result["applied"] is False
+    assert result["rolled_back"] is True
+    assert result["post_write_checks"]["imports"] == "FAILED"
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+    assert "PUT BACK" in result["error"]
+    assert "byte-for-byte the original again" in result["error"]
+    # Writes went out and the Dag was reparsed between them; "nothing happened"
+    # would be false, and the views the user is looking at are stale.
+    assert result["mutation_applied"] is True
+    assert result["ui_updates"] == [{"kind": "dag_definition", "dag_id": DAG_ID}]
+
+
+def test_a_reparsed_dag_that_lost_a_task_the_change_never_mentioned_is_put_back(airflow, tmp_path):
+    """A6. The graph the reviewed diff predicted is not the graph that came out."""
+    airflow.tasks = DEMO_TASKS
+
+    def _lose_report():
+        airflow.tasks = [task for task in DEMO_TASKS if task["task_id"] != "report"]
+
+    original_reparse = codechange._force_reparse
+
+    def _reparse(dag_id, file_token, previous):
+        _lose_report()
+        return original_reparse(dag_id, file_token, previous)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(codechange, "_force_reparse", _reparse)
+        result = _apply(("ammount is a typo", "amount is correct"))
+
+    assert result["applied"] is False
+    assert result["rolled_back"] is True
+    assert result["post_write_checks"]["task_graph"] == "FAILED"
+    assert "no longer defines ['report']" in result["error"]
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_a_rollback_that_fails_says_the_file_is_left_in_a_known_bad_state(airflow, tmp_path):
+    """A8. The loudest case there is. Reporting this as a plain refusal would
+    leave a person believing their Dag is as it was while a file Airflow cannot
+    import sits on disk being parsed."""
+    _import_error_after_the_reparse(airflow, tmp_path)
+
+    def _refuse(path, expected, content):
+        if content == SOURCE:
+            raise OSError("read-only file system")
+        (tmp_path / "sales_summary.py").write_text(content)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(dagsource, "_write_if_unchanged", _refuse)
+        patch.setattr(codechange, "_write_if_unchanged", _refuse)
+        result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    assert result["applied"] is False
+    assert result["rolled_back"] is False
+    assert "PUTTING IT BACK FAILED" in result["error"]
+    assert "known to be bad" in result["error"]
+    assert "needs a person NOW" in result["error"]
+    assert result["mutation_applied"] is True
+    # The bad bytes really are still there — the report is not a guess.
+    assert (tmp_path / "sales_summary.py").read_text() != SOURCE
+
+
+def test_a_post_write_check_that_cannot_be_read_never_reverts_the_users_change(airflow, tmp_path):
+    """The other direction, and the one that matters for trust: an unreadable
+    check is not a failed check. Rolling a reviewed change back because a lookup
+    timed out is an unforced revert of the user's own decision."""
+    airflow.fail_import_errors = httpx.ConnectError("boom")
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    assert result["applied"] is True
+    assert result["post_write_checks"]["imports"].startswith("not established")
+    assert (tmp_path / "sales_summary.py").read_text() != SOURCE
+
+
+def test_a_clean_apply_says_which_post_write_checks_actually_answered(airflow, tmp_path):
+    """A1. The happy path reports what was checked rather than implying it."""
+    airflow.tasks = DEMO_TASKS
+
+    result = _apply(("ammount is a typo", "amount is correct"))
+
+    assert result["applied"] is True
+    assert result["post_write_checks"] == {"imports": "clean", "task_graph": "as predicted"}
+    assert result["post_write_checks_unread"] == []
 
 
 def test_apply_dag_code_changes_reports_a_reparse_that_never_lands(airflow):
@@ -12215,26 +12322,39 @@ def test_the_write_sweep_reaches_a_short_read_in_the_apply_phase(tmp_path, monke
 
     assert reached, "no lever makes a write tool's APPLY read short, so this sweep proves nothing"
     assert len(routes_reached) == len(set(routes_reached))
-    assert landed == 0, (
-        "the write sweep now reaches a LANDED write over a short read, which is the card "
-        "_WRITE_CARDS_THE_SWEEP_CANNOT_REACH says it cannot construct — re-derive that table"
+    # This was ``landed == 0``, and the table below said so: every apply-phase
+    # short read the sweep could reach ended in a refusal, so the state an
+    # operator is most likely to act wrongly on — a write that LANDED beside a
+    # read that was short — could not be built here at all. It can now.
+    # ``apply_dag_code_changes`` reads the import-error list and the task graph
+    # AFTER the write, to decide whether to put the change back, and those reads
+    # can come back short over bytes that are already on disk. The sweep holds
+    # every one of those cards to its own honesty predicates in
+    # ``test_a_write_tools_card_is_honest_when_only_its_apply_reads_short``.
+    assert landed > 0, (
+        "the write sweep no longer reaches a LANDED write over a short read, so the window it "
+        "exists for is uncovered again and _WRITE_CARDS_THE_SWEEP_CANNOT_REACH has to grow"
     )
+    # The one card the table still declares unreachable really is unreached.
+    for _, _, route in _WRITE_CARDS_THE_SWEEP_CANNOT_REACH:
+        assert route not in routes_reached, f"{route} is reachable now; drop it from the table"
 
 
-# The one card this sweep exists for and cannot build, NAMED with why and with
-# what stands in for it. Every apply-phase short read the sweep reaches ends in
-# a refusal, so ``mutation_applied`` is False in all of them — and "a write
-# landed AND a read was short" is the state an operator is most likely to act
-# wrongly on. It is not unreachable in the product; it is unreachable from a
-# world that never enters the compensating path.
+# The card this sweep exists for and cannot build, NAMED with why and with what
+# stands in for it. "A write landed AND a read was short" is the state an
+# operator is most likely to act wrongly on. The sweep reaches it now for
+# ``apply_dag_code_changes``, whose post-write import and graph checks read
+# after the bytes are already on disk — this table is what is left over after
+# that, and it is not unreachable in the product, only from a world that never
+# enters the compensating path.
 _WRITE_CARDS_THE_SWEEP_CANNOT_REACH = {
     ("codechange", "_abandon_backfill", "GET /backfills/<id>/dag_runs"): (
         "the post-write re-read on run_backfill's COMPENSATING path, reached only after the backfill "
         "POST has already gone out and what came back does not match what the user approved. Two "
         "writes have landed by then, so its card carries mutation_applied: True beside "
-        "surviving_runs_read_whole — the only place in this tree where a landed write and a short "
-        "read meet. The sweep drives run_backfill over a double that creates what was asked for, so "
-        "it never enters that branch; the card is held to the sweep's own predicates directly, in "
+        "surviving_runs_read_whole. The sweep drives run_backfill over a double that creates what "
+        "was asked for, so it never enters that branch; the card is held to the sweep's own "
+        "predicates directly, in "
         "test_the_card_a_landed_write_hands_back_over_a_short_read_is_honest"
     ),
 }
@@ -14700,8 +14820,21 @@ def test_the_atomic_file_write_is_reached_only_from_the_tools_that_redeem_a_toke
         for module, owner, request in approvals._GATED_WRITES
         if request == "WRITE the Dag file"
     }
+    rollback = ("codechange", "_put_the_original_back")
+    reaches_the_rollback = {
+        owner
+        for owner, node in _owned_nodes(_module_source("codechange"))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == rollback[1]
+    }
 
-    assert callers == gated == {("codechange", "apply_dag_code_changes"), ("codechange", "revert_dag_code")}
+    assert gated == {("codechange", "apply_dag_code_changes"), ("codechange", "revert_dag_code")}
+    # The third caller is the rollback, which holds no gate of its own and is
+    # declared ungated for the reason its entry gives: it is reached from ONE
+    # place, and that place redeemed the token for the very write it undoes. The
+    # caller set is checked rather than the reason recited.
+    assert callers == gated | {rollback}
+    assert (*rollback, "WRITE the Dag file") in approvals._UNGATED_WRITES
+    assert reaches_the_rollback == {"apply_dag_code_changes"}
 
 
 @pytest.mark.parametrize(

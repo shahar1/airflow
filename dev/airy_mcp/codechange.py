@@ -560,6 +560,10 @@ def apply_dag_code_changes(
             backup = _backup_path(path)
         except DagFileError as e:
             return {"applied": False, "mutation_applied": False, "error": str(e)}
+        # Read here, under the same lock and immediately before the write, so
+        # the graph the post-write check compares against is the one this write
+        # actually replaced rather than one read at some earlier moment.
+        graph_before = reading._tasks(dag_id)
         try:
             _write_if_unchanged(path, source, patched)
         except DagFileDriftError as e:
@@ -592,6 +596,22 @@ def apply_dag_code_changes(
         reparse, version_after = _force_reparse(dag_id, dag["file_token"], version_before_write)
     except Exception as e:  # the write already landed; never raise past it
         reparse = f"file patched, but the reparse request failed: {_explain_error(e)}"
+    # Only NOW is there anything to check: a compile in memory says the bytes are
+    # Python, and it says nothing about whether Airflow can import them or about
+    # the Dag they produce. Both questions have to be asked of the Dag processor,
+    # which means after the write and after the reparse.
+    checks = _post_write_checks(dag_id, dag, graph_before, impact)
+    if checks["problem"] is not None:
+        return _put_the_original_back(
+            dag_id,
+            dag,
+            path,
+            written=patched,
+            original=source,
+            version_before_write=version_before_write,
+            reparse=reparse,
+            checks=checks,
+        )
     return {
         "applied": True,
         "mutation_applied": True,
@@ -599,8 +619,130 @@ def apply_dag_code_changes(
         "change_count": len(pairs),
         "diff": diff,
         "reparse": reparse,
+        "post_write_checks": checks["checks"],
+        "post_write_checks_unread": checks["unread"],
         **({"warning": backup_failure} if backup_failure else {}),
         **_definition_updates(dag_id, version_before_write, version_after),
+    }
+
+
+def _post_write_checks(
+    dag_id: str, dag: dict[str, Any], graph_before: reading.Reading, impact: dict[str, Any]
+) -> dict[str, Any]:
+    """What the Dag processor makes of the bytes that were just written.
+
+    Two questions, and a third answer for each of them. Does the file still
+    import, and is the Dag it produces the one the reviewed diff predicted? An
+    unreadable or short check is NOT a failure: rolling a reviewed change back
+    because a lookup timed out is an unforced revert of the user's own decision.
+    A check that could not be established says so, names the read that fell
+    short, and the change stands.
+    """
+    checks: dict[str, Any] = {}
+    unread: list[str] = []
+    problem: str | None = None
+
+    errors = reading._find_import_errors(dag)
+    if errors.read_failed:
+        checks["imports"] = f"not established ({errors.error})"
+    elif errors.rows:
+        checks["imports"] = "FAILED"
+        problem = (
+            f"the file no longer imports after the change: "
+            f"{_quoted(str(next(iter(errors.rows)).get('detail')), 400)}"
+        )
+    elif not errors.complete:
+        # An empty page of a read that did not finish is not an absence of
+        # import errors, and "clean" over it is the claim this must not make.
+        checks["imports"] = "not established"
+        unread.append(errors.reason)
+    else:
+        checks["imports"] = "clean"
+
+    graph_after = reading._tasks(dag_id)
+    removed = impact.get("removed_task_ids")
+    for graph in (graph_before, graph_after):
+        if not graph.complete:
+            unread.append(graph.reason)
+    if removed is None or not graph_before.complete or not graph_after.complete:
+        checks["task_graph"] = "not established"
+        return {"problem": problem, "checks": checks, "unread": unread}
+    before = {task["task_id"] for task in graph_before.rows}
+    now = {task["task_id"] for task in graph_after.rows}
+    # The static scan is a lower bound on what the patch declares, so it can
+    # under-predict an addition; what it may never do is leave a task the change
+    # did not say it would remove missing from the parsed Dag.
+    lost = sorted(before - set(removed) - now)
+    if lost:
+        checks["task_graph"] = "FAILED"
+        problem = (problem + "; " if problem else "") + (
+            f"the reparsed Dag no longer defines {lost}, which this change did not say it would remove"
+        )
+    else:
+        checks["task_graph"] = "as predicted"
+    return {"problem": problem, "checks": checks, "unread": unread}
+
+
+def _put_the_original_back(
+    dag_id: str,
+    dag: dict[str, Any],
+    path: Any,
+    *,
+    written: str,
+    original: str,
+    version_before_write: int | None,
+    reparse: str,
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    """Undo the write, and say plainly what state the file is in either way.
+
+    A rollback that fails is the case this exists for. Reporting it as a plain
+    refusal would leave a person believing their Dag is as it was while a broken
+    file sits on disk being parsed, so the failure is the loudest thing in the
+    result and ``applied`` is not the field that carries it.
+    """
+    restored = False
+    restore_error = None
+    try:
+        with _exclusive(path):
+            # The same request as the write above, under the same redeemed
+            # approval, putting back the exact bytes that approval replaced.
+            _write_if_unchanged(path, written, original)
+        restored = True
+    except Exception as e:
+        restore_error = _explain_error(e)
+    reparse_back = "not attempted"
+    if restored:
+        try:
+            reparse_back, _ = _force_reparse(dag_id, dag["file_token"], None)
+        except Exception as e:
+            reparse_back = f"the file was restored, but the reparse request failed: {_explain_error(e)}"
+    if restored:
+        error = (
+            f"this change was applied and then PUT BACK: {checks['problem']}. The file on disk is "
+            f"byte-for-byte the original again. Nothing of the change survives; work out what it "
+            f"broke before proposing it a second time."
+        )
+    else:
+        error = (
+            f"this change was applied, it {checks['problem']}, AND PUTTING IT BACK FAILED "
+            f"({_quoted(str(restore_error), 240)}). {path} is left holding the changed bytes, in a "
+            f"state known to be bad. This needs a person NOW: restore the file by hand from "
+            f"{_backup_path(path).name} if it is there."
+        )
+    return {
+        "applied": False,
+        # Writes went out — the patch, and the attempt to put it back — and the
+        # Dag was reparsed in between. "Nothing was applied" would be false.
+        "mutation_applied": True,
+        "rolled_back": restored,
+        "file": str(path),
+        "post_write_checks": checks["checks"],
+        "post_write_checks_unread": checks["unread"],
+        "reparse": reparse,
+        "reparse_after_rollback": reparse_back,
+        "error": error,
+        "ui_updates": [{"kind": "dag_definition", "dag_id": dag_id}],
     }
 
 

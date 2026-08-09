@@ -269,6 +269,13 @@ _UNGATED_WRITES = {
         "the 'WRITE the Dag file' classification for that call — so gating it a second time here "
         "would be a second approval for one reviewed diff"
     ),
+    ("codechange", "_put_the_original_back", "WRITE the Dag file"): (
+        "the rollback inside apply_dag_code_changes, reached only after that tool has redeemed its "
+        "token, written the reviewed bytes, and found that the Dag processor cannot import them or "
+        "that the Dag it produced is not the one the reviewed diff predicted. It writes back the "
+        "exact bytes the approved write replaced and nothing else, so gating it again would ask the "
+        "user to approve undoing a change they are about to be told did not survive"
+    ),
     ("dagsource", "_force_reparse", "PUT /parseDagFile/<token>"): (
         "a post-write call, reached only from a tool that has already redeemed its token, that asks "
         "Airflow to re-read the file that write just changed"
