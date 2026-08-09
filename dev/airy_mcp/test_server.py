@@ -4471,9 +4471,14 @@ def test_rerun_dag_unpauses_once_the_warning_was_delivered(airflow):
         "dag_run_id": "manual__new",
         "state": "queued",
         "unpaused": True,
+        # Nothing here looked at what the run did, so the trigger reports the
+        # work as unverified rather than leaving the field out.
+        "work_verified": None,
+        "verification": result["verification"],
         # No run_id was passed, so the result says outright that nothing about
         # this call is idempotent rather than leaving the reader to assume.
         "idempotency": result["idempotency"],
+        "verify_with": result["verify_with"],
         "next_step": result["next_step"],
         "ui_updates": [{"kind": "dag_run", "dag_id": DAG_ID, "dag_run_id": "manual__new"}],
     }
@@ -4567,8 +4572,70 @@ def test_rerun_dag_tells_the_model_to_check_the_new_run_not_assume(airflow):
 
     assert result["triggered"] is True
     assert "created run manual__new in state queued" in result["next_step"]
-    assert "diagnose_dag with dag_run_id='manual__new'" in result["next_step"]
+    assert "verify_replacement_run with verify_with.args" in result["next_step"]
     assert "never assume success or failure" in result["next_step"]
+
+
+def test_rerun_dag_sends_the_verification_nowhere_but_verify_replacement_run(airflow):
+    """The branch a small model actually took, closed.
+
+    Offered ``verify_replacement_run, or diagnose_dag with dag_run_id=...`` the
+    model took the one whose arguments were already written out and then reported
+    the unverified run as confirmed. The alternative is gone from the payload.
+    """
+    result = server.rerun_dag(DAG_ID)
+
+    assert "diagnose_dag" not in result["next_step"]
+    assert result["verify_with"]["tool"] == "verify_replacement_run"
+    assert result["verify_with"]["args"] == {"dag_id": DAG_ID, "dag_run_id": "manual__new"}
+
+
+def test_rerun_dag_hands_back_the_whole_verification_call_when_told_the_task(airflow):
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, verify_task_id="post_remittance")
+
+    assert result["verify_with"] == {
+        "tool": "verify_replacement_run",
+        "args": {"dag_id": DAG_ID, "dag_run_id": REPLACEMENT, "task_id": "post_remittance"},
+    }
+    # Every argument is there, so nothing asks the caller to finish the call.
+    assert "complete_args_with" not in result["verify_with"]
+    assert server.verify_replacement_run(**result["verify_with"]["args"])["dag_run_id"] == REPLACEMENT
+
+
+def test_rerun_dag_says_which_argument_is_missing_from_the_verification_call(airflow):
+    result = server.rerun_dag(DAG_ID)
+
+    assert "task_id" not in result["verify_with"]["args"]
+    assert "task_id" in result["verify_with"]["complete_args_with"]
+    assert "verify_task_id" in result["verify_with"]["complete_args_with"]
+
+
+def test_rerun_dag_reports_the_work_as_unverified_rather_than_as_done(airflow):
+    """The defect this exists for: a triggered run relayed as a confirmed filing."""
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert result["triggered"] is True
+    assert result["work_verified"] is None
+    assert result["verification"].startswith("NOT VERIFIED.")
+    assert "Only verify_replacement_run settles that" in result["verification"]
+    assert "diagnose_dag does not settle it" in result["verification"]
+    for overclaim in ("confirmed", "filed", "completed", "successful"):
+        assert overclaim in result["verification"]
+
+
+def test_rerun_dag_verification_wording_is_pinned_to_its_bytes():
+    """Read and re-pinned rather than drifted, like the four scope sentences.
+
+    This is the sentence a model relays instead of writing one of its own, and a
+    softened word in it is a different instruction to a small model.
+    """
+    assert codechange._TRIGGER_NOT_VERIFIED == (
+        "NOT VERIFIED. This call created a run and read nothing about what it did, so nothing here "
+        "establishes that the expected work happened. Only verify_replacement_run settles that, and "
+        "until it has answered there is nothing here to report as confirmed, filed, completed or "
+        "successful. diagnose_dag does not settle it either: a diagnosis describes a run, it does not "
+        "check the operation."
+    )
 
 
 def test_rerun_dag_sends_the_required_logical_date(airflow):

@@ -961,6 +961,20 @@ def _existing_run_with_this_identity(dag_id: str, run_id: str) -> dict[str, Any]
     return None
 
 
+# What a created run has NOT established, carried in the trigger's own payload
+# because that is where a small model meets it. Handed `triggered: true` beside a
+# queued run, a model reported the external filing as confirmed and wrote itself
+# a scope sentence to say so. The payload has to deny that reading in its own
+# words: a prompt rule alone did not survive contact with the drawer.
+_TRIGGER_NOT_VERIFIED = (
+    "NOT VERIFIED. This call created a run and read nothing about what it did, so nothing here "
+    "establishes that the expected work happened. Only verify_replacement_run settles that, and "
+    "until it has answered there is nothing here to report as confirmed, filed, completed or "
+    "successful. diagnose_dag does not settle it either: a diagnosis describes a run, it does not "
+    "check the operation."
+)
+
+
 def rerun_dag(
     dag_id: str,
     conf: dict[str, Any] | None = None,
@@ -969,6 +983,7 @@ def rerun_dag(
     unpause_token: str = "",
     run_id: str = "",
     expected_dag_version: int | None = None,
+    verify_task_id: str = "",
 ) -> dict[str, Any]:
     """
     Trigger a fresh run of a Dag on the latest code, once.
@@ -993,6 +1008,19 @@ def rerun_dag(
     since is refused rather than run. **A version that still matches pins the
     version number and not the code** — the result says so in ``version_pin``,
     and the converse of the refusal is not something to tell the user.
+
+    ``run_id``, ``expected_dag_version``, ``note`` and ``verify_task_id`` are
+    arguments of THIS tool and go beside ``dag_id``. None of them is a ``conf``
+    key: ``conf`` carries the Dag's own trigger parameters and nothing else.
+
+    ``verify_task_id`` names the task whose missing work this run is meant to
+    produce. It changes nothing about the run — it is what lets the result hand
+    back the follow-up verification call with every argument already filled in.
+
+    **A created run is not work that happened.** This tool reads nothing about
+    what the run does, so its result says ``work_verified: null`` and carries a
+    ``verify_with`` block naming the one tool that can settle it. Call that tool
+    with those arguments once the run has finished and report only what it says.
 
     Triggering is approved on its own. It redeems no plan token from a source
     change, and an approved source change is not an approval to run.
@@ -1073,6 +1101,9 @@ def rerun_dag(
     except Exception as e:
         return _trigger_did_not_come_back(dag_id, run_id, unpaused, e)
     created_id = run["dag_run_id"]
+    verify_args: dict[str, Any] = {"dag_id": dag_id, "dag_run_id": created_id}
+    if verify_task_id:
+        verify_args["task_id"] = verify_task_id
     return {
         "triggered": True,
         "mutation_applied": True,
@@ -1080,19 +1111,45 @@ def rerun_dag(
         "dag_run_id": created_id,
         "state": run["state"],
         "unpaused": unpaused,
+        # Three-valued and null, like the answer it points at: this call did not
+        # look, so it may not report false either.
+        "work_verified": None,
+        "verification": _TRIGGER_NOT_VERIFIED,
         **({"idempotency": _IDENTITY_SCOPE} if run_id else {"idempotency": _NO_IDENTITY_SUPPLIED}),
         **(
             {"expected_dag_version": expected_dag_version, "version_pin": _VERSION_PIN_SCOPE}
             if expected_dag_version is not None
             else {}
         ),
+        # The follow-up call, assembled here rather than left to the caller. A
+        # small model repeats a list it was handed and drops what it has to build
+        # itself: offered "verify_replacement_run, or diagnose_dag with
+        # dag_run_id=..." it took the branch whose arguments were already written
+        # out, then reported the unverified run as confirmed.
+        "verify_with": {
+            "tool": "verify_replacement_run",
+            "args": verify_args,
+            **(
+                {}
+                if verify_task_id
+                else {
+                    "complete_args_with": (
+                        "task_id — the task whose missing work this run was triggered to produce. "
+                        "This call was not told it; pass verify_task_id to rerun_dag and it is "
+                        "filled in for you."
+                    )
+                }
+            ),
+        },
         # A model that diagnoses right after triggering gets served the *old*
         # failed run by the fallback and reports "it failed again"; the result
         # itself has to say the outcome is not in yet.
         "next_step": (
-            f"created run {created_id} in state {run['state']} — its outcome is not known "
-            f"yet; check it after it completes (verify_replacement_run, or diagnose_dag with "
-            f"dag_run_id={created_id!r}) and never assume success or failure"
+            f"created run {created_id} in state {run['state']} — its outcome is NOT known and NOT "
+            f"verified. Once it has finished, call verify_replacement_run with verify_with.args and "
+            f"report only what that answer says. A diagnosis of this run is not a substitute and "
+            f"never settles it. Do not call the operation confirmed, filed or completed before that "
+            f"tool has answered, and never assume success or failure."
         ),
         "ui_updates": [{"kind": "dag_run", "dag_id": dag_id, "dag_run_id": created_id}],
     }

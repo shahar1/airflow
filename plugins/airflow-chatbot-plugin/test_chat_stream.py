@@ -705,10 +705,26 @@ def test_write_prompt_makes_the_triggered_run_the_middle_of_the_repair_not_the_e
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
 
     assert "`verify_replacement_run`" in normalized
-    assert "establishes nothing about whether the work happened" in normalized
+    assert "having created a run and having read nothing about what it did" in normalized
     assert "`null` means UNKNOWN" in normalized
     assert 'Never relay `null` as "it did not happen"' in normalized
     assert "not a look at the system the task talks to" in normalized
+
+
+def test_write_prompt_leaves_a_replacement_outcome_to_one_tool_only():
+    """
+    The live failure, closed in the prompt as well as in the payload.
+
+    Asked to verify, the model called ``diagnose_dag`` and reported the filing
+    as confirmed. The prompt must not leave a second way to answer.
+    """
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "`verify_replacement_run` is the only tool\n   that settles one" in plugin._WRITE_PROMPT
+    assert "Never report a\n   replacement run's outcome from `diagnose_dag`" in plugin._WRITE_PROMPT
+    assert '"confirmed", "filed", "completed" and "successful" are not available to you' in normalized
+    assert "never a fresh `diagnose_dag`" in normalized
+    assert "quote the result's own `scope` sentence for that and never compose one of your own" in normalized
 
 
 def test_write_prompt_keeps_the_source_write_and_the_run_apart():

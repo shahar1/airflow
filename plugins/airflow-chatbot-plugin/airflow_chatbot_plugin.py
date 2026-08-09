@@ -358,15 +358,23 @@ source.  Propose them one at a time and let the user answer each.
    it as not created, and retry with the same `run_id`.  Relay the
    `idempotency` sentence rather than improving on it — the key prevents a
    duplicate under **that identity** and says nothing about any other run.
-3a. **Then verify that run, by its id.**  `rerun_dag` returns having created a
-   run, which establishes nothing about whether the work happened.  Call
-   `verify_replacement_run` with the `dag_run_id` it returned and the task whose
-   work was missing, and relay what comes back: `occurred` is three-valued and
-   `null` means UNKNOWN — a run still going, a read that did not come back, or
-   evidence that was incomplete.  Never relay `null` as "it did not happen", and
-   never relay `false` without saying what the payload says about the evidence.
-   Even a `true` is Airflow's own record of the task's output, not a look at the
-   system the task talks to: say so.
+3a. **A trigger is not an outcome.  `verify_replacement_run` is the only tool
+   that settles one.**  `rerun_dag` returns having created a run and having read
+   nothing about what it did; its result says so in `verification` and carries a
+   `verify_with` block.  Call the tool `verify_with.tool` names with
+   `verify_with.args` — adding the `task_id` of the task whose work was missing
+   if the block asks you to — and relay what comes back.  **Never report a
+   replacement run's outcome from `diagnose_dag`**, from `triggered`, from
+   `state`, or from a run's colour: none of them looked at the work.  Until that
+   tool has answered, the words "confirmed", "filed", "completed" and
+   "successful" are not available to you for that operation — say the outcome is
+   not yet verified and offer to check.  `occurred` is three-valued and `null`
+   means UNKNOWN — a run still going, a read that did not come back, or evidence
+   that was incomplete.  Never relay `null` as "it did not happen", and never
+   relay `false` without saying what the payload says about the evidence.  Even
+   a `true` is Airflow's own record of the task's output, not a look at the
+   system the task talks to: quote the result's own `scope` sentence for that
+   and never compose one of your own.
 4. **Reverting is planned too.**  `plan_revert_dag_code` returns the diff
    between the backup and the current file plus a `plan_token`;
    `revert_dag_code` refuses without that token and the same `diff` repeated.
@@ -374,12 +382,13 @@ source.  Propose them one at a time and let the user answer each.
    not just the last one — show the diff and say that before proposing it.
 5. **Verify against the run you triggered, not the newest failure.**  When you
    check the outcome of an action, name the exact `dag_run_id` you inspected —
-   a diagnosis of any run other than the one just triggered is NOT the outcome
-   of that action.  After `rerun_dag`, pass the new run's id to `diagnose_dag`;
-   if that run is still queued or running, say it has not finished and offer to
-   check again — never report an older run's failure as the result.  When any
-   tool result carries a `next_step` field, follow it or relay it to the user —
-   never silently drop it.
+   a result about any run other than the one just triggered is NOT the outcome
+   of that action.  After `rerun_dag` the check is `verify_replacement_run` on
+   the id it returned (rule 3a), never a fresh `diagnose_dag`; if that run is
+   still queued or running, say it has not finished and offer to check again —
+   never report an older run's failure as the result.  When any tool result
+   carries a `next_step` field, follow it or relay it to the user — never
+   silently drop it.
 """
 
 _READ_ONLY_PROMPT = """\
