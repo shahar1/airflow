@@ -503,7 +503,7 @@ per §0/C2 a patched name is the only kind that can silently stop controlling th
 | 6 | `evidence.py`| 4 (`transport`†,`primitives`,`reading`) | 2 (`TASK_INSTANCE_DETAIL_LIMIT`×4,`EVENT_SCAN_*`×4) | † the one declared exception (`_event_history`). 24 defs / 1139 lines including the`_U*`/`_L*` legend block, which is constants and moves with zero call-site churn. |
 | 7 | `diagnosis.py`| 5 | 3 (`DIAGNOSIS_LOG_BUDGET_CHARS`×2,`DIAGNOSIS_SUMMARY_BUDGET_CHARS`,`FAILURE_SCAN_LIMIT`,`TASK_COMPARISON_LIMIT`,`DISPATCH_*_LIMIT`) | First tool-bearing module. Read-only tools only — nothing here can mutate, so a mistake in this wave cannot write. That is deliberate: it exercises the tool-relocation mechanics on the safe half. |
 | 8 | `codechange.py`| 4 | 1 (`MAX_BACKFILL_RUNS`×2) | Seven tools, five of them writing. Moves after`diagnosis` has proven tool relocation. |
-| 9 | `recovery.py`| 6 | 1 (`_mapped_in_closure`) | **Last, deliberately.** It holds the only pre-mutation containment gate in the module and the only mutating write the gauntlet certified. Everything it needs already sits in its final home, so its wave is a pure lift with no ordering pressure on anything else. |
+| 9 | `recovery.py`| 6 | 1 (`_mapped_in_closure`) | **Last, deliberately.** It holds the only pre-mutation containment gate in the module. *(Superseded 2026-08-09: this line also called it "the only mutating write the gauntlet certified". It is not — `recovery.py`'s tools are **withdrawn** and uncertified; the certified writes are `apply_dag_code_changes`, `revert_dag_code` and `rerun_dag` in `codechange.py`.)* Everything it needs already sits in its final home, so its wave is a pure lift with no ordering pressure on anything else. |
 
 **Wave 10 (not a move):** `server.py` shrinks to the composition root. This is the wave where the
 re-export block is finalised and the 94-name facade is asserted complete.
@@ -908,11 +908,18 @@ the class under repair. Any adjudicator re-measuring must use psql.
 
 ---
 
-**N11 — The three tool-count / doc facts are reconciled.**
+**N11 — The three tool-count / doc facts are reconciled.** ⚠️ **SUPERSEDED 2026-08-09.**
 
-Check: `dev/airy_mcp/README.md`'s tool table lists **14** tools, including
+~~Check: `dev/airy_mcp/README.md`'s tool table lists **14** tools, including
 `verify_task_instance_recovery`(`server.py:6315`, added by`fe6333c55c`). The freeze found the doc
-still lists 13. A test asserts the registration tuple and the README table agree.
+still lists 13. A test asserts the registration tuple and the README table agree.~~
+
+A 14-tool README is no longer a passing criterion — it is now a **failing** one. Five tools were
+withdrawn from the registered surface (`verify_task_instance_recovery` among them); the
+registration tuple, `TOOL_POLICY` and the README table each carry **ten** names, and
+`test_every_withdrawn_tool_is_unreachable_and_still_implemented` is what holds that shut. The
+part of N11 that survives is the *shape* of the check: the registration tuple and the README
+table must agree, whatever the number is.
 
 ---
 

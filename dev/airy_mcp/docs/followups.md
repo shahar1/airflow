@@ -22,14 +22,24 @@
 **Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [Documentation follow-ups — deliberately NOT mixed into extraction commits](#documentation-follow-ups--deliberately-not-mixed-into-extraction-commits)
-  - [F-1 — the README tool table is stale: 14 tools registered, 13 documented](#f-1--the-readme-tool-table-is-stale-14-tools-registered-13-documented)
+  - [F-1 — ~~the README tool table is stale: 14 tools registered, 13 documented~~ (SUPERSEDED)](#f-1--the-readme-tool-table-is-stale-14-tools-registered-13-documented-superseded)
   - [F-2 — architecture and inventory documents now live in the repo](#f-2--architecture-and-inventory-documents-now-live-in-the-repo)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
 # Documentation follow-ups — deliberately NOT mixed into extraction commits
 
-## F-1 — the README tool table is stale: 14 tools registered, 13 documented
+> ⚠️ **F-1 is SUPERSEDED (2026-08-09) and must not be carried out.** It is a standing order to
+> put `verify_task_instance_recovery` **back** into the README tool table. That tool has since
+> been **withdrawn** — along with `plan_task_instance_clear`, `apply_task_instance_clear`,
+> `plan_backfill` and `run_backfill` — from `server.py`'s registration tuple *and* from the
+> plugin's `TOOL_POLICY` allowlist, because broad automatic discovery and clearing of arbitrary
+> historical task instances is out of scope and uncertified. The registered surface is **ten**
+> tools and the README table lists exactly those ten. Documenting a withdrawn tool as part of
+> the surface is now the defect, not the fix. The text below is kept as the record of what was
+> true before the withdrawal.
+
+## F-1 — ~~the README tool table is stale: 14 tools registered, 13 documented~~ (SUPERSEDED)
 
 `server.py` registers **14** MCP tools. Verified by parsing the registration loop rather than by
 counting the table:

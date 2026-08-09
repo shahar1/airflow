@@ -20,7 +20,8 @@
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
-- [Airy self-healing MCP (summit demo)](#airy-self-healing-mcp-summit-demo)
+- [Airy: an approval-gated Dag repair loop (summit demo)](#airy-an-approval-gated-dag-repair-loop-summit-demo)
+  - [The registered surface: ten tools](#the-registered-surface-ten-tools)
   - [Withdrawn: the broad recovery surface](#withdrawn-the-broad-recovery-surface)
   - [Setup (Breeze)](#setup-breeze)
   - [Showcase: incident_triage and incident_digest](#showcase-incident_triage-and-incident_digest)
@@ -30,7 +31,7 @@
   - [The Dag-processor question, and the long-term answer](#the-dag-processor-question-and-the-long-term-answer)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
-# Airy self-healing MCP (summit demo)
+# Airy: an approval-gated Dag repair loop (summit demo)
 
 A second MCP sidecar with the **write-capable** tools that
 `astro-airflow-mcp` deliberately does not have, scoped to **one** workflow:
@@ -45,22 +46,14 @@ is **not** planned that way and carries no token; its own arguments describe it
 completely, and it re-establishes its own preconditions immediately before it
 acts. The two are separate approvals, and one never authorizes the other.
 
-## Withdrawn: the broad recovery surface
+## The registered surface: ten tools
 
-`plan_task_instance_clear`, `apply_task_instance_clear`,
-`verify_task_instance_recovery`, `plan_backfill` and `run_backfill` used to be
-registered here. They are **withdrawn**: broad automatic discovery and clearing
-of arbitrary historical task instances is out of scope and uncertified, and an
-attempt to certify completeness over that surface failed. They are absent from
-`server.py`'s registration tuple *and* from the plugin's `TOOL_POLICY`
-allowlist, so nothing offers them and a call naming one is refused rather than
-guessed at.
-
-Their implementations (`recovery.py`, `plan_backfill`/`run_backfill` in
-`codechange.py`) and **all** of their tests stay in the tree deliberately, as
-the record of what was built and of why it is not exposed. Both test sweeps
-still drive them, so nothing about withdrawing them relaxes what they have to
-prove — see `test_every_withdrawn_tool_is_unreachable_and_still_implemented`.
+Every tool an MCP client is told about, and nothing else.  `server.py`'s
+registration tuple and the plugin's `TOOL_POLICY` allowlist are the two
+authorities, and they carry these same ten names; a tool absent from either is
+not offered and a call naming it is refused rather than guessed at.  Five names
+that used to be here are gone — see [Withdrawn](#withdrawn-the-broad-recovery-surface)
+below.
 
 | Tool | What it does |
 |---|---|
@@ -80,6 +73,23 @@ a 403/404 into `Dag 'x' does not exist or you cannot see it` — deliberately th
 same words for both, so an unauthorized caller cannot use the error to confirm
 an id exists. And results carry a pre-digested `summary` wherever a small model
 must relay a finding completely.
+
+## Withdrawn: the broad recovery surface
+
+`plan_task_instance_clear`, `apply_task_instance_clear`,
+`verify_task_instance_recovery`, `plan_backfill` and `run_backfill` used to be
+registered here. They are **withdrawn**: broad automatic discovery and clearing
+of arbitrary historical task instances is out of scope and uncertified, and an
+attempt to certify completeness over that surface failed. They are absent from
+`server.py`'s registration tuple *and* from the plugin's `TOOL_POLICY`
+allowlist, so nothing offers them and a call naming one is refused rather than
+guessed at.
+
+Their implementations (`recovery.py`, `plan_backfill`/`run_backfill` in
+`codechange.py`) and **all** of their tests stay in the tree deliberately, as
+the record of what was built and of why it is not exposed. Both test sweeps
+still drive them, so nothing about withdrawing them relaxes what they have to
+prove — see `test_every_withdrawn_tool_is_unreachable_and_still_implemented`.
 
 This deliberately goes past both of the AIPs it borrows its framing from.
 **AIP-91** (Draft, not yet voted) phase 1 is **GET-only**: per-user
