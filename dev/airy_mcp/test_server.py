@@ -22,6 +22,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import os
 import re
 import sys
 import types
@@ -499,36 +500,344 @@ def fresh_token_store():
     server._approved_clear_sets.clear()
 
 
-# Every read this test session observed at the HTTP wire itself, cleared per
-# test by the fixture below. Module-global rather than a fixture return value
-# because the observation point is installed for EVERY test, not only the ones
-# that ask for it: a read that never touches ``transport`` is exactly the read
-# an instrument watching ``transport`` cannot see.
+# ---------------------------------------------------------------------------
+# THE observation point: the interpreter's own audit hook.
+#
+# Four rounds of this instrument put the observer one layer too high, and each
+# layer was NAMED "the wire" without being it. ``transport._api`` is the
+# boundary's front door, not the wire. ``httpx.Client.send`` is httpx's front
+# door, not the wire: ``httpx.HTTPTransport().handle_request(request)`` is
+# public API and never touches ``Client``, and a ``Client`` subclass that
+# overrides ``send`` never calls it either — both reached a real socket
+# unobserved, and a hard negative published over the read left the suite green.
+#
+# The observer is now the audit hook, which is not a layer of any library: the
+# ``socket.connect`` event is raised inside CPython's own ``_socket`` module,
+# below every spelling, every alias, every subclass and every third-party HTTP
+# client. What it covers and what it does NOT is stated in
+# ``_OBSERVER_BOUNDARY`` below and proved by the canary suite, rather than
+# asserted in prose.
+# ---------------------------------------------------------------------------
+
+_SIDECAR_DIR = Path(__file__).parent
+_SIDECAR_PREFIX = f"{_SIDECAR_DIR}{os.sep}"
+
+# Frames that are the harness or the boundary rather than a sidecar function
+# asking for something. ``transport`` IS the boundary, and this file is the
+# instrument.
+_NOT_A_SIDECAR_CALLER = ("transport", "test_server")
+
+
+def _frame_site():
+    """The innermost sidecar function on the stack, or None if there is none.
+
+    Walks ``f_back`` rather than building an ``inspect.stack()``: this runs
+    inside an audit hook, on every effectful event the process raises, and the
+    frame objects are all that is wanted. Compares the code filename as a
+    string for the same reason.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename.startswith(_SIDECAR_PREFIX):
+            stem = filename[len(_SIDECAR_PREFIX) : -3]
+            if filename.endswith(".py") and os.sep not in stem and stem not in _NOT_A_SIDECAR_CALLER:
+                return (stem, frame.f_code.co_name)
+        frame = frame.f_back
+    return None
+
+
+# Every read this test session observed at the wire itself, cleared per test by
+# the fixture below. Module-global rather than a fixture return value because
+# the observation point is installed for EVERY test, not only the ones that ask
+# for it: a read that never touches ``transport`` is exactly the read an
+# instrument watching ``transport`` cannot see.
 _OBSERVED_READS: list[tuple[tuple[str, str], str, str]] = []
+
+# Every filesystem or process mutation the audit hook attributed to a sidecar
+# frame, in the same per-test window. The write census used to be a hand-list of
+# 32 names checked against the SOURCE; ``os.symlink`` and ``subprocess.run``
+# added inside a read-only tool were not on it, really created a file in the
+# Dags bundle, and left the suite byte-identically green.
+_OBSERVED_WRITES: list[tuple[tuple[str, str], str, str]] = []
+
+# Audit events a sidecar frame raised that no table below classifies. An event
+# kind nothing has an opinion about is exactly the mechanism the previous four
+# rounds were defeated by, so it FAILS the test that raised it rather than
+# passing quietly.
+_UNCLASSIFIED_EVENTS: list[tuple[tuple[str, str], str]] = []
 
 
 class _UnobservedWire(RuntimeError):
     """A test put bytes on a real socket."""
 
 
+# What the observer covers, and — the half that matters — what it does not.
+# Every claim here is exercised by a canary in the suite below, and every
+# exclusion is a mechanism that would go UNPROVEN rather than PASS.
+_OBSERVER_BOUNDARY = {
+    "covered: TCP connect": (
+        "the ``socket.connect`` audit event is raised by CPython's own _socket module before the "
+        "syscall, so it fires for httpx, requests, urllib, http.client, a bare socket.socket, a "
+        "raw _socket.socket, connect_ex, IPv4, IPv6 and AF_UNIX alike, for clients imported or "
+        "aliased long before the observer was armed, and for attempts that fail before sending"
+    ),
+    "covered: connectionless sends": (
+        "``socket.sendto`` and ``socket.sendmsg`` carry the peer address, so a UDP datagram that "
+        "never calls connect is observed at the send instead"
+    ),
+    "covered: filesystem mutation in this process": (
+        "``open`` with any write, create, append, truncate or update flag, plus the os.rename, "
+        "os.remove, os.symlink, os.link, os.truncate, os.mkdir, os.rmdir, os.chmod, os.chown, "
+        "os.utime, os.setxattr, os.removexattr, shutil.* and tempfile.* events — raised by CPython "
+        "and the stdlib themselves, so the spelling, the alias and the import time do not matter"
+    ),
+    "covered: leaving this process": (
+        "``subprocess.Popen``, ``os.system``, ``os.exec``, ``os.posix_spawn`` and ``os.fork`` are "
+        "recorded as mutations in their own right, because what the child then does is NOT observed"
+    ),
+    "NOT covered: other processes": (
+        "the hook is per-interpreter. A child process is observed at the moment it is created and "
+        "never again, which is why creating one is itself classified as a mutation rather than "
+        "waved through"
+    ),
+    "NOT covered: native code": (
+        "a C extension or a ctypes call that issues a syscall directly raises no audit event. "
+        "``ctypes.dlopen``, ``ctypes.dlsym`` and ``ctypes.call_function`` are therefore themselves "
+        "classified as mutations, so reaching for that route is visible even though its effect is not"
+    ),
+    "NOT covered: os.mkfifo and os.mknod": (
+        "CPython raises no audit event for either — measured, not assumed. They are observed by a "
+        "second, weaker layer that patches the module attribute, which ``posix.mkfifo`` would walk "
+        "around; the residue is declared here rather than hidden"
+    ),
+    "NOT covered: writes through a descriptor obtained elsewhere": (
+        "``os.write``, ``os.pwrite``, ``os.writev`` and ``os.sendfile`` raise nothing. Every "
+        "writable descriptor this process opens is seen at its ``open``, so the residue is a "
+        "descriptor inherited, duplicated or passed in from outside"
+    ),
+    "NOT covered: paths no test executes": (
+        "runtime observation sees what runs. It is the AST census beside it that reads the whole "
+        "tree, and neither is closure on its own — this is why both are kept"
+    ),
+}
+
+# Audit events that mean something outside this process changed, or may have.
+# Not a spelling list: these are the events CPython and the stdlib raise
+# themselves, so an unlisted SPELLING of a listed effect still arrives here.
+_MUTATING_EVENTS = {
+    "open": "a path opened; classified as a write only when the flags or the mode ask to write",
+    "os.rename": ("os.rename and os.replace both raise it, and a rename IS the atomic Dag-file write"),
+    "os.remove": "os.remove, os.unlink and Path.unlink all raise it",
+    "os.symlink": "a new name in the filesystem pointing at a target",
+    "os.link": ("a new hard link, which is a second name for a file this process did not create"),
+    "os.truncate": "os.truncate and os.ftruncate both raise it",
+    "os.mkdir": "a new directory, from os.mkdir, os.makedirs or tempfile.mkdtemp",
+    "os.rmdir": ("a directory removed, including the ones shutil.rmtree removes one at a time"),
+    "os.chmod": "a mode changed on a path this process did not necessarily create",
+    "os.chown": ("os.chown and os.lchown both raise it; ownership is state outside this process"),
+    "os.utime": ("timestamps changed on a path, which is what a Dag processor's staleness check reads"),
+    "os.setxattr": ("an extended attribute set on a path, which is content outside this process"),
+    "os.removexattr": ("an extended attribute removed from a path, which is content outside this process"),
+    "os.system": "a shell command; what it does is not observed here",
+    "os.exec": "this process replaced by another; nothing after it is observed",
+    "os.posix_spawn": "a child process; what it does is not observed here",
+    "os.fork": "a child process, including the one os.spawn* and os.popen use",
+    "os.forkpty": ("a child process with a pty attached; what it does is not observed here"),
+    "subprocess.Popen": "a child process; what it does is not observed here",
+    "shutil.copyfile": ("bytes copied onto another path, which is a write to the destination"),
+    "shutil.copymode": ("a mode copied onto another path, changing that path's permissions"),
+    "shutil.copystat": ("stat copied onto another path, changing its mode and its timestamps"),
+    "shutil.copytree": ("a whole tree copied onto another path, every file of it a write"),
+    "shutil.move": ("a path moved, which is a write at the destination and a removal at the source"),
+    "shutil.rmtree": ("a tree removed, recursively, which is the most destructive call in the stdlib"),
+    "shutil.chown": ("an owner changed on a path, which is state outside this process"),
+    "shutil.unpack_archive": "an archive written out into the filesystem",
+    "shutil.make_archive": ("an archive written out, whose contents are files this process read"),
+    "tempfile.mkstemp": ("a new file, wherever it was asked for, which need not be a temp directory"),
+    "tempfile.mkdtemp": "a new directory, wherever it was asked for",
+    "ctypes.dlopen": "native code loaded; its syscalls raise nothing, so reaching for it is the event",
+    "ctypes.dlsym": "a native symbol resolved; its syscalls raise nothing",
+    "ctypes.call_function": "a native function pointer called; its syscalls raise nothing",
+    "socket.bind": "a listening socket, which is an effect on the machine even though it reads nothing",
+}
+
+# Audit events that carry a peer address: a way of reaching Airflow. Recorded
+# AND refused, so no test in this file can reach a real socket by any spelling.
+_NETWORK_EVENTS = {
+    "socket.connect": "every TCP, IPv6 and AF_UNIX connect, from any client, at any level",
+    "socket.sendto": "a connectionless datagram, which never calls connect",
+    "socket.sendmsg": ("the same connectionless datagram, spelled through a separate C entry point"),
+}
+
+# Events a sidecar frame may raise that change nothing outside this process,
+# each with why. This is the ONLY list here whose membership grants silence, so
+# every entry says what makes the event inert — and anything absent from all
+# three tables fails the test that raised it.
+_INERT_EVENTS = {
+    "import": "a module imported; the import machinery's own reads are covered by the open event",
+    "exec": "a code object executed inside this interpreter",
+    "compile": "source turned into a code object, in memory",
+    "marshal.dumps": ("an object serialised into bytes in memory; nothing leaves this process"),
+    "marshal.loads": ("a code object deserialised in memory, as the import machinery does"),
+    "marshal.load": ("a code object deserialised in memory, as the import machinery does"),
+    "code.__new__": ("a code object built in memory; executing it is the exec event, not this one"),
+    "function.__new__": ("a function object built in memory; calling it changes nothing by itself"),
+    "object.__getattr__": ("an attribute read from an object that already exists in this process"),
+    "object.__setattr__": "an attribute set on an object in this process",
+    "object.__delattr__": "an attribute deleted from an object in this process",
+    "builtins.id": "the identity of an object in this process",
+    "sys._getframe": ("a frame of this process's own stack, which this observer itself asks for"),
+    "sys.set_asyncgen_hook_firstiter": "an async generator hook of this interpreter, set by asyncio.run",
+    "sys.set_asyncgen_hook_finalizer": "an async generator hook of this interpreter, set by asyncio.run",
+    "sys._getframemodulename": "the module name of a frame of this process's own stack",
+    "os.listdir": ("a directory read; the names come back and nothing on disk changes"),
+    "os.scandir": ("a directory read; the entries come back and nothing on disk changes"),
+    "os.stat": ("metadata read from a path, which is how every existence check is spelled"),
+    "os.getxattr": ("an extended attribute read back from a path, changing nothing"),
+    "os.listxattr": ("extended attribute names read back from a path, changing nothing"),
+    "os.chdir": "this process's own working directory; nothing on disk changes",
+    "glob.glob": ("a directory read through a pattern, which is a listing and nothing more"),
+    "pathlib.Path.glob": "a directory read through a pattern, spelled through pathlib",
+    "fcntl.flock": "an advisory lock on an open descriptor; not one byte of the file changes",
+    "fcntl.fcntl": "descriptor flags in this process; nothing on disk changes",
+    "fcntl.ioctl": "a device control on a descriptor this process already holds",
+    "pickle.find_class": "a class looked up during unpickling, in memory",
+    "socket.__new__": "a socket object allocated; it has reached nothing until it connects or sends",
+    "socket.getaddrinfo": "a name resolved, which the connect event below then reports",
+    "urllib.Request": "a request object built in memory; what reaches the network is the connect under it",
+    "http.client.connect": (
+        "raised by http.client BEFORE the socket it is about to open, so the reach itself is still "
+        "the socket.connect underneath and that is what is recorded and refused"
+    ),
+    "socket.gethostbyname": ("a name resolved to an address; nothing is connected to and nothing is sent"),
+    "socket.gethostname": ("this machine's own name, read out of the kernel and no further"),
+    "_thread.start_new_thread": (
+        "a thread of THIS interpreter, so its frames run under this same hook — proven by the "
+        "background-thread canary, which is attributed to the function the thread runs. Unlike a "
+        "child process, nothing it does escapes observation"
+    ),
+    "gc.get_objects": ("this process's own heap, enumerated in memory"),
+    "gc.get_referrers": ("this process's own heap, walked backwards in memory"),
+    "gc.get_referents": ("this process's own heap, walked forwards in memory"),
+}
+
+# Opening a path for anything other than reading. ``O_RDONLY`` is zero, so a
+# read carries none of these bits — which is what keeps a read from being
+# reported as a write.
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+# Mutators CPython raises NO audit event for. Measured by a canary below rather
+# than assumed, and covered by a second, WEAKER layer that rebinds the module
+# attribute — weaker because a module object can be reached by another name.
+# This is a hand list and it is not closure; it is the named residue of a
+# mechanism that is, and the boundary above says so.
+_UNAUDITED_MUTATORS = {
+    "mkfifo": "creates a named pipe in the filesystem and raises no audit event of any kind",
+    "mknod": "creates a device or pipe node in the filesystem and raises no audit event of any kind",
+}
+
+_ARMED = False
+_INSIDE_THE_HOOK = False
+
+
+def _record_unaudited(name, real):
+    """Wrap a mutator the audit hook cannot see, so that at least this spelling of it is observed."""
+
+    def recorded(*args, **kwargs):
+        site = _frame_site()
+        if site is not None:
+            _OBSERVED_WRITES.append((site, f"os.{name}", repr(args[0]) if args else "<no argument>"))
+        return real(*args, **kwargs)
+
+    recorded.wrapped_real = real
+    return recorded
+
+
+def _open_is_for_writing(args):
+    """Whether an ``open`` audit event asked for anything but reading.
+
+    The flags are the primary signal because ``os.open`` reports no mode at
+    all; the mode string is a cross-check for the same question, and either
+    saying yes is enough. ``r+`` counts: it is an update handle, and the one in
+    this tree that only takes a lock through it is declared as such.
+    """
+    mode = args[1] if len(args) > 1 else None
+    flags = args[2] if len(args) > 2 else 0
+    if isinstance(flags, int) and flags & _WRITE_FLAGS:
+        return True
+    return isinstance(mode, str) and bool(set(mode) & set("wxa+"))
+
+
+def _audit(event, args):
+    """The observer. Never raises for anything but a peer address.
+
+    An audit hook cannot be removed once installed, so it is installed once, at
+    import, and armed per test. It must not raise on an event the interpreter
+    is merely passing through: the only refusal here is the network one, which
+    is the contract this suite already had at the httpx layer.
+    """
+    global _INSIDE_THE_HOOK
+    if _INSIDE_THE_HOOK or not _ARMED:
+        return
+    if event in _INERT_EVENTS:
+        return
+    network = event in _NETWORK_EVENTS
+    mutating = event in _MUTATING_EVENTS
+    if mutating and event == "open" and not _open_is_for_writing(args):
+        return
+    _INSIDE_THE_HOOK = True
+    try:
+        site = _frame_site()
+        if site is None:
+            detail = None
+        elif network:
+            detail = f"{args[1]!r}" if len(args) > 1 else "<no peer>"
+            _OBSERVED_READS.append((site, event, detail))
+        elif mutating:
+            detail = f"{args[0]!r}" if args else "<no argument>"
+            _OBSERVED_WRITES.append((site, event, detail))
+        else:
+            detail = None
+            _UNCLASSIFIED_EVENTS.append((site, event))
+    finally:
+        _INSIDE_THE_HOOK = False
+    if network:
+        raise _UnobservedWire(
+            f"{'.'.join(site) if site else 'a frame outside the sidecar'} reached a real socket "
+            f"({event} {detail or ''}) — every read has to go through transport._api"
+        )
+
+
+sys.addaudithook(_audit)
+
+# The real methods, kept so a canary can lift the httpx layer and prove that the
+# audit hook alone still catches what goes through it.
+_REAL_HTTPX_SEND = {
+    (httpx.Client, "send"): httpx.Client.send,
+    (httpx.AsyncClient, "send"): httpx.AsyncClient.send,
+    (httpx.HTTPTransport, "handle_request"): httpx.HTTPTransport.handle_request,
+    (httpx.AsyncHTTPTransport, "handle_async_request"): httpx.AsyncHTTPTransport.handle_async_request,
+}
+
+
 @pytest.fixture(autouse=True)
 def wire_is_never_reached_unobserved(monkeypatch):
-    """THE observation point: ``httpx``'s own send, under every spelling.
+    """Arm the audit hook, and keep the httpx-level refusals as a second layer.
 
-    ``transport._api`` is where the double is installed, not where the bytes
-    go. A module that writes ``import httpx as _hx`` and calls ``_hx.get(...)``
-    reaches Airflow without passing ``transport`` at all — the reader registry
-    saw nothing, the AST guard beside it matched only the literal name
-    ``httpx``, and a hard negative published over the failed read left the whole
-    suite green.
-
-    Everything httpx sends — ``httpx.get``, ``httpx.request``, ``httpx.stream``,
-    a ``Client`` built by hand, an ``AsyncClient`` — funnels through
-    ``Client.send``, so patching that one method observes the call however it
-    was spelled, under whatever alias, through however many indirections. It is
-    recorded AND refused: no test in this file may reach a real socket.
+    The GUARANTEE is the audit hook: ``socket.connect`` is raised below every
+    library, so a read is observed however it was spelled, under whatever alias,
+    through however many indirections, and whether or not the client was
+    imported before this fixture ran. The httpx patches below are NOT that
+    guarantee — they were, for one round, and ``HTTPTransport().handle_request``
+    walked straight past them onto a real socket. They are kept because they
+    refuse earlier and more cheaply, and because ``handle_request`` is the layer
+    a sidecar module would most plausibly reach for.
     """
+    global _ARMED
     _OBSERVED_READS.clear()
+    _OBSERVED_WRITES.clear()
+    _UNCLASSIFIED_EVENTS.clear()
 
     def refuse(self, request, *args, **kwargs):
         site = _reading_site()
@@ -540,6 +849,27 @@ def wire_is_never_reached_unobserved(monkeypatch):
 
     monkeypatch.setattr(httpx.Client, "send", refuse)
     monkeypatch.setattr(httpx.AsyncClient, "send", refuse)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", refuse)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
+    for name in _UNAUDITED_MUTATORS:
+        for holder in (os, sys.modules.get("posix")):
+            real = getattr(holder, name, None)
+            if real is not None:
+                monkeypatch.setattr(holder, name, _record_unaudited(name, real))
+    _ARMED = True
+    try:
+        yield
+    finally:
+        _ARMED = False
+    assert _UNCLASSIFIED_EVENTS == [], (
+        f"a sidecar frame raised an audit event no table classifies: {_UNCLASSIFIED_EVENTS}. "
+        f"An event kind nothing has an opinion about is unproven, not harmless"
+    )
+    unclassified = sorted({site for site, _, _ in _OBSERVED_WRITES} - _classified_write_sites())
+    assert unclassified == [], (
+        f"a mutation reached the filesystem from {unclassified}, and the approval registry names "
+        f"no write there at all: {[entry for entry in _OBSERVED_WRITES if entry[0] in unclassified]}"
+    )
 
 
 def _parses(airflow, tmp_path):
@@ -9742,21 +10072,16 @@ def _owned_nodes(tree, owner="<module>"):
 # so a read is seen through any number of indirections, under any alias.
 # ---------------------------------------------------------------------------
 
-_SIDECAR_DIR = Path(__file__).parent
-
 
 def _reading_site():
     """The function that made the read now in progress: the first frame outside transport.
 
     Frames inside ``transport`` are the boundary itself and frames inside this
     file are the harness, so what is left is the sidecar function that asked.
+    The walk itself is ``_frame_site``, shared with the audit hook so that a
+    read reported by either observer is attributed the same way.
     """
-    for frame in inspect.stack()[1:]:
-        path = Path(frame.filename)
-        if path.parent != _SIDECAR_DIR or path.stem in ("transport", "test_server"):
-            continue
-        return (path.stem, frame.function)
-    return ("<outside the package>", "<unknown>")
+    return _frame_site() or ("<outside the package>", "<unknown>")
 
 
 def _watch_reads(monkeypatch):
@@ -13580,6 +13905,23 @@ def _mutating_calls():
     return [entry for entry in _write_spelled_calls() if entry not in approvals._NOT_A_WRITE]
 
 
+def _classified_write_sites():
+    """Every ``(module, function)`` the approval registry says performs a write.
+
+    Derived from the product's own three tables rather than restated, and used
+    by the runtime observer: a mutation seen at a site none of them names is a
+    write the product never declared, whatever it was spelled.
+    """
+    return {
+        (module, owner)
+        for module, owner, _ in (
+            *approvals._GATED_WRITES,
+            *approvals._UNGATED_WRITES,
+            *approvals._NOT_A_WRITE,
+        )
+    }
+
+
 def test_every_call_spelled_like_a_write_is_a_write_or_is_declared_not_to_be():
     """The census is closed in both directions: a declaration that outlives its
     call is an exemption waiting for the next call of that spelling, and a
@@ -14425,3 +14767,802 @@ def test_a_non_empty_blast_radius_over_a_short_catalog_is_caveated_too(airflow):
     assert result["produces_assets"] == [f"daily_sales_{n}" for n in range(_SWEEP_ROWS)]
     assert result["asset_catalog_read_whole"] is False
     assert "is not closed" in result["scope"]
+
+
+# ---------------------------------------------------------------------------
+# The instrument's own red-team canary suite.
+#
+# Everything above this line tests the SERVER. This section tests the
+# INSTRUMENT: it drives, at each observation point, the exact mechanisms that
+# defeated the previous four rounds, plus new ones built to defeat this one.
+#
+# Three rules it is built to:
+#
+#   1. A canary that the observer catches proves the observer catches it. A
+#      canary nothing catches has to FAIL here, not pass quietly — which is why
+#      the deliberately unsupported mechanisms below are asserted to be
+#      unobserved AND to fail closed by some other route.
+#   2. Nothing here is tuned to a spelling. Every read canary is a different
+#      way of reaching the same socket, and the observer does not know about
+#      any of them; every write canary is a different way of reaching the same
+#      filesystem.
+#   3. The boundary is stated, then measured. ``_OBSERVER_BOUNDARY`` claims a
+#      set of covered and uncovered mechanisms, and the canaries below are what
+#      make each of those claims a test rather than a sentence.
+# ---------------------------------------------------------------------------
+
+
+def _as_sidecar_code(body, module="evidence", name="_reach_out"):
+    """Compile a function whose frames are attributed to a sidecar module.
+
+    The observer attributes an event to the innermost frame whose code file is
+    a module of this package, so a function compiled under ``evidence.py``'s
+    path is indistinguishable from one written there. That is the whole threat
+    model: a reader or a writer ADDED to the tree, not one already in it.
+    """
+    source = f"def {name}(**kwargs):\n" + "".join(f"    {line}\n" for line in body.splitlines())
+    namespace: dict = {}
+    exec(compile(source, str(_SIDECAR_DIR / f"{module}.py"), "exec"), namespace)
+    return namespace[name]
+
+
+def _take_observed_writes():
+    """Consume the writes observed so far, so a canary's own mutation does not
+    reach the per-test census that would rightly reject its synthetic site."""
+    taken = list(_OBSERVED_WRITES)
+    _OBSERVED_WRITES.clear()
+    return taken
+
+
+@pytest.fixture
+def httpx_layer_lifted(monkeypatch):
+    """Put the real httpx methods back, leaving the audit hook standing alone.
+
+    This is the fixture that makes the read canaries mean something. With the
+    httpx patches in place a canary proves only that ONE of the two layers
+    works, and the round this repairs shipped exactly that proof: eleven of
+    thirteen spellings were caught, and the two that were not reached a real
+    socket. Lifted, every spelling below has nothing between it and the wire
+    except ``socket.connect``.
+    """
+    for (owner, name), real in _REAL_HTTPX_SEND.items():
+        monkeypatch.setattr(owner, name, real)
+
+
+# Somewhere nothing listens, reached without leaving the machine. The observer
+# refuses BEFORE the syscall, so none of these canaries emits a packet — which
+# is also why a port that would refuse instantly and one that would hang are
+# the same test here.
+_NOWHERE = ("127.0.0.1", 9)
+_NOWHERE_URL = "http://127.0.0.1:9/pools"
+
+# Every way of reaching Airflow this instrument has been defeated by, plus the
+# ones it has not been tried with yet. Each is the BODY of a function compiled
+# under ``evidence.py``, so each is a reader added to the sidecar.
+_READ_SPELLINGS = {
+    # The two that walked past ``httpx.Client.send`` onto a real socket.
+    "httpx-transport-handle-request": (
+        f"import httpx\nreturn httpx.HTTPTransport().handle_request(httpx.Request('GET', {_NOWHERE_URL!r}))"
+    ),
+    "httpx-client-subclass-overriding-send": (
+        "import httpx\n"
+        "class _C(httpx.Client):\n"
+        "    def send(self, request, **kw):\n"
+        "        return self._transport.handle_request(request)\n"
+        f"return _C().send(httpx.Request('GET', {_NOWHERE_URL!r}))"
+    ),
+    # The eleven the previous round did catch, kept as regressions.
+    "httpx-get": f"import httpx\nreturn httpx.get({_NOWHERE_URL!r}, timeout=0.5)",
+    "httpx-post": f"import httpx\nreturn httpx.post({_NOWHERE_URL!r}, json={{}}, timeout=0.5)",
+    "httpx-request": f"import httpx\nreturn httpx.request('GET', {_NOWHERE_URL!r}, timeout=0.5)",
+    "httpx-stream": (
+        "import httpx\n"
+        f"with httpx.stream('GET', {_NOWHERE_URL!r}, timeout=0.5) as response:\n"
+        "    return response.status_code"
+    ),
+    "httpx-client-request": (
+        f"import httpx\nreturn httpx.Client(timeout=0.5).request('GET', {_NOWHERE_URL!r})"
+    ),
+    "httpx-client-get": f"import httpx\nreturn httpx.Client(timeout=0.5).get({_NOWHERE_URL!r})",
+    "httpx-prebuilt-request": (
+        f"import httpx\nreturn httpx.Client(timeout=0.5).send(httpx.Request('GET', {_NOWHERE_URL!r}))"
+    ),
+    "httpx-async-client": (
+        "import asyncio, httpx\n"
+        "async def _go():\n"
+        "    async with httpx.AsyncClient(timeout=0.5) as client:\n"
+        f"        return await client.get({_NOWHERE_URL!r})\n"
+        "return asyncio.run(_go())"
+    ),
+    "httpx-reused-client": (f"import httpx\nclient = kwargs['client']\nreturn client.get({_NOWHERE_URL!r})"),
+    "httpx-explicit-transport": (
+        "import httpx\n"
+        f"return httpx.Client(transport=httpx.HTTPTransport(), timeout=0.5).get({_NOWHERE_URL!r})"
+    ),
+    "httpx-assembled-import-name": (
+        f"_hx = __import__('h' + 'ttpx')\nreturn _hx.get({_NOWHERE_URL!r}, timeout=0.5)"
+    ),
+    # The separately-disclosed class the httpx layer never covered at all.
+    "urllib-urlopen": (
+        f"import urllib.request\nreturn urllib.request.urlopen({_NOWHERE_URL!r}, timeout=0.5)"
+    ),
+    "http-client-raw": (
+        "import http.client\n"
+        "connection = http.client.HTTPConnection('127.0.0.1', 9, timeout=0.5)\n"
+        "connection.request('GET', '/pools')\n"
+        "return connection.getresponse()"
+    ),
+    "raw-socket-connect": (
+        "import socket\n"
+        "s = socket.socket()\n"
+        "s.settimeout(0.5)\n"
+        "try:\n"
+        f"    s.connect({_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "raw-socket-connect-ex": (
+        "import socket\n"
+        "s = socket.socket()\n"
+        "s.settimeout(0.5)\n"
+        "try:\n"
+        f"    return s.connect_ex({_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "raw-socket-create-connection": (
+        f"import socket\nreturn socket.create_connection({_NOWHERE!r}, timeout=0.5)"
+    ),
+    # The C class the ``socket`` module is a wrapper around. Patching
+    # ``socket.socket.connect`` would leave this one standing; the audit event
+    # is raised underneath both.
+    "raw-underscore-socket": (
+        "import _socket\n"
+        "s = _socket.socket()\n"
+        "s.settimeout(0.5)\n"
+        "try:\n"
+        f"    s.connect({_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "socket-subclass": (
+        "import socket\n"
+        "class _S(socket.socket):\n"
+        "    pass\n"
+        "s = _S()\n"
+        "s.settimeout(0.5)\n"
+        "try:\n"
+        f"    s.connect({_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "ipv6-connect": (
+        "import socket\n"
+        "s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n"
+        "s.settimeout(0.5)\n"
+        "try:\n"
+        "    s.connect(('::1', 9))\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "unix-domain-connect": (
+        "import socket\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "try:\n"
+        "    s.connect(kwargs['path'])\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "udp-sendto-without-connect": (
+        "import socket\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "try:\n"
+        f"    return s.sendto(b'x', {_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "udp-sendmsg-without-connect": (
+        "import socket\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "try:\n"
+        f"    return s.sendmsg([b'x'], [], 0, {_NOWHERE!r})\n"
+        "finally:\n"
+        "    s.close()"
+    ),
+    "read-on-a-background-thread": (
+        "import socket, threading\n"
+        "box = {}\n"
+        "def _worker():\n"
+        "    s = socket.socket()\n"
+        "    s.settimeout(0.5)\n"
+        "    try:\n"
+        f"        s.connect({_NOWHERE!r})\n"
+        "    except BaseException as exc:\n"
+        "        box['error'] = exc\n"
+        "    finally:\n"
+        "        s.close()\n"
+        "thread = threading.Thread(target=_worker)\n"
+        "thread.start()\n"
+        "thread.join()\n"
+        "if 'error' in box:\n"
+        "    raise box['error']"
+    ),
+    "read-inside-asyncio": (
+        "import asyncio, socket\n"
+        "async def _go():\n"
+        "    s = socket.socket()\n"
+        "    s.settimeout(0.5)\n"
+        "    try:\n"
+        f"        s.connect({_NOWHERE!r})\n"
+        "    finally:\n"
+        "        s.close()\n"
+        "return asyncio.run(_go())"
+    ),
+    "read-behind-lru-cache": (
+        "import functools, socket\n"
+        "@functools.lru_cache(maxsize=1)\n"
+        "def _cached(port):\n"
+        "    s = socket.socket()\n"
+        "    s.settimeout(0.5)\n"
+        "    try:\n"
+        "        s.connect(('127.0.0.1', port))\n"
+        "    finally:\n"
+        "        s.close()\n"
+        "return _cached(9)"
+    ),
+}
+
+
+# Clients that catch the refusal and raise something of their own instead. The
+# read is still refused and still recorded; what is lost is only the exception
+# TYPE, and that loss is named here rather than absorbed by a looser assertion.
+_CLIENT_SWALLOWED_THE_REFUSAL: dict[str, tuple] = {}
+
+# Spellings whose client makes more than one connection attempt, so the
+# observer records more than one refusal. Declared, because "observed exactly
+# once" is otherwise the claim, and a silent second record would mean the first
+# refusal did not stop anything.
+_ATTEMPTS_PER_READ: dict[str, int] = {}
+
+
+def _drive_read_canary(spelling, tmp_path, client=None):
+    """Run one read canary and hand back what the observer recorded."""
+    reader = _as_sidecar_code(_READ_SPELLINGS[spelling])
+    _OBSERVED_READS.clear()
+    with pytest.raises(BaseException) as raised:  # noqa: PT011
+        reader(client=client, path=str(tmp_path / "nothing.sock"))
+    return raised.value, list(_OBSERVED_READS)
+
+
+@pytest.mark.parametrize("spelling", sorted(_READ_SPELLINGS))
+def test_no_spelling_of_a_read_reaches_the_network_unobserved(spelling, tmp_path, httpx_layer_lifted):
+    """THE canary. The httpx layer is LIFTED, so the only thing between each of
+    these and a real socket is the audit hook.
+
+    Two of these — ``HTTPTransport().handle_request`` and a ``Client`` subclass
+    that overrides ``send`` — reached a counting socket unobserved under the
+    observer this replaces, with the whole suite byte-identically green. Three
+    more classes (urllib, http.client, a bare socket) were never covered by it
+    at all.
+    """
+    with httpx.Client(timeout=0.5) as reused:
+        error, observed = _drive_read_canary(spelling, tmp_path, client=reused)
+
+    sites = sorted({site for site, _, _ in observed})
+
+    assert observed, f"{spelling} reached the network and nothing recorded it"
+    # Attributed to the sidecar MODULE, and to whichever of its frames made the
+    # call: a reader hidden in a nested function, a thread target or a
+    # coroutine is attributed to that function rather than to its caller, which
+    # is the finer answer and the one an operator would need.
+    assert {module for (module, _) in sites} == {"evidence"}, f"{spelling} was attributed to {sites}"
+    assert _unregistered_reads(observed) == sites
+    assert isinstance(error, BaseException)
+
+
+@pytest.mark.parametrize("spelling", sorted(_READ_SPELLINGS))
+def test_the_refusal_is_what_stops_each_read_rather_than_the_network(spelling, tmp_path, httpx_layer_lifted):
+    """A canary that "failed" because nothing was listening would prove nothing.
+
+    The observer refuses BEFORE the syscall, so the refusal has to be the thing
+    that surfaced — either raised straight out, or carried inside whatever the
+    client wrapped it in. A spelling whose client swallows the refusal
+    ENTIRELY is still refused and still recorded; it is called out separately
+    rather than counted as a clean catch.
+    """
+    with httpx.Client(timeout=0.5) as reused:
+        error, observed = _drive_read_canary(spelling, tmp_path, client=reused)
+
+    assert observed
+    assert _refusal_inside(error) or isinstance(error, _CLIENT_SWALLOWED_THE_REFUSAL.get(spelling, ())), (
+        f"{spelling} failed for a reason that is not the refusal: {type(error).__name__}: {error}"
+    )
+
+
+def _refusal_inside(error, depth=0):
+    """Whether the refusal is this exception or something it is carrying."""
+    if isinstance(error, _UnobservedWire):
+        return True
+    if depth > 6:
+        return False
+    carried = [error.__cause__, error.__context__, *getattr(error, "exceptions", [])]
+    return any(inner is not None and _refusal_inside(inner, depth + 1) for inner in carried)
+
+
+@pytest.mark.parametrize("spelling", sorted(_READ_SPELLINGS))
+def test_the_audit_hook_catches_every_read_spelling_with_the_httpx_layer_in_place_too(spelling, tmp_path):
+    """The same matrix with both layers standing, which is how the suite runs.
+
+    Layered observation must not DOUBLE-count: whichever layer fires first
+    raises, so exactly one record is made per attempt — except where the client
+    itself retries, which is named rather than smoothed over.
+    """
+    with httpx.Client(timeout=0.5) as reused:
+        _, observed = _drive_read_canary(spelling, tmp_path, client=reused)
+
+    assert {module for (module, _), _, _ in observed} == {"evidence"}
+    assert len(observed) == _ATTEMPTS_PER_READ.get(spelling, 1), (
+        f"{spelling} was recorded {len(observed)} times; a read is one attempt unless the client "
+        f"retries, and a retrying client has to be declared"
+    )
+
+
+# The spellings the observer this replaces could not see, each with what it was
+# blind to. Measured against a counting ``httpx.Client.send`` rather than
+# recited: the test below computes the set and compares it in BOTH directions,
+# so a spelling that starts being visible fails as loudly as one that stops.
+_SPELLINGS_THE_HTTPX_LAYER_CANNOT_SEE = {
+    "httpx-transport-handle-request": (
+        "``httpx.HTTPTransport().handle_request(request)`` is public API and never touches Client, "
+        "so the observer that called itself 'everything httpx sends' watched a method this call "
+        "does not make. Measured at a real counting socket, the bytes arrived"
+    ),
+    "httpx-client-subclass-overriding-send": (
+        "a subclass whose send goes straight to the transport never calls the patched method it "
+        "overrides; patching a class attribute cannot observe a subclass that replaces it"
+    ),
+    "urllib-urlopen": ("urllib is not httpx, so nothing in the httpx layer is anywhere on this call path"),
+    "http-client-raw": ("http.client is what urllib itself sits on, which is one layer below even that"),
+    "raw-socket-connect": ("a bare socket reaches Airflow with no HTTP client involved at any point"),
+    "raw-socket-connect-ex": (
+        "connect_ex is a second C entry point beside connect, and an observer that patched only "
+        "the one would let the other through"
+    ),
+    "raw-socket-create-connection": (
+        "socket.create_connection is stdlib, not httpx, and is the helper every client is built on"
+    ),
+    "raw-underscore-socket": (
+        "the C class the socket module merely wraps; an observer patching socket.socket misses it"
+    ),
+    "socket-subclass": (
+        "a socket subclass escapes an attribute patch for exactly the reason the Client subclass above does"
+    ),
+    "ipv6-connect": (
+        "an AF_INET6 socket carries the same bytes to a different address family, and localhost "
+        "answers on both"
+    ),
+    "unix-domain-connect": ("an AF_UNIX socket reaches a local Airflow with no TCP involved at any layer"),
+    "udp-sendto-without-connect": (
+        "a datagram never calls connect at all, so an observer watching only connect is blind to it"
+    ),
+    "udp-sendmsg-without-connect": (
+        "the same datagram, spelled through sendmsg, which is a separate C entry point again"
+    ),
+    "read-on-a-background-thread": (
+        "a bare socket, merely on another thread, where a fixture-scoped patch is no different"
+    ),
+    "read-inside-asyncio": (
+        "a bare socket, merely inside a coroutine, which changes the stack and nothing else"
+    ),
+    "read-behind-lru-cache": (
+        "a bare socket behind a memo, so the second call reaches nothing and the first still does"
+    ),
+}
+
+
+def _spellings_the_httpx_layer_misses(tmp_path, monkeypatch):
+    """Which read spellings never reach ``httpx.Client.send`` at all.
+
+    The real httpx methods are restored and a COUNTING wrapper put on the two
+    the previous observer watched, so this measures the previous observer's
+    reach directly. The audit hook stays armed, which is what stops any of
+    these from reaching a socket while it is measured.
+    """
+    missed = set()
+    with httpx.Client(timeout=0.5) as reused:
+        for spelling in sorted(_READ_SPELLINGS):
+            reached = []
+            with monkeypatch.context() as patch:
+                for (owner, name), real in _REAL_HTTPX_SEND.items():
+                    patch.setattr(owner, name, real)
+
+                def counted(self, request, *args, _real=_REAL_HTTPX_SEND[(httpx.Client, "send")], **kwargs):
+                    reached.append(request)
+                    return _real(self, request, *args, **kwargs)
+
+                patch.setattr(httpx.Client, "send", counted)
+                patch.setattr(httpx.AsyncClient, "send", counted)
+                _drive_read_canary(spelling, tmp_path, client=reused)
+            if not reached:
+                missed.add(spelling)
+    return missed
+
+
+def test_the_observation_point_this_replaces_is_measurably_blind(tmp_path, monkeypatch):
+    """The canaries above are only worth what the OLD observer missed.
+
+    A canary suite that the previous instrument would also have caught proves
+    nothing about the repair. Sixteen of these twenty-seven spellings never
+    reach ``httpx.Client.send``, which is the method whose docstring said
+    "everything httpx sends funnels through" it — and two of the sixteen are
+    httpx itself.
+    """
+    missed = _spellings_the_httpx_layer_misses(tmp_path, monkeypatch)
+
+    assert sorted(missed) == sorted(_SPELLINGS_THE_HTTPX_LAYER_CANNOT_SEE), (
+        "the reach of the observation point this replaces has changed"
+    )
+    for spelling, reason in _SPELLINGS_THE_HTTPX_LAYER_CANNOT_SEE.items():
+        assert len(reason) > 55, spelling
+
+
+# ---------------------------------------------------------------------------
+# The write canaries.
+#
+# The write census was a frozenset of 32 names matched against the SOURCE. Of
+# the mutating surface it claimed to enumerate it held 17 of 34 os names, 5 of
+# 12 shutil names, 5 of 7 tempfile names and none of subprocess — and there was
+# no runtime observation of a filesystem write anywhere, so ``os.symlink`` and
+# ``subprocess.run`` added inside the READ-ONLY plan_revert_dag_code really
+# created a file in the Dags bundle with the suite byte-identically green.
+#
+# Each canary below is a different way of reaching the filesystem, run from a
+# frame attributed to a sidecar module, and each has to be OBSERVED. None of
+# them is a name the observer knows: the events they raise come from CPython
+# and the stdlib themselves.
+# ---------------------------------------------------------------------------
+
+_WRITE_SPELLING_CANARIES = {
+    # The two that landed a file in the Dags bundle with the suite green.
+    "os.symlink": "import os\nos.symlink(kwargs['root'] / 'src', kwargs['root'] / 'leak')",
+    "subprocess.run": (
+        "import subprocess\nsubprocess.run(['touch', str(kwargs['root'] / 'leak')], check=False)"
+    ),
+    "os.system": "import os\nos.system('touch ' + str(kwargs['root'] / 'leak'))",
+    # The rest of the surface the 32-name list did not hold.
+    "os.link": "import os\nos.link(kwargs['root'] / 'src', kwargs['root'] / 'hard')",
+    "os.truncate": "import os\nos.truncate(kwargs['root'] / 'src', 0)",
+    "os.ftruncate": (
+        "import os\n"
+        "handle = os.open(kwargs['root'] / 'src', os.O_RDWR)\n"
+        "try:\n"
+        "    os.ftruncate(handle, 0)\n"
+        "finally:\n"
+        "    os.close(handle)"
+    ),
+    "os.setxattr": "import os\nos.setxattr(str(kwargs['root'] / 'src'), 'user.leak', b'1')",
+    "os.chown": "import os\nos.chown(kwargs['root'] / 'src', -1, -1)",
+    "os.posix_spawn": (
+        "import os\n"
+        "pid = os.posix_spawn('/usr/bin/touch', ['touch', str(kwargs['root'] / 'leak')], {})\n"
+        "os.waitpid(pid, 0)"
+    ),
+    "shutil.copyfileobj": (
+        "import io, shutil\n"
+        "with open(kwargs['root'] / 'leak', 'wb') as handle:\n"
+        "    shutil.copyfileobj(io.BytesIO(b'x'), handle)"
+    ),
+    "shutil.copytree": ("import shutil\nshutil.copytree(kwargs['root'] / 'tree', kwargs['root'] / 'copy')"),
+    "shutil.copystat": ("import shutil\nshutil.copystat(kwargs['root'] / 'src', kwargs['root'] / 'other')"),
+    "tempfile.NamedTemporaryFile": (
+        "import tempfile\ntempfile.NamedTemporaryFile(dir=kwargs['root'], delete=False).close()"
+    ),
+    "tempfile.TemporaryDirectory": (
+        "import tempfile\ntempfile.TemporaryDirectory(dir=kwargs['root']).cleanup()"
+    ),
+    # The spellings the 32-name list DID hold, kept as regressions so a repair
+    # that moves the mechanism cannot quietly drop them.
+    "os.remove": "import os\nos.remove(kwargs['root'] / 'src')",
+    "os.replace": "import os\nos.replace(kwargs['root'] / 'src', kwargs['root'] / 'moved')",
+    "os.rename": "import os\nos.rename(kwargs['root'] / 'src', kwargs['root'] / 'moved')",
+    "os.chmod": "import os\nos.chmod(kwargs['root'] / 'src', 0o644)",
+    "os.utime": "import os\nos.utime(kwargs['root'] / 'src')",
+    "os.mkdir": "import os\nos.mkdir(kwargs['root'] / 'made')",
+    "os.rmdir": "import os\nos.rmdir(kwargs['root'] / 'tree')",
+    "Path.rename": "(kwargs['root'] / 'src').rename(kwargs['root'] / 'moved')",
+    "Path.unlink": "(kwargs['root'] / 'src').unlink()",
+    "Path.write_bytes": "(kwargs['root'] / 'leak').write_bytes(b'x')",
+    "shutil.rmtree": "import shutil\nshutil.rmtree(kwargs['root'] / 'tree')",
+    "shutil.move": ("import shutil\nshutil.move(str(kwargs['root'] / 'src'), str(kwargs['root'] / 'moved'))"),
+    # Every mode of every way of opening a path for writing.
+    "open-w": "open(kwargs['root'] / 'leak', 'w').close()",
+    "open-a": "open(kwargs['root'] / 'leak', 'a').close()",
+    "open-x": "open(kwargs['root'] / 'leak', 'x').close()",
+    "open-r-plus": "open(kwargs['root'] / 'src', 'r+').close()",
+    "io.open-wb": "import io\nio.open(kwargs['root'] / 'leak', 'wb').close()",
+    "os.open-write-flags": (
+        "import os\nos.close(os.open(kwargs['root'] / 'leak', os.O_WRONLY | os.O_CREAT))"
+    ),
+    "os.open-append-flags": (
+        "import os\nos.close(os.open(kwargs['root'] / 'leak', os.O_APPEND | os.O_CREAT | os.O_WRONLY))"
+    ),
+    "os.fdopen-write": (
+        "import os\nos.fdopen(os.open(kwargs['root'] / 'leak', os.O_WRONLY | os.O_CREAT), 'w').close()"
+    ),
+    # Aliased, indirected and pre-bound spellings: the class of evasion that
+    # defeated every source scan this instrument ever rested on.
+    "Path.write_text-via-alias": ("_w = type(kwargs['root']).write_text\n_w(kwargs['root'] / 'leak', 'x')"),
+    "os-aliased-before-the-observer-was-armed": "kwargs['prebound'](kwargs['root'] / 'leak', b'x')",
+    "getattr-spelled-remove": "import os\ngetattr(os, 'rem' + 'ove')(kwargs['root'] / 'src')",
+    "write-on-a-background-thread": (
+        "import threading\n"
+        "thread = threading.Thread(target=lambda: (kwargs['root'] / 'leak').write_text('x'))\n"
+        "thread.start()\n"
+        "thread.join()"
+    ),
+    # A write that FAILS still asked for the mutation, and the ask is the event.
+    "open-w-into-a-missing-directory": "open(kwargs['root'] / 'nope' / 'leak', 'w').close()",
+    "os.remove-of-a-missing-path": "import os\nos.remove(kwargs['root'] / 'nope')",
+}
+
+# The same shapes, spelled to READ. A read reported as a write would make the
+# census meaningless in the other direction, and ``r+`` is the interesting case:
+# it is an update handle, so it is classified as a write even where this tree
+# only takes a lock through it — which is declared in ``approvals._NOT_A_WRITE``.
+_READ_SPELLINGS_THAT_ARE_NOT_WRITES = {
+    "open-r": "open(kwargs['root'] / 'src').close()",
+    "open-rb": "open(kwargs['root'] / 'src', 'rb').close()",
+    "io.open-r": "import io\nio.open(kwargs['root'] / 'src').close()",
+    "os.open-O_RDONLY": "import os\nos.close(os.open(kwargs['root'] / 'src', os.O_RDONLY))",
+    "Path.read_text": "(kwargs['root'] / 'src').read_text()",
+    "Path.read_bytes": "(kwargs['root'] / 'src').read_bytes()",
+    "os.listdir": "import os\nos.listdir(kwargs['root'])",
+    "os.stat": "import os\nos.stat(kwargs['root'] / 'src')",
+    "Path.exists": "(kwargs['root'] / 'src').exists()",
+    "Path.glob": "list(kwargs['root'].glob('*'))",
+}
+
+
+# Canaries that raise more than one mutating event, with how many. Measured,
+# not predicted: a stdlib helper that copies a file and then its mode really
+# does mutate twice, and hiding that behind a "one write" assertion would be
+# the census lying in the quiet direction.
+_COMPOUND_WRITES = {
+    "os.fdopen-write": 2,
+    "shutil.move": 3,
+    "tempfile.NamedTemporaryFile": 3,
+    "tempfile.TemporaryDirectory": 4,
+}
+
+_WHY_A_WRITE_IS_COMPOUND = {
+    "os.fdopen-write": "os.open creates the file and os.fdopen opens a handle onto the descriptor",
+    "shutil.move": "its own shutil.move event, the os.rename it performs, and the open it tries first",
+    "tempfile.NamedTemporaryFile": "its own tempfile.mkstemp event, the open under it, and the file it names",
+    "tempfile.TemporaryDirectory": "tempfile.mkdtemp, the os.mkdir under it, and the removal on cleanup",
+}
+
+
+@pytest.fixture
+def write_target(tmp_path):
+    """A little world a canary can safely mutate: one file and one directory."""
+    (tmp_path / "src").write_text("original\n")
+    (tmp_path / "other").write_text("other\n")
+    (tmp_path / "tree").mkdir()
+    return tmp_path
+
+
+def _drive_write_canary(body, root, module="evidence", name="_mutate"):
+    """Run one write canary and hand back what the observer recorded."""
+    writer = _as_sidecar_code(body, module=module, name=name)
+    _take_observed_writes()
+    with contextlib.suppress(BaseException):
+        writer(root=root, prebound=_PREBOUND_WRITER)
+    return _take_observed_writes()
+
+
+# Bound at import, long before any fixture arms the observer. A writer captured
+# early is the standard way past an instrument that patches names when a test
+# starts; the audit hook is raised by the function itself, so when it was
+# looked up does not matter.
+_PREBOUND_WRITER = Path.write_bytes
+
+
+@pytest.mark.parametrize("spelling", sorted(_WRITE_SPELLING_CANARIES))
+def test_no_spelling_of_a_write_reaches_the_filesystem_unobserved(spelling, write_target):
+    """THE write canary, and the half of this instrument that had no runtime
+    observation at all until now.
+
+    ``os.symlink`` and ``subprocess.run`` inside the read-only
+    ``plan_revert_dag_code`` left the suite at 2640 passed, 1 skipped while
+    really landing a file in the Dags bundle. Neither name was in the 32-name
+    frozenset that called itself the mutating surface of os, shutil, tempfile
+    and pathlib.
+    """
+    observed = _drive_write_canary(_WRITE_SPELLING_CANARIES[spelling], write_target)
+
+    assert observed, f"{spelling} reached the filesystem and nothing recorded it"
+    assert {module for (module, _), _, _ in observed} == {"evidence"}, (
+        f"{spelling} was observed but attributed to {sorted({site for site, _, _ in observed})}"
+    )
+
+
+@pytest.mark.parametrize("spelling", sorted(_READ_SPELLINGS_THAT_ARE_NOT_WRITES))
+def test_a_read_of_the_filesystem_is_never_reported_as_a_write(spelling, write_target):
+    """The other direction, and the one that would make the census worthless.
+
+    An observer that reported every ``open`` would put every source read, every
+    backup read and every log read into the write census, and the census would
+    be discarded as noise within a day. ``O_RDONLY`` is zero, so a read carries
+    none of the flags this looks for.
+    """
+    observed = _drive_write_canary(_READ_SPELLINGS_THAT_ARE_NOT_WRITES[spelling], write_target)
+
+    assert observed == [], f"{spelling} reads and was reported as a mutation: {observed}"
+
+
+def test_every_write_canary_is_observed_exactly_once_or_says_why_not(write_target):
+    """Layered observation must not double-count.
+
+    A census that reports one mutation twice is one an operator learns to
+    discount. The ones that legitimately raise more than one event are the
+    compound stdlib helpers, which really do perform more than one mutation,
+    and each is named with what its parts are.
+    """
+    counts = {
+        spelling: len(_drive_write_canary(body, write_target))
+        for spelling, body in sorted(_WRITE_SPELLING_CANARIES.items())
+    }
+
+    assert {spelling: count for spelling, count in counts.items() if count != 1} == _COMPOUND_WRITES
+    for spelling, reason in _WHY_A_WRITE_IS_COMPOUND.items():
+        assert len(reason) > 40, spelling
+    assert sorted(_COMPOUND_WRITES) == sorted(_WHY_A_WRITE_IS_COMPOUND)
+
+
+# ---------------------------------------------------------------------------
+# What the observer does NOT cover, asserted as tests.
+#
+# The half of an instrument that decides whether it can be trusted is the half
+# that says where it stops. Each test here drives a mechanism the boundary
+# above declares uncovered, and asserts BOTH that it really is uncovered — so
+# the declaration is measured rather than defensive — and that reaching for it
+# still fails closed by some other route. A mechanism that were silently
+# covered would make the boundary a lie in the harmless direction; one that
+# were silently uncovered AND passed would be the fourth repeat of this
+# instrument's one failure.
+# ---------------------------------------------------------------------------
+
+
+def test_the_mutators_cpython_raises_no_audit_event_for_are_the_declared_ones(write_target):
+    """The boundary claims os.mkfifo and os.mknod are invisible to the hook. Measured.
+
+    If CPython ever starts raising an event for them, this fails and the weaker
+    second layer beside them can be dropped; if a THIRD such mutator is found,
+    it fails here rather than passing somewhere else.
+    """
+    unseen = {}
+    for name in sorted(_UNAUDITED_MUTATORS):
+        body = f"import os\nos.{name}(kwargs['root'] / 'node-{name}')"
+        writer = _as_sidecar_code(body, name="_mutate")
+        _take_observed_writes()
+        with _without_the_second_layer(os, name), _without_the_second_layer(sys.modules["posix"], name):
+            with contextlib.suppress(BaseException):
+                writer(root=write_target)
+            unseen[name] = _take_observed_writes()
+
+    assert {name: observed for name, observed in unseen.items() if observed == []} == {
+        name: [] for name in _UNAUDITED_MUTATORS
+    }, f"an audit event now covers one of these: {unseen}"
+    for name, reason in _UNAUDITED_MUTATORS.items():
+        assert len(reason) > 55, name
+
+
+@contextlib.contextmanager
+def _without_the_second_layer(holder, name):
+    """Lift the weaker second layer, leaving the audit hook alone with a mutator."""
+    patched = getattr(holder, name)
+    setattr(holder, name, getattr(patched, "wrapped_real", patched))
+    try:
+        yield
+    finally:
+        setattr(holder, name, patched)
+
+
+@pytest.mark.parametrize("name", sorted(_UNAUDITED_MUTATORS))
+def test_the_second_layer_observes_what_the_audit_hook_cannot(name, write_target):
+    """The weaker layer earns its place: with it installed, the mutator IS seen."""
+    observed = _drive_write_canary(f"import os\nos.{name}(kwargs['root'] / 'node-{name}')", write_target)
+
+    assert [event for _, event, _ in observed] == [f"os.{name}"]
+
+
+def test_a_write_made_by_a_child_process_is_unproven_rather_than_passed(write_target):
+    """THE deliberately unsupported mechanism, and the one that decides whether
+    this instrument fails open or closed.
+
+    A file written by ``subprocess.run(['touch', ...])`` is written by another
+    interpreter, which this hook cannot see and never will. What must not
+    happen is that the sidecar therefore looks clean. Creating the child is
+    itself classified as a mutation, so the site is reported, the census
+    rejects it, and the answer is "something left this process and was not
+    observed" rather than "no write was seen".
+    """
+    landed = write_target / "leak"
+    observed = _drive_write_canary(
+        f"import subprocess\nsubprocess.run(['touch', {str(landed)!r}], check=False)",
+        write_target,
+        module="codechange",
+        name="plan_revert_dag_code",
+    )
+
+    # The child really did write, and the hook really did not see that write.
+    assert landed.exists(), "the canary did not actually reach the filesystem"
+    assert [event for _, event, _ in observed] == ["subprocess.Popen"]
+    assert not [event for _, event, _ in observed if event == "open"]
+    # And it still fails closed: the site is one no approval names.
+    unclassified = {site for site, _, _ in observed} - _classified_write_sites()
+    assert unclassified == {("codechange", "plan_revert_dag_code")}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "import os\nos.symlink(kwargs['root'] / 'src', kwargs['root'] / 'sales_summary.py.airy-leak')",
+        "import subprocess\nsubprocess.run(['touch', str(kwargs['root'] / 'leak')], check=False)",
+        "import os\nos.system('touch ' + str(kwargs['root'] / 'leak'))",
+        "(kwargs['root'] / 'leak').write_text('x')",
+    ],
+    ids=["os.symlink", "subprocess.run", "os.system", "Path.write_text"],
+)
+def test_a_write_added_to_a_read_only_tool_is_rejected_wherever_it_is_spelled(body, write_target):
+    """The FATAL finding, end to end.
+
+    ``os.symlink`` and ``subprocess.run`` added inside ``plan_revert_dag_code``
+    — a tool that reads and never writes — left the suite at 2640 passed, 1
+    skipped, while ``sales_summary.py.airy-leak`` really appeared in the Dags
+    bundle. Neither name was in the frozenset that called itself the mutating
+    surface; there was no runtime observation of a filesystem write anywhere.
+    """
+    observed = _drive_write_canary(body, write_target, module="codechange", name="plan_revert_dag_code")
+
+    assert observed, "a write inside a read-only tool was not observed at all"
+    unclassified = {site for site, _, _ in observed} - _classified_write_sites()
+    assert unclassified == {("codechange", "plan_revert_dag_code")}, (
+        "a write landed in a tool the approval registry names no write in, and the census took it"
+    )
+
+
+def test_the_observer_boundary_names_what_it_covers_and_what_it_does_not(capsys):
+    """The boundary, printed, so a reader of the run does not have to find it here.
+
+    Both halves are required. An instrument that lists only what it covers is
+    read as covering everything else too, which is precisely how ``httpx``'s
+    ``Client.send`` came to be described as "the wire".
+    """
+    covered = [name for name in _OBSERVER_BOUNDARY if name.startswith("covered")]
+    uncovered = [name for name in _OBSERVER_BOUNDARY if name.startswith("NOT covered")]
+    print("\n".join(f"{name}\n    {reason}" for name, reason in _OBSERVER_BOUNDARY.items()))
+
+    assert covered, "the boundary names nothing it covers"
+    assert uncovered, "a boundary with only one side is not a boundary"
+    for name, reason in _OBSERVER_BOUNDARY.items():
+        assert len(reason) > 80, name
+    assert "NOT covered" in capsys.readouterr().out
+
+
+def test_every_audit_event_the_observer_classifies_is_classified_exactly_once():
+    """The three tables are a partition, not three overlapping opinions.
+
+    An event in both the mutating table and the inert one would be answered by
+    whichever branch ran first, which is a coin toss written as a classification.
+    """
+    tables = (_MUTATING_EVENTS, _NETWORK_EVENTS, _INERT_EVENTS)
+    counted: dict[str, int] = {}
+    for table in tables:
+        for event in table:
+            counted[event] = counted.get(event, 0) + 1
+
+    assert [event for event, count in counted.items() if count > 1] == []
+    for table in tables:
+        for event, reason in table.items():
+            assert len(reason) > 40, event
