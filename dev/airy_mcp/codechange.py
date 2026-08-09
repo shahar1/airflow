@@ -376,6 +376,52 @@ def _approval_spent_before_the_write(outcome_key: str, which: str, error: Except
     }
 
 
+_UNPAUSE_APPROVAL_IS_GONE = (
+    "The unpause approval was already spent by this attempt and cannot be redeemed again — put the "
+    "question to the user afresh and call rerun_dag without unpause to get a new unpause_token."
+)
+
+
+def _unpause_did_not_come_back(dag_id: str, error: Exception) -> dict[str, Any]:
+    """The answer when the unpause write itself did not come back.
+
+    ``_redeem_token`` burns the approval, and the PATCH behind it was the one
+    write in this tree with nothing between it and the caller: a transient
+    ``RequestError`` raised out of the tool with the approval spent and nothing
+    reported, and the retry with the same token answered "unpausing NAME needs
+    the unpause_token from its paused-Dag warning" — the user's own mistake, in
+    this tool's own words, over a token this tool had already destroyed.
+
+    A 4xx is a refusal the route CHOSE, so it changed nothing and says so.
+    Anything else leaves the paused state unestablished, because an httpx error
+    can be raised after the request has already reached Airflow.
+    """
+    refused = isinstance(error, httpx.HTTPStatusError) and 400 <= error.response.status_code < 500
+    if refused:
+        return {
+            "triggered": False,
+            "mutation_applied": False,
+            "unpaused": False,
+            "dag_id": dag_id,
+            "error": (
+                f"{dag_id} was NOT unpaused and no run was triggered: Airflow refused the unpause "
+                f"({_quoted(_explain_error(error), 240)}). Nothing was changed. "
+                f"{_UNPAUSE_APPROVAL_IS_GONE}"
+            ),
+        }
+    # ``mutation_applied`` is absent, not false: the request may have landed.
+    return {
+        "triggered": False,
+        "unpaused": None,
+        "dag_id": dag_id,
+        "error": (
+            f"the unpause of {dag_id} did not come back ({_quoted(_explain_error(error), 240)}), so "
+            f"whether it is still paused is NOT established and no run was triggered. Check the Dag's "
+            f"paused state in Airflow before doing anything else. {_UNPAUSE_APPROVAL_IS_GONE}"
+        ),
+    }
+
+
 _REPLAN_STEER = (
     "the file changed since this plan was made. Make a NEW plan from the current source "
     "that contains every remaining change, show it, and apply that instead."
@@ -692,7 +738,10 @@ def rerun_dag(
                     f"call rerun_dag without unpause first and put that warning to the user"
                 ),
             }
-        transport._api("PATCH", _dag_url(dag_id), json={"is_paused": False})
+        try:
+            transport._api("PATCH", _dag_url(dag_id), json={"is_paused": False})
+        except Exception as e:
+            return _unpause_did_not_come_back(dag_id, e)
         unpaused = True
     else:
         unpaused = False

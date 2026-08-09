@@ -1301,7 +1301,12 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     if dag_ids is not None:
         body["dag_ids"] = list(dag_ids)
     resp = transport._api("POST", "/dags/~/dagRuns/~/taskInstances/list", json=body)
-    scan = reading.read_of(resp, "task_instances", _FAILURE_SCAN_ROUTE)
+    # ``limit`` is what buys the overflow sentinel, and this is the read whose
+    # entire product is a claim of ABSENCE — "no clusters means no FAILED task
+    # instance in the window". Without it, a page that came back FULL at
+    # ``page_limit`` beside no ``total_entries`` reported itself read whole and
+    # signed that claim over a window it had only sampled.
+    scan = reading.read_of(resp, "task_instances", _FAILURE_SCAN_ROUTE, limit=reading.FAILURE_SCAN_LIMIT)
     # Belt and braces: never fetch a log for a Dag outside the allowlist, whatever
     # the API returned. A dropped row is a row this scan did not cover, so the
     # filter reduces what was kept — the omitted count used to be computed off

@@ -318,6 +318,45 @@ def _partial_effect_possible(ti: dict[str, Any], history_rules_out_partial: bool
     return True
 
 
+def _earlier_attempt_executed(history: reading.Reading, ti: dict[str, Any]) -> bool | None:
+    """Whether an attempt OTHER than the recorded one carries execution fields.
+
+    Asked of the history only where the history can answer it: an empty, clamped
+    or unread one goes through ``failed_read`` so ``find()`` answers UNKNOWN
+    rather than ABSENT.
+
+    ``complete`` is True for a reading of ZERO rows as well, so asking a
+    never-dispatched target's empty history DIRECTLY got a confident "no earlier
+    attempt executed" — which the gate published as "nothing outside Airflow can
+    have been touched" while the plan, over the very same payload, said the
+    question was open and warned about it.
+    """
+    status = reading.history_status(history)
+    answerable = (
+        history
+        if status in ("checked", "partial")
+        else reading.failed_read(history.route, reading.attempt_error(history) or status)
+    )
+    return reading.find(
+        answerable,
+        lambda row: row.get("try_number") != ti.get("try_number") and _carries_execution_fields(row),
+        f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
+    ).as_field()
+
+
+def _history_rules_out_partial(history: reading.Reading, earlier_executed: bool | None) -> bool:
+    """Whether the attempt history can carry the weight of a hard ``False``.
+
+    ``False`` is a positive claim that nothing outside Airflow can have been
+    touched, and it SUPPRESSES the half-operation warning. It is only ever
+    earned by a history that was read whole and HOLDS ATTEMPTS, none of them
+    carrying execution fields; a truncated one, an unread one, an empty one, or
+    one that does hold such an attempt leaves the question open — ``None``, not
+    ``False``. THE one place that is decided, for the plan and for the gate.
+    """
+    return reading.history_status(history) == "checked" and earlier_executed is False
+
+
 def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[str, Any]:
     """What the evidence says about the attempt this instance has recorded.
 
@@ -340,24 +379,11 @@ def _recovery_evidence(dag_id: str, run_path: str, ti: dict[str, Any]) -> dict[s
     rows = list(shown.rows)
     history_status = reading.history_status(whole)
     live_executed = _carries_execution_fields(ti)
-    # A truncated list can only ever prove presence, and this is the one field
-    # that suppresses the half-operation warning when it comes back False.
-    earlier_executed = reading.find(
-        whole
-        if history_status in ("checked", "partial")
-        else reading.failed_read(whole.route, reading.attempt_error(whole) or history_status),
-        lambda r: r.get("try_number") != ti.get("try_number") and _carries_execution_fields(r),
-        f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
-    ).as_field()
+    earlier_executed = _earlier_attempt_executed(whole, ti)
 
     missing = [key for key in _DISPATCH_EVIDENCE_KEYS if key not in ti]
     present = [name for name in _EXECUTION_FIELDS if ti.get(name) not in (None, "")]
-    # ``False`` here is a positive claim that nothing outside Airflow can have
-    # been touched, and it SUPPRESSES the half-operation warning. It is only ever
-    # earned by a history that was read whole and holds no attempt with execution
-    # fields; a truncated history, an unread one, or one that does hold such an
-    # attempt leaves the question open, which is ``None``, not ``False``.
-    history_rules_out_partial = history_status == "checked" and earlier_executed is False
+    history_rules_out_partial = _history_rules_out_partial(whole, earlier_executed)
     partial_possible = _partial_effect_possible(ti, history_rules_out_partial)
     if _is_never_dispatched_attempt(ti):
         dispatched: bool | None = False
@@ -1179,13 +1205,20 @@ def _rule_target_attempt_not_moved(ctx: _GateContext) -> dict[str, Any] | None:
         or _FIELD_NOT_SENT in (planned_states.get(where), planned_attempts.get(where))
     )
     if unreadable:
-        return _expired_evidence(
+        # An UNREADABLE field is not a moved row, and this refusal used to say it
+        # was: routed through ``_expired_evidence`` it reported
+        # ``instances_that_moved``, told the user the approval "no longer
+        # describes what would be written", and asked them to name what changed
+        # — three claims over rows that had not moved and a precondition that
+        # had not been violated. Nothing moved; a read could not be shown
+        # complete, which is the other refusal entirely.
+        return _incomplete_read(
             ctx.dag_id,
             ctx.dag_run_id,
-            f"the clear preview did not report state or try_number for {unreadable}, so whether "
-            f"the attempt this approval was given for is still the attempt on the row is NOT "
-            f"established",
-            instances_that_moved=unreadable,
+            f"clear preview's state and try_number for {unreadable}",
+            _CLEAR_PREVIEW_ROUTE,
+            "the preview did not report state or try_number for those rows, so whether the attempt "
+            "this approval was given for is still the attempt on the row is NOT established",
         )
     if not moved:
         return None
@@ -1299,11 +1332,13 @@ def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any]
             # half-operation warning on the operator's card, and it was computed
             # at plan time and never recomputed — the gate held the fresh rows
             # one find() away and read only how many there were.
-            earlier_executed = reading.find(
-                history,
-                lambda row: row.get("try_number") != ti.get("try_number") and _carries_execution_fields(row),
-                f"no attempt of {_ti_where(ti)} other than the recorded one carries execution fields",
-            ).as_field()
+            #
+            # Asked through the plan card's own function, not a second find()
+            # beside it: ``complete`` is True for an EMPTY reading too, so
+            # asking the rows directly made a never-dispatched target's history
+            # answer ABSENT here and UNKNOWN on the plan — a disagreement inside
+            # the one decision this pair exists to have exactly once.
+            earlier_executed = _earlier_attempt_executed(history, ti)
             ctx.state["earlier_attempt_executed"] = earlier_executed
             # The SAME decision the plan card makes, taken through the same
             # function. Re-asking only "does an OTHER attempt carry execution
@@ -1323,7 +1358,9 @@ def _rule_target_attempt_history_read_whole(ctx: _GateContext) -> dict[str, Any]
                 None,
             )
             ctx.state["partial_effect_possible"] = (
-                None if live is None else _partial_effect_possible(live, earlier_executed is False)
+                None
+                if live is None
+                else _partial_effect_possible(live, _history_rules_out_partial(history, earlier_executed))
             )
             return None
         return _incomplete_read(
@@ -1945,7 +1982,13 @@ def _verify_instance(
     """
     where = _ti_where(ti)
     try_number = ti.get("try_number")
-    history = _attempt_reading(_attempt_history(dag_id, run_path, ti))
+    # The READ and the DISPLAY, kept apart. ``/tries`` is unpaginated, so the
+    # whole page is in hand and the ten-row clamp decides only how many attempts
+    # are listed back; handing the clamped reading to the duration baseline made
+    # that display bound a shortfall and left the leg permanently ``None`` for
+    # any task with more than ten recorded attempts.
+    whole_history = _attempt_history(dag_id, run_path, ti)
+    history = _attempt_reading(whole_history)
     history_status = reading.history_status(history)
     checks = []
 
@@ -2058,7 +2101,7 @@ def _verify_instance(
         )
     )
 
-    baseline, source, beyond_the_sample = _duration_baseline(dag_id, dag_run_id, ti, history)
+    baseline, source, beyond_the_sample = _duration_baseline(dag_id, dag_run_id, ti, whole_history)
     others = sorted(row["duration"] for row in baseline.rows)
     if not isinstance(duration, (int, float)):
         checks.append(_check("duration_in_line_with_history", None, "the row carries no duration to compare"))

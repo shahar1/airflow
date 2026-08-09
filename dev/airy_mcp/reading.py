@@ -1328,12 +1328,16 @@ def _duration_baseline(
     # A page that comes back UNDER the limit while the route accounts for more IS
     # a read that fell short, and that one still counts.
     #
-    # ``attempts`` is NOT the same case and is charged in full. ``/tries`` is
-    # unpaginated: it hands over every recorded attempt and this tool discards
-    # the oldest of them AFTER they arrive. That is a discard, not a sample
-    # size, and dropping it let a baseline drawn over the ten most recent
-    # attempts — all of them fast — vouch for a re-run that a whole history
-    # would have called far too fast to have done the work.
+    # ``attempts`` is NOT the same case and is charged in full: what it omits is
+    # what the ROUTE did not hand over, and a baseline drawn over attempts nobody
+    # read has a gap the reader has to be told about.
+    #
+    # The caller therefore passes the WHOLE /tries reading here, not the
+    # ten-row display clamp: the page was in hand, the clamp decides only how
+    # many attempts are SHOWN, and charging that display bound to this reading
+    # made the leg permanently unanswerable for any task with more than ten
+    # recorded attempts — the ordinary sensor with ``retries >= 10``, which is
+    # the case the write gate's own rule says must not be permanently refused.
     unread = attempts.omitted + (rest.omitted if rest.kept < RUN_HISTORY_LIMIT else 0)
     # Rows EXAMINED, not rows kept: ``usable()`` is this reading's own filter for
     # what may enter a baseline, and charging its discards to the shortfall
@@ -1341,7 +1345,7 @@ def _duration_baseline(
     examined = len(attempts.rows) + len(rest.rows)
     sampled = f"the most recent {RUN_HISTORY_LIMIT} run(s) of this task" if rest.omitted else "every run read"
     if attempts.omitted:
-        sampled += f", and {attempts.omitted} earlier recorded attempt(s) were not among the rows compared"
+        sampled += f", and {attempts.omitted} recorded attempt(s) of this instance were not read at all"
     return (
         matches_of(
             samples,

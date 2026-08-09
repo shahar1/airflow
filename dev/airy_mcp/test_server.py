@@ -129,6 +129,8 @@ class FakeAirflow:
         self.cancelled = False
         self.fail_cancel: Exception | None = None
         self.fail_trigger: Exception | None = None
+        self.fail_unpause: Exception | None = None
+        self.omit_failure_scan_total: bool = False
         self.assets: list[dict] = []
         self.bump_version_on_reparse = True
         self.fail_reparse: Exception | None = None
@@ -317,6 +319,8 @@ class FakeAirflow:
             return {"content": self.sources_by_version[version], "version_number": version}
         if path == f"/dags/{DAG_ID}":
             if method == "PATCH":
+                if self.fail_unpause:
+                    raise self.fail_unpause
                 self.is_paused = kwargs["json"]["is_paused"]
                 return {}
             return {
@@ -366,10 +370,14 @@ class FakeAirflow:
             tis = self.task_instances
             if wanted is not None:
                 tis = [ti for ti in tis if ti["dag_id"] in set(wanted)]
-            return {
-                "task_instances": tis[: (kwargs["json"]).get("page_limit", 100)],
-                "total_entries": len(tis),
-            }
+            # The count is OMITTABLE here, exactly as on every other list route.
+            # It was not, and the batch route is the only read whose whole
+            # product is a claim of ABSENCE ("no clusters means no FAILED task
+            # instance in the window") — so the one shape that would have caught
+            # a missing overflow sentinel, a full page beside no count at all,
+            # could not be constructed in this suite.
+            limit = (kwargs["json"]).get("page_limit", 100)
+            return _counted({"task_instances": tis[:limit]}, len(tis), self.omit_failure_scan_total)
         if path.endswith("/xcomEntries"):
             if self.fail_xcoms:
                 raise self.fail_xcoms
@@ -3268,6 +3276,27 @@ def test_find_failure_clusters_counts_the_failures_beyond_its_scan(airflow, monk
     assert result["failures_omitted"] == 3
 
 
+def test_a_full_failure_scan_with_no_count_is_not_a_whole_read(airflow, monkeypatch):
+    """The one read whose entire product is a claim of ABSENCE, and the only list
+    read in the tree with no overflow sentinel: ``page_limit`` went out on the
+    request and no ``limit`` reached the reading, so a page that came back FULL
+    beside no ``total_entries`` reported ``failures_read_whole: True`` and signed
+    "no clusters means no FAILED task instance in the window"."""
+    monkeypatch.setattr(reading, "FAILURE_SCAN_LIMIT", 2)
+    airflow.omit_failure_scan_total = True
+    airflow.task_instances = [
+        {"dag_id": DAG_ID, "task_id": f"t{i}", "dag_run_id": f"r{i}", "try_number": 1} for i in range(5)
+    ]
+    airflow.log = "ValueError: boom"
+
+    result = server.find_failure_clusters(hours=6, dag_ids=[DAG_ID])
+
+    assert result["failures_scanned"] == 2
+    assert result["failures_read_whole"] is False
+    assert result["failures_omitted"] >= 1
+    assert "No clusters means no FAILED task instance" not in result["scope"]
+
+
 def _approve(dag_id, from_date, to_date, plan=None):
     """plan_backfill, then run_backfill the way an honest caller would."""
     plan = plan if plan is not None else server.plan_backfill(dag_id, from_date, to_date)
@@ -3573,6 +3602,43 @@ def test_rerun_dag_unpauses_once_the_warning_was_delivered(airflow):
         "next_step": result["next_step"],
         "ui_updates": [{"kind": "dag_run", "dag_id": DAG_ID, "dag_run_id": "manual__new"}],
     }
+
+
+@pytest.mark.parametrize(
+    ("failure", "unpaused", "expected"),
+    [
+        (httpx.ConnectError("boom"), None, "NOT established"),
+        (
+            httpx.HTTPStatusError(
+                "denied", request=httpx.Request("PATCH", "/dags"), response=httpx.Response(403)
+            ),
+            False,
+            "Nothing was changed",
+        ),
+    ],
+    ids=["dropped-connection", "refused"],
+)
+def test_an_unpause_that_does_not_come_back_does_not_blame_the_user_for_the_spent_token(
+    airflow, failure, unpaused, expected
+):
+    """``_redeem_token`` burns the approval and the PATCH behind it was
+    unguarded, so a transient failure raised out of the tool with the token gone
+    and nothing reported — and the retry with that same token answered
+    "unpausing sales_summary needs the unpause_token from its paused-Dag
+    warning", which is the false user-error the guard beside both code-write
+    paths exists to prevent. This is the third write path, and it was missed."""
+    airflow.is_paused = True
+    token = server.rerun_dag(DAG_ID)["unpause_token"]
+    airflow.fail_unpause = failure
+
+    result = server.rerun_dag(DAG_ID, unpause=True, unpause_token=token)
+
+    assert result["triggered"] is False
+    assert result["unpaused"] is unpaused
+    assert expected in result["error"]
+    assert "already spent by this attempt" in result["error"]
+    assert "needs the unpause_token from its paused-Dag warning" not in result["error"]
+    assert ("POST", f"/dags/{DAG_ID}/dagRuns") not in airflow.calls
 
 
 def test_rerun_dag_leaves_an_active_dag_alone(airflow):
@@ -8497,11 +8563,18 @@ def test_a_whole_page_this_tool_clamped_is_reported_as_a_partial_read(recovered_
     assert "prior_attempt_preserved" in entry["unestablished_checks"]
 
 
-def test_the_attempts_the_baseline_discarded_are_charged_to_the_baseline(recovered_run):
-    """P2. ``/tries`` is unpaginated: it hands over every recorded attempt and
-    this tool keeps the newest ten. Those are DISCARDED rows, not a sample size,
-    and dropping them let a median over ten fast attempts vouch for a re-run
-    that the whole history calls far too fast to have done the work."""
+def test_the_attempts_beyond_the_display_clamp_still_reach_the_baseline(recovered_run):
+    """``/tries`` is unpaginated: it hands over every recorded attempt and this
+    tool SHOWS the newest ten. Drawing the baseline over only those ten let a
+    median of fast attempts vouch for a re-run the whole history calls far too
+    fast to have done the work.
+
+    The whole page reaches the baseline, so the leg is ANSWERED — and answered
+    against every attempt, which is what catches the too-fast re-run. Charging
+    the display clamp to the reading instead made the leg permanently ``None``
+    for any task with more than ten recorded attempts, an ordinary sensor with
+    ``retries >= 10`` among them; a permanent refusal is not a caution.
+    """
     slow = [
         {
             "try_number": n,
@@ -8527,8 +8600,27 @@ def test_the_attempts_the_baseline_discarded_are_charged_to_the_baseline(recover
         "duration_in_line_with_history",
     )
 
-    assert leg["passed"] is None
-    assert "NOT read whole" in leg["detail"]
+    # ``False``, not ``True`` and not ``None``: the 15 slow attempts the display
+    # clamp hides are in the baseline, so a 0.5s re-run is out of line with it.
+    assert leg["passed"] is False
+    assert "NOT read whole" not in leg["detail"]
+
+
+@pytest.mark.parametrize("recorded", [2, 11, 30], ids=["under-the-clamp", "over-it", "far-over-it"])
+def test_the_duration_leg_stays_answerable_however_many_attempts_were_recorded(recovered_run, recorded):
+    """The ten-row clamp on ``/tries`` decides how many attempts are SHOWN, and
+    it was being charged to the reading the duration baseline is drawn from — so
+    two recorded attempts answered the leg and eleven made it ``None``, for
+    good, over a page that was entirely in hand. ``/tries`` is unpaginated; an
+    ordinary sensor with ``retries >= 10`` is the case the write gate's own rule
+    says must not be permanently refused."""
+    recovered_run.tries_by_task[("summarize", -1)] = [
+        {**row, "hostname": "worker-1", "pid": 4110 + n} for n, row in enumerate(_attempts(recorded))
+    ]
+
+    entry = _verify(prior_attempts={"summarize": recorded - 1, "report": 1})["instances"][0]
+
+    assert _leg(entry, "duration_in_line_with_history")["passed"] is not None
 
 
 def test_a_source_truncated_tries_page_and_the_clamp_report_the_same_way(recovered_run):
@@ -8995,6 +9087,15 @@ def test_a_preview_that_reports_no_attempt_at_all_cannot_say_the_attempt_has_not
     assert result["cleared"] is False
     assert "did not report state or try_number" in result["error"]
     assert cleared_run.cleared == []
+    # Nothing MOVED — a read could not be shown complete. Routed through the
+    # staleness refusal, this said three things that were not true: that those
+    # instances had moved, that the approval no longer described what would be
+    # written, and that the user should name what changed.
+    assert "instances_that_moved" not in result
+    assert result.get("refused_precondition") == "target_attempt_not_moved"
+    assert "no longer describes what would be written" not in result["error"]
+    assert "name what changed" not in result["next_step"]
+    assert "name the read that could not be shown complete" in result["next_step"]
 
 
 def test_an_unreadable_attempt_history_refuses_the_write(cleared_run):
@@ -13734,6 +13835,25 @@ def _bare_target(fake):
                 "end_date": "2026-08-07T22:21:17.323403+00:00",
             }
     return fake
+
+
+def test_the_gate_does_not_rule_out_a_half_operation_over_an_empty_attempt_history(cleared_run):
+    """A complete read of ZERO attempts is complete, so ``find()`` over it
+    answered ABSENT — and the gate published that ``False`` as "nothing outside
+    Airflow can have been touched", tagged "re-read immediately before the
+    write", suppressing the warning. The plan, routing the same history through
+    ``failed_read``, answered ``None`` over the same payload and warned. Both
+    now ask the one function, and it answers the plan's answer.
+    """
+    _bare_target(cleared_run)
+    cleared_run.tries_by_task[("summarize", -1)] = []
+    plan = _gate_plan(cleared_run)
+    assert plan["recovery_evidence"]["partial_external_effect_possible"] is None
+
+    result = _gate_apply(plan)
+
+    assert result["cleared"] is True
+    assert result["partial_external_effect_possible"] is None
 
 
 def test_a_history_with_no_earlier_dispatched_attempt_still_settles_the_risk(cleared_run):
