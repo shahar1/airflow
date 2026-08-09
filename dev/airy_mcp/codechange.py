@@ -690,20 +690,140 @@ def _validate_conf(dag_id: str, conf: Any, params: dict[str, Any]) -> str | None
     return None
 
 
+# What the trigger's own approval rests on, and the only claim it may make when
+# one of these cannot be re-established: nothing was created. Both checks run
+# BEFORE any write goes out, so "not applied" here is a fact and not a guess.
+_TRIGGER_PRECONDITION_UNREAD = (
+    "so the facts this trigger rests on were not re-established. No run was created and nothing was changed."
+)
+
+# The non-claim that travels with every idempotent trigger. A caller that reads
+# "no duplicate" as "this work has not been done" will stop looking, so the
+# limit of what the key buys is said in the payload rather than only here.
+_IDENTITY_SCOPE = (
+    "This prevents a duplicate under this exact run identity only. It establishes nothing about "
+    "whether a semantically equivalent run exists under a different id, in this Dag or elsewhere."
+)
+
+
+def _version_precondition(dag_id: str, expected: int) -> dict[str, Any] | None:
+    """Refuse unless the Dag is still on the version this run was agreed against."""
+    try:
+        current = reading._latest_version(dag_id)
+    except _READ_FAILURES as e:
+        return {
+            "triggered": False,
+            "mutation_applied": False,
+            "dag_id": dag_id,
+            "error": (
+                f"no run was triggered: the Dag's version could not be read "
+                f"({_quoted(_explain_error(e), 240)}), {_TRIGGER_PRECONDITION_UNREAD}"
+            ),
+        }
+    if current != expected:
+        return {
+            "triggered": False,
+            "mutation_applied": False,
+            "dag_id": dag_id,
+            "expected_dag_version": expected,
+            "current_dag_version": current,
+            "error": (
+                f"no run was triggered: {dag_id} was on Dag version {expected} when this run was "
+                f"agreed and is on {current} now, so the code that would run is not the code that "
+                f"was approved. Nothing was created. Re-check the Dag and ask the user again."
+            ),
+        }
+    return None
+
+
+def _existing_run_with_this_identity(dag_id: str, run_id: str) -> dict[str, Any] | None:
+    """The run already carrying this identity, a refusal, or ``None`` to go ahead.
+
+    Three answers, never two. A run that is there is returned and nothing is
+    created. A 404 is a real absence and the trigger proceeds. Anything else —
+    a permission refusal, a timeout, a 5xx — leaves the absence UNESTABLISHED,
+    and creating a run on an unestablished absence is exactly the duplicate the
+    identity exists to prevent, so it refuses instead.
+    """
+    try:
+        run, error = reading._resolve_run(dag_id, run_id)
+    except Exception as e:
+        return {
+            "triggered": False,
+            "mutation_applied": False,
+            "dag_id": dag_id,
+            "dag_run_id": run_id,
+            "error": (
+                f"no run was triggered: whether {run_id!r} already exists could not be read "
+                f"({_quoted(_explain_error(e), 240)}), {_TRIGGER_PRECONDITION_UNREAD} Retry with "
+                f"this same run_id — that is what keeps the retry from creating a second run."
+            ),
+        }
+    if run is not None:
+        return {
+            "triggered": False,
+            # Nothing was written on this call: the run was already there.
+            "mutation_applied": False,
+            "already_existed": True,
+            "dag_id": dag_id,
+            "dag_run_id": run.get("dag_run_id", run_id),
+            "state": run.get("state"),
+            "idempotency": _IDENTITY_SCOPE,
+            "next_step": (
+                f"run {run.get('dag_run_id', run_id)!r} already exists in state "
+                f"{run.get('state')!r} and NO new run was created; check that run's outcome "
+                f"rather than triggering again"
+            ),
+        }
+    # ``_resolve_run`` turns a 404 into a sentence and a 403 into a different
+    # one. Only the 404 is an absence; the 403 says the run could not be read.
+    if error and "permission refusal" in error:
+        return {
+            "triggered": False,
+            "mutation_applied": False,
+            "dag_id": dag_id,
+            "dag_run_id": run_id,
+            "error": (
+                f"no run was triggered: {error}, {_TRIGGER_PRECONDITION_UNREAD} Whether "
+                f"{run_id!r} already exists is NOT established."
+            ),
+        }
+    return None
+
+
 def rerun_dag(
     dag_id: str,
     conf: dict[str, Any] | None = None,
     note: str = "",
     unpause: bool = False,
     unpause_token: str = "",
+    run_id: str = "",
+    expected_dag_version: int | None = None,
 ) -> dict[str, Any]:
     """
-    Trigger a fresh run of a Dag on the latest code.
+    Trigger a fresh run of a Dag on the latest code, once.
 
     ``conf`` sets the Dag's trigger parameters and is validated against the
     Dag's own params schema — unknown keys and wrong types are refused with the
     list of what the Dag accepts. Leave it out for a Dag without parameters.
     ``note`` is attached to the created run.
+
+    ``run_id`` is the exact identity to create the run under, chosen by YOU, and
+    it is what makes a retry safe: before triggering, this tool asks Airflow
+    whether a run with that identity already exists, and if one does it returns
+    that run and creates nothing. Pass the same ``run_id`` on every retry of the
+    same intended run. **Idempotency here prevents duplication under THIS
+    identity and nothing more** — it does not establish that no semantically
+    equivalent run exists under some other id, and no field in the result says
+    otherwise. Without ``run_id`` Airflow mints the identity and a second call
+    creates a second run.
+
+    ``expected_dag_version`` is the Dag version the run was agreed against. When
+    given, it is re-read immediately before the trigger and a Dag that has moved
+    since is refused rather than run.
+
+    Triggering is approved on its own. It redeems no plan token from a source
+    change, and an approved source change is not an approval to run.
 
     A paused Dag will not run until it is unpaused, and unpausing also resumes
     its *scheduled* runs — a lasting change beyond this one run. So it cannot be
@@ -725,6 +845,18 @@ def rerun_dag(
         error = _validate_conf(dag_id, conf, details.get("params") or {})
         if error:
             return {"triggered": False, "mutation_applied": False, "error": error}
+    # The trigger's OWN preconditions, re-established here and nowhere else.
+    # Before the pause branch for the same reason the conf check is: neither is
+    # a reason to have unpaused a Dag, and an unpause spent on a trigger this
+    # then refuses is a lasting change bought for nothing.
+    if expected_dag_version is not None:
+        drift = _version_precondition(dag_id, expected_dag_version)
+        if drift is not None:
+            return drift
+    if run_id:
+        existing = _existing_run_with_this_identity(dag_id, run_id)
+        if existing is not None:
+            return existing
     if dag["is_paused"]:
         if not unpause:
             return {
@@ -754,54 +886,112 @@ def rerun_dag(
         unpaused = True
     else:
         unpaused = False
+    body: dict[str, Any] = {
+        "logical_date": None,
+        "conf": conf or {},
+        "note": note or "Triggered via Airy",
+    }
+    if run_id:
+        # The identity goes out WITH the create, so Airflow's own uniqueness
+        # constraint is the last line: two racing calls carrying the same key
+        # cannot both land, whatever the pre-check saw.
+        body["dag_run_id"] = run_id
     try:
-        run = transport._api(
-            "POST",
-            _dag_url(dag_id, "/dagRuns"),
-            json={"logical_date": None, "conf": conf or {}, "note": note or "Triggered via Airy"},
-        )
+        run = transport._api("POST", _dag_url(dag_id, "/dagRuns"), json=body)
     except Exception as e:
-        # The unpause already committed. Reporting only the failure would leave
-        # the user thinking nothing happened, with the Dag now scheduling again.
-        return {
-            "triggered": False,
-            # ``unpaused`` is a WRITE that committed: the Dag is scheduling
-            # again, on its own schedule, whether or not this run exists.
-            # Reporting "nothing was applied" over it left the drawer red and
-            # the views unrefreshed while the scheduler queued runs — the same
-            # shape as the abandoned backfill, fixed there and left here.
-            "mutation_applied": unpaused,
-            "dag_id": dag_id,
-            "unpaused": unpaused,
-            "error": (
-                f"triggering the run failed: {_explain_error(e)}"
-                + (
-                    f". {dag_id} WAS unpaused first and is still unpaused, so it is scheduling "
-                    f"again — tell the user, and pause it again if that is not what they wanted."
-                    if unpaused
-                    else ""
-                )
-            ),
-            # The Dag's paused state changed even though no run was created, so
-            # the views the user is looking at are stale.
-            **({"ui_updates": [{"kind": "dag_definition", "dag_id": dag_id}]} if unpaused else {}),
-        }
+        return _trigger_did_not_come_back(dag_id, run_id, unpaused, e)
+    created_id = run["dag_run_id"]
     return {
         "triggered": True,
         "mutation_applied": True,
         "dag_id": dag_id,
-        "dag_run_id": run["dag_run_id"],
+        "dag_run_id": created_id,
         "state": run["state"],
         "unpaused": unpaused,
+        **({"idempotency": _IDENTITY_SCOPE} if run_id else {"idempotency": _NO_IDENTITY_SUPPLIED}),
         # A model that diagnoses right after triggering gets served the *old*
         # failed run by the fallback and reports "it failed again"; the result
         # itself has to say the outcome is not in yet.
         "next_step": (
-            f"created run {run['dag_run_id']} in state {run['state']} — its outcome is not known "
-            f"yet; check it after it completes (diagnose_dag with dag_run_id={run['dag_run_id']!r}) "
-            f"and never assume success or failure"
+            f"created run {created_id} in state {run['state']} — its outcome is not known "
+            f"yet; check it after it completes (verify_replacement_run, or diagnose_dag with "
+            f"dag_run_id={created_id!r}) and never assume success or failure"
         ),
-        "ui_updates": [{"kind": "dag_run", "dag_id": dag_id, "dag_run_id": run["dag_run_id"]}],
+        "ui_updates": [{"kind": "dag_run", "dag_id": dag_id, "dag_run_id": created_id}],
+    }
+
+
+_NO_IDENTITY_SUPPLIED = (
+    "No run_id was supplied, so Airflow minted this run's identity and nothing here is idempotent: "
+    "calling again with the same arguments creates a SECOND run."
+)
+
+
+def _trigger_did_not_come_back(dag_id: str, run_id: str, unpaused: bool, error: Exception) -> dict[str, Any]:
+    """The answer when the create did not come back — refused, or unsettled.
+
+    A 4xx is a refusal the route CHOSE, so nothing was created and the result
+    says so. Anything else — a timeout, a connect failure, a 5xx — can be raised
+    after the request has already reached Airflow, so whether a run exists is
+    genuinely UNKNOWN. Reporting that as "not triggered" was a false negative
+    that sent the operator to trigger a second time.
+    """
+    refused = isinstance(error, httpx.HTTPStatusError) and 400 <= error.response.status_code < 500
+    conflict = isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409
+    # The unpause already committed if it happened, and it is a lasting change
+    # whatever became of the run.
+    aftermath = (
+        f" {dag_id} WAS unpaused first and is still unpaused, so it is scheduling again — tell "
+        f"the user, and pause it again if that is not what they wanted."
+        if unpaused
+        else ""
+    )
+    stale = {"ui_updates": [{"kind": "dag_definition", "dag_id": dag_id}]} if unpaused else {}
+    if refused:
+        taken = (
+            f" Airflow refused the identity {run_id!r} as already taken, so a run under it exists "
+            f"and this call created nothing further."
+            if conflict and run_id
+            else ""
+        )
+        return {
+            "triggered": False,
+            # The create was refused, so the only thing that may have been
+            # written is the unpause.
+            "mutation_applied": unpaused,
+            "dag_id": dag_id,
+            "unpaused": unpaused,
+            **({"already_existed": True} if conflict and run_id else {}),
+            "error": (
+                f"NO run was created: Airflow refused the trigger "
+                f"({_quoted(_explain_error(error), 240)}).{taken}{aftermath}"
+            ),
+            **stale,
+        }
+    # ``mutation_applied`` is deliberately absent unless the unpause landed: the
+    # create may have landed too, and false would be a claim this cannot make.
+    return {
+        "triggered": None,
+        "mutation_outcome": "unknown",
+        "dag_id": dag_id,
+        "unpaused": unpaused,
+        **({"dag_run_id": run_id} if run_id else {}),
+        **({"mutation_applied": True} if unpaused else {}),
+        "error": (
+            f"whether a run was created is NOT established: the trigger did not come back "
+            f"({_quoted(_explain_error(error), 240)}), and a request can fail after Airflow has "
+            f"already accepted it. Do NOT report this as triggered and do NOT report it as not "
+            f"triggered."
+            + (
+                f" Retry with run_id={run_id!r} — the same identity — which will find the run if "
+                f"it landed instead of creating a second one."
+                if run_id
+                else " No run_id was supplied, so a retry would create a second run if the first "
+                "one landed; check the Dag's runs by hand before triggering again."
+            )
+            + aftermath
+        ),
+        **stale,
     }
 
 

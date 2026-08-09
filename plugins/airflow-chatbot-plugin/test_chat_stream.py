@@ -688,6 +688,18 @@ def test_write_prompt_says_the_clear_and_the_backfill_are_gone_rather_than_descr
         assert withdrawn not in normalized, f"the prompt still offers {withdrawn}"
 
 
+def test_write_prompt_tells_the_model_to_name_the_run_and_reuse_the_name():
+    """The idempotency key is worth nothing if the model invents a new one on retry."""
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "Pass a `run_id` you choose" in normalized
+    assert "repeat it **verbatim** on any retry" in normalized
+    assert "`expected_dag_version`" in normalized
+    assert "do not report the run as created, do not report it as not created" in normalized
+    # The non-claim has to survive the relay.
+    assert "says nothing about any other run" in normalized
+
+
 def test_write_prompt_keeps_the_source_write_and_the_run_apart():
     """Two approvals, never one: an approved patch is not permission to run."""
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())

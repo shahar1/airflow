@@ -368,7 +368,23 @@ class FakeAirflow:
             if method == "POST":
                 if self.fail_trigger:
                     raise self.fail_trigger
-                return {"dag_run_id": "manual__new", "state": "queued"}
+                wanted = (kwargs.get("json") or {}).get("dag_run_id")
+                if not wanted:
+                    return {"dag_run_id": "manual__new", "state": "queued"}
+                # Airflow's own uniqueness constraint on the run id, which is
+                # what makes a client-supplied identity worth anything: two
+                # calls carrying the same one cannot both create a run.
+                if wanted in self.runs_by_id:
+                    raise httpx.HTTPStatusError(
+                        f"error for url 'http://internal-api:8080/api/v2{path}'",
+                        request=httpx.Request("POST", path),
+                        response=httpx.Response(
+                            409, json={"detail": f"DAGRun with run_id: {wanted} already exists"}
+                        ),
+                    )
+                created = {"dag_run_id": wanted, "state": "queued"}
+                self.runs_by_id[wanted] = created
+                return created
             total = len(self.runs) if self.runs_total is None else self.runs_total
             page = _paged(self.runs, kwargs.get("params"))
             return _counted({"dag_runs": page}, total, self.omit_dag_runs_total)
@@ -3315,14 +3331,22 @@ def test_source_tools_accept_the_bytes_they_were_authorized_for(airflow):
 
 
 def test_rerun_dag_says_the_dag_is_still_unpaused_when_the_trigger_fails(airflow):
-    """The unpause committed first; reporting only the failure would hide it."""
+    """The unpause committed first; reporting only the failure would hide it.
+
+    ``triggered`` is None rather than False here: a dropped connection can be
+    raised after Airflow has already accepted the create, so False would be a
+    claim this call cannot make. What the test is for — that the unpause is
+    reported as the landed write it is — is unchanged, and every assertion below
+    still fails if that report goes away.
+    """
     airflow.is_paused = True
     token = server.rerun_dag(DAG_ID)["unpause_token"]
     airflow.fail_trigger = httpx.ConnectError("boom")
 
     result = server.rerun_dag(DAG_ID, unpause=True, unpause_token=token)
 
-    assert result["triggered"] is False
+    assert result["triggered"] is None
+    assert result["mutation_outcome"] == "unknown"
     assert result["unpaused"] is True
     assert "is still unpaused" in result["error"]
     # R7. The unpause COMMITTED. Reporting "nothing was applied" over it left
@@ -3332,15 +3356,43 @@ def test_rerun_dag_says_the_dag_is_still_unpaused_when_the_trigger_fails(airflow
     assert result["ui_updates"] == [{"kind": "dag_definition", "dag_id": DAG_ID}]
 
 
-def test_rerun_dag_applies_nothing_when_the_trigger_fails_and_nothing_was_unpaused(airflow):
-    """The other direction: no unpause, no write, and the flag says so."""
-    airflow.fail_trigger = httpx.ConnectError("boom")
+def test_rerun_dag_applies_nothing_when_the_trigger_is_refused_and_nothing_was_unpaused(airflow):
+    """The other direction: no unpause, no write, and the flag says so.
+
+    Driven by a 4xx now. A refusal is a decision the route took, so nothing was
+    created and ``mutation_applied: False`` is a fact; the dropped connection
+    this used to use cannot support that claim and is covered by the test below.
+    """
+    airflow.fail_trigger = httpx.HTTPStatusError(
+        "denied", request=httpx.Request("POST", "/dagRuns"), response=httpx.Response(403)
+    )
 
     result = server.rerun_dag(DAG_ID)
 
     assert result["triggered"] is False
     assert result["unpaused"] is False
     assert result["mutation_applied"] is False
+    assert "NO run was created" in result["error"]
+    assert "ui_updates" not in result
+
+
+def test_rerun_dag_will_not_call_an_unsettled_trigger_a_failure(airflow):
+    """A create that did not come back is UNKNOWN, and never a false negative.
+
+    Reporting ``triggered: False`` over a dropped connection sent the operator
+    to trigger a second time, which is the duplicate the identity exists to
+    prevent. ``mutation_applied`` is absent, not false: the request may have
+    landed.
+    """
+    airflow.fail_trigger = httpx.ConnectError("boom")
+
+    result = server.rerun_dag(DAG_ID)
+
+    assert result["triggered"] is None
+    assert result["mutation_outcome"] == "unknown"
+    assert "mutation_applied" not in result
+    assert "NOT established" in result["error"]
+    assert "do NOT report it as not triggered" in result["error"]
     assert "ui_updates" not in result
 
 
@@ -3355,8 +3407,156 @@ def test_rerun_dag_relays_the_api_detail_when_the_trigger_is_refused(airflow):
     result = server.rerun_dag(DAG_ID)
 
     assert result["triggered"] is False
-    assert "triggering the run failed: a run with this logical date already exists" in result["error"]
+    assert "Airflow refused the trigger" in result["error"]
+    assert "a run with this logical date already exists" in result["error"]
     assert "internal-api" not in result["error"]
+
+
+def _triggers(airflow):
+    """Every create that reached the transport, counted at the transport."""
+    return [call for call in airflow.calls if call == ("POST", f"/dags/{DAG_ID}/dagRuns")]
+
+
+REPLACEMENT = "airy__replacement__1"
+
+
+def test_a_run_id_makes_the_created_run_carry_the_identity_that_was_chosen(airflow):
+    """The identity is the caller's, not Airflow's — that is what a retry matches on."""
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert result["triggered"] is True
+    assert result["dag_run_id"] == REPLACEMENT
+    assert len(_triggers(airflow)) == 1
+    assert airflow.payloads[-1]["dag_run_id"] == REPLACEMENT
+
+
+def test_the_same_run_id_twice_finds_the_first_run_and_creates_nothing(airflow):
+    """The whole point of the key. Measured at the transport: exactly one create."""
+    first = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    second = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert first["triggered"] is True
+    assert second["triggered"] is False
+    assert second["already_existed"] is True
+    assert second["mutation_applied"] is False
+    assert second["dag_run_id"] == REPLACEMENT
+    assert len(_triggers(airflow)) == 1
+
+
+def test_the_idempotency_claim_is_bounded_to_the_identity_it_was_given(airflow):
+    """A caller that reads "no duplicate" as "this work is not running anywhere"
+    stops looking, so the payload says what the key does NOT establish."""
+    server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert "under this exact run identity only" in result["idempotency"]
+    assert "semantically equivalent run exists under a different id" in result["idempotency"]
+
+
+def test_a_run_that_already_exists_is_reported_rather_than_re_created(airflow):
+    """Not only a run this server made: any run already carrying the identity."""
+    airflow.runs_by_id[REPLACEMENT] = {"dag_run_id": REPLACEMENT, "state": "running"}
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert result["triggered"] is False
+    assert result["already_existed"] is True
+    assert result["state"] == "running"
+    assert _triggers(airflow) == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("boom"),
+        httpx.HTTPStatusError(
+            "denied", request=httpx.Request("GET", "/dagRuns"), response=httpx.Response(403)
+        ),
+        httpx.HTTPStatusError("boom", request=httpx.Request("GET", "/dagRuns"), response=httpx.Response(500)),
+    ],
+    ids=["dropped-connection", "forbidden", "server-error"],
+)
+def test_an_unestablished_absence_never_authorizes_a_create(airflow, monkeypatch, failure):
+    """The pre-check has three answers, and only one of them is "go ahead".
+
+    Treating an unreadable lookup as an absence is exactly the duplicate the
+    identity exists to prevent: the run may be sitting there.
+    """
+
+    def _refuse(dag_id, run_id):
+        raise failure
+
+    monkeypatch.setattr(reading, "_resolve_run", _refuse)
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    assert result["triggered"] is False
+    assert result["mutation_applied"] is False
+    assert _triggers(airflow) == []
+
+
+def test_a_dag_version_that_moved_since_the_run_was_agreed_refuses_the_trigger(airflow):
+    """The trigger's own precondition, re-established immediately before it acts:
+    the code that would run has to be the code that was approved."""
+    airflow.version = 5
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, expected_dag_version=4)
+
+    assert result["triggered"] is False
+    assert result["mutation_applied"] is False
+    assert result["current_dag_version"] == 5
+    assert "is on 5 now" in result["error"]
+    assert _triggers(airflow) == []
+
+
+def test_a_pinned_version_that_still_matches_lets_the_trigger_through(airflow):
+    airflow.version = 4
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, expected_dag_version=4)
+
+    assert result["triggered"] is True
+    assert len(_triggers(airflow)) == 1
+
+
+def test_a_version_pin_that_cannot_be_read_refuses_rather_than_riding_through(airflow):
+    airflow.fail_versions = httpx.ConnectError("boom")
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, expected_dag_version=4)
+
+    assert result["triggered"] is False
+    assert result["mutation_applied"] is False
+    assert "not re-established" in result["error"]
+    assert _triggers(airflow) == []
+
+
+def test_a_refused_trigger_never_burns_the_unpause_it_would_have_needed(airflow):
+    """Order matters: the trigger's own preconditions are checked before the
+    unpause, so a Dag whose version moved is not left scheduling again for a run
+    that was then refused."""
+    airflow.is_paused = True
+    airflow.version = 5
+    token = server.rerun_dag(DAG_ID)["unpause_token"]
+
+    result = server.rerun_dag(
+        DAG_ID, unpause=True, unpause_token=token, run_id=REPLACEMENT, expected_dag_version=4
+    )
+
+    assert result["triggered"] is False
+    assert ("PATCH", f"/dags/{DAG_ID}") not in airflow.calls
+    assert _triggers(airflow) == []
+
+
+def test_an_approved_source_change_cannot_authorize_a_trigger(airflow):
+    """Separate authorities, enforced by the token store's own namespacing:
+    the plan token a source change issues is of a different kind, and there is
+    no argument on this tool that would accept one."""
+    plan = server.plan_dag_code_changes(DAG_ID, [{"old": "typo", "new": "mistake"}])
+
+    assert server._peek_token("dag_code", plan["plan_token"]) is not None
+    assert server._peek_token("unpause", plan["plan_token"]) is None
+    assert "plan_token" not in inspect.signature(server.rerun_dag).parameters
 
 
 def seed_two_runs(airflow):
@@ -3993,9 +4193,13 @@ def test_rerun_dag_unpauses_once_the_warning_was_delivered(airflow):
         "dag_run_id": "manual__new",
         "state": "queued",
         "unpaused": True,
+        # No run_id was passed, so the result says outright that nothing about
+        # this call is idempotent rather than leaving the reader to assume.
+        "idempotency": result["idempotency"],
         "next_step": result["next_step"],
         "ui_updates": [{"kind": "dag_run", "dag_id": DAG_ID, "dag_run_id": "manual__new"}],
     }
+    assert "calling again with the same arguments creates a SECOND run" in result["idempotency"]
 
 
 @pytest.mark.parametrize(

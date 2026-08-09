@@ -343,13 +343,21 @@ source.  Propose them one at a time and let the user answer each.
    Grid controls — never describe a clear or a backfill as something you are
    about to do, and never substitute `rerun_dag` for one: it creates a *new*
    Dag run and is not an implementation of clearing.
-3. **A replacement run is a separate decision.**  After a fix the user approved,
-   offer to trigger a replacement run — do not trigger on your own.  An approved
-   patch is never permission to run anything.  `conf` is validated against the
-   Dag's `params` schema: turn what the user asked for into typed conf keys, and
-   pass no conf at all for a Dag without params.  A refusal lists the valid
-   params with their types and defaults — relay that list instead of guessing
-   again.
+3. **A replacement run is a separate decision, triggered once, by name.**  After
+   a fix the user approved, offer to trigger a replacement run — do not trigger
+   on your own.  An approved patch is never permission to run anything.  Pass a
+   `run_id` you choose, and repeat it **verbatim** on any retry: that is what
+   makes a retry find the run it already created instead of creating a second
+   one.  Pass `expected_dag_version` — the version the fix produced — so a Dag
+   that moved since the user agreed is refused rather than run.  `conf` is
+   validated against the Dag's `params` schema: turn what the user asked for
+   into typed conf keys, and pass no conf at all for a Dag without params.  A
+   refusal lists the valid params with their types and defaults — relay that
+   list instead of guessing again.  When the result says the outcome is
+   `unknown`, say exactly that: do not report the run as created, do not report
+   it as not created, and retry with the same `run_id`.  Relay the
+   `idempotency` sentence rather than improving on it — the key prevents a
+   duplicate under **that identity** and says nothing about any other run.
 4. **Reverting is planned too.**  `plan_revert_dag_code` returns the diff
    between the backup and the current file plus a `plan_token`;
    `revert_dag_code` refuses without that token and the same `diff` repeated.
@@ -850,9 +858,13 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
         # rows the answer is derived from are checked separately.
         "get_blast_radius": (("GET", Entity.DEPENDENCIES),),
         "revert_dag_code": patch_source,
-        # Reads the Dag to see whether it is paused, then creates a run.
-        # Unpausing is a separate, lasting edit — only demanded when actually asked for.
+        # Reads the Dag to see whether it is paused, then creates a run. Two
+        # further permissions are demanded only when the call actually asks for
+        # what they cover: a run identity means reading the run that may already
+        # carry it, and unpausing is a separate, lasting edit.
         "rerun_dag": (read_dag, ("POST", Entity.RUN))
+        + ((("GET", Entity.RUN),) if tool_args.get("run_id") else ())
+        + ((("GET", Entity.VERSION),) if tool_args.get("expected_dag_version") is not None else ())
         + ((("PUT", None),) if tool_args.get("unpause") else ()),
     }
     return requirements[tool_name]
