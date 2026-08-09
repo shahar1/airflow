@@ -15,15 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Airy self-healing MCP server (demo).
+Airy approval-gated Dag repair MCP server (demo).
 
 Write-capable tools on top of the Airflow REST API, scoped to ONE workflow:
 ``diagnose_dag`` finds what is wrong with a named run,
 ``plan_dag_code_changes``/``apply_dag_code_changes`` repair that Dag's source as
-one atomic change, ``plan_revert_dag_code``/``revert_dag_code`` put it back, and
-``rerun_dag`` triggers a specifically identified replacement run whose external
-result ``verify_replacement_run`` then reads back.  Deliberately goes beyond
-AIP-91 phase 1 (read-only) to show where the value ends up.
+one atomic change, ``plan_revert_dag_code``/``revert_dag_code`` put it back,
+``rerun_dag`` triggers a specifically identified replacement run, and
+``verify_replacement_run`` reads back what that run recorded.  Deliberately
+goes beyond AIP-91 phase 1 (read-only) to show where the value ends up.
 
 What this server is certified to do is exactly that workflow and nothing wider:
 diagnose a green run whose expected work never executed, propose an exact source
@@ -31,9 +31,13 @@ correction, obtain explicit human approval, apply it safely, trigger a
 specifically identified replacement run, and check what that run actually
 recorded.  Nothing here observes the external system: ``occurred: true`` is the
 presence of an output record in Airflow, and ``external_system_checked`` is
-always false, so the claim stops at the record.  Broad automatic discovery and
-clearing of arbitrary historical task instances is OUT OF SCOPE and
-uncertified; the tools that did it
+always false, so the claim stops at the record.  AUTHORSHIP of the correction is
+not part of the claim either: in every measured rehearsal the ``old``/``new``
+strings were supplied by the operator, so what is certified is what this server
+does with a patch it is handed - checks it against the real bytes, shows the
+diff, applies it atomically, and puts it back if the file stops importing.
+Broad automatic discovery and clearing of arbitrary historical task instances is
+OUT OF SCOPE and uncertified; the tools that did it
 (``plan_task_instance_clear``, ``apply_task_instance_clear``,
 ``verify_task_instance_recovery``, ``plan_backfill``, ``run_backfill``) are
 WITHDRAWN from the registered surface below and are not reachable from the demo.
