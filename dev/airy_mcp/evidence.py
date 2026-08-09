@@ -1023,16 +1023,20 @@ def _event_history(dag_id: str, run_id: str, audit_scope: str) -> dict[str, Any]
                 },
             )
             page = resp["event_logs"]
-            claimed = resp.get("total_entries")
             fetched += page
             pages += 1
-            if isinstance(claimed, int) and not isinstance(claimed, bool):
-                total = claimed
+            # A route that omits its count does not get to end the scan and
+            # certify it whole, and neither does one that CONTRADICTS the rows
+            # it just sent: a ``total_entries`` of 3 behind twelve rows stopped
+            # this loop two pages in and reported the run read whole, which
+            # turned a run-scoped row on a later page into "this run has none".
+            # ``_accountable_total`` refuses both counts; a FULL page is then
+            # the evidence of at least one more row. Same sentinel as the
+            # run-instance scan and the backfill run list, for the same reason.
+            accountable = reading._accountable_total(resp.get("total_entries"), len(fetched), None)
+            if accountable is not None:
+                total = accountable
             else:
-                # A route that omits its count does not get to end the scan and
-                # certify it whole; a FULL page is evidence of at least one more
-                # row. Same sentinel as the run-instance scan and the backfill
-                # run list, for the same reason.
                 total = len(fetched) + (1 if len(page) >= reading.EVENT_SCAN_PAGE else 0)
             # An empty page ends it whatever the count says.
             if not page:

@@ -344,19 +344,27 @@ def _accountable_total(claimed: Any, delivered: int, limit: int | None) -> int |
     """What a route's own count is worth to a completeness question.
 
     THE one place a ``total_entries`` is turned into a number a reading may
-    reason with, because there are three ways it fails to be one and each was
+    reason with, because there are four ways it fails to be one and each was
     handled at a different call site — or, in ``matches_of``, at none:
 
     * a count in a form this reading cannot use (``"12"``) is not a count, and
       dropping it to "no count at all" made an unreadable total
       indistinguishable from an exhaustive read;
+    * a count LOWER than what the route has already handed over is not a count
+      either. It is contradicted by the rows in hand, so it accounts for
+      nothing — and a paging loop that took it at face value stopped on it and
+      certified a scan that had read four rows of twelve. What the route says
+      about its rows is refused; what the PAGE says about them still holds, so
+      the two clauses below decide, exactly as they do for a route that sent no
+      count at all;
     * no count at all beside a page that came back FULL at the limit this read
       asked for is evidence of at least one more row;
     * no count at all beside a short page is a page that ended naturally.
     """
     if isinstance(claimed, int) and not isinstance(claimed, bool):
-        return claimed
-    if claimed is not None:
+        if claimed >= delivered:
+            return claimed
+    elif claimed is not None:
         return delivered + 1
     if limit is not None and delivered >= limit:
         return delivered + 1

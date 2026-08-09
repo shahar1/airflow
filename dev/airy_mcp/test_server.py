@@ -7442,8 +7442,12 @@ def test_only_a_whole_event_scan_answers_whether_this_run_has_a_run_scoped_event
     universe — which a route accounting for more, and a row this reading
     discarded, both take away. A count of what was left out is the same claim in
     arithmetic, so it is a number only where the verdict is one. A source that
-    accounts for FEWER rows than it sent has truncated nothing, so it unsettles
-    neither.
+    accounts for FEWER rows than it sent settles nothing either way: the count is
+    refused, and this scan is whole because its PAGE came back short — the same
+    evidence a route that sent no count at all is read by. Put the same count
+    behind a full page and the answer goes away, which is what
+    ``test_a_count_lower_than_the_rows_it_came_with_stops_no_scan_and_certifies_none``
+    and its ceiling companion measure.
     """
     airflow.event_logs_total = claimed
 
@@ -7478,6 +7482,47 @@ def test_a_scan_that_stopped_at_its_own_ceiling_claims_no_run_scoped_absence(air
     assert capped["run_scoped_events"] == []
     assert capped["any_run_scoped_event"] is None
     assert capped["run_scoped_events_omitted"] is None
+
+
+def test_a_count_lower_than_the_rows_it_came_with_stops_no_scan_and_certifies_none(airflow, monkeypatch):
+    """The same twelve rows behind a ``total_entries`` of three.
+
+    The route contradicts itself, and the loop believed the count over the rows
+    in its own hand: it stopped after two pages and called the scan whole, so
+    the run-scoped row on page six became "this run has none" — the hard
+    negative, manufactured by a number the route cannot have meant. A count
+    below what has already been handed over accounts for nothing, so the page
+    shape bounds the scan instead, and the scan reads the run out.
+    """
+    rows = [{**_TASK_SCOPED_ROW, "event_log_id": index} for index in range(11)] + [_RUN_SCOPED_ROW]
+    airflow.event_logs_total = 3
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 2)
+
+    history = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+
+    assert (history["status"], history["events_scanned"], history["events_omitted"]) == ("checked", 12, 0)
+    assert history["any_run_scoped_event"] is True
+    assert history["run_scoped_events_omitted"] == 0
+
+
+def test_a_refused_count_still_leaves_the_ceiling_to_take_the_answer_away(airflow, monkeypatch):
+    """Refusing the count is not the same as certifying the scan without one.
+
+    The scan below stops where it was told to stop, four rows into twelve, and
+    the run-scoped row is on a page it never asked for. Nothing it read may
+    become an absence.
+    """
+    rows = [{**_TASK_SCOPED_ROW, "event_log_id": index} for index in range(11)] + [_RUN_SCOPED_ROW]
+    airflow.event_logs_total = 1
+    monkeypatch.setattr(reading, "EVENT_SCAN_PAGE", 2)
+    monkeypatch.setattr(reading, "EVENT_SCAN_LIMIT", 4)
+
+    history = _audited_run(airflow, EXECUTED_TI, events=rows)["event_history"]
+
+    assert (history["status"], history["events_scanned"]) == ("partial", 4)
+    assert history["run_scoped_events"] == []
+    assert history["any_run_scoped_event"] is None
+    assert history["run_scoped_events_omitted"] is None
 
 
 @pytest.mark.parametrize(
