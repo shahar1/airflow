@@ -700,6 +700,17 @@ def test_write_prompt_tells_the_model_to_name_the_run_and_reuse_the_name():
     assert "says nothing about any other run" in normalized
 
 
+def test_write_prompt_makes_the_triggered_run_the_middle_of_the_repair_not_the_end():
+    """A created run is not a repaired one, and null is not "it did not happen"."""
+    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
+
+    assert "`verify_replacement_run`" in normalized
+    assert "establishes nothing about whether the work happened" in normalized
+    assert "`null` means UNKNOWN" in normalized
+    assert 'Never relay `null` as "it did not happen"' in normalized
+    assert "not a look at the system the task talks to" in normalized
+
+
 def test_write_prompt_keeps_the_source_write_and_the_run_apart():
     """Two approvals, never one: an approved patch is not permission to run."""
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
@@ -1407,19 +1418,60 @@ def test_the_audit_log_permission_is_optional_and_never_gates_the_tool(auth_mana
     """
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
 
-    # ``verify_task_instance_recovery`` was the second widened tool; it is
-    # withdrawn, so diagnose_dag is the whole of the widened surface.
+    # ``verify_task_instance_recovery`` was the second audit-widened tool; it is
+    # withdrawn, so diagnose_dag is the whole of THAT surface.
     widened = ("diagnose_dag",)
     for name in widened:
         optional = plugin._tool_optional_access_requirements(name)
         assert optional["audit_scope"] == (("GET", Entity.AUDIT_LOG),)
         assert ("GET", Entity.AUDIT_LOG) not in plugin._tool_access_requirements(name, {})
-    # Every other tool asks for nothing optional, so nothing else is widened.
+    # Every other tool asks for nothing optional, so nothing else is widened —
+    # except the replacement-run check, which is widened by XCom on the same
+    # rule and is asserted on its own below.
     assert all(
         plugin._tool_optional_access_requirements(name) == {}
         for name in plugin.TOOL_POLICY
-        if name not in widened
+        if name not in (*widened, "verify_replacement_run")
     )
+
+
+def test_the_xcom_permission_widens_the_replacement_run_check_rather_than_gating_it(auth_manager):
+    """
+    The safety net must not come off while the write stays on.
+
+    XCom does not gate triggering, so demanding it for the check would let a role
+    hold everything except XCom, trigger the replacement run, and then be refused
+    the only read that says whether the work happened.
+    """
+    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
+
+    optional = plugin._tool_optional_access_requirements("verify_replacement_run")
+    mandatory = plugin._tool_access_requirements("verify_replacement_run", {})
+
+    assert optional["xcom_scope"] == (("GET", Entity.XCOM),)
+    assert ("GET", Entity.XCOM) not in mandatory
+
+    _grant(auth_manager, [("GET", "RUN"), ("GET", "TASK_INSTANCE")])
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "verify_replacement_run", args) is None
+    assert args["xcom_scope"] == "denied"
+
+
+def test_verifying_a_replacement_run_changes_nothing_and_is_never_gated_behind_a_confirmation(
+    auth_manager,
+):
+    """A check the user has to approve is a check that does not happen."""
+    assert "verify_replacement_run" not in plugin.WRITE_TOOLS
+    assert not any(
+        method in ("PUT", "POST")
+        for method, _ in plugin._tool_access_requirements("verify_replacement_run", {})
+    )
+    _grant(auth_manager, [("GET", "RUN"), ("GET", "TASK_INSTANCE"), ("GET", "XCOM")])
+    args = {"dag_id": "sales_summary"}
+
+    assert plugin._authorize_tool_call(FakeUser(), "verify_replacement_run", args) is None
+    assert args["xcom_scope"] == "granted"
 
 
 def test_the_audit_scope_must_clear_every_dag_in_a_shared_source_file(monkeypatch, auth_manager):

@@ -15,22 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Changes that are not a clear.
+Changes that are not a clear, and the check on the run one of them starts.
 
-The seven tools that repair a Dag's source, revert it, start a fresh run, or
-create a backfill - together with the conf validation that stands in front of a
-trigger.  Five of them write; every one of the five is reached only through a
-plan that was shown to the user first, and refuses without the single-use token
-that plan handed back.
+The tools that repair a Dag's source, revert it, start a fresh run, or create a
+backfill - together with the conf validation that stands in front of a trigger
+and the read that says whether the run it started did the work.
 
 ``plan_dag_code_changes``/``apply_dag_code_changes`` are one atomic set of edits
 against the exact bytes the plan was made from.  ``plan_revert_dag_code``/
 ``revert_dag_code`` restore the original Airy backed up, discarding every change
-Airy applied.  ``rerun_dag`` starts a fresh run on the latest code, validating
-``conf`` against the Dag's own params schema and refusing to unpause without a
-second, separately-warned token.  ``plan_backfill``/``run_backfill`` create a
-range of runs, re-checking at execution time that the range is still the one the
-user approved and cancelling what landed if it is not.
+Airy applied.  ``rerun_dag`` starts a fresh run on the latest code under an
+identity the caller chooses, validating ``conf`` against the Dag's own params
+schema and refusing to unpause without a second, separately-warned token.
+``verify_replacement_run`` reads back, for THAT run and no other, whether the
+task whose work was missing recorded its output; it writes nothing.
+``plan_backfill``/``run_backfill`` create a range of runs - both WITHDRAWN from
+the registered surface, kept here as the record of what was built.
+
+The two mutations a user asks for are approved separately and neither approval
+reaches the other: a source write redeems a token of its own kind, and the
+trigger redeems none at all and re-establishes its own preconditions instead.
 
 Wave 8 of the move-only extraction in ``docs/extraction-plan.md``.
 
@@ -56,6 +60,7 @@ from __future__ import annotations
 import difflib
 from hashlib import md5
 from typing import Any
+from urllib.parse import quote
 
 # ``_read_reviewed_file`` and ``MAX_BACKFILL_RUNS`` are rebound by the suite, so the
 # sites that use them go through the module object and are never imported by name;
@@ -88,7 +93,7 @@ from dagsource import (
     _patch,
     _write_if_unchanged,
 )
-from primitives import _quoted
+from primitives import _quoted, _ti_key
 from reading import (
     _backfill_runs,
     _build_asset_note,
@@ -1261,3 +1266,236 @@ def _abandon_backfill(
     if unread:
         result["surviving_runs_unread"] = unread
     return result
+
+
+# The states a run can still leave. An absence read while any of these is the
+# run's state is an absence in a run that has not finished producing evidence,
+# which is not an absence at all.
+_RUN_STILL_GOING = ("queued", "running", "restarting", "scheduled", None)
+
+# What a positive answer here IS, said in the payload because that is where a
+# small model meets it. The XCom record is the task's own report of its work -
+# the closest thing to the external artefact that stays inside the API this
+# server speaks - and it is not an observation of the external system.
+_VERIFY_SCOPE = (
+    "`occurred: true` means this run's own record shows the task executed and recorded the "
+    "expected output. Nothing here observed the external system directly. `occurred: null` means "
+    "UNKNOWN - the run is unfinished, a read did not come back, or the evidence covered less than "
+    'the answer needs - and is NEVER to be relayed as "it did not happen".'
+)
+
+
+def _verification(
+    occurred: bool | None,
+    reason: str,
+    *readings: reading.Reading,
+    **fields: Any,
+) -> dict[str, Any]:
+    """One shape for every answer, so the caveats cannot be dropped by a branch.
+
+    Every reading this answer rests on is passed in, and each one that came back
+    short says so in its own words. A tool that answers over a list it did not
+    read whole has to put that in the payload, not only in the verdict.
+    """
+    # Always present, empty when nothing was short. A key that only appears
+    # under truncation is a claim that arrives with the shortfall, and the
+    # reader has no way to tell its absence from a whole read.
+    return {
+        "occurred": occurred,
+        "reason": reason,
+        "external_system_checked": False,
+        "scope": _VERIFY_SCOPE,
+        "unread": [read.reason for read in readings if read is not None and not read.complete],
+        **fields,
+    }
+
+
+def verify_replacement_run(
+    dag_id: str,
+    dag_run_id: str,
+    task_id: str,
+    map_index: int = -1,
+    output_key: str = "",
+    xcom_scope: str = "",
+) -> dict[str, Any]:
+    """
+    Say whether ONE named run's named task actually did its work — or that it is unknown.
+
+    Read-only. ``dag_run_id`` must be the exact id of the run you are asking
+    about; ``latest`` and ``previous`` are refused, because the whole value of
+    this check is that it is about the run you triggered and not about whichever
+    run is newest by the time you ask.
+
+    ``occurred`` is THREE-valued and null is not false:
+
+    * ``true`` — the instance recorded its output, so this run's own record
+      shows the work happened. Positive evidence, so a read that was cut short
+      does not weaken it.
+    * ``false`` — the run has finished, every relevant record was read whole,
+      and the output is not there. Only ever returned on a complete read.
+    * ``null`` — UNKNOWN. The run is still going, a read did not come back or
+      timed out, permission for the output records was not granted, or the
+      evidence was not read whole. Say "not established", never "it did not
+      happen".
+
+    ``output_key`` names the record to look for; without it any output record
+    counts. ``xcom_scope`` is set by the caller's permissions, not by you, and
+    it degrades rather than gates: without it the answer is ``null``.
+
+    ``external_system_checked`` is always false. A ``true`` here is Airflow's
+    own record of the task's output, not a look at the system the task talks to.
+    """
+    if dag_run_id in ("", "latest", "previous"):
+        return _verification(
+            None,
+            (
+                "name the exact dag_run_id of the run you are asking about — this check is only "
+                "worth something when it is pinned to that one run, and 'latest' is whichever run "
+                "is newest by the time it is asked"
+            ),
+            dag_id=dag_id,
+        )
+    try:
+        run, error = reading._resolve_run(dag_id, dag_run_id)
+    except Exception as e:
+        return _verification(
+            None,
+            f"the run could not be read ({_quoted(_explain_error(e), 240)}), so nothing about it "
+            f"is established",
+            dag_id=dag_id,
+            dag_run_id=dag_run_id,
+        )
+    if run is None:
+        return _verification(None, str(error), dag_id=dag_id, dag_run_id=dag_run_id)
+    resolved = run["dag_run_id"]
+    run_state = run.get("state")
+    finished = run_state not in _RUN_STILL_GOING
+    run_path = f"/dagRuns/{quote(resolved, safe='')}"
+    common: dict[str, Any] = {
+        "dag_id": dag_id,
+        "dag_run_id": resolved,
+        "task_id": task_id,
+        "map_index": map_index,
+        "run_state": run_state,
+        "run_finished": finished,
+    }
+
+    try:
+        scan = reading._run_task_instances(dag_id, run_path)
+    except Exception as e:
+        return _verification(
+            None,
+            f"the run's task instances could not be read ({_quoted(_explain_error(e), 240)}), so "
+            f"whether {task_id} ran in it is not established",
+            **common,
+        )
+    located = reading.find(
+        scan,
+        lambda ti: _ti_key(ti) == (task_id, map_index),
+        f"no instance of {task_id} was among the instances this reading read",
+    )
+    if located.is_unknown():
+        return _verification(
+            None,
+            f"{scan.kept} of {scan.universe} of the run's task instances were read, so "
+            f"{task_id} not being among them is not evidence that it is not there",
+            scan,
+            evidence_read_whole=False,
+            **common,
+        )
+    if located.is_absent():
+        # A complete read of a finished run that holds no such instance IS an
+        # absence of the work. A complete read of a run still going is not.
+        return _verification(
+            # False, not None: a finished run whose instances were all read and
+            # which holds no instance of this task is an absence of the work.
+            False if finished else None,
+            (
+                f"the run holds no instance of {task_id} at map_index {map_index}, and every "
+                f"instance it holds was read"
+            )
+            if finished
+            else (
+                f"the run holds no instance of {task_id} yet, and it is still {run_state} — the "
+                f"instance may not have been created"
+            ),
+            scan,
+            evidence_read_whole=True,
+            **common,
+        )
+    ti = next(row for row in scan.rows if _ti_key(row) == (task_id, map_index))
+    common["task_state"] = ti.get("state")
+
+    output = reading._recorded_output(dag_id, run_path, ti, xcom_scope)
+    if output.read_failed:
+        return _verification(
+            None,
+            f"the instance's output records could not be read ({_quoted(output.error, 200)}), so "
+            f"whether it recorded its work is not established",
+            scan,
+            evidence_read_whole=False,
+            **common,
+        )
+    recorded = reading.find(
+        output,
+        (lambda row: row.get("key") == output_key) if output_key else (lambda row: True),
+        f"no output record{f' keyed {output_key!r}' if output_key else ''} was among the records "
+        f"this reading read",
+    )
+    seen = [row.get("key") for row in output.rows]
+    whole = scan.complete and output.complete
+    if recorded.is_present():
+        # Positive evidence. A short read cannot take it away: the record that
+        # was found was found.
+        return _verification(
+            True,
+            f"{task_id} recorded output in this run"
+            + (f" keyed {output_key!r}" if output_key else "")
+            + f". Records seen: {seen}.",
+            scan,
+            output,
+            evidence_read_whole=whole,
+            **common,
+        )
+    if recorded.is_unknown():
+        return _verification(
+            None,
+            f"{output.kept} of {output.universe} of the instance's output records were read, "
+            f"so an absence among them is not an absence. Records seen: {seen}.",
+            scan,
+            output,
+            evidence_read_whole=False,
+            **common,
+        )
+    if not finished:
+        return _verification(
+            None,
+            f"the instance has recorded no matching output yet and the run is still {run_state}, "
+            f"so this is not established either way. Records seen: {seen}.",
+            scan,
+            output,
+            evidence_read_whole=whole,
+            **common,
+        )
+    # ``whole`` is asked once more here rather than assumed: the instance list
+    # can be short even when the output records are not, and an absence drawn
+    # over either is not an absence.
+    if not whole:
+        return _verification(
+            None,
+            f"the run has finished and {task_id} recorded no matching output, but the evidence "
+            f"was not all read, so this is not established. Records seen: {seen}.",
+            scan,
+            output,
+            evidence_read_whole=False,
+            **common,
+        )
+    return _verification(
+        False,
+        f"the run has finished, every output record was read, and {task_id} recorded no "
+        f"output" + (f" keyed {output_key!r}" if output_key else "") + f". Records seen: {seen}.",
+        scan,
+        output,
+        evidence_read_whole=True,
+        **common,
+    )

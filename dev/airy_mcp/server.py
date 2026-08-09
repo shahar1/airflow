@@ -105,6 +105,7 @@ from codechange import (
     rerun_dag,
     revert_dag_code,
     run_backfill,  # noqa: F401 - WITHDRAWN from the registered surface; kept as ``server.run_backfill``
+    verify_replacement_run,
 )
 
 # Wave 5 of the move-only extraction: the Dag file - where it is, the jail around
@@ -294,6 +295,7 @@ for _tool in (
     plan_revert_dag_code,
     revert_dag_code,
     rerun_dag,
+    verify_replacement_run,
 ):
     mcp.tool(_tool)
 

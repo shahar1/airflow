@@ -3559,6 +3559,119 @@ def test_an_approved_source_change_cannot_authorize_a_trigger(airflow):
     assert "plan_token" not in inspect.signature(server.rerun_dag).parameters
 
 
+def _replacement_world(airflow, *, state="success", output=None, task_state="success"):
+    """One finished run holding one instance of ``summarize``, and its output."""
+    airflow.runs_by_id[REPLACEMENT] = {"dag_run_id": REPLACEMENT, "state": state}
+    airflow.tis_by_run[REPLACEMENT] = [
+        {"task_id": "summarize", "state": task_state, "map_index": -1, "try_number": 1}
+    ]
+    airflow.xcoms_by_task[("summarize", -1)] = output or []
+
+
+def test_verify_replacement_run_confirms_the_work_from_the_runs_own_record(airflow):
+    """The positive answer, and the caveat that has to travel with it."""
+    _replacement_world(airflow, output=[{"key": "return_value", "timestamp": "2024-01-02T00:00:00+00:00"}])
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is True
+    assert result["evidence_read_whole"] is True
+    assert result["external_system_checked"] is False
+    assert "Nothing here observed the external system directly" in result["scope"]
+
+
+def test_verify_replacement_run_answers_for_the_named_key_and_not_for_any_output(airflow):
+    _replacement_world(airflow, output=[{"key": "other", "timestamp": "2024-01-02T00:00:00+00:00"}])
+
+    result = server.verify_replacement_run(
+        DAG_ID, REPLACEMENT, task_id="summarize", output_key="return_value", xcom_scope="granted"
+    )
+
+    assert result["occurred"] is False
+    assert "recorded no output keyed 'return_value'" in result["reason"]
+
+
+def test_verify_replacement_run_calls_an_absence_absent_only_on_a_whole_read(airflow):
+    """B9. An absence drawn over a read that did not cover everything is not an
+    absence, and answering false there is the defect this is for."""
+    _replacement_world(airflow)
+    airflow.xcoms_total = 9
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is None
+    assert result["evidence_read_whole"] is False
+    assert result["unread"]
+
+
+def test_verify_replacement_run_withholds_an_answer_while_the_run_is_still_going(airflow):
+    """B8's sibling: unfinished is UNKNOWN, never "the work did not happen"."""
+    _replacement_world(airflow, state="running", task_state="running")
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is None
+    assert result["run_finished"] is False
+    assert "still running" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout("timed out"), httpx.ConnectError("boom")],
+    ids=["timeout", "dropped-connection"],
+)
+def test_verify_replacement_run_is_unknown_when_the_evidence_read_does_not_come_back(airflow, failure):
+    """B8. A read that timed out is not a negative answer about the world."""
+    _replacement_world(airflow)
+    airflow.fail_xcoms = failure
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is None
+    assert result["evidence_read_whole"] is False
+    assert "not established" in result["reason"]
+
+
+def test_verify_replacement_run_without_the_xcom_scope_answers_null_and_not_false(airflow):
+    """The permission degrades the reading; it never gates the tool, and it never
+    turns an unread record into an absent one."""
+    _replacement_world(airflow, output=[{"key": "return_value", "timestamp": "2024-01-02T00:00"}])
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize")
+
+    assert result["occurred"] is None
+    assert result["evidence_read_whole"] is False
+
+
+@pytest.mark.parametrize("named", ["", "latest", "previous"], ids=["empty", "latest", "previous"])
+def test_verify_replacement_run_refuses_anything_but_an_exact_run_id(airflow, named):
+    """The whole value of this check is that it is about the run that was
+    triggered, and 'latest' is whichever run is newest when it is asked."""
+    result = server.verify_replacement_run(DAG_ID, named, task_id="summarize")
+
+    assert result["occurred"] is None
+    assert "name the exact dag_run_id" in result["reason"]
+
+
+def test_verify_replacement_run_says_the_task_never_ran_only_over_a_finished_whole_read(airflow):
+    airflow.runs_by_id[REPLACEMENT] = {"dag_run_id": REPLACEMENT, "state": "success"}
+    airflow.tis_by_run[REPLACEMENT] = [{"task_id": "extract", "state": "success", "map_index": -1}]
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert result["occurred"] is False
+    assert "holds no instance of summarize" in result["reason"]
+
+
+def test_verify_replacement_run_never_writes(airflow):
+    """It is a read. Counted at the transport rather than read off the docstring."""
+    _replacement_world(airflow, output=[{"key": "return_value", "timestamp": "2024-01-02T00:00"}])
+
+    server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    assert [call for call in airflow.calls if call[0] in ("POST", "PUT", "PATCH", "DELETE")] == []
+
+
 def seed_two_runs(airflow):
     airflow.runs_by_id = {
         "old": {
@@ -11176,6 +11289,9 @@ _SWEPT_TOOLS = {
         audit_scope="granted",
         xcom_scope="granted",
     ),
+    "verify_replacement_run": lambda: server.verify_replacement_run(
+        DAG_ID, "manual__1", task_id="summarize", xcom_scope="granted"
+    ),
     # ``_ONE_EDIT``, not the two-occurrence one the sweep used to drive: a change
     # whose ``old`` appears twice is refused in this tool's first line, so all 39
     # of its cases compared one error string against itself.
@@ -11257,18 +11373,26 @@ _WITHDRAWN_TOOLS = frozenset(
 )
 
 
+# Registered since ``baselines/tool-schemas.json`` was taken, and named for the
+# same reason the withdrawn set is: the freeze records what the surface WAS, and
+# the arithmetic against it is what stays readable.
+_TOOLS_ADDED_SINCE_THE_FREEZE = frozenset({"verify_replacement_run"})
+
+
 def test_the_sweep_covers_every_registered_tool():
     """Every registered tool is in exactly one sweep, and the count is READ off
     the freeze rather than retyped — a literal here is a number a new tool's
     author can bump in the same commit that hides it.
 
-    The freeze is 14 and five tools were deliberately withdrawn, so the
-    arithmetic is stated rather than the total retyped.
+    The freeze is 14; five tools were deliberately withdrawn and one deliberately
+    added, so the arithmetic is stated rather than the total retyped.
     """
     registered = set(_registered_tools())
 
     assert registered == (set(_SWEPT_TOOLS) | _WRITING_TOOLS) - _WITHDRAWN_TOOLS
-    assert len(registered) == _frozen_tool_count() - len(_WITHDRAWN_TOOLS)
+    assert len(registered) == (
+        _frozen_tool_count() - len(_WITHDRAWN_TOOLS) + len(_TOOLS_ADDED_SINCE_THE_FREEZE)
+    )
     assert not set(_SWEPT_TOOLS) & _WRITING_TOOLS
 
 
@@ -11473,6 +11597,7 @@ def test_the_instruments_own_census_is_derived_and_printed(capsys):
         "compound levers": len(_truncation_knobs()[1]),
         "registered tools": len(_registered_tools()),
         "withdrawn tools": len(_WITHDRAWN_TOOLS),
+        "tools added since the freeze": len(_TOOLS_ADDED_SINCE_THE_FREEZE),
         "value-swept tools": len(_SWEPT_TOOLS),
         "tools declared inert": len(_TOOLS_THAT_MOVE_NOTHING),
         "writing tools": len(_WRITING_TOOLS),
@@ -11557,6 +11682,10 @@ _CONSERVATIVE_FLAGS = {
     "task_instances_read_whole": ("$.run_a.task_instances_read_whole", "$.run_b.task_instances_read_whole"),
     "task_list_read_whole": ("$.tasks.task_list_read_whole",),
     "asset_catalog_read_whole": ("$.asset_catalog_read_whole",),
+    # The replacement-run check's own read coverage. It going True -> False is
+    # the disclosure working: the answer beside it is the three-valued
+    # ``occurred``, which withholds itself rather than answering false.
+    "evidence_read_whole": ("$.evidence_read_whole",),
     "failures_read_whole": ("$.failures_read_whole",),
     "runs_read_whole": ("$.run_history.runs_read_whole",),
     "runs_not_covered_read_whole": ("$.run_history.task_comparison.runs_not_covered_read_whole",),
@@ -16743,6 +16872,11 @@ _ENUMERATION_INVENTORY = {
     "_SWEPT_TOOLS": (
         "closed both ways",
         "registered tools observed at mcp.tool registration must equal the swept plus the writing tools",
+    ),
+    "_TOOLS_ADDED_SINCE_THE_FREEZE": (
+        "closed both ways",
+        "carried in the same tool-registry identity: the frozen count minus the withdrawn plus these "
+        "must equal what mcp.tool was observed being handed",
     ),
     "_WITHDRAWN_TOOLS": (
         "closed both ways",

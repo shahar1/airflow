@@ -358,6 +358,15 @@ source.  Propose them one at a time and let the user answer each.
    it as not created, and retry with the same `run_id`.  Relay the
    `idempotency` sentence rather than improving on it — the key prevents a
    duplicate under **that identity** and says nothing about any other run.
+3a. **Then verify that run, by its id.**  `rerun_dag` returns having created a
+   run, which establishes nothing about whether the work happened.  Call
+   `verify_replacement_run` with the `dag_run_id` it returned and the task whose
+   work was missing, and relay what comes back: `occurred` is three-valued and
+   `null` means UNKNOWN — a run still going, a read that did not come back, or
+   evidence that was incomplete.  Never relay `null` as "it did not happen", and
+   never relay `false` without saying what the payload says about the evidence.
+   Even a `true` is Airflow's own record of the task's output, not a look at the
+   system the task talks to: say so.
 4. **Reverting is planned too.**  `plan_revert_dag_code` returns the diff
    between the backup and the current file plus a `plan_token`;
    `revert_dag_code` refuses without that token and the same `diff` repeated.
@@ -760,6 +769,11 @@ TOOL_POLICY: dict[str, dict[str, bool]] = {
     "plan_dag_code_changes": {"reads_source": True},
     # Same rule: the revert plan reads the backup and the current file whole.
     "plan_revert_dag_code": {"reads_source": True},
+    # Read-only, and the step that turns a triggered run into a verified one: it
+    # reads back what that run actually recorded. Kept out of WRITE_TOOLS
+    # deliberately — a check the user has to approve is a check that does not
+    # happen, and the answer is the same whoever asks for it.
+    "verify_replacement_run": {},
     "apply_dag_code_changes": {"writes": True, "reads_source": True},
     "revert_dag_code": {"writes": True, "reads_source": True},
     "rerun_dag": {"writes": True},
@@ -836,6 +850,12 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
     # permission in Airflow to mirror.
     patch_source = (("PUT", None), read_dag, ("GET", Entity.CODE), ("GET", Entity.VERSION))
     requirements: dict[str, tuple[tuple[str, Any], ...]] = {
+        # Reads one run and its instances. No PUT and no POST: it changes
+        # nothing. XCOM is NOT here — it widens the reading instead, in
+        # ``_tool_optional_access_requirements``, so a role that can trigger the
+        # run can always also run the check on it. A verification a writer can
+        # be denied is a safety net that comes off while the write stays on.
+        "verify_replacement_run": (("GET", Entity.RUN), ("GET", Entity.TASK_INSTANCE)),
         # Reads the Dag itself (for its file location), its runs, instances,
         # logs, source and task graph.
         "diagnose_dag": (
@@ -895,6 +915,9 @@ def _tool_optional_access_requirements(tool_name: str) -> dict[str, tuple[tuple[
 
     optional: dict[str, dict[str, tuple[tuple[str, Any], ...]]] = {
         "diagnose_dag": {"audit_scope": (("GET", Entity.AUDIT_LOG),)},
+        # A leg of the check, not the whole of it: without the permission the
+        # answer is ``null`` — not established — and never ``false``.
+        "verify_replacement_run": {"xcom_scope": (("GET", Entity.XCOM),)},
     }
     return optional.get(tool_name, {})
 
