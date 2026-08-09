@@ -17006,6 +17006,20 @@ _ENUMERATION_INVENTORY = {
         "closed both ways",
         "registered tools observed at mcp.tool registration must equal the swept plus the writing tools",
     ),
+    "_MATRIX_IDS": (
+        "fail-closed",
+        "the seventeen preregistered acceptance cases; the ids are asserted against the frozen A1-A8 "
+        "and B1-B9 set, so a case added or renamed fails rather than quietly widening the matrix",
+    ),
+    "_SETTLED_TRIGGER_SENTENCES": (
+        "non-exhaustive vocabulary",
+        "the settled sentences rerun_dag itself produces, used to check that an UNKNOWN answer carries "
+        "none of them; a new settled spelling has to be added here to be checked",
+    ),
+    "_SETTLED_VERIFY_SENTENCES": (
+        "non-exhaustive vocabulary",
+        "the same, for verify_replacement_run's two settled answers; a new one has to be added here",
+    ),
     "_TOOLS_ADDED_SINCE_THE_FREEZE": (
         "closed both ways",
         "carried in the same tool-registry identity: the frozen count minus the withdrawn plus these "
@@ -17410,3 +17424,469 @@ def test_a_read_through_requests_is_observed_like_every_other_client(httpx_layer
 
     assert [site for site, _, _ in _OBSERVED_READS] == [("evidence", "_reach_out")]
     assert _unregistered_reads(_OBSERVED_READS) == [("evidence", "_reach_out")]
+
+
+# ---------------------------------------------------------------------------
+# THE ACCEPTANCE MATRIX.
+#
+# Seventeen cases, preregistered and frozen before any of them was written, over
+# the two actions this demo is certified for: applying an approved source
+# correction, and triggering plus verifying one specifically identified
+# replacement run. It does not grow. A finding outside it is a documented
+# limitation or future work — not a new row here.
+#
+# Every case asserts the same four things, and the shared checker below is what
+# makes that true of all seventeen rather than of the ones whose author
+# remembered:
+#
+#   (a) whether an action occurred at all;
+#   (b) the EXACT action count at the transport or filesystem boundary, counted
+#       there rather than read off the payload;
+#   (c) the truthful user-facing status — the tool's own outcome field;
+#   (d) no implication beyond the available evidence, checked as words that must
+#       NOT appear and, where the case turns on it, words that must.
+# ---------------------------------------------------------------------------
+
+_MATRIX_IDS = (
+    "A1-hash-matches",
+    "A2-source-drifted",
+    "A3-escapes-the-jail",
+    "A4-patch-will-not-apply",
+    "A5-parse-fails-after-write",
+    "A6-graph-differs",
+    "A7-rollback-restores",
+    "A8-rollback-fails",
+    "B1-first-trigger",
+    "B2-same-key-retried",
+    "B3-run-already-exists",
+    "B4-version-moved",
+    "B5-trigger-refused",
+    "B6-trigger-ambiguous",
+    "B7-verification-confirms",
+    "B8-verification-times-out",
+    "B9-operation-absent",
+)
+
+
+def _dag_file_writes():
+    """Atomic replacements of a Dag file, counted at the interpreter's own hook.
+
+    ``os.rename`` is the event ``os.replace`` raises, and ``_write_if_unchanged``
+    is the only place in the tree that makes one. Counted here rather than by
+    wrapping the helper, so the number is the filesystem boundary's and not a
+    layer above it.
+    """
+    return len(
+        [
+            entry
+            for entry in _OBSERVED_WRITES
+            if entry[0] == ("dagsource", "_write_if_unchanged") and entry[1] == "os.rename"
+        ]
+    )
+
+
+def _run_creates(airflow):
+    """Run-creating POSTs that reached the transport."""
+    return len([call for call in airflow.calls if call == ("POST", f"/dags/{DAG_ID}/dagRuns")])
+
+
+# The sentences these two tools produce when they DO settle an outcome, taken
+# from the tools themselves. A payload that declines to settle may carry none of
+# them: that is (d) made checkable, rather than a hunt for loose words — "whether
+# a run was created is NOT established" contains "was created" and settles
+# nothing.
+_SETTLED_TRIGGER_SENTENCES = ("created run ", "NO run was created", "already exists")
+_SETTLED_VERIFY_SENTENCES = ("recorded output in this run", "recorded no output")
+
+
+def _the_four_axes(
+    case,
+    *,
+    occurred,
+    expected_occurred,
+    count,
+    expected_count,
+    status,
+    expected_status,
+    must_say=(),
+    must_not_say=(),
+):
+    """(a), (b), (c) and (d) for one case, in one place so no case can skip one."""
+    # ``scope`` is the fixed instruction a tool ships beside every answer — it
+    # tells the reader what null MEANS, so it quotes the very phrases (d) forbids
+    # a claim from using. The (d) check is about what this call CLAIMS, so the
+    # instruction is not part of the text it is asked of; (c) still reads the
+    # whole payload.
+    claims = {key: value for key, value in status.items() if key != "scope"}
+    text = json.dumps(claims, default=str)
+    whole = json.dumps(status, default=str)
+    assert occurred is expected_occurred, f"{case}: (a) action-occurred is {occurred!r}"
+    assert count == expected_count, f"{case}: (b) boundary count is {count}, expected {expected_count}"
+    for phrase in must_say:
+        assert phrase in whole, f"{case}: (c) the status never says {phrase!r}"
+    for phrase in must_not_say:
+        assert phrase not in text, f"{case}: (d) the status implies {phrase!r} on this evidence"
+    assert expected_status(status), f"{case}: (c) the status is not the truthful one: {status}"
+
+
+def test_the_acceptance_matrix_is_the_frozen_seventeen():
+    """The matrix does not grow, and the ids are the ones registered."""
+    registered = {name.split("-")[0] for name in _MATRIX_IDS}
+
+    assert len(_MATRIX_IDS) == 17
+    assert registered == {f"A{n}" for n in range(1, 9)} | {f"B{n}" for n in range(1, 10)}
+    assert len(set(_MATRIX_IDS)) == 17
+
+
+def test_matrix_A1_an_approved_patch_over_matching_bytes_is_applied_once(airflow, tmp_path):
+    airflow.tasks = DEMO_TASKS
+    _OBSERVED_WRITES.clear()
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    _the_four_axes(
+        "A1",
+        occurred=result["applied"],
+        expected_occurred=True,
+        count=_dag_file_writes(),
+        expected_count=1,
+        status=result,
+        expected_status=lambda r: r["mutation_applied"] is True and "error" not in r,
+        must_not_say=("rolled_back", "not established"),
+    )
+    assert (tmp_path / "sales_summary.py").read_text() != SOURCE
+
+
+def test_matrix_A2_a_source_that_moved_after_approval_is_refused_and_names_the_drift(airflow, tmp_path):
+    changes = _changes(('"column": "ammount"', '"column": "amount"'))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    (tmp_path / "sales_summary.py").write_text(SOURCE + "# someone else got here first\n")
+    _OBSERVED_WRITES.clear()
+
+    result = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+
+    _the_four_axes(
+        "A2",
+        occurred=result["applied"],
+        expected_occurred=False,
+        count=_dag_file_writes(),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["mutation_applied"] is False,
+        must_say=("is not the version Airflow has parsed",),
+    )
+    assert (tmp_path / "sales_summary.py").read_text().endswith("got here first\n")
+
+
+def test_matrix_A3_a_patch_whose_file_escapes_the_bundle_is_refused_in_words(airflow, tmp_path):
+    changes = _changes(('"column": "ammount"', '"column": "amount"'))
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    # The Dag record now names a path outside the write jail.
+    airflow.relative_fileloc = "../escaped.py"
+    (tmp_path.parent / "escaped.py").write_text(SOURCE)
+    _OBSERVED_WRITES.clear()
+
+    result = server.apply_dag_code_changes(DAG_ID, changes, plan["plan_token"])
+
+    _the_four_axes(
+        "A3",
+        occurred=result["applied"],
+        expected_occurred=False,
+        count=_dag_file_writes(),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["mutation_applied"] is False,
+        must_say=("outside the editable Dag bundle", "Nothing was written"),
+    )
+    assert (tmp_path.parent / "escaped.py").read_text() == SOURCE
+
+
+@pytest.mark.parametrize("old", ["not-in-the-file", "ammount"], ids=["absent", "twice"])
+def test_matrix_A4_a_patch_that_cannot_be_applied_is_refused_and_writes_nothing(airflow, tmp_path, old):
+    _OBSERVED_WRITES.clear()
+    changes = _changes((old, "amount"))
+
+    plan = server.plan_dag_code_changes(DAG_ID, changes)
+    # And the write is unreachable from it: no token was issued, so an apply
+    # attempted anyway is refused rather than writing over the same bad patch.
+    applied = server.apply_dag_code_changes(DAG_ID, changes, plan.get("plan_token", ""))
+
+    _the_four_axes(
+        "A4",
+        occurred=plan["planned"] or applied["applied"],
+        expected_occurred=False,
+        count=_dag_file_writes(),
+        expected_count=0,
+        status={"plan": plan, "apply": applied},
+        expected_status=lambda r: r["apply"]["mutation_applied"] is False,
+        must_say=("exactly once",),
+    )
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_matrix_A5_a_write_that_stops_the_dag_parsing_is_put_back(airflow, tmp_path):
+    _import_error_after_the_reparse(airflow, tmp_path)
+    _OBSERVED_WRITES.clear()
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    _the_four_axes(
+        "A5",
+        occurred=result["applied"],
+        expected_occurred=False,
+        # Two: the patch, and putting it back. Both are real writes and the
+        # count is what says the file was touched at all.
+        count=_dag_file_writes(),
+        expected_count=2,
+        status=result,
+        expected_status=lambda r: r["rolled_back"] is True and r["mutation_applied"] is True,
+        must_say=("no longer imports", "PUT BACK"),
+    )
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_matrix_A6_a_reparsed_graph_that_differs_unexpectedly_is_put_back(airflow, tmp_path):
+    airflow.tasks = DEMO_TASKS
+    original_reparse = codechange._force_reparse
+
+    def _reparse(dag_id, file_token, previous):
+        airflow.tasks = [task for task in DEMO_TASKS if task["task_id"] != "report"]
+        return original_reparse(dag_id, file_token, previous)
+
+    _OBSERVED_WRITES.clear()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(codechange, "_force_reparse", _reparse)
+        result = _apply(("ammount is a typo", "amount is correct"))
+
+    _the_four_axes(
+        "A6",
+        occurred=result["applied"],
+        expected_occurred=False,
+        count=_dag_file_writes(),
+        expected_count=2,
+        status=result,
+        expected_status=lambda r: r["post_write_checks"]["task_graph"] == "FAILED",
+        must_say=("no longer defines ['report']", "did not say it would remove"),
+    )
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_matrix_A7_a_rollback_that_succeeds_restores_the_original_bytes_and_says_so(airflow, tmp_path):
+    _import_error_after_the_reparse(airflow, tmp_path)
+    _OBSERVED_WRITES.clear()
+
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    _the_four_axes(
+        "A7",
+        occurred=result["rolled_back"],
+        expected_occurred=True,
+        count=_dag_file_writes(),
+        expected_count=2,
+        status=result,
+        expected_status=lambda r: r["applied"] is False,
+        must_say=("byte-for-byte the original again", "Nothing of the change survives"),
+        # The restore is stated as a fact about the file, never as a claim that
+        # the Dag is now fine — nothing here re-checked that.
+        must_not_say=("the Dag is healthy",),
+    )
+    assert (tmp_path / "sales_summary.py").read_text() == SOURCE
+
+
+def test_matrix_A8_a_rollback_that_fails_is_never_silent(airflow, tmp_path):
+    _import_error_after_the_reparse(airflow, tmp_path)
+
+    def _refuse(path, expected, content):
+        if content == SOURCE:
+            raise OSError("read-only file system")
+        (tmp_path / "sales_summary.py").write_text(content)
+
+    _OBSERVED_WRITES.clear()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(codechange, "_write_if_unchanged", _refuse)
+        result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    _the_four_axes(
+        "A8",
+        occurred=result["rolled_back"],
+        expected_occurred=False,
+        # The helper that raises the boundary event was replaced for this case,
+        # so the count is taken where the state is: the file itself is not the
+        # original, and that is the fact the report has to match.
+        count=0 if (tmp_path / "sales_summary.py").read_text() == SOURCE else 1,
+        expected_count=1,
+        status=result,
+        expected_status=lambda r: r["applied"] is False and r["mutation_applied"] is True,
+        must_say=("PUTTING IT BACK FAILED", "known to be bad", "needs a person NOW"),
+        must_not_say=("Nothing of the change survives",),
+    )
+
+
+def test_matrix_B1_the_first_trigger_creates_one_run_under_the_chosen_identity(airflow):
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    _the_four_axes(
+        "B1",
+        occurred=result["triggered"],
+        expected_occurred=True,
+        count=_run_creates(airflow),
+        expected_count=1,
+        status=result,
+        expected_status=lambda r: r["dag_run_id"] == REPLACEMENT and r["mutation_applied"] is True,
+        must_say=("under this exact run identity only",),
+    )
+
+
+def test_matrix_B2_the_same_identity_retried_creates_nothing(airflow):
+    server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    _the_four_axes(
+        "B2",
+        occurred=result["triggered"],
+        expected_occurred=False,
+        # One, from the first call. The retry adds none.
+        count=_run_creates(airflow),
+        expected_count=1,
+        status=result,
+        expected_status=lambda r: r["already_existed"] is True and r["mutation_applied"] is False,
+        must_say=("already exists", "NO new run was created"),
+        # The key bounds itself: it never claims the work is not running elsewhere.
+        must_not_say=("no other run",),
+    )
+
+
+def test_matrix_B3_a_run_this_server_never_made_still_blocks_the_create(airflow):
+    airflow.runs_by_id[REPLACEMENT] = {"dag_run_id": REPLACEMENT, "state": "running"}
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    _the_four_axes(
+        "B3",
+        occurred=result["triggered"],
+        expected_occurred=False,
+        count=_run_creates(airflow),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["already_existed"] is True and r["state"] == "running",
+        must_say=("already exists",),
+    )
+
+
+def test_matrix_B4_a_dag_version_that_moved_after_approval_refuses_the_trigger(airflow):
+    airflow.version = 5
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT, expected_dag_version=4)
+
+    _the_four_axes(
+        "B4",
+        occurred=result["triggered"],
+        expected_occurred=False,
+        count=_run_creates(airflow),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["mutation_applied"] is False,
+        must_say=("no run was triggered", "not the code that was approved"),
+    )
+
+
+def test_matrix_B5_a_trigger_the_route_refuses_creates_nothing_and_says_so(airflow):
+    airflow.fail_trigger = httpx.HTTPStatusError(
+        "denied", request=httpx.Request("POST", "/dagRuns"), response=httpx.Response(403)
+    )
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    _the_four_axes(
+        "B5",
+        occurred=result["triggered"],
+        expected_occurred=False,
+        # The POST went out and was refused; no RUN came of it.
+        count=len(airflow.runs_by_id),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["mutation_applied"] is False,
+        must_say=("NO run was created",),
+        must_not_say=("not established",),
+    )
+
+
+def test_matrix_B6_a_trigger_that_does_not_come_back_is_unknown_in_both_directions(airflow):
+    airflow.fail_trigger = httpx.ReadTimeout("timed out")
+
+    result = server.rerun_dag(DAG_ID, run_id=REPLACEMENT)
+
+    _the_four_axes(
+        "B6",
+        occurred=result["triggered"],
+        expected_occurred=None,
+        count=len(airflow.runs_by_id),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["mutation_outcome"] == "unknown" and "mutation_applied" not in r,
+        must_say=("NOT established", "do NOT report it as not triggered"),
+        # Neither a false negative nor a false positive.
+        must_not_say=_SETTLED_TRIGGER_SENTENCES,
+    )
+
+
+def test_matrix_B7_a_confirmed_operation_is_read_off_the_runs_own_record(airflow):
+    _replacement_world(airflow, output=[{"key": "return_value", "timestamp": "2024-01-02T00:00:00+00:00"}])
+    _OBSERVED_WRITES.clear()
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    _the_four_axes(
+        "B7",
+        occurred=result["occurred"],
+        expected_occurred=True,
+        # A verification writes nothing, anywhere.
+        count=_dag_file_writes() + len([c for c in airflow.calls if c[0] != "GET"]),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["evidence_read_whole"] is True,
+        must_say=("Nothing here observed the external system directly",),
+        must_not_say=("the external system is correct",),
+    )
+    assert result["external_system_checked"] is False
+
+
+def test_matrix_B8_a_verification_that_times_out_is_unknown_and_not_a_failure(airflow):
+    _replacement_world(airflow)
+    airflow.fail_xcoms = httpx.ReadTimeout("timed out")
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    _the_four_axes(
+        "B8",
+        occurred=result["occurred"],
+        expected_occurred=None,
+        count=len([c for c in airflow.calls if c[0] != "GET"]),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["evidence_read_whole"] is False,
+        must_say=("not established",),
+        must_not_say=_SETTLED_VERIFY_SENTENCES,
+    )
+
+
+@pytest.mark.parametrize("complete", [True, False], ids=["whole-read", "short-read"])
+def test_matrix_B9_an_absent_operation_is_reported_absent_only_on_a_whole_read(airflow, complete):
+    _replacement_world(airflow)
+    if not complete:
+        airflow.xcoms_total = 9
+
+    result = server.verify_replacement_run(DAG_ID, REPLACEMENT, task_id="summarize", xcom_scope="granted")
+
+    _the_four_axes(
+        "B9",
+        occurred=result["occurred"],
+        expected_occurred=False if complete else None,
+        count=len([c for c in airflow.calls if c[0] != "GET"]),
+        expected_count=0,
+        status=result,
+        expected_status=lambda r: r["evidence_read_whole"] is complete,
+        must_say=("recorded no output",) if complete else ("an absence among them is not an absence",),
+        must_not_say=() if complete else ("recorded no output",),
+    )

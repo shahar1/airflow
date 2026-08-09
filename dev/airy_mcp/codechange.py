@@ -506,7 +506,19 @@ def apply_dag_code_changes(
         return {"applied": False, "mutation_applied": False, "error": message + _APPROVAL_IS_GONE}
     except _READ_FAILURES as e:
         return _approval_spent_before_the_write("applied", "the Dag record", e)
-    path = _dag_path(dag_id, dag)
+    try:
+        # The write jail, re-asked after the approval and not only before it: the
+        # Dag record names the file, and a record that now names a path outside
+        # the bundle is a write this tool must refuse in words. Raising here sent
+        # the jail refusal out as an exception, which is the one shape a caller
+        # cannot tell from "the tool crashed, maybe after writing".
+        path = _dag_path(dag_id, dag)
+    except DagFileError as e:
+        return {
+            "applied": False,
+            "mutation_applied": False,
+            "error": f"this change was NOT applied: {e}. Nothing was written." + _APPROVAL_IS_GONE,
+        }
     try:
         version_before_write = _latest_version(dag_id)
     except _READ_FAILURES as e:
