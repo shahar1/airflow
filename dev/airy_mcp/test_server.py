@@ -10210,11 +10210,39 @@ _SWEPT_TOOLS = {
         audit_scope="granted",
         xcom_scope="granted",
     ),
-    "plan_dag_code_changes": lambda: server.plan_dag_code_changes(
-        DAG_ID, [{"old": "ammount", "new": "amount"}]
-    ),
-    "plan_revert_dag_code": lambda: server.plan_revert_dag_code(DAG_ID),
+    # ``_ONE_EDIT``, not the two-occurrence one the sweep used to drive: a change
+    # whose ``old`` appears twice is refused in this tool's first line, so all 39
+    # of its cases compared one error string against itself.
+    "plan_dag_code_changes": lambda: _plan_a_code_change_on_a_fresh_approval(),
+    "plan_revert_dag_code": lambda: _plan_a_revert_over_a_backup(),
 }
+
+
+def _plan_a_code_change_on_a_fresh_approval():
+    """The value sweep's driver: one plan, over no live approval of its own.
+
+    Two plans from the same source are refused by design — the split-repair rule
+    — and every sweep here calls its tool TWICE on one world, so the second call
+    would compare that refusal against the first call's plan. Only the sweep's
+    own leftovers are dropped; the rule itself is exercised by its own tests.
+    """
+    server._issued_tokens.clear()
+    return _plan_a_code_change()
+
+
+def _plan_a_revert_over_a_backup():
+    """A revert plan needs a backup to revert TO.
+
+    Written here rather than by applying a change, because a tool in the VALUE
+    sweep may not write: with no backup on disk this tool refuses in its first
+    line, and all 39 of its cases compared "Airy has not changed this Dag"
+    against itself.
+    """
+    backup = dagsource.DAGS_DIR / "sales_summary.py.airy-bak"
+    if not backup.exists():
+        backup.write_text(SOURCE.replace("typo", "mistake"))
+    return server.plan_revert_dag_code(DAG_ID)
+
 
 # The tools that write. Excluded from the VALUE sweep because the answer a
 # truncated read must produce for them is a REFUSAL — so each one is swept for
@@ -10286,17 +10314,56 @@ def test_no_tool_in_the_value_sweep_writes_anything(airflow, tmp_path, tool):
     assert _writes(airflow) == []
 
 
-def _planned_code_change():
-    changes = [{"old": "ammount", "new": "amount"}]
-    plan = server.plan_dag_code_changes(DAG_ID, changes)
-    return server.apply_dag_code_changes(DAG_ID, changes, plan.get("plan_token", ""))
+# An edit that appears EXACTLY ONCE in the sweep world's source. The sweep drove
+# ``{"old": "ammount"}``, which appears twice, so ``plan_dag_code_changes``
+# refused in its first line and the apply behind it answered "no reviewed plan"
+# — three of the five write tools reached their own write path not once, and 117
+# write cases were structurally dead while reading as coverage.
+_ONE_EDIT = [{"old": "typo", "new": "mistake"}]
 
 
-def _planned_clear():
+def _plan_a_code_change():
+    return server.plan_dag_code_changes(DAG_ID, _ONE_EDIT)
+
+
+def _apply_the_planned_code_change(plan):
+    return server.apply_dag_code_changes(
+        DAG_ID, _ONE_EDIT, plan.get("plan_token", ""), plan.get("asset_note", "")
+    )
+
+
+def _plan_a_revert():
+    """A revert needs something to revert TO, so a reviewed change is applied first.
+
+    Without a backup on disk the plan refuses with "Airy has not changed this
+    Dag", and every sweep over the revert was a sweep over that sentence.
+    """
+    _apply_the_planned_code_change(_plan_a_code_change())
+    return server.plan_revert_dag_code(DAG_ID)
+
+
+def _apply_the_planned_revert(plan):
+    return server.revert_dag_code(DAG_ID, plan.get("plan_token", ""), plan.get("diff", ""))
+
+
+def _plan_a_backfill():
+    return server.plan_backfill(DAG_ID, "2024-01-01", "2024-01-02")
+
+
+def _apply_the_planned_backfill(plan):
+    return server.run_backfill(
+        DAG_ID, "2024-01-01", "2024-01-02", plan.get("plan_token", ""), plan.get("planned_runs")
+    )
+
+
+def _plan_a_clear():
+    return server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
+
+
+def _apply_the_planned_clear(plan):
     # A plan that REFUSES is the honest outcome under several levers, and the
     # apply is still driven after one: what it answers over a spent-or-absent
     # approval is exactly the card this sweep is about.
-    plan = server.plan_task_instance_clear(DAG_ID, task_id="report", only_failed=False)
     return server.apply_task_instance_clear(
         DAG_ID,
         plan.get("dag_run_id") or "manual__1",
@@ -10307,14 +10374,20 @@ def _planned_clear():
     )
 
 
+def _planned_code_change():
+    return _apply_the_planned_code_change(_plan_a_code_change())
+
+
+def _planned_clear():
+    return _apply_the_planned_clear(_plan_a_clear())
+
+
 def _planned_backfill():
-    plan = server.plan_backfill(DAG_ID, "2024-01-01", "2024-01-02")
-    return server.run_backfill(DAG_ID, "2024-01-01", "2024-01-02", plan.get("plan_token", ""))
+    return _apply_the_planned_backfill(_plan_a_backfill())
 
 
 def _planned_revert():
-    plan = server.plan_revert_dag_code(DAG_ID)
-    return server.revert_dag_code(DAG_ID, plan.get("plan_token", ""))
+    return _apply_the_planned_revert(_plan_a_revert())
 
 
 # Every tool, driven all the way to its reads. The writers are handed a REAL
@@ -10381,11 +10454,20 @@ def test_the_instruments_own_census_is_derived_and_printed(capsys):
         "no-count knobs": len(flags),
         "levers": len(_LEVERS),
         "levers declared inert": len(_LEVERS_THAT_MOVE_NOTHING),
+        # Seven of the levers are COMPOUND — each sets a no-count flag AND clamps
+        # every row-count bound — so they are near-copies of one another, and a
+        # raw case count over them reads as far more discrimination than they
+        # buy. What the sweep is worth is measured beside this census, in
+        # ``test_the_sweeps_discrimination_is_measured_rather_than_counted``.
+        "compound levers": len(_truncation_knobs()[1]),
         "registered tools": len(_registered_tools()),
         "value-swept tools": len(_SWEPT_TOOLS),
+        "tools declared inert": len(_TOOLS_THAT_MOVE_NOTHING),
         "writing tools": len(_WRITING_TOOLS),
+        "write applies that cannot read short": len(_WRITE_TOOLS_WHOSE_APPLY_CANNOT_READ_SHORT),
         "value sweep cases": len(_LEVERS) * len(_SWEPT_TOOLS),
         "write sweep cases": len(_LEVERS) * len(_WRITING_TOOLS),
+        "two-phase write sweep cases": len(_LEVERS) * len(_TWO_PHASE_WRITES),
     }
     print("\n".join(f"{value:>5}  {name}" for name, value in census.items()))
 
@@ -10395,7 +10477,8 @@ def test_the_instruments_own_census_is_derived_and_printed(capsys):
     )
     assert census["registered tools"] == census["value-swept tools"] + census["writing tools"]
     assert census["levers declared inert"] < census["levers"], "the whole axis is inert"
-    assert "levers" in capsys.readouterr().out.replace("\n", " ") or True
+    assert census["tools declared inert"] < census["value-swept tools"], "every swept tool is inert"
+    assert "levers" in capsys.readouterr().out.replace("\n", " ")
 
 
 def test_the_observed_registry_would_catch_a_read_through_a_second_entry_point():
@@ -10435,6 +10518,13 @@ _CONSERVATIVE_FLAGS = {
     "cleared": ("$.cleared",),
     "created": ("$.created",),
     "verified": ("$.verified",),
+    # The other three call-outcome flags, in the same class as ``cleared`` and
+    # ``created`` and reached for the first time by the two-phase write sweep:
+    # each says whether THIS CALL did the thing, and each goes False when the
+    # apply refuses over a read it could not take whole.
+    "applied": ("$.applied",),
+    "reverted": ("$.reverted",),
+    "triggered": ("$.triggered",),
     "mutation_applied": ("$.mutation_applied",),
     "recovery_verified": ("$.recovery_verified",),
     # A world claim, not a call claim: ``clean`` is the conjunction over the
@@ -10484,7 +10574,28 @@ _COVERAGE_DISCLOSURES = {
         "$.task_instances_omitted",
     ),
     "events_omitted": ("$.audit_read.events_omitted", "$.event_history.events_omitted"),
+    # The apply's refusal reasons. This list is absent from a card that applied,
+    # so under a short read it appears where nothing was — but what it appears
+    # holding is the tool naming the read it could not take whole, which is the
+    # opposite of a manufactured claim. Held to that by the test below rather
+    # than by this sentence.
+    "blocking": ("$.impact.blocking",),
 }
+
+
+def test_the_apply_only_ever_blocks_over_a_read_it_names(tmp_path, monkeypatch):
+    """``impact.blocking`` is exempt as a disclosure, so it is checked to BE one:
+    under a shorter read the only thing it may hold is the tool naming the read
+    that came back short. A blocker of any other kind appearing here would be a
+    claim the truncation manufactured, wearing a disclosure's exemption."""
+    short, _ = _write_answer_in_two_phases(
+        tmp_path / "short", monkeypatch, "apply_dag_code_changes", "claims-more:tasks_total"
+    )
+
+    blocking = (short.get("impact") or {}).get("blocking")
+    assert blocking, "the sweep no longer reaches the branch this exemption was written for"
+    for blocker in blocking:
+        assert "was not read whole" in blocker or "could not be read" in blocker, blocker
 
 
 def _path_shape(path):
@@ -10805,7 +10916,10 @@ def _answer_on_a_fresh_world(root, monkeypatch, tool, lever):
     with monkeypatch.context() as patch:
         patch.setattr(transport, "_api", fake)
         patch.setattr(dagsource, "DAGS_DIR", root)
-        patch.setattr(dagsource, "REPARSE_TIMEOUT_S", 2.0)
+        # Zero, not the fixture's two seconds: the sweep drives 390 applies and the
+        # double never bumps the version, so every one of them would sit out the
+        # whole wait. Both arms get the same note, which is what the sweep compares.
+        patch.setattr(dagsource, "REPARSE_TIMEOUT_S", 0.0)
         server._issued_tokens.clear()
         server._approved_clear_sets.clear()
         _sweep_world(fake)
@@ -10829,6 +10943,103 @@ def test_a_write_tools_answer_never_manufactures_a_claim_under_a_shorter_read(
 
     assert _manufactured_positives(complete, truncated) == []
     assert _manufactured_negatives(complete, truncated) == []
+
+
+# The write tools as two phases, so a lever can be pulled BETWEEN them.
+#
+# Every lever is global — the plan and the apply read the world through the same
+# knobs — so a lever that shortens the apply's re-read shortens the plan's too,
+# and the plan then refuses before there is an apply to sweep. The state this
+# sweep exists to test was therefore unconstructible: all fifteen short reads it
+# counted across 195 cases were PLAN-phase ones the value sweep already covers,
+# and the apply phase reached a short read exactly zero times. Plan whole, apply
+# short is the realistic window and the entire reason the gate re-reads.
+_TWO_PHASE_WRITES = {
+    "apply_dag_code_changes": (_plan_a_code_change, _apply_the_planned_code_change),
+    "apply_task_instance_clear": (_plan_a_clear, _apply_the_planned_clear),
+    "revert_dag_code": (_plan_a_revert, _apply_the_planned_revert),
+    "run_backfill": (_plan_a_backfill, _apply_the_planned_backfill),
+    # No plan phase by design — it is the one tool declared deliberately ungated
+    # — so the lever lands before its only phase, exactly as before.
+    "rerun_dag": (dict, lambda plan: server.rerun_dag(DAG_ID)),
+}
+
+
+def _write_answer_in_two_phases(root, monkeypatch, tool, lever):
+    """One write tool's card and the readings its APPLY phase found short.
+
+    The plan is always made over the whole world; the lever is pulled after it
+    and before the apply, which is the only way this sweep can construct the
+    window between an approval and the write it authorizes.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sales_summary.py").write_text(SOURCE)
+    fake = FakeAirflow()
+    fake.dags_dir = root
+    plan_phase, apply_phase = _TWO_PHASE_WRITES[tool]
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_api", fake)
+        patch.setattr(dagsource, "DAGS_DIR", root)
+        # Zero, not the fixture's two seconds: the sweep drives 390 applies and the
+        # double never bumps the version, so every one of them would sit out the
+        # whole wait. Both arms get the same note, which is what the sweep compares.
+        patch.setattr(dagsource, "REPARSE_TIMEOUT_S", 0.0)
+        server._issued_tokens.clear()
+        server._approved_clear_sets.clear()
+        _sweep_world(fake)
+        plan = plan_phase()
+        if lever is not None:
+            _LEVERS[lever](fake, patch)
+        short_reads = _watching_readings(patch)
+        return apply_phase(plan), short_reads
+
+
+@pytest.mark.parametrize("tool", sorted(_TWO_PHASE_WRITES))
+@pytest.mark.parametrize("lever", sorted(_LEVERS))
+def test_a_write_tools_card_is_honest_when_only_its_apply_reads_short(tmp_path, monkeypatch, tool, lever):
+    """N5a, N5b and N5c on the write tools, over the window they exist for.
+
+    The card that says ``cleared: true`` is the one an operator acts on, and it
+    is written by the apply phase alone — so the apply is what has to be swept
+    for a manufactured claim and for a shortfall it did not name. N5c was
+    parametrized over the read-only tools only, which left the one property that
+    matters most for a card claiming a write landed entirely unchecked there.
+    """
+    whole, baseline_short = _write_answer_in_two_phases(tmp_path / "whole", monkeypatch, tool, None)
+    assert baseline_short == [], f"the whole arm of {tool}'s differential is not whole: {baseline_short}"
+    short, short_reads = _write_answer_in_two_phases(tmp_path / "short", monkeypatch, tool, lever)
+
+    assert _manufactured_positives(whole, short) == []
+    assert _manufactured_negatives(whole, short) == []
+    unnamed = _routes_whose_shortfall_is_unnamed(
+        short_reads, whole, short, _without_tokens(whole), _without_tokens(short)
+    )
+    assert unnamed == [], (
+        f"{tool} reached a short read on {unnamed} in its APPLY phase under {lever} and named "
+        f"that read's shortfall nowhere on the card it handed back"
+    )
+
+
+def test_the_write_sweep_reaches_a_short_read_in_the_apply_phase(tmp_path, monkeypatch, capsys):
+    """The measurement that made the sweep's own claim false, printed.
+
+    195 write cases reached zero apply-phase short reads: every one of the
+    fifteen it counted was a plan-phase read the value sweep already had. A
+    sweep whose subject cannot be constructed certifies its own silence.
+    """
+    reached = {}
+    cases = 0
+    for tool in sorted(_TWO_PHASE_WRITES):
+        for lever in sorted(_LEVERS):
+            root = tmp_path / f"{tool}-{lever}".replace(".", "_").replace(":", "_")
+            _, short_reads = _write_answer_in_two_phases(root, monkeypatch, tool, lever)
+            if short_reads:
+                cases += 1
+                reached.setdefault(tool, set()).update(route for route, _, _ in short_reads)
+    print(f"{cases} of {len(_TWO_PHASE_WRITES) * len(_LEVERS)} write cases read short in the APPLY phase")
+    print("\n".join(f"{tool}: {sorted(routes)}" for tool, routes in sorted(reached.items())))
+
+    assert reached, "no lever makes a write tool's APPLY read short, so this sweep proves nothing"
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
@@ -10887,6 +11098,119 @@ def test_no_lever_is_inert_except_the_ones_declared_inert(airflow, tmp_path, mon
 
     assert sorted(set(_LEVERS) - moved) == sorted(_LEVERS_THAT_MOVE_NOTHING), (
         "a lever's reach changed: it now moves an answer, or it has stopped moving one"
+    )
+
+
+# Tools no lever moves, each NAMED with why — the other axis of the same
+# question. The instrument declared inert LEVERS and never inert TOOLS, so two
+# plan tools that refused in their own first line contributed 78 structurally
+# dead value cases while the case count read as coverage.
+_TOOLS_THAT_MOVE_NOTHING = {
+    "plan_revert_dag_code": (
+        "it makes one object read (GET /dags/<id>) and reads the backup off disk; there is no list "
+        "in its answer for a truncation lever to shorten"
+    ),
+}
+
+# The same declaration for the write sweep, where inertness is about the APPLY
+# phase: which tools no lever can make read short between the approval and the
+# write. Both of these reach the write with no shortenable list read in hand.
+_WRITE_TOOLS_WHOSE_APPLY_CANNOT_READ_SHORT = {
+    "rerun_dag": (
+        "GET /dags/<id> and /details plus two writes, and no list read of its own — the one tool "
+        "declared deliberately ungated, with no plan phase to be short of"
+    ),
+    "revert_dag_code": (
+        "its apply re-reads GET /dags/<id> (one object) and the version list at limit=1 by design, "
+        "then compares byte-exact digests; neither is a sample anything could be omitted from"
+    ),
+}
+
+
+def _value_sweep_discrimination(airflow, monkeypatch):
+    """Every case of the value sweep, and what each one actually reached."""
+    short_cases = 0
+    scenarios = set()
+    moved = {}
+    for tool in sorted(_SWEPT_TOOLS):
+        for lever in sorted(_LEVERS):
+            with monkeypatch.context() as patch:
+                _sweep_world(airflow)
+                whole = _without_tokens(_SWEPT_TOOLS[tool]())
+                _LEVERS[lever](airflow, patch)
+                short_reads = _watching_readings(patch)
+                short = _without_tokens(_SWEPT_TOOLS[tool]())
+            if short != whole:
+                moved.setdefault(tool, set()).add(lever)
+            if short_reads:
+                short_cases += 1
+                scenarios.add((tool, tuple(sorted({route for route, _, _ in short_reads}))))
+    return short_cases, scenarios, moved
+
+
+def test_the_sweeps_discrimination_is_measured_rather_than_counted(airflow, tmp_path, monkeypatch, capsys):
+    """What the case count is worth, printed beside it.
+
+    A case is not a scenario. Seven of the levers are COMPOUND — each sets a
+    no-count flag AND clamps every row-count bound — so they are near-copies of
+    one another and produce most of the short reads between them. The number
+    that describes this instrument is the count of distinct
+    ``(tool, short-route-set)`` situations it constructs, and it is a fraction
+    of the raw case count.
+    """
+    short_cases, scenarios, moved = _value_sweep_discrimination(airflow, monkeypatch)
+    inert = sorted(set(_SWEPT_TOOLS) - set(moved))
+    print(
+        f"\nvalue sweep: {len(_SWEPT_TOOLS) * len(_LEVERS)} raw cases, {short_cases} reaching a short "
+        f"read, {len(scenarios)} distinct (tool, short-route-set) scenarios\n"
+        + "\n".join(f"  {tool:32} moved by {len(levers)} lever(s)" for tool, levers in sorted(moved.items()))
+        + "\n"
+        + "\n".join(f"  {tool}: {list(routes)}" for tool, routes in sorted(scenarios))
+    )
+
+    assert inert == sorted(_TOOLS_THAT_MOVE_NOTHING), (
+        "a tool's reach changed: it now moves under some lever, or it has stopped moving"
+    )
+    assert len(scenarios) < short_cases, "the raw case count is no longer overstating the scenarios"
+    for tool, reason in _TOOLS_THAT_MOVE_NOTHING.items():
+        assert len(reason) > 60, tool
+
+
+def test_the_write_tools_whose_apply_cannot_read_short_are_declared(tmp_path, monkeypatch):
+    """The same declaration on the write axis, where an undeclared inert tool is
+    a card claiming ``cleared: true`` that no lever ever pressed."""
+    reached = set()
+    for tool in sorted(_TWO_PHASE_WRITES):
+        for lever in sorted(_LEVERS):
+            root = tmp_path / f"{tool}-{lever}".replace(".", "_").replace(":", "_")
+            _, short_reads = _write_answer_in_two_phases(root, monkeypatch, tool, lever)
+            if short_reads:
+                reached.add(tool)
+
+    assert sorted(set(_TWO_PHASE_WRITES) - reached) == sorted(_WRITE_TOOLS_WHOSE_APPLY_CANNOT_READ_SHORT)
+    for tool, reason in _WRITE_TOOLS_WHOSE_APPLY_CANNOT_READ_SHORT.items():
+        assert len(reason) > 60, tool
+
+
+@pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
+def test_the_differential_baseline_is_itself_a_whole_read(airflow, tmp_path, monkeypatch, tool):
+    """Every sweep here is a DIFFERENTIAL against an arm ASSUMED whole, and
+    nothing asserted it.
+
+    It is whole today for all nine tools, but the moment ``_SWEEP_ROWS`` or one
+    of the boundary's bounds moves past the other, both sweeps degrade silently
+    and in BOTH directions: a manufactured claim stops being visible because the
+    baseline already carried it, and an honest disclosure reads as newly
+    appearing because the baseline was already disclosing it.
+    """
+    _sweep_world(airflow)
+    short_reads = _watching_readings(monkeypatch)
+
+    _SWEPT_TOOLS[tool]()
+
+    assert short_reads == [], (
+        f"{tool}'s whole arm already reaches a short read on {sorted({r for r, _, _ in short_reads})}, "
+        f"so every case swept against it compares two short reads"
     )
 
 
