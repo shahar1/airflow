@@ -1770,6 +1770,21 @@ def _extract_plan_token(tool_name: str, content: Any) -> str | None:
     return None
 
 
+def _extract_verify_with(tool_name: str, content: Any) -> dict[str, Any] | None:
+    """Return the verification call a trigger just handed the model, if any."""
+    if tool_name != "rerun_dag":
+        return None
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            return None
+    if not isinstance(content, dict) or content.get("triggered") is not True:
+        return None
+    block = content.get("verify_with")
+    return block if isinstance(block, dict) and isinstance(block.get("args"), dict) else None
+
+
 def _carries_a_plan(part: Any, issued_tokens: set[str]) -> bool:
     """
     Whether a proposed write carries a token this run's plan tools actually issued.
@@ -1811,6 +1826,51 @@ def _needs_correcting(outcome: dict[str, Any]) -> bool:
     if not outcome.get("messages") or outcome.get("suspended"):
         return False
     return bool(outcome.get("planned") and not outcome.get("proposed"))
+
+
+def _needs_verifying(outcome: dict[str, Any]) -> bool:
+    """
+    Report a run the model triggered and then never checked.
+
+    Measured, not assumed: handed a trigger result that says NOT VERIFIED and
+    carries the whole follow-up call, ``gpt-4o-mini`` called ``get_blast_radius``
+    and ``diagnose_dag`` and stopped. The payload and the prompt both say what
+    the next call is; neither can make it happen, and an unverified trigger is
+    the one outcome this workflow may not leave a user holding.
+    """
+    if not outcome.get("messages") or outcome.get("suspended"):
+        return False
+    return bool(outcome.get("verify_with") and not outcome.get("verified"))
+
+
+def _correction_for(outcome: dict[str, Any]) -> str | None:
+    """
+    Return the one correction this run has earned, or ``None``.
+
+    One per run, and the unproposed plan comes first: a repair that never
+    reached its write has no run to verify.
+    """
+    if _needs_correcting(outcome):
+        return _UNPROPOSED_PLAN_CORRECTION
+    if _needs_verifying(outcome):
+        return _verification_correction(outcome["verify_with"])
+    return None
+
+
+def _verification_correction(verify_with: dict[str, Any]) -> str:
+    """Return the correction for an unverified trigger, carrying the call it asks for."""
+    args = json.dumps(verify_with.get("args") or {}, sort_keys=True)
+    missing = verify_with.get("complete_args_with")
+    return (
+        f"You triggered a run and did not verify it. A created run is not work that happened, and "
+        f"nothing you called afterwards looked at the operation — a diagnosis describes a run, it "
+        f"does not check it. Call verify_replacement_run now with {args}"
+        + (f", adding {missing}" if isinstance(missing, str) and missing else "")
+        + ". Then report only what that answer says: `occurred: null` is UNKNOWN and often means "
+        "the run has not finished — say that and offer to check again, never that the work did not "
+        "happen. Do not call the operation confirmed, filed, completed or successful unless "
+        "verify_replacement_run said so, and do not write a scope sentence of your own."
+    )
 
 
 async def _run_and_stream(
@@ -1864,6 +1924,11 @@ async def _run_and_stream(
                         ):
                             outcome["planned"] = True
                             outcome.setdefault("issued_tokens", set()).add(token)
+                        if outcome is not None:
+                            if block := _extract_verify_with(event.part.tool_name, event.part.content):
+                                outcome["verify_with"] = block
+                            elif event.part.tool_name == "verify_replacement_run":
+                                outcome["verified"] = True
                         changed = _resource_changed_frame(event.part.tool_name, event.part.content)
                         if changed:
                             yield changed
@@ -1923,12 +1988,12 @@ async def _stream_agent(
             outcome=outcome,
         ):
             yield payload
-        if _needs_correcting(outcome):
+        if correction := _correction_for(outcome):
             async for payload in _run_and_stream(
                 agent,
                 user_id=user_id,
                 page_url=page_url,
-                user_prompt=_UNPROPOSED_PLAN_CORRECTION,
+                user_prompt=correction,
                 message_history=outcome["messages"],
             ):
                 yield payload
@@ -1981,12 +2046,12 @@ async def _resume_agent(
         # The run that resumes an approved write can go on to plan the *next*
         # change — "fix it, then re-run" — and narrate that one instead of
         # proposing it. The same correction applies here as on a fresh turn.
-        if _needs_correcting(outcome):
+        if correction := _correction_for(outcome):
             async for payload in _run_and_stream(
                 agent,
                 user_id=pending.user_id,
                 page_url=pending.page_url,
-                user_prompt=_UNPROPOSED_PLAN_CORRECTION,
+                user_prompt=correction,
                 message_history=outcome["messages"],
             ):
                 pending.frames.append(payload)

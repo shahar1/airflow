@@ -2563,6 +2563,106 @@ async def test_a_narrated_plan_with_a_suspension_elsewhere_is_not_corrected(monk
     assert not any(p["type"] == "error" for p in payloads)
 
 
+TRIGGERED = {
+    "triggered": True,
+    "mutation_applied": True,
+    "dag_run_id": "airy_repair_1",
+    "verify_with": {
+        "tool": "verify_replacement_run",
+        "args": {"dag_id": "d", "dag_run_id": "airy_repair_1", "task_id": "post_remittance"},
+    },
+}
+
+
+def trigger_result_event(content=None):
+    return FunctionToolResultEvent(
+        part=ToolReturnPart(
+            tool_name="rerun_dag",
+            content=TRIGGERED if content is None else content,
+            tool_call_id="r1",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_the_model_never_verified_is_corrected_once(monkeypatch):
+    """The measured failure: handed the whole verification call, the model diagnosed instead."""
+    agent = ScriptedAgent(
+        [
+            [
+                trigger_result_event(),
+                FunctionToolResultEvent(
+                    part=ToolReturnPart(tool_name="diagnose_dag", content={}, tool_call_id="d1")
+                ),
+                run_result_event(),
+            ],
+            [text_delta_event("Verifying now.")],
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    payloads = [p async for p in plugin._stream_agent("re-run it", user_id="alice")]
+
+    assert "You triggered a run and did not verify it" in agent.prompts[1]
+    assert '"task_id": "post_remittance"' in agent.prompts[1]
+    assert "a diagnosis describes a run, it does not check it" in agent.prompts[1]
+    assert payloads[-1] == {"type": "text", "delta": "Verifying now."}
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_the_model_did_verify_is_left_alone(monkeypatch):
+    agent = ScriptedAgent(
+        [
+            [
+                trigger_result_event(),
+                FunctionToolResultEvent(
+                    part=ToolReturnPart(tool_name="verify_replacement_run", content={}, tool_call_id="v1")
+                ),
+                run_result_event(),
+            ]
+        ]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("re-run it", user_id="alice")]
+
+    assert len(agent.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_that_created_nothing_earns_no_verification_chase(monkeypatch):
+    """Nothing was created, so there is no run to check and nothing to correct."""
+    agent = ScriptedAgent(
+        [[trigger_result_event({"triggered": False, "error": "refused"}), run_result_event()]]
+    )
+    monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
+
+    [p async for p in plugin._stream_agent("re-run it", user_id="alice")]
+
+    assert len(agent.prompts) == 1
+
+
+def test_the_verification_correction_names_the_argument_the_trigger_could_not_fill():
+    correction = plugin._verification_correction(
+        {
+            "tool": "verify_replacement_run",
+            "args": {"dag_id": "d", "dag_run_id": "r"},
+            "complete_args_with": "task_id — the task whose missing work this run was triggered to produce",
+        }
+    )
+
+    assert "adding task_id" in correction
+    assert "`occurred: null` is UNKNOWN" in correction
+    assert "never that the work did not happen" in correction
+
+
+def test_an_unproposed_plan_outranks_an_unverified_trigger():
+    """One correction per run, and a repair that never wrote has no run to check."""
+    both = {"messages": ["m"], "planned": True, "verify_with": {"args": {"dag_id": "d"}}}
+
+    assert plugin._correction_for(both) == plugin._UNPROPOSED_PLAN_CORRECTION
+
+
 def test_the_correction_tells_the_model_to_plan_first_when_no_plan_ran():
     """Without this branch the correction invites a hallucinated token."""
     assert "call the matching plan tool first" in plugin._UNPROPOSED_PLAN_CORRECTION
