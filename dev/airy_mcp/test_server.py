@@ -10540,10 +10540,18 @@ def test_no_leaf_wearing_a_conservative_name_escapes_the_declared_paths(airflow,
 # rows were not read" is not a claim that there are none, and the counter is
 # what makes that true — so it is named here and asserted to rise, rather than
 # the enumeration being waved through.
+#
+# ``{}`` binds the counter to the SAME key the enumeration is under. Without it
+# the tie was by prefix: ``rows_omitted`` is keyed by task id, so one task's
+# counter rising by 1 excused every other task's enumeration emptying — proven
+# over all of them at once, with the sweep reporting nothing.
 _SAMPLED_ENUMERATIONS = {
-    "$.run_history.task_comparison.tasks": "$.run_history.task_comparison.rows_omitted",
+    "$.run_history.task_comparison.tasks": "$.run_history.task_comparison.rows_omitted.{}",
     "$.run_history.task_comparison.runs_not_covered": "$.run_history.runs_omitted",
-    "$.run_history.task_comparison.task_ids_compared": "$.task_instances_omitted",
+    "$.run_history.task_comparison.task_ids_compared": (
+        "$.run_history.task_comparison.task_ids_omitted",
+        "$.task_instances_omitted",
+    ),
     # The two enumerations of what was verified, against the two enumerations of
     # what could not be. An empty verified set beside a named unlocatable one is
     # the tool saying it reached nothing, not that there was nothing.
@@ -10557,11 +10565,20 @@ _SAMPLED_ENUMERATIONS = {
 
 
 def _sampled_under(path):
-    """The omission counters that stand behind this enumeration, if it is a sample."""
+    """The omission counters that stand behind THIS enumeration, by identity.
+
+    A declared counter carrying ``{}`` is bound to the same key the enumeration
+    is under, so ``tasks.report`` is excused only by ``rows_omitted.report``.
+    Matching any leaf under the counter's PREFIX made every task's counter stand
+    for every task's enumeration.
+    """
     shape = _path_shape(path)
-    for prefix, counters in _SAMPLED_ENUMERATIONS.items():
-        if shape == prefix or shape.startswith(prefix + "."):
-            return (counters,) if isinstance(counters, str) else counters
+    for prefix, declared in _SAMPLED_ENUMERATIONS.items():
+        if shape != prefix and not shape.startswith(prefix + "."):
+            continue
+        within = shape[len(prefix) :].lstrip(".")
+        counters = (declared,) if isinstance(declared, str) else declared
+        return tuple(counter.format(within) for counter in counters if within or "{}" not in counter)
     return None
 
 
@@ -10573,11 +10590,23 @@ def test_every_sampled_enumeration_names_a_counter_that_is_not_itself():
             assert counter != prefix
 
 
+def test_a_sampled_enumeration_is_excused_only_by_its_own_counter():
+    """The evasion this binding closes: every per-task enumeration emptied while
+    one unrelated task's counter rose by 1, and the sweep reported nothing."""
+    prefix = "$.run_history.task_comparison"
+    whole = {"run_history": {"task_comparison": {"tasks": {"a": [{}], "b": [{}]}, "rows_omitted": {}}}}
+    short = {"run_history": {"task_comparison": {"tasks": {"a": [], "b": []}, "rows_omitted": {"a": 9}}}}
+
+    assert _sampled_under(f"{prefix}.tasks.a[]") == (f"{prefix}.rows_omitted.a",)
+    assert _discloses_more(whole, short, _sampled_under(f"{prefix}.tasks.a[]")) is True
+    assert _discloses_more(whole, short, _sampled_under(f"{prefix}.tasks.b[]")) is False
+
+
 def _discloses_more(complete, truncated, counters):
     """Whether any of the named omission counters went UP between the two answers."""
     before, after = dict(_leaves(complete)), dict(_leaves(truncated))
     for path, now in after.items():
-        if not any(_path_shape(path).startswith(counter) for counter in counters):
+        if _path_shape(path) not in counters:
             continue
         was = before.get(path)
         if isinstance(now, int) and not isinstance(now, bool):
@@ -10949,49 +10978,84 @@ _TRUNCATION_VOCABULARY = (
 )
 
 
-def _names_this_read(route, reason, omitted, whole, short, before, after):
-    """Whether the payload discloses THIS read's shortfall, not some other one.
+def _mentions_route(route, text):
+    """Whether this exact route is named — not merely a longer route that starts with it.
 
-    Three ties, all of them to the read itself rather than to a vocabulary:
-    the route string, the sentence the ``Reading`` wrote for its own shortfall
-    (or the distinctive clauses of it), and a coverage leaf whose value moved by
-    exactly the number of rows this read did not cover. A bare word matched
-    anywhere in the payload is none of those — stripping ``get_blast_radius`` of
-    both its caveat and its coverage flag and adding an unrelated
-    ``"schedule_source": "unavailable"`` satisfied the old rule outright.
+    ``route in text`` made every route that is a PREFIX of another auto-satisfied:
+    ``GET /dags/<dag>/dagRuns/<run>/taskInstances`` begins the routes for
+    ``/tries``, ``/xcomEntries`` and ``/listMapped``, and ``GET /dags/<dag>/dagRuns``
+    begins both — so disclosing the longer read silently discharged the shorter,
+    and ``diagnose_dag`` reaches both together.
     """
-    if route and route in after and route not in before:
+    return re.search(re.escape(route) + r"(?![/\w-])", text) is not None
+
+
+def _named_by_words(route, reason, before, after):
+    """The two ties that carry the read's own IDENTITY: its route and its sentence.
+
+    A bare word matched anywhere in the payload is neither — stripping
+    ``get_blast_radius`` of both its caveat and its coverage flag and adding an
+    unrelated ``"schedule_source": "unavailable"`` satisfied the old rule.
+    """
+    if route and _mentions_route(route, after) and not _mentions_route(route, before):
         return True
-    for clause in (part.strip() for part in reason.split(";")):
-        if len(clause) > 12 and clause in after and clause not in before:
-            return True
-    # The exact number of rows THIS read did not cover, appearing where the
-    # whole answer had no such number. Arithmetic is a tie in a way a status
-    # word is not: "9996 not seen" belongs to the read that missed 9996 rows.
-    if omitted and re.search(rf"\b{omitted}\b", after) and not re.search(rf"\b{omitted}\b", before):
-        return True
-    for path in _coverage_disclosures(whole, short):
-        value = dict(_leaves(short)).get(path)
-        # A COUNT that equals the rows this read did not cover is tied to it by
-        # arithmetic. A bare status word — ``"partial"``, ``"unavailable"`` —
-        # carries no identity at all, and any leaf anywhere holding one used to
-        # count as this read naming itself.
-        if isinstance(value, int) and not isinstance(value, bool) and value == omitted and omitted:
-            return True
-    return False
+    return any(
+        len(clause) > 12 and clause in after and clause not in before
+        for clause in (part.strip() for part in reason.split(";"))
+    )
+
+
+def _arithmetic_ties(omitted, whole, short, before, after):
+    """How many times the payload discloses exactly this many unread rows.
+
+    A COUNT is a tie in a way a status word is not: "9996 not seen" belongs to
+    the read that missed 9996 rows. It is counted rather than tested, because
+    two reads short by the SAME number used to share one disclosure — one
+    sentence discharging both.
+    """
+    if not omitted:
+        return 0
+    pattern = rf"\b{omitted}\b"
+    occurrences = len(re.findall(pattern, after)) - len(re.findall(pattern, before))
+    leaves = dict(_leaves(short))
+    counted = sum(
+        1
+        for path in _coverage_disclosures(whole, short)
+        if isinstance(leaves.get(path), int)
+        and not isinstance(leaves.get(path), bool)
+        and leaves[path] == omitted
+    )
+    return max(occurrences, counted)
+
+
+def _names_this_read(route, reason, omitted, whole, short, before, after):
+    """Whether the payload discloses THIS read's shortfall, not some other one."""
+    return _named_by_words(route, reason, before, after) or bool(
+        _arithmetic_ties(omitted, whole, short, before, after)
+    )
 
 
 def _routes_whose_shortfall_is_unnamed(short_reads, whole, short, before, after):
-    """EVERY short read, not one of them. ``named`` needed a single member, so a
-    tool reaching two short reads and disclosing one passed while swallowing the
-    other."""
-    return sorted(
-        {
-            route
-            for route, reason, omitted in short_reads
-            if not _names_this_read(route, reason, omitted, whole, short, before, after)
-        }
-    )
+    """EVERY short read, not one of them, and no two of them on one disclosure.
+
+    ``named`` needed a single member, so a tool reaching two short reads and
+    disclosing one passed while swallowing the other. The arithmetic tie had the
+    same shape one level down: two reads short by the same count both matched
+    the one number in the payload, so each occurrence now discharges one read
+    and no more.
+    """
+    unnamed = []
+    spent: dict[int, int] = {}
+    for route, reason, omitted in sorted(set(short_reads)):
+        if _named_by_words(route, reason, before, after):
+            continue
+        if omitted not in spent:
+            spent[omitted] = _arithmetic_ties(omitted, whole, short, before, after)
+        if spent[omitted] > 0:
+            spent[omitted] -= 1
+            continue
+        unnamed.append(route)
+    return sorted(set(unnamed))
 
 
 @pytest.mark.parametrize("tool", sorted(_SWEPT_TOOLS))
@@ -11047,6 +11111,28 @@ def test_every_short_read_has_to_be_named_and_not_merely_one_of_them():
     after = "{'note': 'GET /assets was NOT read whole'}"
 
     assert _routes_whose_shortfall_is_unnamed(reads, {}, {}, whole, after) == ["GET /pools"]
+
+
+def test_disclosing_a_longer_route_does_not_discharge_the_route_it_starts_with():
+    """I6's route tie was a bare substring test, so any route that is a PREFIX of
+    another was auto-satisfied. ``diagnose_dag`` and ``verify_task_instance_recovery``
+    reach both of these together, and disclosing only the longer one left the
+    shorter swallowed and unnamed."""
+    short = "GET /dags/<dag>/dagRuns/<run>/taskInstances"
+    long = f"{short}/<task>/tries"
+    after = str({"note": f"{long} was NOT read whole: 4 of 900 row(s) were read"})
+
+    assert _named_by_words(long, "", "{}", after)
+    assert not _named_by_words(short, "", "{}", after)
+
+
+def test_two_reads_short_by_the_same_count_do_not_share_one_disclosure():
+    """The arithmetic tie was a membership test, so one number in the payload
+    named every read that had missed that many rows."""
+    reads = [("GET /a", "", 896), ("GET /b", "", 896)]
+    after = str({"a_omitted": 896})
+
+    assert _routes_whose_shortfall_is_unnamed(reads, {}, {}, "{}", after) == ["GET /b"]
 
 
 def test_a_correct_disclosure_keeps_counting_when_it_is_renamed():
