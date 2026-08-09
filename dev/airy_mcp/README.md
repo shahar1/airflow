@@ -21,6 +21,7 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
 - [Airy self-healing MCP (summit demo)](#airy-self-healing-mcp-summit-demo)
+  - [Withdrawn: the broad recovery surface](#withdrawn-the-broad-recovery-surface)
   - [Setup (Breeze)](#setup-breeze)
   - [Showcase: incident_triage and incident_digest](#showcase-incident_triage-and-incident_digest)
   - [Demo run-book](#demo-run-book)
@@ -32,10 +33,34 @@
 # Airy self-healing MCP (summit demo)
 
 A second MCP sidecar with the **write-capable** tools that
-`astro-airflow-mcp` deliberately does not have. Every mutation is planned first:
-the planning tool is read-only and returns a single-use `plan_token`, and the
-writing tool refuses without it — so the approval card shows the change the user
-is actually approving.
+`astro-airflow-mcp` deliberately does not have, scoped to **one** workflow:
+diagnose a run whose expected work never executed, propose an exact source
+correction, get it approved, apply it safely, trigger a specifically identified
+replacement run, and check what that run actually recorded.
+
+A **source** change is planned first: the planning tool is read-only and returns
+a single-use `plan_token`, and the writing tool refuses without it — so the
+approval card shows the change the user is actually approving. Triggering a run
+is **not** planned that way and carries no token; its own arguments describe it
+completely, and it re-establishes its own preconditions immediately before it
+acts. The two are separate approvals, and one never authorizes the other.
+
+## Withdrawn: the broad recovery surface
+
+`plan_task_instance_clear`, `apply_task_instance_clear`,
+`verify_task_instance_recovery`, `plan_backfill` and `run_backfill` used to be
+registered here. They are **withdrawn**: broad automatic discovery and clearing
+of arbitrary historical task instances is out of scope and uncertified, and an
+attempt to certify completeness over that surface failed. They are absent from
+`server.py`'s registration tuple *and* from the plugin's `TOOL_POLICY`
+allowlist, so nothing offers them and a call naming one is refused rather than
+guessed at.
+
+Their implementations (`recovery.py`, `plan_backfill`/`run_backfill` in
+`codechange.py`) and **all** of their tests stay in the tree deliberately, as
+the record of what was built and of why it is not exposed. Both test sweeps
+still drive them, so nothing about withdrawing them relaxes what they have to
+prove — see `test_every_withdrawn_tool_is_unreachable_and_still_implemented`.
 
 | Tool | What it does |
 |---|---|
@@ -45,13 +70,8 @@ is actually approving.
 | `plan_revert_dag_code(dag_id)` | read-only: previews a revert as the diff between the backup and the current file, plus a relayable `summary` and a single-use `plan_token` (kind `revert`). No backup → no token, just a relayable "nothing to revert" |
 | `revert_dag_code(dag_id, plan_token, diff)` | restores the **original** file, discarding every fix (rehearse the demo from the chat). Requires the token from `plan_revert_dag_code` *and* the same `diff` repeated in the arguments, so the confirmation card shows exactly what reverting discards; at execution it re-verifies that the backup is still there and the current bytes still hash to what the plan was made from — drift aborts |
 | `compare_dag_runs(dag_id, run_a, run_b)` | per-task duration deltas and conf changes; takes exact run ids or `latest`/`previous` ("compare the last two runs" is `previous` vs `latest`). A mapped task is aggregated to one row per task — instance count plus the *longest* instance's duration, not whichever `map_index` the API listed last. Names the differing Dag versions but does **not** diff them, since an older version may hold a co-located Dag the caller was never authorized against |
-| `find_failure_clusters(hours, dag_ids)` | recent failed task instances grouped by normalised error signature; `dag_ids` is set by the caller's permissions, not by the model. Log fetches pass each instance's `map_index`, so a mapped failure is signed by its own log rather than the unmapped instance's; `failures_omitted` reports how many failures the scan the clusters were built from did not cover — counted off the reading after the allowlist filter reduced it, not off the page before — so "3 clusters" never quietly means "of the 50 I looked at". A log that cannot be read joins `failures_unreadable` rather than taking the tool down, and whenever coverage is short `scope` stops claiming the window holds no failed instance |
-| `plan_backfill(dag_id, from, to)` | dry-run preview — read-only; returns every planned run and the `plan_token` that authorizes creating them |
-| `run_backfill(dag_id, from, to, plan_token, planned_runs)` | creates the backfill, only for a plan the user reviewed and that still produces the same runs, capped at `AIRY_MCP_MAX_BACKFILL_RUNS` (50) |
+| `find_failure_clusters(hours, dag_ids)` | **read-only orientation, not recovery**: recent failed task instances grouped by normalised error signature, so a person can pick the ONE run to look at next. It repairs, clears and re-runs nothing, and the reading is a sample rather than a census — do not read a cluster list as the whole of what is broken. `dag_ids` is set by the caller's permissions, not by the model. Log fetches pass each instance's `map_index`, so a mapped failure is signed by its own log rather than the unmapped instance's; `failures_omitted` reports how many failures the scan the clusters were built from did not cover — counted off the reading after the allowlist filter reduced it, not off the page before — so "3 clusters" never quietly means "of the 50 I looked at". A log that cannot be read joins `failures_unreadable` rather than taking the tool down, and whenever coverage is short `scope` stops claiming the window holds no failed instance |
 | `get_blast_radius(dag_id)` | assets this Dag produces/consumes and the Dags up- and downstream of them |
-| `plan_task_instance_clear(dag_id, task_id/position, dag_run_id)` | read-only: resolves `latest` to an exact run and a position to a task id (refused where a branch means the graph does not fix the order), dry-runs the clear, and returns the exact instances it would affect. Takes the downstream with it by default, as Airflow's own clear dialog does — `include_downstream=False` holds it to the one task |
-| `apply_task_instance_clear(dag_id, dag_run_id, task_ids, plan_token)` | re-runs the **existing** instances in their own run: repeats the dry run *and* the task-set check, aborts if either moved, and never creates a Dag run. After the clear it compares what actually cleared against the plan: `cleared_matches_plan`, and on drift a `cleared_delta` (`missing`/`extra`) plus a warning — truthful reporting of an outcome that moved, not a rollback; the clear itself did happen |
-| `verify_task_instance_recovery(dag_id, dag_run_id, instances, prior_attempts, target_task_id, cleared_after, audit_scope, xcom_scope)` | read-only: the step that makes a clear a *recovery* rather than a colour change. Call it after `apply_task_instance_clear` with the arguments that call handed back in `verify_with.args`. Reports each leg separately — a new attempt exists, the earlier attempt survived in `/tries`, state, execution fields read together, duration against this instance's own history, the new attempt's log, the audit transitions this API can see, and whether output was recorded after the clear; a downstream instance must record output *after the target's re-run finished*, which catches a completion notice that survived from before. The re-expansion baseline is taken from what **this server** recorded when it redeemed the plan token, never from `instances`, so a mapped task the scheduler re-expanded shows as an addition by identity. Without `target_task_id` every role is `unclassified` and the dating leg reports "not established". `external_system_checked` is always false: `verified` means Airflow's own record is consistent with a re-run, not that the work outside Airflow is correct. `audit_scope`/`xcom_scope` are set by the caller's permissions, not by the model, and **degrade rather than gate** — without them those legs report "not established" and the rest of the reading stands |
 | `rerun_dag(dag_id, conf=None, note="", unpause=False, unpause_token="")` | triggers a **new** run. `conf` is validated against the Dag's own `params` schema (from `GET /dags/{dag_id}/details`): unknown keys are refused with the full list of valid params, types and defaults; enum and type violations are refused; a Dag without params accepts only an empty conf — and validation runs *before* the unpause flow, so a bad conf never burns an `unpause_token`. `note` is attached to the created run (default "Triggered via Airy"). A paused Dag first returns a warning and a token, and only a second call carrying it may unpause |
 
 Two conventions run through the whole surface. Any tool's first GET translates
@@ -213,9 +233,9 @@ fails loudly, and its error names the record and both recoveries:
 1. **Re-trigger with conf** — `rerun_dag` with `{"skip_invalid": true}`; Airy
    turns the natural-language ask into typed conf that the params schema
    validates.
-2. **Fix the feed and clear** — `plan`/`apply_dag_code_changes` replacing the
-   malformed literal with a parseable timestamp, then
-   `plan`/`apply_task_instance_clear` on `normalize`.
+2. **Fix the feed and re-run** — `plan`/`apply_dag_code_changes` replacing the
+   malformed literal with a parseable timestamp, then `rerun_dag` for the
+   replacement run.
 
 ## Demo run-book
 
@@ -242,35 +262,16 @@ Both fixes are single unique strings: `"column": "ammount"` → `"amount"`, and
 edit landed would have been computed against source that no longer exists, which
 is why they go in one call.
 
-### Clearing an existing task instance
+### Reset between rehearsals
 
-Run this one from its own starting state, not after the repair above: once both
-bugs are fixed, `report` never fails, so there is nothing to clear.
+Ask Airy to *"revert sales_summary"* — a planned flow, so `plan_revert_dag_code`
+shows the diff before `revert_dag_code` is approved — or use the file-level
+reset below.
 
-1. From a run where `extract` and `summarize` succeeded and `report` failed, fix
-   only the `summarise` typo and let it reparse — do **not** trigger a new run.
-2. **"Clear the third task in the latest run."** → `plan_task_instance_clear`
-   resolves `latest` to an exact run id and "third" to `report` from the
-   *topological* order (`GET /dags/{id}/tasks` sorts alphabetically, which would
-   have answered `summarize`), then dry-runs the clear. A position is refused
-   whenever more than one task could legitimately occupy it — worked out from
-   each task's ancestor and descendant counts, so a task on a short branch that
-   could float anywhere after its parent makes those positions unanswerable
-   too. The task a diamond rejoins at is still fixed, and still answerable.
-3. The card names the Dag, the exact run, `report`, whether the downstream goes
-   with it, that it runs on the latest parsed code, and that it creates no Dag
-   run. Approve → the same instances are re-queued, each previous attempt is
-   kept in task-instance history, and the Grid updates without a reload.
-
-Clearing takes the downstream with it because clearing alone usually does not
-finish the job: a task sitting in `upstream_failed` is never rescheduled, and one
-that already succeeded keeps the XCom value the re-run exists to replace. So
-clearing `summarize` on its own would leave `report` exactly as broken as it was.
-That is not silent — the plan lists every instance before the card is shown.
-
-Reset between rehearsals: ask Airy to *"revert sales_summary"* — now a planned
-flow, so `plan_revert_dag_code` shows the diff before `revert_dag_code` is
-approved — or use the file-level reset below.
+> The clearing beat that used to stand here (*"clear the third task in the
+> latest run"*) is gone with the tools that drove it. Airy no longer clears task
+> instances at all; a task instance that needs re-running inside an existing run
+> is Airflow's own Grid control, not Airy's.
 
 ### Incident triage beats
 
@@ -284,9 +285,9 @@ approved — or use the file-level reset below.
    refused with the full catalog of valid params, types and defaults.
 4. **Recovery B** (rehearse from a fresh failure, not after A) — *"fix the
    feed"* → `plan_dag_code_changes` replacing the malformed timestamp (it occurs
-   exactly once), then `plan`/`apply_task_instance_clear` on `normalize`. The
-   repaired record parses but falls outside the default 24 h window, so the
-   run succeeds with one record visible in the report's "dropped" line.
+   exactly once), `apply_dag_code_changes`, then `rerun_dag` for the replacement
+   run. The repaired record parses but falls outside the default 24 h window, so
+   the run succeeds with one record visible in the report's "dropped" line.
 5. A successful run's `publish_report` emits the `incident_report` asset event
    → an `incident_digest` run starts within seconds and logs the full markdown
    report.
@@ -337,12 +338,10 @@ Declared up front, all of them cheap to replace:
    `_tool_access_requirements` maps each tool to the `(method, DagAccessEntity)`
    pairs Airflow's own routes demand, and every one has to pass. `diagnose_dag`
    therefore needs `RUN`, `TASK_INSTANCE`, `TASK_LOGS`, `CODE` and `TASK`, not
-   just Dag-level read; triggering a run is `POST` on `RUN`, not edit on the Dag;
-   clearing a task instance is `PUT` on `TASK_INSTANCE`, which Airflow's route
-   demands of its *dry run* too, so the read-only planner is held to it as well.
+   just Dag-level read; triggering a run is `POST` on `RUN`, not edit on the Dag.
    Write tools are offered per permission, not as one "may you edit a Dag?": a
-   user who may clear task instances but not rewrite Dag files is offered exactly
-   the clear. (Under the simple auth manager both answers come from the role, so
+   user who may trigger runs but not rewrite Dag files is offered exactly the
+   re-run. (Under the simple auth manager both answers come from the role, so
    this only bites under FAB.) The
    Dag's `team_name` is passed in `DagDetails`, because a team-scoped auth
    manager answers a different question without it.
@@ -409,60 +408,36 @@ Declared up front, all of them cheap to replace:
    refused rather than overwritten by a buffer computed from bytes that have
    moved. A writer that does not take the lock — a human in an editor — is
    outside what a file-backed bundle can defend.
-5. **Consent that outlives the click, proved with tokens.** Every mutation is
-   reachable only through the plan that was shown, and some change Airflow
-   beyond the thing the user thinks they approved:
+5. **Consent that outlives the click, proved with tokens.** Every *source*
+   mutation is reachable only through the plan that was shown, and some change
+   Airflow beyond the thing the user thinks they approved. Triggering is the
+   deliberate exception and is covered by its own confirmation card rather than
+   by a token:
    - `apply_dag_code_changes` needs the `plan_token` from
      `plan_dag_code_changes`, and its `changes` must be the ones planned — they
      are in the *arguments* so the card shows every hunk, and the token is what
      proves the diff was not invented. At execution the source is re-hashed
      against the digest the plan was made from: same bytes, or no write.
-   - `apply_task_instance_clear` needs the `plan_token` from
-     `plan_task_instance_clear`, and repeats both checks at the moment of
-     execution: an instance that started running since the preview aborts it
-     rather than being killed by an approval given for a failed one, and a Dag
-     that gained a task since the preview aborts it too — clearing re-queues the
-     run, and the scheduler then reconciles a re-queued run against the latest
-     version, which would create instances nobody reviewed. That is why the
-     check does not depend on `run_on_latest_version`.
-   - `plan_backfill` returns **every** planned run with both halves of its
-     identity, and issues no token at all above the cap — a token must not
-     authorize runs the preview was too abbreviated to have shown, and a
-     partitioned Dag has no logical date to show in the first place.
-   - `run_backfill` must repeat the plan back in `planned_runs` — the runs are in
-     the *arguments* so the confirmation card spells out every run it will create,
-     and the token is what proves the list was not invented. Mismatched, and it
-     refuses.
-   - `run_backfill` needs the single-use `plan_token` from `plan_backfill`, its
-     arguments must match that plan exactly, and the dry run is repeated at the
-     moment of execution — schedule or state drift since the preview aborts it.
-     `AIRY_MCP_MAX_BACKFILL_RUNS` (50) still caps the size. Preview and create
-     are two REST calls and so cannot be atomic from outside Airflow; what
-     actually got created is therefore read back and compared by run *identity*
-     — `(logical_date, partition_key)`, since the same count can be different
-     runs; the date is canonicalised by parsing, the partition key compared
-     exactly, and slots Airflow could not fill (no `dag_run_id`, or an
-     `exception_reason`) do not count as created. A backfill that does not match
-     is cancelled. Cancelling is a
-     compensating action, not a rollback: it pauses the backfill and fails its
-     *queued* runs, so anything the scheduler already picked up is reported in
-     `surviving_runs` rather than quietly implied to be gone. *Real answer:* an
-     expected-plan precondition on `POST /backfills` itself.
+   - `revert_dag_code` needs the `plan_token` from `plan_revert_dag_code` and
+     the same `diff` repeated, and re-hashes the current bytes immediately
+     before restoring: same bytes, or no write.
    - `rerun_dag` on a paused Dag returns a warning plus an `unpause_token`
      instead of unpausing. Only a second call carrying that token may unpause,
      and the confirmation card retitles itself to "Re-run and resume this Dag's
      schedule" so the lasting effect is in the line people actually read.
 
-   One in-memory, per-process token store holds all four kinds (source change,
-   clear, backfill, unpause), like the pending-approval store. A token proves the
-   warning was issued and the plan was shown, not that a human read either — the
-   confirmation card is what covers that.
+   One in-memory, per-process token store holds the kinds that remain (source
+   change, revert, unpause), like the pending-approval store. Kinds are
+   namespaced, so a token issued for one kind can never be redeemed for another
+   — which is what keeps an approved source patch from authorizing a run. A
+   token proves the warning was issued and the plan was shown, not that a human
+   read either; the confirmation card is what covers that.
 
 6. **Refreshing the page around the chat.** A write that lands changes what the
    Dag view behind the drawer is showing, and that view will not notice: core
    queries have a five-minute stale time, window-focus refetch is off, and the
-   Grid only polls while a run is active — so a terminal run cleared from the
-   chat, or a source edit, sits stale until a manual reload.
+   Grid only polls while a run is active — so a run triggered from the chat, or
+   a source edit, sits stale until a manual reload.
 
    The chatbot cannot fix that from inside: it is injected as its own React root,
    outside Airflow's `QueryClientProvider`, so `useQueryClient()` is not
@@ -505,15 +480,15 @@ shortcuts above:
 ## Tests
 
 ```bash
-uv run --project airflow-core pytest dev/airy_mcp/test_server.py -q           # 205 tests
-uv run --project airflow-core pytest dev/airy_mcp/test_incident_triage.py -q  # 48 tests
+uv run --project airflow-core pytest dev/airy_mcp/test_server.py -q
+uv run --project airflow-core pytest dev/airy_mcp/test_incident_triage.py -q
 ```
 
 The plugin and UI suites:
 
 ```bash
-cd plugins/airflow-chatbot-plugin && uv run --project ../../airflow-core pytest test_chat_stream.py -q  # 211 tests
-cd plugins/airflow-chatbot-plugin && pnpm exec vitest run                                               # 265 tests
+cd plugins/airflow-chatbot-plugin && uv run --project ../../airflow-core pytest test_chat_stream.py -q
+cd plugins/airflow-chatbot-plugin && pnpm exec vitest run
 cd airflow-core/src/airflow/ui && pnpm exec vitest run src/queries/useResourceChanged.test.ts
 ```
 

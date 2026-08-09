@@ -183,14 +183,17 @@ def test_event_payload_refuses_to_call_a_denied_write_a_success():
         # A paused Dag refuses the trigger and says so in its own field; before
         # this key was read, the drawer reported "Re-ran Dag · approved by you".
         {"triggered": False, "unpause_token": "t0k3n"},
-        {"created": False, "error": "the backfill did not match"},
-        {"cleared": False, "error": "no reviewed plan for this clear"},
+        {"applied": False, "error": "the source changed since it was planned"},
+        {"reverted": False, "error": "no reviewed plan for this revert"},
         {"mutation_applied": False, "error": "the source changed since it was planned"},
     ],
-    ids=["not_triggered", "not_created", "not_cleared", "no_mutation"],
+    ids=["not_triggered", "not_applied", "not_reverted", "no_mutation"],
 )
 def test_event_payload_refuses_to_call_any_no_op_write_a_success(content):
-    tool = {"triggered": "rerun_dag", "created": "run_backfill", "cleared": "apply_task_instance_clear"}.get(
+    # The ``created`` and ``cleared`` arms named withdrawn tools; the rule they
+    # proved — ANY named outcome key reading false is a refusal — is unchanged
+    # and is now driven through the outcome keys the live write tools use.
+    tool = {"triggered": "rerun_dag", "reverted": "revert_dag_code"}.get(
         next(iter(content)), "apply_dag_code_changes"
     )
     event = FunctionToolResultEvent(part=ToolReturnPart(tool_name=tool, content=content, tool_call_id="c1"))
@@ -203,15 +206,15 @@ def test_event_payload_refuses_to_call_any_no_op_write_a_success(content):
 
 def test_a_write_whose_outcome_is_unknown_is_neither_a_success_nor_a_failure():
     """
-    The clear request failed after it was sent, so the tool cannot say whether it landed.
+    The trigger request failed after it was sent, so the tool cannot say whether it landed.
 
     Red says the write did not happen, which is the one thing this result
     explicitly declines to claim; green says it did. The drawer already has an
     amber "may have landed" rendering, and this is what it is for.
     """
-    content = {"cleared": False, "mutation_outcome": "unknown", "error": "not established from here"}
+    content = {"triggered": False, "mutation_outcome": "unknown", "error": "not established from here"}
     event = FunctionToolResultEvent(
-        part=ToolReturnPart(tool_name="apply_task_instance_clear", content=content, tool_call_id="c1")
+        part=ToolReturnPart(tool_name="rerun_dag", content=content, tool_call_id="c1")
     )
 
     payload = plugin._event_payload(event)
@@ -221,29 +224,30 @@ def test_a_write_whose_outcome_is_unknown_is_neither_a_success_nor_a_failure():
     assert plugin._write_refused(content) is False
     assert plugin._write_unsettled(content) is True
     # Still off the green path: a refresh would be a claim the write happened.
-    assert plugin._resource_changed_frame("apply_task_instance_clear", content) is None
+    assert plugin._resource_changed_frame("rerun_dag", content) is None
 
 
 def test_a_write_that_landed_and_was_compensated_is_not_reported_as_nothing_happening():
     """
-    An abandoned backfill created runs, cancelled them, and some are still going.
+    An unpaused Dag whose run then failed to trigger: something WAS written.
 
-    ``created: false`` says the runs the USER approved were not created;
-    ``mutation_applied: true`` says something was written anyway. Reading the
-    per-tool key alone painted a red "Run backfill failed" over runs that were
-    executing — while the same result fired the refresh underneath it.
+    ``triggered: false`` says the run the USER approved was not created;
+    ``mutation_applied: true`` says the unpause landed anyway, and the Dag is
+    scheduling again. Reading the per-tool key alone painted a red "Re-run
+    failed" over that — while the same result fired the refresh underneath it.
+    (This test used to be driven by an abandoned backfill, which is the same
+    shape and a withdrawn tool.)
     """
     content = {
-        "created": False,
+        "triggered": False,
         "mutation_applied": True,
-        "backfill_id": 7,
-        "cancelled": True,
-        "surviving_runs": [{"dag_run_id": "backfill__1", "state": "running"}],
-        "error": "the backfill did not match the 3 runs the user approved; cancelled",
-        "ui_updates": [{"kind": "dag_run", "dag_id": "sales_summary"}],
+        "dag_id": "sales_summary",
+        "unpaused": True,
+        "error": "triggering the run failed; sales_summary WAS unpaused first and is still unpaused",
+        "ui_updates": [{"kind": "dag_definition", "dag_id": "sales_summary"}],
     }
     event = FunctionToolResultEvent(
-        part=ToolReturnPart(tool_name="run_backfill", content=content, tool_call_id="c1")
+        part=ToolReturnPart(tool_name="rerun_dag", content=content, tool_call_id="c1")
     )
 
     payload = plugin._event_payload(event)
@@ -251,8 +255,8 @@ def test_a_write_that_landed_and_was_compensated_is_not_reported_as_nothing_happ
     assert payload["failed"] is False
     assert payload["unsettled"] is True
     assert plugin._write_refused(content) is False
-    # The runs exist, so the views the user is looking at are stale.
-    assert plugin._resource_changed_frame("run_backfill", content) is not None
+    # The Dag is scheduling again, so the views the user is looking at are stale.
+    assert plugin._resource_changed_frame("rerun_dag", content) is not None
 
 
 def test_event_payload_refuses_to_call_a_conf_refusal_a_success():
@@ -537,10 +541,10 @@ def test_render_system_prompt_advertises_writes_only_to_editors():
     assert "Read-only access" not in writable
     assert "apply_dag_code_changes" not in read_only
     # The whole point of the write contract: propose by calling the tool, and
-    # never let a re-run stand in for clearing an instance that already exists.
+    # never let a re-run stand in for a clear this session cannot perform at all.
     assert "calling the write tool *is* the proposal" in writable
     assert '"proceeding with"' in writable
-    assert "never an implementation of clearing" in writable
+    assert "not an implementation of clearing" in writable
     assert "Read-only access" in read_only
     # Both modes keep the follow-up button protocol.
     assert "[ACTION:" in writable
@@ -661,36 +665,37 @@ def test_write_prompt_pins_verification_to_the_triggered_run():
     assert "never silently drop it" in normalized
 
 
-def test_write_prompt_makes_the_clear_the_middle_of_the_recovery_not_the_end():
+def test_write_prompt_says_the_clear_and_the_backfill_are_gone_rather_than_describing_them():
+    """
+    The prompt rules that walked the model through a clear are withdrawn with it.
+
+    Replacing them with silence would leave a model that has seen the words
+    "clear this task" free to improvise a substitute, which is exactly what
+    ``rerun_dag`` would look like. So the prompt states the absence.
+    """
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
 
-    assert "`verify_task_instance_recovery`" in normalized
-    assert "`recovery_verified: false`" in normalized
-    assert "A task instance that is green is not a recovery" in normalized
-    assert "nothing here observed the external system" in normalized
-    assert "do not report the earlier answer as the outcome" in normalized
+    assert "no tool that clears an existing task instance and none that creates a backfill" in normalized
+    assert "say plainly that Airy cannot do it" in normalized
+    assert "not an implementation of clearing" in normalized
+    for withdrawn in (
+        "plan_task_instance_clear",
+        "apply_task_instance_clear",
+        "verify_task_instance_recovery",
+        "plan_backfill",
+        "run_backfill",
+    ):
+        assert withdrawn not in normalized, f"the prompt still offers {withdrawn}"
 
 
-def test_write_prompt_demands_the_evidence_and_the_warnings_reach_the_user():
+def test_write_prompt_keeps_the_source_write_and_the_run_apart():
+    """Two approvals, never one: an approved patch is not permission to run."""
     normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
 
-    assert "`recovery_evidence`" in normalized
-    assert "`blast_radius`" in normalized
-    assert "**every** entry of `warnings`" in normalized
-    # The reading the sidecar hands over must not be upgraded on the way out.
-    assert "never upgrade" in normalized
-    assert 'into "the task never ran"' in normalized
-    assert "performs the task's external operation again" in normalized
-    assert "does not promise the original version" in normalized
-
-
-def test_write_prompt_tells_the_model_to_re_plan_rather_than_retry_a_refused_flag():
-    normalized = " ".join(plugin._render_system_prompt(None, can_write=True).split())
-
-    assert "excluded a *succeeded* instance" in normalized
-    assert "make ONE new plan with the flag it names" in normalized
-    assert "which flag changed and why" in normalized
-    assert "Never re-issue the same plan hoping for a different answer" in normalized
+    assert "Two approvals, never one" in normalized
+    assert "An approved patch is not permission to run anything" in normalized
+    assert "an approved run is not permission to touch the source" in normalized
+    assert "An approved patch is never permission to run anything" in normalized
 
 
 def test_render_system_prompt_explains_an_admin_kill_switch():
@@ -1311,10 +1316,8 @@ FIX_ACCESS = [("PUT", None), ("GET", None), ("GET", "CODE"), ("GET", "VERSION")]
         ("plan_revert_dag_code", [("GET", None), ("GET", "TASK")], "GET on CODE"),
         # Triggering a run is POST on RUN, not edit on the Dag.
         ("rerun_dag", [("PUT", None), ("GET", None)], "POST on RUN"),
-        # Airflow gates even the backfill preview on POST.
-        ("plan_backfill", [("GET", "RUN")], "POST on RUN"),
     ],
-    ids=["logs", "source", "code-read", "revert-plan", "run-create", "backfill-preview"],
+    ids=["logs", "source", "code-read", "revert-plan", "run-create"],
 )
 def test_authorize_tool_call_demands_each_underlying_permission(auth_manager, tool, granted, missing):
     _grant(auth_manager, granted)
@@ -1392,7 +1395,9 @@ def test_the_audit_log_permission_is_optional_and_never_gates_the_tool(auth_mana
     """
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
 
-    widened = ("diagnose_dag", "verify_task_instance_recovery")
+    # ``verify_task_instance_recovery`` was the second widened tool; it is
+    # withdrawn, so diagnose_dag is the whole of the widened surface.
+    widened = ("diagnose_dag",)
     for name in widened:
         optional = plugin._tool_optional_access_requirements(name)
         assert optional["audit_scope"] == (("GET", Entity.AUDIT_LOG),)
@@ -1403,50 +1408,6 @@ def test_the_audit_log_permission_is_optional_and_never_gates_the_tool(auth_mana
         for name in plugin.TOOL_POLICY
         if name not in widened
     )
-
-
-def test_the_xcom_permission_widens_the_verification_rather_than_gating_it(auth_manager):
-    """
-    The safety net must not come off while the write stays on.
-
-    XCom gates neither the plan nor the clear, so demanding it for the
-    verification let a role hold everything except XCom, plan the clear, get it
-    approved, apply it — and then be refused the only check that says whether
-    the re-run actually happened. TASK_LOGS is deliberately not treated this way:
-    the plan demands it too, so a role without it never reaches a plan_token.
-    """
-    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
-
-    optional = plugin._tool_optional_access_requirements("verify_task_instance_recovery")
-    mandatory = plugin._tool_access_requirements("verify_task_instance_recovery", {})
-
-    assert optional["xcom_scope"] == (("GET", Entity.XCOM),)
-    assert ("GET", Entity.XCOM) not in mandatory
-    assert ("GET", Entity.TASK_LOGS) in mandatory
-    assert ("GET", Entity.TASK_LOGS) in plugin._tool_access_requirements("plan_task_instance_clear", {})
-
-    _grant(auth_manager, [p for p in VERIFY_ACCESS if p[1] != "XCOM"])
-    args = {"dag_id": "sales_summary"}
-
-    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", args) is None
-    assert args["xcom_scope"] == "denied"
-
-
-def test_the_two_optional_scopes_of_a_verification_are_answered_independently(auth_manager):
-    """A user may read a Dag's XCom records and not its audit log, or the reverse."""
-    _grant(auth_manager, VERIFY_ACCESS)
-    args = {"dag_id": "sales_summary"}
-
-    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", args) is None
-    assert args["xcom_scope"] == "granted"
-    assert args["audit_scope"] == "denied"
-
-    _grant(auth_manager, [*VERIFY_ACCESS, ("GET", "AUDIT_LOG")])
-    both = {"dag_id": "sales_summary"}
-
-    assert plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", both) is None
-    assert both["xcom_scope"] == "granted"
-    assert both["audit_scope"] == "granted"
 
 
 def test_the_audit_scope_must_clear_every_dag_in_a_shared_source_file(monkeypatch, auth_manager):
@@ -1606,70 +1567,57 @@ def test_every_policy_tool_states_the_permissions_it_needs():
         assert plugin._tool_access_requirements(name, {})
 
 
-def test_clearing_demands_the_permission_airflow_asks_of_its_dry_run(auth_manager):
-    """Airflow's clearTaskInstances route gates the preview on PUT too, so both tools do."""
-    from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity as Entity
-
-    for name in ("plan_task_instance_clear", "apply_task_instance_clear"):
-        assert ("PUT", Entity.TASK_INSTANCE) in plugin._tool_access_requirements(name, {})
-
-
-CLEAR_ACCESS = [("PUT", "TASK_INSTANCE"), ("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK")]
-PLAN_CLEAR_ACCESS = [*CLEAR_ACCESS, ("GET", "TASK_LOGS"), ("GET", "VERSION")]
-VERIFY_ACCESS = [("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK_LOGS"), ("GET", "XCOM")]
-
-
-@pytest.mark.parametrize(
-    ("tool", "granted", "missing"),
-    [
-        # The plan reads the evidence the approval turns on; without it there is
-        # no recovery proposal to make, so these gate the plan rather than widen it.
-        ("plan_task_instance_clear", CLEAR_ACCESS, "GET on TASK_LOGS"),
-        (
-            "plan_task_instance_clear",
-            [p for p in PLAN_CLEAR_ACCESS if p != ("GET", "VERSION")],
-            "GET on VERSION",
-        ),
-        # Verification reads what the re-run recorded. XCom is NOT here: it
-        # widens the reading instead, so that a role which can apply the clear
-        # can always also run the check on it.
-        (
-            "verify_task_instance_recovery",
-            [p for p in VERIFY_ACCESS if p[1] != "TASK_LOGS"],
-            "GET on TASK_LOGS",
-        ),
-    ],
-    ids=["plan-logs", "plan-versions", "verify-logs"],
+# The broad recovery surface, WITHDRAWN. Named here so the refusal below is
+# checked against the list rather than against one example, and so a tool put
+# back into the policy without a decision fails this file.
+WITHDRAWN_TOOLS = (
+    "plan_task_instance_clear",
+    "apply_task_instance_clear",
+    "verify_task_instance_recovery",
+    "plan_backfill",
+    "run_backfill",
 )
-def test_the_recovery_tools_demand_each_underlying_permission(auth_manager, tool, granted, missing):
-    _grant(auth_manager, granted)
-
-    assert missing in plugin._authorize_tool_call(FakeUser(), tool, {"dag_id": "sales_summary"})
 
 
-def test_verifying_a_recovery_changes_nothing_and_is_never_gated_behind_a_confirmation(auth_manager):
-    """A verification the user has to approve is a verification that does not happen."""
-    assert "verify_task_instance_recovery" not in plugin.WRITE_TOOLS
-    assert not any(
-        method == "PUT" or method == "POST"
-        for method, _ in plugin._tool_access_requirements("verify_task_instance_recovery", {})
-    )
-    _grant(auth_manager, VERIFY_ACCESS)
+@pytest.mark.parametrize("tool", WITHDRAWN_TOOLS)
+def test_a_withdrawn_recovery_tool_is_refused_by_the_allowlist(auth_manager, tool):
+    """
+    Unreachable, not merely discouraged.
 
-    assert (
-        plugin._authorize_tool_call(FakeUser(), "verify_task_instance_recovery", {"dag_id": "sales_summary"})
-        is None
-    )
+    The three permission tests that used to stand here asked whether these tools
+    demanded the right permissions. That question is obsolete: the tools are
+    absent from ``TOOL_POLICY``, which is an allowlist, so no permission a user
+    could hold makes one of them runnable. A full-rights user is granted here on
+    purpose — the refusal must not depend on the caller being under-privileged.
+    """
+    _grant(auth_manager, [*DIAGNOSE_ACCESS, *FIX_ACCESS, ("PUT", "TASK_INSTANCE"), ("POST", "RUN")])
+
+    denial = plugin._authorize_tool_call(FakeUser(), tool, {"dag_id": "sales_summary"})
+
+    assert tool not in plugin.TOOL_POLICY
+    assert denial is not None
+    assert "not a tool Airy is allowed to run" in denial
+
+
+def test_a_withdrawn_tool_is_also_filtered_out_of_the_offered_toolset(auth_manager):
+    """
+    The allowlist gates the call; the same allowlist gates what is offered.
+
+    A tool the model is never shown cannot be proposed at all, which is the
+    layer that stops a refusal from having to be the last line of defence.
+    """
+    for tool in WITHDRAWN_TOOLS:
+        assert tool not in plugin.TOOL_POLICY
+        assert tool not in plugin.WRITE_TOOLS
+        assert tool not in plugin.PLAN_TOOLS
 
 
 def test_the_policy_is_the_only_source_of_write_tools():
     """WRITE_TOOLS is derived, so a new tool cannot be added without classifying it."""
     assert {
         "apply_dag_code_changes",
-        "apply_task_instance_clear",
         "revert_dag_code",
         "rerun_dag",
-        "run_backfill",
     } == plugin.WRITE_TOOLS
     assert all(plugin.TOOL_POLICY[name]["writes"] for name in plugin.WRITE_TOOLS)
 
@@ -1678,9 +1626,7 @@ def test_every_write_tool_is_classified_for_plan_tokens():
     """Token-required is derived by exemption, so a future write tool must be classified."""
     assert {
         "apply_dag_code_changes",
-        "apply_task_instance_clear",
         "revert_dag_code",
-        "run_backfill",
     } == plugin.TOKEN_REQUIRED_WRITES
     assert {"rerun_dag"} == plugin.TOKENLESS_WRITES
     assert plugin.TOKENLESS_WRITES | plugin.TOKEN_REQUIRED_WRITES == plugin.WRITE_TOOLS
@@ -1928,16 +1874,19 @@ def test_gate_toolsets_authorizes_outside_the_approval_gate(auth_manager, can_wr
 @pytest.mark.parametrize(
     ("granted", "expected"),
     [
-        (
-            [("PUT", "TASK_INSTANCE"), ("GET", "TASK_INSTANCE"), ("GET", "RUN"), ("GET", "TASK")],
-            {"apply_task_instance_clear"},
-        ),
+        ([("GET", None), ("POST", "RUN")], {"rerun_dag"}),
         (FIX_ACCESS, {"apply_dag_code_changes", "revert_dag_code"}),
     ],
-    ids=["clear-only", "source-only"],
+    ids=["run-only", "source-only"],
 )
 def test_writable_tools_offers_each_write_on_its_own_permission(auth_manager, granted, expected):
-    """Clearing a task instance and rewriting a Dag file are not the same right."""
+    """
+    Triggering a run and rewriting a Dag file are not the same right.
+
+    The clear-only arm this test used to carry named a withdrawn tool; the rule
+    it proves — one permission per write, not one "may you edit a Dag?" — is what
+    keeps a user who may only trigger runs from being offered the source writes.
+    """
     auth_manager.allowed = {(method, entity, None, None) for method, entity in granted}
 
     assert plugin._writable_tools(FakeUser()) == expected
@@ -2404,11 +2353,11 @@ async def test_a_resumed_run_that_narrates_its_next_plan_is_corrected_too(monkey
         [
             [
                 approved_write,
-                plan_result_event(tool="plan_backfill"),
-                text_delta_event("Now backfilling..."),
+                plan_result_event(tool="plan_revert_dag_code"),
+                text_delta_event("Now reverting..."),
                 run_result_event(),
             ],
-            [text_delta_event("Proposing the backfill.")],
+            [text_delta_event("Proposing the revert.")],
         ]
     )
     monkeypatch.setattr(plugin, "_build_agent", lambda *a, **kw: (agent, None))
@@ -2417,7 +2366,7 @@ async def test_a_resumed_run_that_narrates_its_next_plan_is_corrected_too(monkey
     payloads = [p async for p in plugin._resume_agent(pending, approved=True)]
 
     assert "did not propose it" in agent.prompts[1]
-    assert payloads[-1] == {"type": "text", "delta": "Proposing the backfill."}
+    assert payloads[-1] == {"type": "text", "delta": "Proposing the revert."}
     # The replay of this nonce has to show the correction as well.
     assert pending.frames[-1] == payloads[-1]
 
@@ -2543,11 +2492,15 @@ async def test_no_correction_when_the_write_was_actually_proposed(monkeypatch, p
     assert payloads[-1]["type"] == "confirm_required"
 
 
-CLEARED = {
-    "cleared": True,
+# The landed-write fixture. It used to be a clear; that tool is withdrawn, and a
+# withdrawn tool would make every case below pass for the wrong reason — the
+# frame is withheld because the name is not a write tool at all, not because the
+# result said nothing landed. So the shape moved to a write that still exists.
+APPLIED = {
+    "applied": True,
     "mutation_applied": True,
     "ui_updates": [
-        {"kind": "task_instances", "dag_id": "sales_summary", "dag_run_id": "manual__1"},
+        {"kind": "dag_definition", "dag_id": "sales_summary", "version_number": 2},
     ],
 }
 
@@ -2555,15 +2508,15 @@ CLEARED = {
 @pytest.mark.parametrize(
     ("tool", "content"),
     [
-        ("apply_task_instance_clear", CLEARED),
-        ("apply_task_instance_clear", json.dumps(CLEARED)),
+        ("apply_dag_code_changes", APPLIED),
+        ("apply_dag_code_changes", json.dumps(APPLIED)),
     ],
     ids=["dict", "json_string"],
 )
 def test_resource_changed_frame_carries_a_landed_write(tool, content):
     assert plugin._resource_changed_frame(tool, content) == {
         "type": "resource_changed",
-        "updates": CLEARED["ui_updates"],
+        "updates": APPLIED["ui_updates"],
     }
 
 
@@ -2571,18 +2524,30 @@ def test_resource_changed_frame_carries_a_landed_write(tool, content):
     ("tool", "content"),
     [
         # Never for a read tool, whatever it claims.
-        ("diagnose_dag", CLEARED),
+        ("diagnose_dag", APPLIED),
         # Never for a write that did not land...
-        ("apply_task_instance_clear", {"mutation_applied": False, "ui_updates": CLEARED["ui_updates"]}),
-        ("rerun_dag", {"triggered": False, "ui_updates": CLEARED["ui_updates"]}),
+        ("apply_dag_code_changes", {"mutation_applied": False, "ui_updates": APPLIED["ui_updates"]}),
+        ("rerun_dag", {"triggered": False, "ui_updates": APPLIED["ui_updates"]}),
         # ...nor for one that landed but names nothing to refresh.
-        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": []}),
+        ("apply_dag_code_changes", {"mutation_applied": True, "ui_updates": []}),
         # Nor for updates the browser has no handler for, or that name no Dag.
-        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": [{"kind": "everything"}]}),
-        ("apply_task_instance_clear", {"mutation_applied": True, "ui_updates": [{"kind": "dag_run"}]}),
-        ("apply_task_instance_clear", "not json at all"),
+        ("apply_dag_code_changes", {"mutation_applied": True, "ui_updates": [{"kind": "everything"}]}),
+        ("apply_dag_code_changes", {"mutation_applied": True, "ui_updates": [{"kind": "dag_run"}]}),
+        ("apply_dag_code_changes", "not json at all"),
+        # And never for a name the allowlist no longer carries, however
+        # confidently the payload claims the write landed.
+        ("apply_task_instance_clear", APPLIED),
     ],
-    ids=["read_tool", "not_applied", "not_triggered", "no_updates", "unknown_kind", "no_dag", "not_json"],
+    ids=[
+        "read_tool",
+        "not_applied",
+        "not_triggered",
+        "no_updates",
+        "unknown_kind",
+        "no_dag",
+        "not_json",
+        "withdrawn_tool",
+    ],
 )
 def test_resource_changed_frame_stays_silent_when_nothing_landed(tool, content):
     assert plugin._resource_changed_frame(tool, content) is None
@@ -2592,14 +2557,14 @@ def test_resource_changed_frame_stays_silent_when_nothing_landed(tool, content):
 @pytest.mark.parametrize("denied", [False, True], ids=["settled", "denied"])
 async def test_run_and_stream_emits_the_refresh_only_after_a_clean_write(denied):
     """The frame is what tells the open Dag view to refetch; a denial changed nothing."""
-    content = plugin._DENIAL_MESSAGE if denied else CLEARED
+    content = plugin._DENIAL_MESSAGE if denied else APPLIED
 
     class FakeStream:
         async def __aenter__(self):
             async def gen():
                 yield FunctionToolResultEvent(
                     part=ToolReturnPart(
-                        tool_name="apply_task_instance_clear", content=content, tool_call_id="c1"
+                        tool_name="apply_dag_code_changes", content=content, tool_call_id="c1"
                     )
                 )
 

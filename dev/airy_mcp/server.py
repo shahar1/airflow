@@ -17,29 +17,42 @@
 """
 Airy self-healing MCP server (demo).
 
-Write-capable tools on top of the Airflow REST API — ``diagnose_dag`` finds
-what is wrong, ``plan_dag_code_changes``/``apply_dag_code_changes`` repair the
-source as one atomic change, ``plan_task_instance_clear``/``apply_task_instance_clear``
-re-run an instance that already exists, and ``rerun_dag`` starts a fresh run.
-Deliberately goes beyond AIP-91 phase 1 (read-only) to show where the value ends up.
+Write-capable tools on top of the Airflow REST API, scoped to ONE workflow:
+``diagnose_dag`` finds what is wrong with a named run,
+``plan_dag_code_changes``/``apply_dag_code_changes`` repair that Dag's source as
+one atomic change, ``plan_revert_dag_code``/``revert_dag_code`` put it back, and
+``rerun_dag`` triggers a specifically identified replacement run whose external
+result ``verify_replacement_run`` then reads back.  Deliberately goes beyond
+AIP-91 phase 1 (read-only) to show where the value ends up.
 
-Every mutation a USER ASKS FOR that changes something already there is planned
-first: the planning tool is read-only and hands back a single-use token, and the
-writing tool refuses without it.  That is what makes the approval card show the
-user the change they are actually approving.
+What this server is certified to do is exactly that workflow and nothing wider:
+diagnose a green run whose expected work never executed, propose an exact source
+correction, obtain explicit human approval, apply it safely, trigger a
+specifically identified replacement run, and verify that the expected external
+operation occurred.  Broad automatic discovery and clearing of arbitrary
+historical task instances is OUT OF SCOPE and uncertified; the tools that did it
+(``plan_task_instance_clear``, ``apply_task_instance_clear``,
+``verify_task_instance_recovery``, ``plan_backfill``, ``run_backfill``) are
+WITHDRAWN from the registered surface below and are not reachable from the demo.
+Their implementations and their tests are kept in the tree deliberately, as the
+evidence of what was built and of why it is not exposed.
 
-Four writes are outside that rule, and ``approvals._UNGATED_WRITES`` is the
-authority on which - this sentence is not, and used to say "``rerun_dag`` is the
-one deliberate exception" while the registry it points at held four.  Two are
-asked for: ``rerun_dag`` only ADDS a run and the call's own arguments describe it
+Each of the two mutations a user asks for is approved on its own, and one
+approval never authorizes the other.  A source write is planned first: the
+planning tool is read-only and hands back a single-use token of ITS OWN kind,
+and the writing tool refuses without it.  Triggering redeems no source token at
+all - it is approved by its own tool call, whose arguments describe it
+completely - and it re-establishes its own preconditions immediately before it
+acts.
+
+Three writes are outside the plan-first rule, and ``approvals._UNGATED_WRITES``
+is the authority on which - this sentence is not.  One is asked for:
+``rerun_dag`` only ADDS a run and the call's own arguments describe it
 completely (the lasting part of it, unpausing, has a token and a warning of its
-own).  The other two are COMPENSATING actions inside a write the user already
-approved - cancelling a backfill that did not match the runs they reviewed, and
-re-parsing a file that was just written - and neither is a change the user could
-have been asked about separately, because neither exists until the approved write
-has already happened.  ``_abandon_backfill``'s cancel does change something that
-was already there: it pauses the backfill and fails its queued runs.  That is a
-rollback attempt, not a rollback, and the tool says so in its own result.
+own).  The others are steps INSIDE a write the user already approved - the
+atomic replace itself, and re-parsing a file that was just written - and neither
+is a change the user could have been asked about separately, because neither
+exists until the approved write has already happened.
 
 Runs as a second MCP sidecar next to the read-only ``astro-airflow-mcp``.
 
@@ -86,12 +99,12 @@ from codechange import (
     _describe_params,  # noqa: F401 - re-exported for ``server._describe_params``
     _validate_conf,  # noqa: F401 - re-exported for ``server._validate_conf``
     apply_dag_code_changes,
-    plan_backfill,
+    plan_backfill,  # noqa: F401 - WITHDRAWN from the registered surface; kept as ``server.plan_backfill``
     plan_dag_code_changes,
     plan_revert_dag_code,
     rerun_dag,
     revert_dag_code,
-    run_backfill,
+    run_backfill,  # noqa: F401 - WITHDRAWN from the registered surface; kept as ``server.run_backfill``
 )
 
 # Wave 5 of the move-only extraction: the Dag file - where it is, the jail around
@@ -244,9 +257,9 @@ from recovery import (
     _STALE_ARTEFACT,  # noqa: F401 - re-exported for ``server._STALE_ARTEFACT``
     _clear_flags,  # noqa: F401 - re-exported for ``server._clear_flags``
     _recovery_evidence,  # noqa: F401 - re-exported for ``server._recovery_evidence``
-    apply_task_instance_clear,
-    plan_task_instance_clear,
-    verify_task_instance_recovery,
+    apply_task_instance_clear,  # noqa: F401 - WITHDRAWN; kept as ``server.apply_task_instance_clear``
+    plan_task_instance_clear,  # noqa: F401 - WITHDRAWN; kept as ``server.plan_task_instance_clear``
+    verify_task_instance_recovery,  # noqa: F401 - WITHDRAWN; kept as ``server.verify_task_instance_recovery``
 )
 
 # The three transport helpers the suite only ever reads, never patches, so a re-export
@@ -262,18 +275,22 @@ mcp: FastMCP = FastMCP("airy-selfheal")
 
 # Registered here rather than with @mcp.tool so the module keeps exporting plain
 # functions — directly callable from tests.
+#
+# This tuple IS the demo-visible surface: a tool absent from it is never handed
+# to FastMCP, so no MCP client is ever told it exists and no model can call it.
+# Five tools that used to sit here — ``plan_backfill``, ``run_backfill``,
+# ``plan_task_instance_clear``, ``apply_task_instance_clear`` and
+# ``verify_task_instance_recovery`` — were withdrawn because they are the broad
+# recovery surface this server no longer claims to have got right. They are
+# still imported above, so their code and their tests stay exercisable in the
+# tree; what changed is that nothing exposes them.
 for _tool in (
     diagnose_dag,
     compare_dag_runs,
     find_failure_clusters,
-    plan_backfill,
-    run_backfill,
     get_blast_radius,
     plan_dag_code_changes,
     apply_dag_code_changes,
-    plan_task_instance_clear,
-    apply_task_instance_clear,
-    verify_task_instance_recovery,
     plan_revert_dag_code,
     revert_dag_code,
     rerun_dag,

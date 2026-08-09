@@ -300,13 +300,21 @@ successful.
 
 _WRITE_PROMPT = """\
 
-**Self-healing.**  Every change is planned first and written second.  The
-planning tools are read-only and hand back a `plan_token`; the write tools
-refuse without it.  A write tool suspends until the user approves it with in-UI
-Confirm/Reject buttons, so **calling the write tool *is* the proposal**: never
-ask for permission in prose, never say you are "about to", "will now" or are
+**Self-healing.**  Airy repairs ONE thing: a Dag whose source is wrong.  A
+*source* change is planned first and written second — the planning tools are
+read-only and hand back a `plan_token`, and the source write tools refuse
+without it.  Triggering a run is not planned that way and carries no
+`plan_token`; its own arguments are the whole of what it does.  Either way a
+write tool suspends until the user approves it with in-UI Confirm/Reject
+buttons, so **calling the write tool *is* the proposal**: never ask for
+permission in prose, never say you are "about to", "will now" or are
 "proceeding with" a change, and never report a change as made without the tool
 result that says so.
+
+**Two approvals, never one.**  Applying a source patch and triggering a run are
+separate decisions and get separate confirmations.  An approved patch is not
+permission to run anything, and an approved run is not permission to touch the
+source.  Propose them one at a time and let the user answer each.
 
 1. **Repair as one change.**  One repair means exactly ONE
    `plan_dag_code_changes` call carrying *every* fix, followed by exactly ONE
@@ -328,43 +336,20 @@ result that says so.
    carries `unaddressed_findings`, fold fixes for them into the ONE new plan —
    or tell the user explicitly which findings you are leaving out and why;
    never let one drop silently.
-2. **Clearing is not re-running.**  To re-run a task inside a run that already
-   exists — "clear", "retry this task", "same run" — use
-   `plan_task_instance_clear` and then `apply_task_instance_clear`.  `rerun_dag`
-   creates a *new* Dag run and is never an implementation of clearing.  The
-   clear takes everything downstream of the task with it, which is what makes
-   the re-run mean anything — tell the user which instances `affected` lists.
-   If the plan refuses (an ambiguous position, nothing to clear, a task set that
-   would move), report that and clear nothing.  When a refusal carries a
-   `next_step` — for example that `only_failed` excluded a *succeeded* instance
-   — follow it: make ONE new plan with the flag it names, and say in the reply
-   which flag changed and why.  Never re-issue the same plan hoping for a
-   different answer.
-2a. **A clear is a recovery only when it is shown to be one.**  Before proposing
-   the write, relay the plan's `recovery_evidence` (what the recorded attempt's
-   fields say, in its own words — never upgrade "consistent with the task
-   process never having been dispatched on this attempt" into "the task never
-   ran"), the `blast_radius` instance list, and **every** entry of `warnings`.
-   The warnings are not optional context: re-running performs the task's
-   external operation again, and the user is the only one who can say whether
-   that is safe.  Say what the plan's `version` block says about Dag versions —
-   including that it does not promise the original version, and that the code
-   which re-runs is the file on disk now.
-2b. **Then verify.**  `apply_task_instance_clear` re-queues instances and
-   returns; it establishes nothing about whether they ran, which is why it
-   reports `recovery_verified: false`.  Call `verify_task_instance_recovery`
-   with the arguments in its `verify_with.args` and report what comes back:
-   the per-instance verdicts, any `failed_checks` or `unestablished_checks`, and
-   `operator_action_required`.  If the run has not finished, say so and offer to
-   check again — do not report the earlier answer as the outcome.  A task
-   instance that is green is not a recovery: only say the work was restored when
-   the verification says `verified`, and even then say that nothing here
-   observed the external system.
-3. After a successful fix, offer to re-run — do not re-run on your own.
-   `rerun_dag` accepts a `conf` validated against the Dag's `params` schema:
-   turn what the user asked for into typed conf keys, and pass no conf at all
-   for a Dag without params.  A refusal lists the valid params with their types
-   and defaults — relay that list instead of guessing again.
+2. **There is no clearing and no backfilling.**  This session has no tool that
+   clears an existing task instance and none that creates a backfill.  If the
+   user asks to "clear", "retry this task in the same run" or "backfill a date
+   range", say plainly that Airy cannot do it and point them at Airflow's own
+   Grid controls — never describe a clear or a backfill as something you are
+   about to do, and never substitute `rerun_dag` for one: it creates a *new*
+   Dag run and is not an implementation of clearing.
+3. **A replacement run is a separate decision.**  After a fix the user approved,
+   offer to trigger a replacement run — do not trigger on your own.  An approved
+   patch is never permission to run anything.  `conf` is validated against the
+   Dag's `params` schema: turn what the user asked for into typed conf keys, and
+   pass no conf at all for a Dag without params.  A refusal lists the valid
+   params with their types and defaults — relay that list instead of guessing
+   again.
 4. **Reverting is planned too.**  `plan_revert_dag_code` returns the diff
    between the backup and the current file plus a `plan_token`;
    `revert_dag_code` refuses without that token and the same `diff` repeated.
@@ -383,8 +368,8 @@ result that says so.
 _READ_ONLY_PROMPT = """\
 
 **Read-only access.**  This session has no write tools: you can diagnose and
-explain, but applying fixes, re-running or backfilling requires Dag-edit
-permission the user does not have.  You cannot even plan a change.  If asked
+explain, but applying fixes or re-running requires Dag-edit permission the user
+does not have.  You cannot even plan a change.  If asked
 to change anything, lead with that — never promise to apply, proceed with or
 follow up on a write, and never ask the user to confirm one.
 """
@@ -748,37 +733,35 @@ def _user_can_write(user: Any) -> bool:
 #   reads_source  hands back Dag source, so the whole source file must be readable
 #   reads_assets  derived from the asset table
 #   fleet         may be called with no dag_id, scoped by a ``dag_ids`` allowlist
+#
+# WITHDRAWN, deliberately absent rather than listed-and-refused:
+# ``plan_task_instance_clear``, ``apply_task_instance_clear``,
+# ``verify_task_instance_recovery``, ``plan_backfill`` and ``run_backfill``.
+# They are the broad recovery surface — automatic discovery and clearing of
+# arbitrary historical task instances — which this demo no longer claims to have
+# got right. The sidecar does not register them either, so this entry's absence
+# is the second of two independent reasons the model can never reach them; an
+# allowlist that does not name a tool refuses it outright.
 TOOL_POLICY: dict[str, dict[str, bool]] = {
     "diagnose_dag": {"reads_source": True},
     "compare_dag_runs": {"reads_source": True},
     "find_failure_clusters": {"fleet": True},
     "get_blast_radius": {"reads_assets": True},
-    "plan_backfill": {},
     # Read-only, but it reads the whole source file to plan against it, so it is
     # held to the same co-located-Dag rule as the write it precedes.
     "plan_dag_code_changes": {"reads_source": True},
     # Same rule: the revert plan reads the backup and the current file whole.
     "plan_revert_dag_code": {"reads_source": True},
-    "plan_task_instance_clear": {},
-    # Read-only, and the step that turns a clear into a recovery: it reads back
-    # what the re-run actually recorded. Kept out of WRITE_TOOLS deliberately —
-    # a verification the user has to approve is a verification that does not
-    # happen, and the answer is the same whoever asks for it.
-    "verify_task_instance_recovery": {},
     "apply_dag_code_changes": {"writes": True, "reads_source": True},
-    "apply_task_instance_clear": {"writes": True},
     "revert_dag_code": {"writes": True, "reads_source": True},
     "rerun_dag": {"writes": True},
-    "run_backfill": {"writes": True},
 }
 
 WRITE_TOOLS = frozenset(name for name, policy in TOOL_POLICY.items() if policy.get("writes"))
 
 # Read-only tools that hand back a single-use token. A run that gets one and
 # then proposes nothing has narrated a change instead of offering it.
-PLAN_TOOLS = frozenset(
-    {"plan_dag_code_changes", "plan_revert_dag_code", "plan_task_instance_clear", "plan_backfill"}
-)
+PLAN_TOOLS = frozenset({"plan_dag_code_changes", "plan_revert_dag_code"})
 
 # Writes that refuse without a plan_token. Derived by exemption, so a write
 # tool added later is token-required until someone explicitly decides it is
@@ -844,41 +827,6 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
     # versions to tell whether the reparse landed; there is no write-the-code
     # permission in Airflow to mirror.
     patch_source = (("PUT", None), read_dag, ("GET", Entity.CODE), ("GET", Entity.VERSION))
-    # Airflow's clearTaskInstances route carries one PUT-on-TASK_INSTANCE
-    # dependency that covers its dry run as well, so the planner is held to the
-    # same permission as the clear it previews. Both also list the run's
-    # instances to see whether re-queuing it would change the task set.
-    clear = (
-        ("PUT", Entity.TASK_INSTANCE),
-        ("GET", Entity.TASK_INSTANCE),
-        ("GET", Entity.RUN),
-        ("GET", Entity.TASK),
-    )
-    # Planning a clear now reads the evidence the approval turns on — the
-    # target's attempt history, the log of the attempt it recorded, and the
-    # Dag's version list. Those are separate permissions on the real routes, and
-    # they gate the plan rather than widening it: a plan that cannot show the
-    # evidence is not the recovery proposal this tool exists to make.
-    plan_clear = (*clear, ("GET", Entity.TASK_LOGS), ("GET", Entity.VERSION))
-    # Verifying reads instances, their attempt histories and the new attempt's
-    # log. No PUT: it changes nothing.
-    #
-    # XCOM is NOT here — it widens the reading instead, in
-    # ``_tool_optional_access_requirements``. Demanding it made the safety net
-    # removable while the write stayed available: a role holding everything
-    # except XCom could plan the clear, get it approved and apply it, and was
-    # then refused the verification that says whether the re-run actually
-    # happened.
-    #
-    # TASK_LOGS stays mandatory, and the asymmetry is deliberate: ``plan_clear``
-    # demands it too, so a role without it never reaches a plan_token and the
-    # write is unavailable to it in the first place. There is no state in which
-    # dropping TASK_LOGS costs the verification but keeps the clear.
-    verify = (
-        ("GET", Entity.TASK_INSTANCE),
-        ("GET", Entity.RUN),
-        ("GET", Entity.TASK_LOGS),
-    )
     requirements: dict[str, tuple[tuple[str, Any], ...]] = {
         # Reads the Dag itself (for its file location), its runs, instances,
         # logs, source and task graph.
@@ -895,9 +843,6 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
         # A revert plan is a code-change plan computed from the backup.
         "plan_revert_dag_code": (read_dag, ("GET", Entity.CODE), ("GET", Entity.TASK)),
         "apply_dag_code_changes": patch_source,
-        "plan_task_instance_clear": plan_clear,
-        "apply_task_instance_clear": clear,
-        "verify_task_instance_recovery": verify,
         # Scans task instances fleet-wide, then reads each failure's log.
         "find_failure_clusters": (("GET", Entity.TASK_INSTANCE), ("GET", Entity.TASK_LOGS)),
         "compare_dag_runs": (*runs, ("GET", Entity.CODE)),
@@ -909,11 +854,6 @@ def _tool_access_requirements(tool_name: str, tool_args: dict[str, Any]) -> tupl
         # Unpausing is a separate, lasting edit — only demanded when actually asked for.
         "rerun_dag": (read_dag, ("POST", Entity.RUN))
         + ((("PUT", None),) if tool_args.get("unpause") else ()),
-        # Airflow gates even the backfill dry run on POST; mirror that.
-        "plan_backfill": (("POST", Entity.RUN),),
-        # Creating it is POST, but it then reads back what landed and may cancel
-        # it — all three are separate permissions on the real backfill routes.
-        "run_backfill": (("POST", Entity.RUN), ("GET", Entity.RUN), ("PUT", Entity.RUN)),
     }
     return requirements[tool_name]
 
@@ -943,16 +883,6 @@ def _tool_optional_access_requirements(tool_name: str) -> dict[str, tuple[tuple[
 
     optional: dict[str, dict[str, tuple[tuple[str, Any], ...]]] = {
         "diagnose_dag": {"audit_scope": (("GET", Entity.AUDIT_LOG),)},
-        # Both are legs of the verification, not the whole of it: without either
-        # permission the matching legs report "could not be established" and the
-        # rest of the reading stands. XCom is here rather than in the mandatory
-        # tuple so that a role which can apply the clear can always also run the
-        # check on it — a verification a writer can be denied is a safety net
-        # that comes off while the write stays on.
-        "verify_task_instance_recovery": {
-            "audit_scope": (("GET", Entity.AUDIT_LOG),),
-            "xcom_scope": (("GET", Entity.XCOM),),
-        },
     }
     return optional.get(tool_name, {})
 

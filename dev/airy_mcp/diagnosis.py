@@ -1301,8 +1301,15 @@ def find_failure_clusters(hours: float = 24, dag_ids: list[str] | None = None) -
     """
     Group recent task failures by error signature.
 
-    Answers "what is breaking, fleet-wide?" — biggest clusters first, each
-    with example task instances to drill into.
+    Read-only orientation, and only that: biggest clusters first, each with
+    example task instances to drill into, so a person can decide which ONE run
+    to look at next. It repairs nothing, clears nothing and re-runs nothing, and
+    a cluster it reports is not a set of instances anything here will act on.
+
+    The reading is a sample, not a census: ``failures_omitted`` says how many
+    failures the scan did not cover, and whenever coverage is short ``scope``
+    stops claiming the window holds no failed instance. Do not read a cluster
+    list as the whole of what is broken.
 
     ``dag_ids`` is set by the caller's permissions, not by you: whatever you pass
     is replaced with the Dags the signed-in user may actually read.

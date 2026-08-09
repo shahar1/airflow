@@ -11030,16 +11030,61 @@ _DELIBERATELY_UNGATED_TOOLS = {"rerun_dag"}
 
 _WRITING_TOOLS = frozenset(_WRITE_REFUSALS) | _DELIBERATELY_UNGATED_TOOLS
 
+# The broad recovery surface, WITHDRAWN from ``server.py``'s registration tuple
+# and from the plugin's ``TOOL_POLICY``. Their implementations and their tests
+# stay in the tree, and both sweeps keep driving them — a withdrawn tool is
+# still held to everything it was held to before, which is the whole point of
+# keeping it. What changed is that nothing exposes it, so the registered surface
+# is the swept surface MINUS these five.
+#
+# Declared here rather than edited into ``baselines/tool-schemas.json``: the
+# freeze records what the surface was, the scope change is what moved, and
+# subtracting a named set from the frozen count keeps both facts readable. This
+# is the same pattern ``docs/deferred-semantics.md`` already uses for the one
+# docstring that diverged from the freeze.
+_WITHDRAWN_TOOLS = frozenset(
+    {
+        "plan_backfill",
+        "run_backfill",
+        "plan_task_instance_clear",
+        "apply_task_instance_clear",
+        "verify_task_instance_recovery",
+    }
+)
+
 
 def test_the_sweep_covers_every_registered_tool():
     """Every registered tool is in exactly one sweep, and the count is READ off
     the freeze rather than retyped — a literal here is a number a new tool's
-    author can bump in the same commit that hides it."""
+    author can bump in the same commit that hides it.
+
+    The freeze is 14 and five tools were deliberately withdrawn, so the
+    arithmetic is stated rather than the total retyped.
+    """
     registered = set(_registered_tools())
 
-    assert registered == set(_SWEPT_TOOLS) | _WRITING_TOOLS
-    assert len(registered) == _frozen_tool_count()
+    assert registered == (set(_SWEPT_TOOLS) | _WRITING_TOOLS) - _WITHDRAWN_TOOLS
+    assert len(registered) == _frozen_tool_count() - len(_WITHDRAWN_TOOLS)
     assert not set(_SWEPT_TOOLS) & _WRITING_TOOLS
+
+
+def test_every_withdrawn_tool_is_unreachable_and_still_implemented():
+    """Withdrawal is removal from the SURFACE, and the two halves of that are
+    checked separately.
+
+    Unreachable: the name is not in the registration tuple, so FastMCP is never
+    handed it and no MCP client is ever told it exists. Preserved: the function
+    is still there, still imported into ``server``, and still callable — which
+    is what lets its own tests keep running as the record of what was built.
+    """
+    registered = set(_registered_tools())
+
+    for name in sorted(_WITHDRAWN_TOOLS):
+        assert name not in registered, f"{name} is still registered"
+        assert callable(getattr(server, name)), f"{name}'s implementation is gone"
+        # Held to both sweeps still, so nothing about withdrawing it relaxes
+        # what it has to prove.
+        assert name in set(_SWEPT_TOOLS) | _WRITING_TOOLS, f"{name} lost its sweep when it was withdrawn"
 
 
 @pytest.mark.parametrize("tool", sorted(_WRITE_REFUSALS))
@@ -11223,6 +11268,7 @@ def test_the_instruments_own_census_is_derived_and_printed(capsys):
         # ``test_the_sweeps_discrimination_is_measured_rather_than_counted``.
         "compound levers": len(_truncation_knobs()[1]),
         "registered tools": len(_registered_tools()),
+        "withdrawn tools": len(_WITHDRAWN_TOOLS),
         "value-swept tools": len(_SWEPT_TOOLS),
         "tools declared inert": len(_TOOLS_THAT_MOVE_NOTHING),
         "writing tools": len(_WRITING_TOOLS),
@@ -11237,7 +11283,10 @@ def test_the_instruments_own_census_is_derived_and_printed(capsys):
     assert census["levers"] == (
         census["source-count knobs"] + census["no-count knobs"] + census["row-count bounds"]
     )
-    assert census["registered tools"] == census["value-swept tools"] + census["writing tools"]
+    assert (
+        census["registered tools"]
+        == census["value-swept tools"] + census["writing tools"] - census["withdrawn tools"]
+    )
     assert census["levers declared inert"] < census["levers"], "the whole axis is inert"
     assert census["tools declared inert"] < census["value-swept tools"], "every swept tool is inert"
     assert "levers" in capsys.readouterr().out.replace("\n", " ")
@@ -16490,6 +16539,11 @@ _ENUMERATION_INVENTORY = {
     "_SWEPT_TOOLS": (
         "closed both ways",
         "registered tools observed at mcp.tool registration must equal the swept plus the writing tools",
+    ),
+    "_WITHDRAWN_TOOLS": (
+        "closed both ways",
+        "the same tool-registry identity: registered equals swept plus writing MINUS these, so a name "
+        "left here after re-registration and a name registered while listed here both fail",
     ),
     "_WRITE_REFUSALS": (
         "closed both ways",
