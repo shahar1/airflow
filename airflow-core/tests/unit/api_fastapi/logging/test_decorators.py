@@ -303,3 +303,110 @@ class TestActionLoggingUserFields:
         (logged,) = session.add.call_args.args
         assert logged.owner == "jdoe"
         assert logged.owner_display_name == "Jane Doe"
+
+
+class _FakeUser(BaseUser):
+    def get_id(self) -> str:
+        return "id"
+
+    def get_name(self) -> str:
+        return "jdoe"
+
+    def get_display_name(self) -> str:
+        return "Jane Doe"
+
+
+def _run_action_logging(event, *, path_params=None, query_string=b"", body=None, body_attribution_fields=()):
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"content-type", b"application/json")] if body is not None else [],
+        "query_string": query_string,
+        "path_params": path_params or {},
+    }
+    if body is None:
+        request = Request(scope)
+    else:
+        body_bytes = json.dumps(body).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+        request = Request(scope, receive=receive)
+
+    session = MagicMock(spec=Session)
+    asyncio.run(
+        action_logging(event=event, body_attribution_fields=body_attribution_fields)(
+            request=request, session=session, user=_FakeUser()
+        )
+    )
+    (logged,) = session.add.call_args.args
+    return logged
+
+
+class TestActionLoggingAttribution:
+    """The audit Log's ``dag_id`` / ``task_id`` / ``run_id`` columns gate per-Dag read access,
+    so the free-form request body must not be able to set them. They come from the route's
+    path/query params, plus only the body fields a route explicitly opts into."""
+
+    def test_body_cannot_set_attribution_columns_without_optin(self):
+        logged = _run_action_logging(
+            "post_variable_like_event",
+            body={"dag_id": "finance_etl", "task_id": "payout", "run_id": "manual__2026", "foo": "bar"},
+        )
+        assert logged.dag_id is None
+        assert logged.task_id is None
+        assert logged.run_id is None
+        # the body is still recorded verbatim in ``extra`` for forensics, just not in the columns
+        assert "finance_etl" in logged.extra
+
+    def test_attribution_columns_come_from_path_params(self):
+        logged = _run_action_logging(
+            "test_event",
+            path_params={"dag_id": "real_dag", "task_id": "real_task", "run_id": "real_run"},
+        )
+        assert logged.dag_id == "real_dag"
+        assert logged.task_id == "real_task"
+        assert logged.run_id == "real_run"
+
+    def test_query_string_cannot_set_attribution_columns(self):
+        # Undeclared query params are ignored by the route but still readable here; the URL is
+        # attacker-supplied on any route, so the query string must not feed the columns either.
+        logged = _run_action_logging(
+            "test_event",
+            query_string=b"dag_id=finance_etl&task_id=payout&run_id=manual__2026",
+        )
+        assert logged.dag_id is None
+        assert logged.task_id is None
+        assert logged.run_id is None
+
+    def test_opted_in_body_field_populates_column(self):
+        logged = _run_action_logging(
+            "post_clear_task_instances",
+            path_params={"dag_id": "real_dag"},
+            body={"dag_run_id": "body_run", "dry_run": False},
+            body_attribution_fields=("dag_run_id",),
+        )
+        assert logged.dag_id == "real_dag"
+        assert logged.run_id == "body_run"
+
+    def test_opted_in_body_field_cannot_override_the_same_path_param(self):
+        logged = _run_action_logging(
+            "some_event",
+            path_params={"dag_run_id": "path_run"},
+            body={"dag_run_id": "body_run"},
+            body_attribution_fields=("dag_run_id",),
+        )
+        # even opted in, the body must not overwrite the authoritative path value
+        assert logged.run_id == "path_run"
+
+    def test_opt_in_does_not_let_body_override_a_path_param(self):
+        logged = _run_action_logging(
+            "create_backfill",
+            path_params={"dag_id": "path_dag"},
+            body={"dag_id": "body_dag", "dag_run_id": "body_run"},
+            body_attribution_fields=("dag_run_id",),
+        )
+        # ``dag_id`` was not opted in, so the body value is ignored and the path value stands
+        assert logged.dag_id == "path_dag"
+        assert logged.run_id == "body_run"

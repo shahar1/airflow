@@ -281,8 +281,8 @@ def cancel_backfill(backfill_id: NonNegativeInt, session: SessionDep) -> Backfil
         ]
     ),
     dependencies=[
-        Depends(action_logging()),
         Depends(requires_access_backfill(method="POST")),
+        Depends(action_logging(body_attribution_fields=("dag_id",))),
     ],
 )
 def create_backfill(

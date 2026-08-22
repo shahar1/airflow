@@ -138,7 +138,7 @@ def _mask_variable_entity(extra_fields):
     return result
 
 
-def action_logging(event: str | None = None):
+def action_logging(event: str | None = None, *, body_attribution_fields: tuple[str, ...] = ()):
     async def log_action(
         request: Request,
         session: SessionDep,
@@ -206,6 +206,20 @@ def action_logging(event: str | None = None):
 
         extra_fields["method"] = request.method
 
+        # The audit log is read back under per-Dag access control (see requires_access_event_log),
+        # so the attribution columns must not be settable from attacker-supplied request input:
+        # otherwise any authenticated user could forge an entry for a Dag they cannot access by naming
+        # these keys in a JSON body -- or appending them to the query string -- on a route whose schema
+        # never declared them. Take the columns from the route's path params (fixed by the URL
+        # template), and only from the specific body fields a route opts into via
+        # ``body_attribution_fields``. The full (masked) body is still recorded in ``extra``.
+        attribution = {**request.path_params}
+        for field in body_attribution_fields:
+            # A path param is fixed by the URL template and authoritative; an opted-in body field
+            # only fills a column the path does not already carry -- it must never override one.
+            if field not in attribution and field in masked_body_json:
+                attribution[field] = masked_body_json[field]
+
         # Create log entry
         log = Log(
             event=event_name,
@@ -213,9 +227,9 @@ def action_logging(event: str | None = None):
             owner=user_name,
             owner_display_name=user_display,
             extra=json.dumps(extra_fields),
-            task_id=params.get("task_id"),
-            dag_id=params.get("dag_id"),
-            run_id=params.get("run_id") or params.get("dag_run_id"),
+            task_id=attribution.get("task_id"),
+            dag_id=attribution.get("dag_id"),
+            run_id=attribution.get("run_id") or attribution.get("dag_run_id"),
         )
 
         if "logical_date" in request.query_params:
