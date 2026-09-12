@@ -279,8 +279,7 @@ def initialize_secrets_backends(
     """
     backend_list = []
     worker_mode = False
-    # Determine worker mode - if default_backends is not the server default, it's worker mode
-    # This is a simplified check; in practice, worker mode is determined by the caller
+    # Not the server default search path means we are running as a worker.
     if default_backends != _SERVER_DEFAULT_SECRETS_SEARCH_PATH:
         worker_mode = True
 

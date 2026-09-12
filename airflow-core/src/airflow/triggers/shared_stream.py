@@ -1055,8 +1055,6 @@ class _SharedStreamGroup:
         # (Airflow's standard idiom); dropping the queue is enough here.
         self._subscribers.pop(trigger_id, None)
         self._failed_subscribers.discard(trigger_id)
-        # Capture the event the subscriber is currently sitting on (if any)
-        # before clearing it from the open-windows map.
         open_event_id = self._open_windows.get(trigger_id)
         self._open_windows.pop(trigger_id, None)
         # Implicit resolution: leaving closes the subscriber's window on
@@ -1084,13 +1082,9 @@ class _SharedStreamGroup:
                 self._resolve_subscriber(event_id=event_id, trigger_id=trigger_id, resolution="acked")
                 continue
             if binding.window_closed or event_id == open_event_id:
-                # Subscriber pulled this event — either already moved past it
-                # (window_closed=True, persist confirmations may still be draining) or
-                # is currently sitting on it (open window). Resolve via the acknowledged path.
                 binding.window_closed = True
                 self._maybe_complete(event_id=event_id, trigger_id=trigger_id)
             else:
-                # Subscriber never pulled this event; redeliver via failed.
                 self._resolve_subscriber(event_id=event_id, trigger_id=trigger_id, resolution="failed")
 
     def _fail_overflowed_subscriber(self, trigger_id: int, queue: asyncio.Queue) -> None:

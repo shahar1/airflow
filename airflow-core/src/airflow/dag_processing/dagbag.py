@@ -336,8 +336,6 @@ class DagBag(LoggingMixin):
 
         if result.errors:
             for error in result.errors:
-                # Use the relative file path from error (importer provides relative paths)
-                # Fall back to converting filepath to relative if error.file_path is not set
                 error_path = error.file_path if error.file_path else self._get_relative_fileloc(filepath)
                 error_msg = error.stacktrace if error.stacktrace else error.message
                 self.import_errors[error_path] = error_msg
@@ -585,8 +583,7 @@ def sync_bag_to_db(
 
     import_errors = {(bundle_name, rel_path): error for rel_path, error in dagbag.import_errors.items()}
 
-    # Build the set of all files that were parsed and include files with import errors
-    # in case they are not in file_last_changed
+    # Files with import errors may be missing from file_last_changed.
     files_parsed = set(import_errors)
     if dagbag.bundle_path:
         files_parsed.update(

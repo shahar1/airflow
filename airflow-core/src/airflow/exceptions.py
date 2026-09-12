@@ -254,14 +254,9 @@ class VariableNotUnique(AirflowException):
     """Raise when multiple values are found for the same variable name."""
 
 
-# The try/except handling is needed after we moved all k8s classes to cncf.kubernetes provider
-# These two exceptions are used internally by Kubernetes Executor but also by PodGenerator, so we need
-# to leave them here in case older version of cncf.kubernetes provider is used to run KubernetesPodOperator
-# and it raises one of those exceptions. The code should be backwards compatible even if you import
-# and try/except the exception using direct imports from airflow.exceptions.
-# 1) if you have old provider, both provider and pod generator will throw the "airflow.exceptions" exception.
-# 2) if you have new provider, both provider and pod generator will throw the
-#    "airflow.providers.cncf.kubernetes" as it will be imported here from the provider.
+# These exceptions moved to the cncf.kubernetes provider but are also raised by PodGenerator, so fallbacks
+# stay here for older providers: with an old provider both raise the airflow.exceptions class, with a new one
+# both raise the provider class imported here, so try/except via either import path keeps working.
 try:
     from airflow.providers.cncf.kubernetes.exceptions import PodMutationHookException
 except ImportError:

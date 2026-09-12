@@ -356,17 +356,12 @@ class SecretsMasker(logging.Filter):
         self, item: Redactable, name: str | None, depth: int, max_depth: int, replacement: str = "***"
     ) -> Redacted:
         try:
-            # Key-name-based redaction is unbounded by depth — sensitive keys
-            # must fail closed at any nesting level. The depth cutoff below is
-            # only used to bound the work of pattern-based string masking and
-            # to terminate recursion through self-referential iterables.
+            # Key-name redaction is unbounded by depth so sensitive keys fail closed at any nesting level; the
+            # depth cutoff below only bounds pattern-based string masking and recursion through cycles.
             if name and self.should_hide_value_for_key(name):
                 return self._redact_all(item, depth, max_depth, replacement=replacement)
-            # Always walk dicts so deeper sensitive keys are still caught;
-            # JSON-loaded payloads cannot be self-referential, and any
-            # in-memory cycle hits Python's own recursion limit and is caught
-            # by the except clause below (which fails closed via
-            # "<redaction-failed>").
+            # Walk dicts and iterables unconditionally; a self-referential structure hits the recursion limit
+            # and fails closed in the except clause below.
             if isinstance(item, dict):
                 to_return = {
                     dict_key: self._redact(
@@ -375,11 +370,6 @@ class SecretsMasker(logging.Filter):
                     for dict_key, subval in item.items()
                 }
                 return to_return
-            # Always walk lists/tuples/sets too, mirroring the unconditional dict
-            # walk above, so a sensitive key wrapped in an iterable is still
-            # caught at any nesting depth. Self-referential iterables hit Python's
-            # own recursion limit and are caught by the except clause below, which
-            # fails closed.
             if isinstance(item, (tuple, set)):
                 # Turn set in to tuple!
                 return tuple(
@@ -395,9 +385,6 @@ class SecretsMasker(logging.Filter):
                     )
                     for subval in item
                 ]
-            # The depth cutoff only bounds the work of pattern-based string
-            # masking below — key-name redaction (dicts and iterables above) is
-            # unbounded so sensitive keys fail closed at any depth.
             if depth > max_depth:
                 return item
             if isinstance(item, Enum):

@@ -1236,9 +1236,7 @@ def _get_resource_methods_from_bulk_request(
     action: BulkCreateAction | BulkUpdateAction | BulkDeleteAction,
 ) -> list[ResourceMethod]:
     resource_methods: list[ResourceMethod] = [MAP_BULK_ACTION_TO_AUTH_METHOD[action.action]]
-    # If ``action_on_existence`` == ``overwrite``, we need to check the user has ``PUT`` access as well.
-    # With ``action_on_existence`` == ``overwrite``, a create request is actually an update request if the
-    # resource already exists, hence adding this check.
+    # An overwrite-on-existence create can turn into an update, so PUT access is required too.
     if action.action == BulkAction.CREATE and action.action_on_existence == BulkActionOnExistence.OVERWRITE:
         resource_methods.append("PUT")
     return resource_methods

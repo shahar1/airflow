@@ -72,8 +72,7 @@ def dag_edges(dag: SerializedDAG):
             return
 
         for target_id in task_group.downstream_group_ids:
-            # For every TaskGroup immediately downstream, add edges between downstream_join_id
-            # and upstream_join_id. Skip edges between individual tasks of the TaskGroups.
+            # Downstream TaskGroups: join via downstream_join_id -> upstream_join_id; skip task-to-task edges.
             target_group = task_group_map[target_id]
             edges_to_add.add((task_group.downstream_join_id, target_group.upstream_join_id))
 
@@ -87,9 +86,7 @@ def dag_edges(dag: SerializedDAG):
                 edges_to_add.add((target_group.upstream_join_id, child.task_id))
                 edges_to_skip.add((task_group.downstream_join_id, child.task_id))
 
-        # For every individual task immediately downstream, add edges between downstream_join_id and
-        # the downstream task. Skip edges between individual tasks of the TaskGroup and the
-        # downstream task.
+        # Downstream tasks: join via downstream_join_id; skip leaf-to-task edges.
         for target_id in task_group.downstream_task_ids:
             edges_to_add.add((task_group.downstream_join_id, target_id))
 
@@ -97,9 +94,7 @@ def dag_edges(dag: SerializedDAG):
                 edges_to_add.add((child.task_id, task_group.downstream_join_id))
                 edges_to_skip.add((child.task_id, target_id))
 
-        # For every individual task immediately upstream, add edges between the upstream task
-        # and upstream_join_id. Skip edges between the upstream task and individual tasks
-        # of the TaskGroup.
+        # Upstream tasks: join via upstream_join_id; skip task-to-root edges.
         for source_id in task_group.upstream_task_ids:
             edges_to_add.add((source_id, task_group.upstream_join_id))
             for child in task_group.get_roots():

@@ -479,16 +479,10 @@ class DagFileProcessorManager(LoggingMixin):
 
         stuck_legacy_rows = 0
         for dag in dags_parsed:
-            # Dags whose bundle has been removed from config (bundle no longer active) are stale —
-            # the processor has stopped parsing their files, so the time-based check below would never fire.
-            #
-            # A NULL bundle_name means the row predates bundles (carried over from Airflow 2.x) and has not
-            # been parsed since the upgrade — parsing is what fills bundle_name in. If the file was removed
-            # as part of the upgrade, no parse will ever happen, so bundle_name stays NULL forever. Such a
-            # row can never hit the time-based check below either, because that matches on
-            # (bundle_name, relative_fileloc) and there is no bundle to match against, so without this
-            # branch the Dag stays active in the UI indefinitely. If the file does still exist, the next
-            # parse fills in bundle_name and clears is_stale, so a Dag deactivated here is reactivated.
+            # A Dag whose bundle is inactive (removed from config) or NULL (an Airflow 2.x row never parsed
+            # since the upgrade) can never hit the time-based check below, which matches on (bundle_name,
+            # relative_fileloc). Deactivate it here; if the file still exists, the next parse fills
+            # bundle_name and clears is_stale again.
             if dag.bundle_name is None or dag.bundle_name in inactive_bundles:
                 self.log.info(
                     "Deactivating Dag %s. Its bundle %s is no longer active or is NULL.",
@@ -497,19 +491,14 @@ class DagFileProcessorManager(LoggingMixin):
                 )
                 to_deactivate.add(dag.dag_id)
                 continue
-            # A Dag upgraded from Airflow 2.x can still have a NULL relative_fileloc:
-            # the 0082 migration adds the column as nullable, and the startup repair
-            # in DagBundlesManager only backfills it when the Dag's fileloc resolves to
-            # a configured bundle. Rows whose fileloc matches no bundle stay NULL, so
-            # the time-based stale check below would build Path(None) and crash. Skip
-            # them here and count them so the total is surfaced after the loop.
-            # See https://github.com/apache/airflow/issues/63323.
+            # An Airflow 2.x row can still have a NULL relative_fileloc when the startup repair could not map
+            # its fileloc to a configured bundle; Path(None) below would crash, so skip and count it. See
+            # https://github.com/apache/airflow/issues/63323.
             if dag.relative_fileloc is None:
                 stuck_legacy_rows += 1
                 continue
-            # When the Dag's last_parsed_time is more than the stale_dag_threshold older than the
-            # Dag file's last_finish_time, the Dag is considered stale as has apparently been removed from the file,
-            # This is especially relevant for Dag files that generate Dags in a dynamic manner.
+            # Stale when the file finished parsing more than stale_dag_threshold after the Dag was last seen,
+            # i.e. the Dag was removed from the file (relevant for dynamically generated Dags).
             rel_path = Path(dag.relative_fileloc)
             file_info = DagFileInfo(rel_path=rel_path, bundle_name=dag.bundle_name)
             if file_info not in last_parsed:
@@ -1070,16 +1059,6 @@ class DagFileProcessorManager(LoggingMixin):
             DAG definitions
         :return: None
         """
-        # File Path: Path to the file containing the DAG definition
-        # PID: PID associated with the process that's processing the file. May
-        # be empty.
-        # Runtime: If the process is currently running, how long it's been
-        # running for in seconds.
-        # Last Runtime: If the process ran before, how long did it take to
-        # finish in seconds
-        # Last Run: When the file finished processing in the previous run.
-        # Last # of DB Queries: The number of queries performed to the
-        # Airflow database during last parsing of the file.
         headers = [
             "Bundle",
             "File Path",

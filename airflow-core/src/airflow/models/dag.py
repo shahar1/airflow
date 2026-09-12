@@ -317,8 +317,6 @@ class DagModel(Base):
     These items are stored in the database for state related information.
     """
     dag_id: Mapped[str] = mapped_column(StringID(), primary_key=True)
-    # A DAG can be paused from the UI / DB
-    # Set this default value of is_paused based on a configuration value!
     is_paused_at_creation = airflow_conf.getboolean("core", "dags_are_paused_at_creation")
     is_paused: Mapped[bool] = mapped_column(Boolean, default=is_paused_at_creation)
     # Whether that DAG was seen on the last DagBag load

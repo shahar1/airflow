@@ -1218,13 +1218,9 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         :param session:
         :return: Number of task instance with state changed.
         """
-        # The user can either request a certain number of tis to schedule per main scheduler loop (default
-        # is non-zero). If that value has been set to zero, that means use the value of core.parallelism (or
-        # however many free slots are left). core.parallelism represents the max number of running TIs per
-        # scheduler. Historically this value was stored in the executor, who's job it was to control/enforce
-        # it. However, with multiple executors, any of which can run up to core.parallelism TIs individually,
-        # we need to make sure in the scheduler now that we don't schedule more than core.parallelism totally
-        # across all executors.
+        # max_tis_per_query == 0 means "use core.parallelism" (minus occupied slots). Parallelism used to be
+        # enforced per executor; with multiple executors the scheduler must cap the total across all of them
+        # here.
         num_occupied_slots = sum([executor.slots_occupied for executor in self.executors])
         if self.job.max_tis_per_query == 0:
             max_tis = self._parallelism - num_occupied_slots
@@ -2517,10 +2513,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
     def _create_dag_runs(self, dag_models: Collection[DagModel], session: Session) -> None:
         """Create a DAG run and update the dag_model to control if/when the next DAGRun should be created."""
-        # Bulk Fetch DagRuns with dag_id and logical_date same
-        # as DagModel.dag_id and DagModel.next_dagrun
-        # This list is used to verify if the DagRun already exist so that we don't attempt to create
-        # duplicate DagRuns
+        # Existing runs keyed by (dag_id, next_dagrun), used below to avoid creating duplicates.
         existing_dagrun_objects = session.scalars(
             select(DagRun)
             .where(
@@ -2579,11 +2572,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 self.log.error("Dag not found in serialized_dag table", dag_id=dag_model.dag_id)
                 continue
 
-            # Explicitly check if the DagRun already exists. This is an edge case
-            # where a Dag Run is created but `DagModel.next_dagrun` and `DagModel.next_dagrun_create_after`
-            # are not updated.
-            # We opted to check DagRun existence instead
-            # of catching an Integrity error and rolling back the session i.e
+            # The run may already exist when DagModel.next_dagrun / next_dagrun_create_after were not updated;
+            # checking beats catching an IntegrityError and rolling back the session.
             if dr := existing_dagruns.get((dag_model.dag_id, dag_model.next_dagrun)):
                 self.log.warning(
                     "run already exists; skipping dagrun creation",

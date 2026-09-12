@@ -350,9 +350,8 @@ class Trigger(Base):
     ) -> list[int]:
         """Retrieve a list of trigger ids."""
         query = select(cls.id).where(cls.triggerer_id == triggerer_id)
-        # By default, there is no trigger queue assignment. Only filter by queue when explicitly set in the triggerer CLI.
-        # Filter by queues if the triggerer explicitly was called with `--queues`, otherwise, filter out
-        # Triggers which have an explicit `queue` value since there may be other triggerer hosts explicitly assigned to that queue.
+        # Triggers with an explicit `queue` belong to triggerers started with `--queues`; without it only
+        # unassigned triggers are picked up.
         if queues:
             query = query.filter(cls.queue.in_(queues))
         else:

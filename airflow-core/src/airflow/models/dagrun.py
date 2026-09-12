@@ -1681,9 +1681,7 @@ class DagRun(Base, LoggingMixin):
                 return expanded_tis
             return ()
 
-        # Check dependencies.
         expansion_happened = False
-        # Set of task ids for which was already done _revise_map_indexes_if_mapped
         revised_map_index_task_ids: set[str] = set()
         for schedulable in itertools.chain(schedulable_tis, additional_tis):
             if TYPE_CHECKING:
@@ -1723,13 +1721,10 @@ class DagRun(Base, LoggingMixin):
                         # evaluated later in this pass recomputes it instead of reading a stale value.
                         dep_context.invalidate_upstream_task_id_counts()
 
-                # _revise_map_indexes_if_mapped might mark the current task as REMOVED
-                # after calculating mapped task length, so we need to re-check
-                # the task state to ensure it's still schedulable
+                # _revise_map_indexes_if_mapped may have marked this task REMOVED; re-check the state.
                 if schedulable.state in SCHEDULEABLE_STATES:
                     ready_tis.append(schedulable)
 
-        # Check if any ti changed state
         tis_filter = TI.filter_for_tis(old_states)
         if tis_filter is not None:
             fresh_tis = session.scalars(select(TI).where(tis_filter)).all()

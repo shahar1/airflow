@@ -116,7 +116,6 @@ def execute_callback(
         return False, "Callback path not found."
 
     try:
-        # Import the callback callable
         # Expected format: "module.path.to.function_or_class"
         module_path, function_name = callback_path.rsplit(".", 1)
         # If the callback is defined within the Dag module, the module path is modified during DAG serialization.

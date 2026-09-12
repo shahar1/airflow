@@ -144,19 +144,16 @@ def _get_legacy_stat_name_and_tags(
     """
     _none: tuple[None, dict[str, Any]] = None, {}
 
-    # If the config flag is enabled/disabled.
     if not _export_legacy_names:
         return _none
 
     stat_from_registry = _get_registry().get(name=stat)
 
-    # If the provided stat exists in the registry.
     if not stat_from_registry:
         return _none
 
     legacy_name = stat_from_registry.get("legacy_name", "-")
 
-    # If the registry stat has a legacy name.
     if legacy_name == "-":
         return _none
 
@@ -173,7 +170,6 @@ def _get_legacy_stat_name_and_tags(
 
     provided_vars = set(tags.keys()) if tags else set()
     missing_vars = set(required_vars) - provided_vars
-    # If there are specified variables in the YAML file that haven't been provided in the tags param.
     if missing_vars:
         raise ValueError(
             f"Missing required variables for metric '{stat}': {sorted(missing_vars)}. "
@@ -182,18 +178,11 @@ def _get_legacy_stat_name_and_tags(
             f"Provide all required variables as tags."
         )
 
-    # 'required_vars' are the ones found in the registry.
-    # If there is a variable that exists in the tags and not in the registry,
-    # then it's extra, and it will be set as a tag for the legacy stat.
+    # Tags that are not name variables are kept as tags on the legacy stat.
     name_var_set = set(required_vars)
-    # StatsD uses '.' as a hierarchy separator in metric names. When a tag value
-    # contains '.', substituting it into the legacy name breaks the hierarchy.
-    # For example, a task inside a task group has task_id="my_group.my_task".
-    # The legacy name "ti.finish.{dag_id}.{task_id}.{state}"
-    # becomes "ti.finish.my_dag.my_group.my_task.success" — 6 segments instead of 5.
-    # StatsD can't tell where task_id ends and state begins. Replacing '.' with '__'
-    # produces "ti.finish.my_dag.my_group__my_task.success", keeping the hierarchy intact.
-    # This is just for legacy names because there are no variables in modern names.
+    # StatsD treats "." as a hierarchy separator, so a tag value like task_id="my_group.my_task" would add a
+    # segment to the legacy name. Replace "." with "__" to keep the segment count stable (modern names have no
+    # variables, so only legacy names need this).
     formatted_name = legacy_name.format(**{k: str(tags[k]).replace(".", "__") for k in required_vars})  # type: ignore[index]
     extra_tags = {k: v for k, v in (tags or {}).items() if k not in name_var_set}
     return formatted_name, extra_tags

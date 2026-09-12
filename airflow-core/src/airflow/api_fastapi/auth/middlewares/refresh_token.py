@@ -57,12 +57,9 @@ class JWTRefreshMiddleware(BaseHTTPMiddleware):
                         request.state.user = user
                         request.state.user_authenticated_via = USER_INJECTED_BY_TRUSTED_MIDDLEWARE
                     if new_user:
-                        # If we created a new user, serialize it and set it as a cookie
                         new_token = get_auth_manager().generate_jwt(new_user)
                 except (HTTPException, AuthManagerRefreshTokenExpiredException):
-                    # Receive a HTTPException when the Airflow token is expired
-                    # Receive a AuthManagerRefreshTokenExpiredException when the potential underlying refresh
-                    # token used by the auth manager is expired
+                    # The Airflow token or the auth manager's refresh token expired: clear the cookie.
                     new_token = ""
 
             response = await call_next(request)
@@ -92,7 +89,6 @@ class JWTRefreshMiddleware(BaseHTTPMiddleware):
                         samesite="lax",
                     )
         except HTTPException as exc:
-            # If any HTTPException is raised during user resolution or refresh, return it as response
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         return response
 

@@ -618,8 +618,7 @@ class CommandFactory:
             "datetime.date",
             "datetime.datetime",
         }
-        # Handle Optional types (e.g., "datetime.datetime | None", "str | None")
-        # Strip " | None" suffix to check the base type
+        # Strip an Optional suffix (e.g. "str | None") before checking the base type.
         base_type = type_name.replace(" | None", "").strip()
         return base_type in primitive_types
 
@@ -912,8 +911,7 @@ class CommandFactory:
                         if isinstance(value, dict):
                             dict_obj[key] = check_operation_and_collect_list_of_dict(value)
 
-                # If dict_obj only have single key return value instead of list
-                # This can happen since we are excluding some keys from user such as total_entries from list operations
+                # Single-key results (keys like total_entries are excluded) are unwrapped instead of listed.
                 if len(dict_obj) == 1:
                     return dict_obj[next(iter(dict_obj.keys()))]
                 # If not nested, return the object as a list which the result should be already a dict

@@ -391,7 +391,6 @@ class DagBundlesManager(LoggingMixin):
             elif not team and bundle_to_team.get(name) is not None:
                 # Only remove ownership if a team was previously associated; stored bundles with
                 # no team already map to None in bundle_to_team.
-                # Remove team association
                 self.log.warning(
                     "Removing ownership of team '%s' from Dag bundle '%s'", bundle_to_team[name], name
                 )
@@ -621,12 +620,9 @@ class DagBundlesManager(LoggingMixin):
         if not template:
             return params
 
-        # Extract template placeholders using regex
-        # This matches {placeholder} patterns in the template
         PLACEHOLDER_PATTERN = re.compile(r"\{([^}]+)\}")
         placeholders = PLACEHOLDER_PATTERN.findall(template)
 
-        # Extract values for each placeholder found in the template
         for placeholder in placeholders:
             field_value = getattr(bundle_instance, placeholder, None)
             if field_value:

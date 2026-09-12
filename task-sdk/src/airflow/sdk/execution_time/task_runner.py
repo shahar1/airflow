@@ -1101,16 +1101,9 @@ def parse(what: StartupDetails, log: Logger) -> RuntimeTaskInstance:
     )
 
 
-# This global variable will be used by Connection/Variable/XCom classes, or other parts of the task's execution,
-# to send requests back to the supervisor process.
-#
-# Why it needs to be a global:
-# - Many parts of Airflow's codebase (e.g., connections, variables, and XComs) may rely on making dynamic requests
-#   to the parent process during task execution.
-# - These calls occur in various locations and cannot easily pass the `CommsDecoder` instance through the
-#   deeply nested execution stack.
-# - By defining `SUPERVISOR_COMMS` as a global, it ensures that this communication mechanism is readily
-#   accessible wherever needed during task execution without modifying every layer of the call stack.
+# Used by Connection/Variable/XCom and other execution-time code to send requests to the supervisor. A global
+# because those calls happen deep in the call stack, where passing the CommsDecoder through every layer is
+# impractical.
 SUPERVISOR_COMMS: CommsDecoder[ToTask, ToSupervisor]
 
 
@@ -1166,7 +1159,6 @@ def get_startup_details() -> StartupDetails:
     ):
         # Clear any Kerberos replace cache if there is one, so new process can't reuse it.
         os.environ.pop("KRB5CCNAME", None)
-        # entrypoint of re-exec process
 
         msg: StartupDetails = TypeAdapter(StartupDetails).validate_json(msgjson)
         reinit_supervisor_comms()
@@ -1175,7 +1167,6 @@ def get_startup_details() -> StartupDetails:
         # on stdout
         log.debug("Using serialized startup message from environment", msg=msg)
     else:
-        # normal entry point
         msg = SUPERVISOR_COMMS._get_response()  # type: ignore[assignment]
 
         if not isinstance(msg, StartupDetails):
@@ -1316,9 +1307,7 @@ def _serialize_template_field(
         if type(obj).__str__ is not object.__str__ or type(obj).__repr__ is not object.__repr__:
             return str(obj)
 
-        # Otherwise fall back to a qualname marker. The default object repr is
-        # `<ClassName object at 0x...>`, which embeds a memory address that flips per process
-        # and would break DAG hash stability — use the class qualname instead.
+        # The default object repr embeds a memory address, which would break Dag hash stability.
         return f"<{qualname(type(obj), True)} object>"
 
     max_length = conf.getint("core", "max_templated_field_length")
@@ -1427,9 +1416,8 @@ def _prepare(ti: RuntimeTaskInstance, log: Logger, context: Context) -> ToSuperv
         # so that we do not call the API unnecessarily
         SUPERVISOR_COMMS.send(msg=SetRenderedFields(rendered_fields=rendered_fields))
 
-    # Try to render map_index_template early with available context (will be re-rendered after execution)
-    # This provides a partial label during task execution for templates using pre-execution context
-    # If rendering fails here, we suppress the error since it will be re-rendered after execution
+    # Render map_index_template early for a partial label; errors are ignored because it is re-rendered after
+    # execution.
     try:
         if rendered_map_index := _render_map_index(context, ti=ti, log=log):
             ti.rendered_map_index = rendered_map_index
@@ -1450,7 +1438,6 @@ def _prepare(ti: RuntimeTaskInstance, log: Logger, context: Context) -> ToSuperv
     except Exception:
         log.exception("error calling listener")
 
-    # No error, carry on and execute the task
     return None
 
 
@@ -1731,24 +1718,12 @@ def run(
                     "Failed to report terminal task state to supervisor",
                     state=state.value if state is not None else None,
                 )
-                # Fail closed for FAILED / UP_FOR_RETRY: when the supervisor
-                # never receives the terminal-state message, exiting 0 would
-                # let the supervisor's final_state property default to
-                # SUCCESS (exit_code == 0 with no _terminal_state set),
-                # turning a real failure into a silent data-quality bug for
-                # every downstream task. We signal main() to sys.exit(1)
-                # AFTER finalize() runs, so on_failure_callback /
-                # on_retry_callback / listener hooks / email_on_failure /
-                # email_on_retry still fire. sys.exit(1) directly here would
-                # raise SystemExit, which is BaseException, not Exception —
-                # main()'s `except Exception:` would not catch it and
-                # finalize() at the call site would be skipped.
-                #
-                # SKIPPED / UP_FOR_RESCHEDULE / DEFERRED are intentionally
-                # not fail-closed: supervisor's final_state would misclassify
-                # them too, but exiting non-zero would map them to FAILED,
-                # which is strictly worse than the default. Those need a
-                # separate fix in supervisor's final_state.
+                # Fail closed for FAILED / UP_FOR_RETRY: without the terminal-state message the supervisor's
+                # final_state defaults to SUCCESS (exit code 0), silently passing a real failure downstream.
+                # main() exits 1 *after* finalize() so callbacks, listeners and failure emails still fire
+                # (sys.exit here would raise SystemExit past main()'s `except Exception` and skip finalize()).
+                # SKIPPED / UP_FOR_RESCHEDULE / DEFERRED are not fail-closed on purpose: a non-zero exit would
+                # map them to FAILED, which is worse than the current misclassification.
                 if state in (TaskInstanceState.FAILED, TaskInstanceState.UP_FOR_RETRY):
                     ti._terminal_state_send_failed = True
 

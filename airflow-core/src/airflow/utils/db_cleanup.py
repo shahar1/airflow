@@ -346,8 +346,6 @@ def _do_delete(
         else:
             print("Performing Delete...")
 
-        # using bulk delete
-        # create a new table and copy the rows there
         timestamp_str = re.sub(r"[^\d]", "", timezone.utcnow().isoformat())[:14]
         target_table_name = _format_table_name(
             orm_model.schema,
@@ -376,7 +374,6 @@ def _do_delete(
                 session.execute(stmt)
             session.commit()
 
-            # delete the rows from the old table
             metadata = reflect_tables([source_table_name, target_table_name], session)
             source_table = metadata.tables[source_table_name]
             target_table = metadata.tables[target_table_name]
@@ -417,12 +414,8 @@ def _do_delete(
                     target_table.drop(bind=session.connection())
                     session.commit()
                 except Exception:
-                    # If we are already unwinding from a delete failure, a cleanup
-                    # error here must not replace the original exception (Python
-                    # makes a ``finally``-raised error the top-level one). Log and
-                    # let the original delete error keep propagating. On the success
-                    # path (no delete error), a drop/commit failure is a real
-                    # problem, so re-raise it.
+                    # While unwinding a delete failure a cleanup error must not shadow the original exception
+                    # (a ``finally``-raised error becomes the top-level one); on the success path re-raise it.
                     if not error_raised:
                         raise
                     logger.warning(

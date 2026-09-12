@@ -384,8 +384,7 @@ class SerializedDAG:
 
         object.__setattr__(dag, "task_group", filter_task_group(self.task_group, None))
 
-        # Removing upstream/downstream references to tasks and TaskGroups that did not make
-        # the cut.
+        # Drop upstream/downstream references to tasks and TaskGroups that did not make the cut.
         groups = dag.task_group.get_task_group_dict()
         for g in groups.values():
             g.upstream_group_ids.intersection_update(groups)
@@ -394,8 +393,6 @@ class SerializedDAG:
             g.downstream_task_ids.intersection_update(dag.task_dict)
 
         for t in dag.tasks:
-            # Removing upstream/downstream references to tasks that did not
-            # make the cut
             t.upstream_task_ids.intersection_update(dag.task_dict)
             t.downstream_task_ids.intersection_update(dag.task_dict)
 

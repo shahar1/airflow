@@ -69,11 +69,8 @@ def show_config(args):
 @providers_configuration_loaded
 def get_value(args):
     """Get one value from configuration."""
-    # while this will make get_value quite a bit slower we must initialize configuration
-    # for providers because we do not know what sections and options will be available after
-    # providers are initialized. Theoretically Providers might add new sections and options
-    # but also override defaults for existing options, so without loading all providers we
-    # cannot be sure what is the final value of the option.
+    # Loading providers slows get_value down, but they can add sections/options and override defaults, so the
+    # final value is unknown without them.
     try:
         value = conf.get(args.section, args.option)
         print(value)

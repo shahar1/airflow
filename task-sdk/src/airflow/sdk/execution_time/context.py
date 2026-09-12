@@ -659,7 +659,6 @@ class TaskStateStoreAccessor:
         stored: JsonValue = value
         if backend is not None:
             ref: str = backend.serialize_task_state_store_to_ref(value=value, key=key, scope=self._scope)
-            # wrap the value with a marker to indicate that it's stored externally, and include the ref to the external storage
             stored = _wrap_external_ref(ref)
 
         msg = SetTaskStateStore(ti_id=self._ti_id, key=key, value=stored, expires_at=expires_at)

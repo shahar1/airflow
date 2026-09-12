@@ -666,8 +666,7 @@ class BaseSerialization:
         elif type_ == DAT.DATETIME:
             return from_timestamp(var)
         elif type_ == DAT.POD:
-            # Attempt to import kubernetes for deserialization. Using attempt_import=True allows
-            # lazy loading of kubernetes libraries only when actually needed for POD deserialization.
+            # attempt_import=True defers importing kubernetes until a POD is actually deserialized.
             if not _has_kubernetes(attempt_import=True):
                 raise RuntimeError(
                     "Cannot deserialize POD objects without kubernetes libraries. "
@@ -1085,9 +1084,8 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                 else op.operator_extra_links
             )
 
-        # Store all template_fields as they are if there are JSON Serializable
-        # If not, store them as strings
-        # And raise an exception if the field is not templateable
+        # Template fields are stored as-is when JSON serializable, otherwise as strings; forbidden
+        # (non-templateable) fields raise.
         forbidden_fields = cls._FORBIDDEN_TEMPLATE_FIELDS
         if op.template_fields:
             for template_field in op.template_fields:
@@ -1211,15 +1209,12 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             else:
                 v = cls._deserialize_field_value(k, v)
 
-            # Handle field differences between SerializedBaseOperator and MappedOperator
-            # Fields that exist in SerializedBaseOperator but not in MappedOperator need to go to partial_kwargs
+            # Fields serialized on SerializedBaseOperator but absent from MappedOperator go to partial_kwargs.
             if (
                 op.is_mapped
                 and k in SerializedBaseOperator.get_serialized_fields()
                 and k not in op.get_serialized_fields()
             ):
-                # This field belongs to SerializedBaseOperator but not MappedOperator
-                # Store it in partial_kwargs where it belongs
                 deserialized_partial_kwarg_defaults[k] = v
                 continue
 
@@ -1525,17 +1520,7 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         op_predefined_extra_links = {}
 
         for name, xcom_key in encoded_op_links.items():
-            # Get the name and xcom_key of the encoded operator and use it to create a XComOperatorLink object
-            # during deserialization.
-            #
-            # Example:
-            # enc_operator['_operator_extra_links'] =
-            # {
-            #     'airflow': 'airflow_link_key',
-            #     'foo-bar': 'link-key',
-            #     'no_response': 'key',
-            #     'raise_error': 'key'
-            # }
+            # Example of ``encoded_op_links``: {"airflow": "airflow_link_key", "foo-bar": "link-key"}
 
             op_predefined_extra_link = XComOperatorLink(name=name, xcom_key=xcom_key)
             op_predefined_extra_links.update({op_predefined_extra_link.name: op_predefined_extra_link})
@@ -1583,12 +1568,10 @@ class OperatorSerialization(DAGNode, BaseSerialization):
 
         client_defaults = {}
 
-        # Only include OPERATOR_DEFAULTS values that differ from schema defaults
         for k, v in OPERATOR_DEFAULTS.items():
             if k not in SerializedBaseOperator.get_serialized_fields():
                 continue
 
-            # Exclude values that are None or empty collections
             if v is None or v in [[], (), set(), {}]:
                 continue
 
@@ -1596,7 +1579,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             if k in schema_defaults and schema_defaults[k] == v:
                 continue
 
-            # Use the existing serialize method to ensure consistent format
             serialized_value = cls.serialize(v)
             # Extract just the value part, consistent with serialize_to_json behavior
             if isinstance(serialized_value, dict) and Encoding.TYPE in serialized_value:
@@ -1954,19 +1936,15 @@ class DagSerialization(BaseSerialization):
     @classmethod
     def to_dict(cls, var: Any) -> dict:
         """Stringifies DAGs and operators contained by var and returns a dict of var."""
-        # Clear any cached client_defaults to ensure fresh generation for this DAG
-        # Clear lru_cache for client defaults
+        # Clear the cache so client_defaults are regenerated for this Dag.
         OperatorSerialization.generate_client_defaults.cache_clear()
 
         json_dict = {"__version": cls.SERIALIZER_VERSION, "dag": cls.serialize_dag(var)}
 
-        # Add client_defaults section with only values that differ from schema defaults
-        # for tasks
         client_defaults = OperatorSerialization.generate_client_defaults()
         if client_defaults:
             json_dict["client_defaults"] = {"tasks": client_defaults}
 
-        # Validate Serialized DAG with Json Schema. Raises Error if it mismatches
         cls.validate_schema(json_dict)
         return json_dict
 

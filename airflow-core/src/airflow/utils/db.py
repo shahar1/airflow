@@ -1180,8 +1180,6 @@ def print_happy_cat(message):
 
 
 def _revision_greater(config, this_rev, base_rev):
-    # Check if there is history between the revisions and the start revision
-    # This ensures that the revisions are above `min_revision`
     script = _get_script_object(config)
     try:
         list(script.revision_map.iterate_revisions(upper=this_rev, lower=base_rev))
@@ -1203,8 +1201,7 @@ def _revisions_above_min_for_offline(config, revisions) -> None:
         raise SystemExit("Offline migration not supported for SQLite.")
     min_version, min_revision = ("2.7.0", "937cbd173ca1")
 
-    # Check if there is history between the revisions and the start revision
-    # This ensures that the revisions are above `min_revision`
+    # Every revision must be above `min_revision`.
     for rev in revisions:
         if not _revision_greater(config, rev, min_revision):
             raise ValueError(

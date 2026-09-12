@@ -86,8 +86,7 @@ Providers with {component} missing 'cli' section in 'get_provider_info': {not_de
 
     # compat loading for older providers that define get_cli_commands methods on Executors
     try:
-        # if there is any executor_provider not in cli_provider, we have to do compat loading
-        # we use without check to avoid actual loading in this check
+        # `executor_without_check` avoids importing the executors just for this check.
         executors_not_defined_cli = {
             executor_name: executor_provider
             for executor_name, executor_provider in providers_manager.executor_without_check
@@ -131,8 +130,7 @@ Providers with {component} missing 'cli' section in 'get_provider_info': {not_de
 
     # compat loading for older providers that define get_cli_commands methods on AuthManagers
     try:
-        # if there is any auth_manager not in cli_provider, we have to do compat loading
-        # we use without check to avoid actual loading in this check
+        # `auth_manager_without_check` avoids importing the auth managers just for this check.
         auth_managers_not_defined_cli = {
             auth_manager_name: auth_manager_provider
             for auth_manager_name, auth_manager_provider in providers_manager.auth_manager_without_check

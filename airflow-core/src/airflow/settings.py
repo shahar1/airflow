@@ -556,22 +556,12 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
         # In-memory SQLite uses SingletonThreadPool which doesn't support pool_size/max_overflow.
         log.debug("settings.prepare_engine_args(): Skipping pool settings for in-memory SQLite")
     else:
-        # Pool settings for all file-based databases including SQLite.
-        # SQLAlchemy 2.0+ uses QueuePool by default for file-based SQLite.
-        # If no config value is defined for the pool size, select a reasonable value.
-        # 0 means no limit, which could lead to exceeding the Database connection limit.
+        # SQLAlchemy 2.0+ uses QueuePool for file-based SQLite too. 0 means no limit, which could exceed the
+        # database connection limit.
         pool_size = conf.getint("database", "SQL_ALCHEMY_POOL_SIZE", fallback=5)
 
-        # The maximum overflow size of the pool.
-        # When the number of checked-out connections reaches the size set in pool_size,
-        # additional connections will be returned up to this limit.
-        # When those additional connections are returned to the pool, they are disconnected and discarded.
-        # It follows then that the total number of simultaneous connections
-        # the pool will allow is pool_size + max_overflow,
-        # and the total number of "sleeping" connections the pool will allow is pool_size.
-        # max_overflow can be set to -1 to indicate no overflow limit;
-        # no limit will be placed on the total number
-        # of concurrent connections. Defaults to 10.
+        # Connections beyond pool_size are allowed up to max_overflow and discarded when returned, so at most
+        # pool_size + max_overflow are open at once; -1 means no overflow limit.
         max_overflow = conf.getint("database", "SQL_ALCHEMY_MAX_OVERFLOW", fallback=10)
 
         # The DB server already has a value for wait_timeout (number of seconds after
@@ -580,10 +570,7 @@ def prepare_engine_args(disable_connection_pool=False, pool_class=None):
         # pool_recycle to an equal or smaller value.
         pool_recycle = conf.getint("database", "SQL_ALCHEMY_POOL_RECYCLE", fallback=1800)
 
-        # Check connection at the start of each connection pool checkout.
-        # Typically, this is a simple statement like "SELECT 1", but may also make use
-        # of some DBAPI-specific method to test the connection for liveness.
-        # More information here:
+        # Test each connection on checkout (pessimistic disconnect handling):
         # https://docs.sqlalchemy.org/en/20/core/pooling.html#disconnect-handling-pessimistic
         pool_pre_ping = conf.getboolean("database", "SQL_ALCHEMY_POOL_PRE_PING", fallback=True)
 
@@ -816,20 +803,16 @@ def initialize():
     configure_logging()
     configure_otel(conf)
     configure_adapters()
-    # The webservers import this file from models.py with the default settings.
 
-    # Configure secrets masker before masking secrets
     _configure_secrets_masker()
 
     is_worker = os.environ.get("_AIRFLOW__REEXECUTED_PROCESS") == "1"
     if not os.environ.get("PYTHON_OPERATORS_VIRTUAL_ENV_MODE", None) and not is_worker:
         configure_orm()
 
-        # mask the sensitive_config_values
         conf.mask_secrets()
     configure_action_logging()
 
-    # Run any custom runtime checks that needs to be executed for providers
     run_providers_custom_runtime_checks()
 
     # Ensure we close DB connections at scheduler and gunicorn worker terminations

@@ -201,12 +201,8 @@ class ExecutorLoader:
         configs: list[tuple[str | None, list[str]]] = []
         seen_teams: set[str | None] = set()
 
-        # The executor_config can look like a few things. One is just a single executor name, such as
-        # "CeleryExecutor". Or a list of executors, such as "CeleryExecutor,KubernetesExecutor,module.path.to.executor".
-        # In these cases these are all executors that are available to all teams, with the first one being the
-        # default executor, as usual. The config can also look like a list of executors, per team, with the team name
-        # prefixing each list of executors separated by a equal sign and then each team list separated by a
-        # semi-colon.
+        # executor_config is either a global list ("CeleryExecutor,KubernetesExecutor,module.path", the first
+        # being the default) or per-team lists separated by ';' with a 'team=' prefix, e.g.
         # "LocalExecutor;team1=CeleryExecutor;team2=KubernetesExecutor,module.path.to.executor".
         for team_executor_config in executor_config.split(";"):
             # The first item in the list may not have a team id (either empty string before the equal

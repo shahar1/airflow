@@ -1178,14 +1178,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         """
         dep_context = dep_context or DepContext()
         if self.state == TaskInstanceState.UP_FOR_RESCHEDULE:
-            # Tasks can be put into UP_FOR_RESCHEDULE by the task runner itself (e.g. when
-            # the worker cannot load the DAG or task). The scheduler must respect the
-            # reschedule_date before scheduling it again.
-            #
-            # We use attrs.evolve to create a *new* DepContext with ReadyToRescheduleDep added,
-            # instead of mutating the caller's dep_context.deps set in-place.  The same
-            # dep_context is shared across all TIs in a scheduler loop, so mutating it would
-            # permanently leak the dep into subsequent, unrelated TIs.
+            # The task runner itself can set UP_FOR_RESCHEDULE (e.g. the worker cannot load the Dag), and the
+            # scheduler must honour reschedule_date. attrs.evolve builds a *new* DepContext: the caller's
+            # dep_context is shared by every TI in the scheduler loop, so mutating its deps set would leak the
+            # dep into unrelated TIs.
             dep_context = attrs.evolve(dep_context, deps=dep_context.deps | {ReadyToRescheduleDep()})
         failed = False
         verbose_aware_logger = self.log.info if verbose else self.log.debug
@@ -1255,7 +1251,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         For exponential backoff, retry_delay is used as base and will be converted to seconds.
         """
-        # Check for a policy-driven delay override.
         if self.retry_delay_override is not None:
             base = self.end_date if self.end_date is not None else timezone.utcnow()
             return base + timedelta(seconds=self.retry_delay_override)
@@ -1266,11 +1261,9 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         multiplier = self.task.retry_exponential_backoff if self.task.retry_exponential_backoff != 0 else 1.0
         if multiplier != 1.0 and multiplier > 0:
             try:
-                # If the min_backoff calculation is below 1, it will be converted to 0 via int. Thus,
-                # we must round up prior to converting to an int, otherwise a divide by zero error
-                # will occur in the modded_hash calculation.
-                # this probably gives unexpected results if a task instance has previously been cleared,
-                # because try_number can increase without bound
+                # Round up before the int conversion: a min_backoff below 1 would become 0 and divide by zero
+                # in modded_hash. Results are unexpected once a task instance has been cleared, because
+                # try_number then grows without bound.
                 min_backoff = math.ceil(delay.total_seconds() * (multiplier ** (self.try_number - 1)))
             except OverflowError:
                 min_backoff = MAX_RETRY_DELAY
@@ -1278,10 +1271,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                     "OverflowError occurred while calculating min_backoff, using MAX_RETRY_DELAY for min_backoff."
                 )
 
-            # In the case when delay.total_seconds() is 0, min_backoff will not be rounded up to 1.
-            # To address this, we impose a lower bound of 1 on min_backoff. This effectively makes
-            # the ceiling function unnecessary, but the ceiling function was retained to avoid
-            # introducing a breaking change.
+            # A zero delay leaves min_backoff at 0, so clamp it to 1 (the ceil above is then redundant but
+            # kept to avoid a behaviour change).
             if min_backoff < 1:
                 min_backoff = 1
 
@@ -1295,11 +1286,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             )
             # between 1 and 1.0 * delay * (multiplier^retry_number)
             modded_hash = min_backoff + ti_hash % min_backoff
-            # timedelta has a maximum representable value. The exponentiation
-            # here means this value can be exceeded after a certain number
-            # of tries (around 50 if the initial delay is 1s, even fewer if
-            # the delay is larger). Cap the value here before creating a
-            # timedelta object so the operation doesn't fail with "OverflowError".
+            # Cap before building the timedelta: the exponentiation exceeds timedelta's maximum after ~50
+            # tries with a 1s initial delay (fewer for larger delays).
             delay_backoff_in_seconds = min(modded_hash, MAX_RETRY_DELAY)
             delay = timedelta(seconds=delay_backoff_in_seconds)
             if self.task.max_retry_delay:
@@ -1403,7 +1391,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         if not mark_success:
             # Firstly find non-runnable and non-requeueable tis.
-            # Since mark_success is not set, we do nothing.
             non_requeueable_dep_context = DepContext(
                 deps=RUNNING_DEPS - REQUEUEABLE_DEPS,
                 ignore_all_deps=ignore_all_deps,
@@ -1419,12 +1406,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                 session.commit()
                 return False
 
-            # For reporting purposes, we report based on 1-indexed,
-            # not 0-indexed lists (i.e. Attempt 1 instead of
-            # Attempt 0 for the first attempt).
-            # Set the task start date. In case it was re-scheduled use the initial
-            # start date that is recorded in task_reschedule table
-            # If the task continues after being deferred (next_method is set), use the original start_date
+            # Keep the original start_date when resuming after a deferral (next_method set); for a rescheduled
+            # task use the first start date recorded in task_reschedule.
             ti.start_date = ti.start_date if ti.next_method else timezone.utcnow()
             if ti.state == TaskInstanceState.UP_FOR_RESCHEDULE:
                 tr_start_date = session.scalar(
@@ -1934,9 +1917,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                 _stop_remaining_tasks(task_instance=ti, session=session)
         else:
             if ti.state == TaskInstanceState.RUNNING:
-                # If the task instance is in the running state, it means it raised an exception and
-                # about to retry so we record the task instance history. For other states, the task
-                # instance was cleared and already recorded in the task instance history.
+                # RUNNING means the task raised and is about to retry, so record its history now; in other
+                # states it was cleared and already recorded.
                 ti.prepare_db_for_next_try(session)
 
             ti.state = State.UP_FOR_RETRY
@@ -2488,24 +2470,18 @@ def _get_relevant_map_indexes(
     """
     from airflow.serialization.definitions.mappedoperator import get_mapped_ti_count
 
-    # This value should never be None since we already know the current task
-    # is in a mapped task group, and should have been expanded, despite that,
-    # we need to check that it is not None to satisfy Mypy.
-    # But this value can be 0 when we expand an empty list, for that it is
-    # necessary to check that ti_count is not 0 to avoid dividing by 0.
+    # ti_count is None only to satisfy mypy (the task is in a mapped group, so it was expanded), but it can be
+    # 0 when an empty list was expanded, which would divide by zero below.
     if not ti_count:
         return None
 
-    # Find the innermost common mapped task group between the current task
-    # If the current task and the referenced task does not have a common
-    # mapped task group, the two are in different task mapping contexts
-    # (like another_task above), and we should use the "whole" value.
+    # Without a common mapped task group the two tasks are in different mapping contexts (like another_task in
+    # the docstring), so the "whole" value is used.
     if (common_ancestor := _find_common_ancestor_mapped_group(task, relative)) is None:
         return None
 
-    # At this point we know the two tasks share a mapped task group, and we
-    # should use a "partial" value. Let's break down the mapped ti count
-    # between the ancestor and further expansion happened inside it.
+    # The tasks share a mapped task group, so split the ti count between the ancestor and any further
+    # expansion inside it.
 
     ancestor_ti_count = get_mapped_ti_count(common_ancestor, run_id, session=session)
     ancestor_map_index = map_index * ancestor_ti_count // ti_count

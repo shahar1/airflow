@@ -707,32 +707,23 @@ class WatchedSubprocess:
             # Closures/lambdas (``<locals>`` / ``<lambda>`` in the qualname) and
             # objects without a qualname can't be named for the exec'd child.
             raise ValueError(f"use_exec=True requires a top-level importable target, got {target!r}")
-        # Create socketpairs/"pipes" to connect to the stdin and out from the subprocess
         child_stdout, read_stdout = socketpair()
         child_stderr, read_stderr = socketpair()
 
         # Place for child to send requests/read responses, and the server side to read/respond
         child_requests, read_requests = socketpair()
 
-        # Open the socketpair before forking off the child, so that it is open when we fork.
         child_logs, read_logs = socketpair()
 
         pid = os.fork()
         if pid == 0:
             if new_process_group:
-                # Put the task-runner into its own process group so its PGID
-                # equals its own PID. The supervisor can then deliver signals
-                # to the whole tree via os.killpg(), reaching every subprocess
-                # the task-runner spawned (e.g. venv children from
-                # PythonVirtualenvOperator). Without this, a SIGTERM from
-                # kill() only hits the task-runner and any Popen children are
-                # reparented to PID 1 and leak as orphans. Also set from the
-                # parent below so the group exists no matter which side of the
-                # fork runs first. See issue #65505.
+                # Own process group (PGID == PID) so killpg() reaches every subprocess the task spawned (e.g.
+                # PythonVirtualenvOperator venv children) instead of leaking orphans. Also set from the parent
+                # below so the group exists whichever side of the fork runs first. See issue #65505.
                 with suppress(OSError):
                     os.setpgid(0, 0)
 
-            # Close and delete of the parent end of the sockets.
             cls._close_unused_sockets(read_requests, read_stdout, read_stderr, read_logs)
 
             # Python GC should delete these for us, but lets make double sure that we don't keep anything
@@ -769,7 +760,6 @@ class WatchedSubprocess:
                     )
                     # execv replaces the process -- unreachable on success
                 else:
-                    # Run the child entrypoint
                     _fork_main(child_requests, child_stdout, child_stderr, child_logs.fileno(), target)
             except BaseException as e:
                 import traceback
@@ -1200,29 +1190,20 @@ class WatchedSubprocess:
         timeout = max(0.01, max_wait_time)
         events = self.selector.select(timeout=timeout)
         for key, _ in events:
-            # Retrieve the handler responsible for processing this file object (e.g., stdout, stderr)
             socket_handler, on_close = key.data
 
-            # Example of handler behavior:
-            # If the subprocess writes "Hello, World!" to stdout:
-            # - `socket_handler` reads and processes the message.
-            # - If EOF is reached, the handler returns False to signal no more reads are expected.
-            # - BrokenPipeError should be caught and treated as if the handler returned false, similar
-            # to EOF case
+            # A handler returns False at EOF; a broken pipe is treated the same way.
             try:
                 need_more = socket_handler(key.fileobj)
             except (BrokenPipeError, ConnectionResetError):
                 need_more = False
 
-            # If the handler signals that the file object is no longer needed (EOF, closed, etc.)
-            # unregister it from the selector to stop monitoring; `wait()` blocks until all selectors
-            # are removed.
+            # Unregister once the handler is done; `wait()` blocks until every selector is removed.
             if not need_more:
                 sock: socket = key.fileobj  # type: ignore[assignment]
                 on_close(sock)
                 sock.close()
 
-        # Check if the subprocess has exited
         return self._check_subprocess_exit(raise_on_timeout=raise_on_timeout, expect_signal=expect_signal)
 
     def _check_subprocess_exit(
@@ -1492,7 +1473,6 @@ class ActivitySubprocess(WatchedSubprocess):
             self._should_retry = ti_context.should_retry
             self._last_successful_heartbeat = time.monotonic()
         except Exception:
-            # On any error kill that subprocess!
             self.kill(signal.SIGKILL)
             raise
 
@@ -1511,7 +1491,6 @@ class ActivitySubprocess(WatchedSubprocess):
             sentry_integration=sentry_integration,
         )
 
-        # Send the message to tell the process what it needs to execute
         log.debug("Sending", msg=msg)
 
         try:

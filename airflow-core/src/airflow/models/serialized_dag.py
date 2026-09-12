@@ -636,9 +636,7 @@ class SerializedDagModel(Base):
                 dag.dag_id, DagWriteMetadata(last_updated=None, dag_hash=None, dag_version=None)
             )
 
-        # Checks if (Current Time - Time when the DAG was written to DB) < min_update_interval
-        # If Yes, does nothing
-        # If No or the DAG does not exists, updates / writes Serialized DAG to DB
+        # Skip the write when the Dag was written to the DB less than min_update_interval ago.
         if min_update_interval is not None:
             if (
                 _prefetched.last_updated is not None
@@ -736,9 +734,8 @@ class SerializedDagModel(Base):
             )
 
         if dag_version and not has_task_instances:
-            # This is for dynamic DAGs that the hashes changes often. We should update
-            # the serialized dag, the dag_version and the dag_code instead of a new version
-            # if the dag_version is not associated with any task instances
+            # A version with no task instances (e.g. a dynamic Dag whose hash changes often) is updated in
+            # place instead of creating a new version.
             new_serialized_dag = cls(dag, _dag_hash=new_dag_hash)
 
             # Use direct UPDATE to avoid loading the full serialized DAG
@@ -766,14 +763,11 @@ class SerializedDagModel(Base):
                     updated_serialized_dag.deadline_alerts.clear()
                     cls._create_deadline_alert_records(updated_serialized_dag, deadline_uuid_mapping)
 
-            # The dag_version and dag_code may not have changed, still we should
-            # do the below actions:
-            # Update the latest dag version
+            # Refresh the latest DagVersion and DagCode even when dag_version and dag_code did not change.
             dag_version.bundle_name = bundle_name
             dag_version.bundle_version = bundle_version
             dag_version.version_data = version_data
             session.merge(dag_version)
-            # Update the latest DagCode
             DagCode.update_source_code(dag_id=dag.dag_id, fileloc=dag.fileloc, session=session)
             stats.incr(
                 "dag.serialization.version_updated",

@@ -97,9 +97,7 @@ def serialize_template_field(template_field: Any, name: str) -> str | dict | lis
         if type(obj).__str__ is not object.__str__ or type(obj).__repr__ is not object.__repr__:
             return str(obj)
 
-        # Otherwise fall back to a qualname marker. The default object repr is
-        # `<ClassName object at 0x...>`, which embeds a memory address that flips per process
-        # and would break DAG hash stability — use the class qualname instead.
+        # The default object repr embeds a memory address, which would break Dag hash stability.
         return f"<{qualname(type(obj), True)} object>"
 
     max_length = conf.getint("core", "max_templated_field_length")

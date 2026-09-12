@@ -1020,8 +1020,7 @@ class DAG:
 
         object.__setattr__(dag, "task_group", filter_task_group(self.task_group, None))
 
-        # Removing upstream/downstream references to tasks and TaskGroups that did not make
-        # the cut.
+        # Drop upstream/downstream references to tasks and TaskGroups that did not make the cut.
         groups = dag.task_group.get_task_group_dict()
         for g in groups.values():
             g.upstream_group_ids.intersection_update(groups)
@@ -1030,8 +1029,6 @@ class DAG:
             g.downstream_task_ids.intersection_update(dag.task_dict)
 
         for t in dag.tasks:
-            # Removing upstream/downstream references to tasks that did not
-            # make the cut
             t.upstream_task_ids.intersection_update(dag.task_dict)
             t.downstream_task_ids.intersection_update(dag.task_dict)
 
@@ -1681,29 +1678,22 @@ def dag(dag_id_or_func=None, __DAG_class=DAG, __warnings_stacklevel_delta=2, **d
 
         @functools.wraps(f)
         def factory(*args, **kwargs):
-            # Generate signature for decorated function and bind the arguments when called
-            # we do this to extract parameters, so we can annotate them on the DAG object.
-            # In addition, this fails if we are missing any args/kwargs with TypeError as expected.
+            # Binding extracts the parameters to annotate on the Dag and raises TypeError on a bad call.
             f_sig = signature(f).bind(*args, **kwargs)
-            # Apply defaults to capture default values if set.
             f_sig.apply_defaults()
 
             with DAG(dag_id, **decorator_kwargs) as dag_obj:
-                # Set Dag documentation from function documentation if it exists and doc_md is not set.
                 if f.__doc__ and not dag_obj.doc_md:
                     dag_obj.doc_md = f.__doc__
 
-                # Generate DAGParam for each function arg/kwarg and replace it for calling the function.
-                # All args/kwargs for function will be DAGParam object and replaced on execution time.
+                # Every function argument becomes a DagParam resolved at execution time.
                 f_kwargs = {}
                 for name, value in f_sig.arguments.items():
                     f_kwargs[name] = dag_obj.param(name, value)
 
-                # set file location to caller source path
                 back = sys._getframe().f_back
                 dag_obj.fileloc = back.f_code.co_filename if back else ""
 
-                # Invoke function to create operators in the Dag scope.
                 r = f(**f_kwargs)
 
                 if _is_valid_dag_result(r):
@@ -1714,7 +1704,6 @@ def dag(dag_id_or_func=None, __DAG_class=DAG, __warnings_stacklevel_delta=2, **d
                     )
                     dag_obj.add_result(r)
 
-            # Return dag object such that it's accessible in Globals.
             return dag_obj
 
         # Ensure that warnings from inside DAG() are emitted from the caller, not here

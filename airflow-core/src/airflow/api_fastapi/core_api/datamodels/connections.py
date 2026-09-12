@@ -154,8 +154,7 @@ class ConnectionHookMetaData(BaseModel):
         if v is None:
             return None
 
-        # Check if extra_fields contains param spec structures (result of SerializedParam.dump())
-        # which have "value" and "schema" keys, or simple dictionary structures
+        # Param spec structures (SerializedParam.dump()) carry "value" and "schema" keys.
         has_param_spec_structure = any(
             isinstance(field_spec, dict) and "value" in field_spec and "schema" in field_spec
             for field_spec in v.values()
@@ -166,18 +165,14 @@ class ConnectionHookMetaData(BaseModel):
             for field_name, field_spec in v.items():
                 if isinstance(field_spec, dict) and "value" in field_spec and "schema" in field_spec:
                     if should_hide_value_for_key(field_name) and field_spec.get("value") is not None:
-                        # Mask only the value, preserve everything else including schema.type
                         redacted_extra_fields[field_name] = {**field_spec, "value": "***"}
                     else:
-                        # Not sensitive or no value, keep as is
                         redacted_extra_fields[field_name] = field_spec
                 else:
-                    # Not a param spec structure, apply redact by default
                     redacted_extra_fields[field_name] = redact(field_spec)
 
             return redacted_extra_fields
 
-        # For simple dictionary structures, use the standard redact function
         return redact(v)
 
 

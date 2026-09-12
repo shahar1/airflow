@@ -68,11 +68,9 @@ class StandaloneCommand:
         self.print_output("standalone", "Starting Airflow Standalone")
         # Silence built-in logging at INFO
         logging.getLogger("").setLevel(logging.WARNING)
-        # Startup checks and prep
         env = self.calculate_env()
         self.find_user_info()
         self.initialize_database()
-        # Set up commands to run
         self.subcommands["scheduler"] = SubCommand(
             self,
             name="scheduler",
@@ -98,14 +96,11 @@ class StandaloneCommand:
             env=env,
         )
 
-        # Run subcommand threads
         for command in self.subcommands.values():
             command.start()
-        # Run output loop
         shown_ready = False
         try:
             while True:
-                # Print all the current lines onto the screen
                 self.update_output()
                 # Print info banner when all components are ready and the
                 # delay has passed
@@ -122,7 +117,6 @@ class StandaloneCommand:
                 time.sleep(0.1)
         except KeyboardInterrupt:
             pass
-        # Stop subcommand threads
         self.print_output("standalone", "Shutting down components")
         for command in self.subcommands.values():
             command.stop()

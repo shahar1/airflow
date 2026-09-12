@@ -453,8 +453,6 @@ class ReferenceModels:
             else:
                 raise ValueError(f"Unsupported database dialect: {dialect}")
 
-            # Query for completed DAG runs with both start and end dates
-            # Order by logical_date descending to get most recent runs first
             query = (
                 select(duration_expr)
                 .filter(DagRun.dag_id == dag_id, DagRun.start_date.isnot(None), DagRun.end_date.isnot(None))
@@ -463,7 +461,6 @@ class ReferenceModels:
 
             query = query.limit(self.max_runs)
 
-            # Get all durations and calculate average
             durations: Sequence = session.execute(query).scalars().all()
 
             if len(durations) < cast("int", self.min_runs):

@@ -70,7 +70,6 @@ class Callback(ABC):
 
             # TODO:  This implementation doesn't support using a lambda function as a callback.
             #        We should consider that in the future, but the addition is non-trivial.
-            # Get the reference path to the callable in the form `airflow.models.deadline.get_from_db`
             return f"{_callback.__module__}.{_callback.__qualname__}"
 
         if not isinstance(_callback, str) or not is_valid_dotpath(_callback.strip()):
@@ -87,10 +86,8 @@ class Callback(ABC):
             return stripped_callback
 
         try:
-            # The provided callback is a string which appears to be a valid dotpath, attempt to import it.
             callback = import_string(stripped_callback)
             if not callable(callback):
-                # The input is a string which can be imported, but is not callable.
                 raise AttributeError(f"Provided callback {callback} is not callable.")
 
             cls.verify_callable(callback)

@@ -129,9 +129,7 @@ class DBDagBag:
             # against the current dag_hash. That validation is a single-row lookup on the
             # uniquely-indexed serialized_dag.dag_version_id column.
             if self._current_dag_hash(version_id, session) == cached.dag_hash:
-                # Still current: restart the revalidation window so the next hits skip the query.
-                # (For a TTLCache this write-back also refreshes the entry's TTL/LRU recency, which
-                # is fine -- the entry was just re-confirmed against the DB.)
+                # Still current: restart the revalidation window (refreshing TTL/LRU recency is fine).
                 with self._lock:
                     current = self._dags.get(version_id)
                     if current is not None and current.dag_hash == cached.dag_hash:
@@ -148,11 +146,8 @@ class DBDagBag:
         if not (serdag := dag_version.serialized_dag):
             return None
 
-        # Double-checked locking: another thread may have cached it while we queried DB. Such an
-        # entry was just loaded from the DB, so it is well within its revalidation window and is
-        # served without an extra hash check, consistent with the policy above. Only emit the miss
-        # metric after confirming no other thread cached it, to avoid counting a single lookup as
-        # both a miss and a hit.
+        # Double-checked locking: another thread may have cached it meanwhile; such an entry is fresh, so
+        # serve it without a hash check and only count a miss after confirming nobody else cached it.
         with self._lock:
             if (cached := self._dags.get(version_id)) is not None:
                 self._on_cache_hit()

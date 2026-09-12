@@ -337,11 +337,9 @@ def get_xcom(
     else:
         xcom_query = xcom_query.where(XComModel.map_index == params.map_index)
 
-    # We use `BaseXCom.get_many` to fetch XComs directly from the database, bypassing the XCom Backend.
-    # This avoids deserialization via the backend (e.g., from a remote storage like S3) and instead
-    # retrieves the raw serialized value from the database. By not relying on `XCom.get_many` or `XCom.get_one`
-    # (which automatically deserializes using the backend), we avoid potential
-    # performance hits from retrieving large data files into the API server.
+    # Read the raw serialized value straight from the database rather than through the XCom backend
+    # (`XCom.get_one`/`get_many` would deserialize, possibly pulling large payloads from remote storage into
+    # the API server).
     result: tuple[XComModel] | None
     if (result := session.scalars(xcom_query.limit(1)).first()) is None:
         if params.offset is None:

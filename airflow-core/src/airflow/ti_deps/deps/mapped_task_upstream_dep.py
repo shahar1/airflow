@@ -65,10 +65,8 @@ class MappedTaskUpstreamDep(BaseTIDep):
         else:
             return
 
-        # Get the tis of all mapped dependencies. In case a mapped dependency is itself mapped, we are
-        # only interested in it if it hasn't been expanded yet, i.e., we filter by map_index=-1. This is
-        # because if it has been expanded, it did not fail and was not skipped outright which is all we need
-        # to know for the purposes of this check.
+        # A mapped dependency that was already expanded (map_index != -1) neither failed nor was skipped
+        # outright, so only unexpanded (map_index == -1) instances matter here.
         mapped_dependency_tis = (
             session.scalars(
                 select(TaskInstance).where(

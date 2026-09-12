@@ -298,11 +298,7 @@ def set_context(logger, value):
     while logger:
         orig_propagate = logger.propagate
         for handler in logger.handlers:
-            # Not all handlers need to have context passed in so we ignore
-            # the error when handlers do not have set_context defined.
-
-            # Don't use getatrr so we have type checking. And we don't care if handler is actually a
-            # FileTaskHandler, it just needs to have a set_context function!
+            # Handlers exposing set_context get the context; the FileTaskHandler cast is just for typing.
             if hasattr(handler, "set_context"):
                 from airflow.utils.log.file_task_handler import FileTaskHandler  # noqa: TC001
 

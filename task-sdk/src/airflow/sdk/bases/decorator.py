@@ -391,12 +391,9 @@ class DecoratedOperator(BaseOperator):
             )
             raise ValueError(message) from err
 
-        # Check that arguments can be binded. There's a slight difference when
-        # we do validation for task-mapping: Since there's no guarantee we can
-        # receive enough arguments at parse time, we use bind_partial to simply
-        # check all the arguments we know are valid. Whether these are enough
-        # can only be known at execution time, when unmapping happens, and this
-        # is called without the _airflow_mapped_validation_only flag.
+        # For mapped validation (`_airflow_mapped_validation_only`) only bind_partial is possible: not all
+        # arguments are known at parse time, so whether they suffice is only checked at execution time, when
+        # unmapping calls this again without the flag.
         try:
             if kwargs.get("_airflow_mapped_validation_only"):
                 signature.bind_partial(*op_args, **op_kwargs)

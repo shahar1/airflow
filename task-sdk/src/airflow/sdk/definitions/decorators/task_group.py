@@ -183,13 +183,9 @@ class _TaskGroupFactory(ExpandableFactory, Generic[FParams, FReturn]):
         )
 
 
-# This covers the @task_group() case. Annotations are copied from the TaskGroup
-# class, only providing a default to 'group_id' (this is optional for the
-# decorator and defaults to the decorated function's name). Please keep them in
-# sync with TaskGroup when you can! Note that since this is an overload, these
-# argument defaults aren't actually used at runtime--the real implementation
-# does not use them, and simply rely on TaskGroup's defaults, so it's not
-# disastrous if they go out of sync with TaskGroup.
+# Overload for the @task_group() form. The annotations mirror TaskGroup (group_id optional, defaulting to the
+# function name); keep them in sync when possible, though the defaults are never used at runtime, so drift is
+# not disastrous.
 @overload
 def task_group(
     group_id: str | None = None,
