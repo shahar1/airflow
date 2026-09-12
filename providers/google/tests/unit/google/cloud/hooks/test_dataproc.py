@@ -21,6 +21,7 @@ from unittest import mock
 from unittest.mock import AsyncMock
 
 import pytest
+from google.api_core.exceptions import InvalidArgument
 from google.api_core.gapic_v1.method import DEFAULT
 from google.cloud.dataproc_v1 import (
     Batch,
@@ -32,7 +33,12 @@ from google.cloud.dataproc_v1 import (
 )
 
 from airflow.providers.common.compat.sdk import AirflowException
-from airflow.providers.google.cloud.hooks.dataproc import DataprocAsyncHook, DataprocHook, DataProcJobBuilder
+from airflow.providers.google.cloud.hooks.dataproc import (
+    DataprocAsyncHook,
+    DataprocHook,
+    DataProcJobBuilder,
+    DataprocResourceIsNotReadyError,
+)
 from airflow.providers.google.common.consts import CLIENT_INFO
 from airflow.version import version
 
@@ -94,6 +100,24 @@ class TestDataprocHook:
     def setup_method(self):
         with mock.patch(BASE_STRING.format("GoogleBaseHook.__init__"), new=mock_init):
             self.hook = DataprocHook(gcp_conn_id="test")
+
+    def test_wait_for_operation_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = TimeoutError("operation did not complete in time")
+
+        with pytest.raises(AirflowException, match="operation did not complete in time"):
+            self.hook.wait_for_operation(operation=operation, timeout=10)
+
+        operation.exception.assert_not_called()
+
+    def test_wait_for_operation_raises_resource_is_not_ready(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = InvalidArgument("The resource is not ready")
+
+        with pytest.raises(DataprocResourceIsNotReadyError, match="The resource is not ready"):
+            self.hook.wait_for_operation(operation=operation, timeout=10)
+
+        operation.exception.assert_not_called()
 
     @mock.patch(DATAPROC_STRING.format("DataprocHook.get_client_options"))
     @mock.patch(DATAPROC_STRING.format("DataprocHook.get_credentials"))

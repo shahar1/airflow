@@ -19,8 +19,11 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+from google.api_core.exceptions import InvalidArgument
 from google.cloud.translate_v3.types import TranslateTextResponse
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.cloud.hooks.translate import CloudTranslateHook, TranslateHook
 from airflow.providers.google.common.consts import CLIENT_INFO
 
@@ -91,6 +94,24 @@ class TestTranslateHook:
             new=mock_base_gcp_hook_default_project_id,
         ):
             self.hook = TranslateHook(gcp_conn_id="test")
+
+    def test_wait_for_operation_done_wraps_polling_timeout(self):
+        operation = mock.MagicMock()
+        operation.done.return_value = False
+
+        with pytest.raises(AirflowException, match="Timeout of .* exceeded"):
+            self.hook.wait_for_operation_done(operation=operation, timeout=0.01, initial=1)
+
+        operation.exception.assert_not_called()
+
+    def test_wait_for_operation_done_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.done.side_effect = InvalidArgument("invalid target language")
+
+        with pytest.raises(AirflowException, match="invalid target language"):
+            self.hook.wait_for_operation_done(operation=operation, timeout=10)
+
+        operation.exception.assert_not_called()
 
     @mock.patch("airflow.providers.google.cloud.hooks.translate.TranslateHook.get_client_options")
     @mock.patch("airflow.providers.google.cloud.hooks.translate.TranslateHook.get_credentials")

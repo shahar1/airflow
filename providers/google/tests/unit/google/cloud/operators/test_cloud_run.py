@@ -102,6 +102,18 @@ class TestCloudRunCreateJobOperator:
 
 
 class TestCloudRunExecuteJobOperator:
+    def test_wait_for_operation_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = TimeoutError("operation did not complete in time")
+        operator = CloudRunExecuteJobOperator(
+            task_id=TASK_ID, project_id=PROJECT_ID, region=REGION, job_name=JOB_NAME
+        )
+
+        with pytest.raises(AirflowException, match="operation did not complete in time"):
+            operator._wait_for_operation(operation)
+
+        operation.exception.assert_not_called()
+
     def test_template_fields(self):
         operator = CloudRunExecuteJobOperator(
             task_id=TASK_ID, project_id=PROJECT_ID, region=REGION, job_name=JOB_NAME, overrides=OVERRIDES

@@ -25,7 +25,7 @@ from typing import (
     cast,
 )
 
-from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import GoogleAPIError
 from google.api_core.gapic_v1.method import DEFAULT, _MethodDefault
 from google.api_core.retry import Retry
 from google.cloud.translate_v2 import Client
@@ -221,11 +221,8 @@ class TranslateHook(GoogleBaseHook, OperationHelper):
         )(_check_if_operation_done)
         try:
             wait_op_for_done(operation=operation)
-        except GoogleAPICallError:
-            if timeout:
-                timeout = int(timeout)
-            error = operation.exception(timeout=timeout)
-            raise AirflowException(error)
+        except GoogleAPIError as ex:
+            raise AirflowException(ex) from ex
 
     @staticmethod
     def extract_object_id(obj: dict) -> str:

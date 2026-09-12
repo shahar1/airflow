@@ -326,11 +326,11 @@ class DataprocHook(GoogleBaseHook):
         """Wait for a long-lasting operation to complete."""
         try:
             return operation.result(timeout=timeout, retry=result_retry)
-        except Exception:
-            error = operation.exception(timeout=timeout)
-            if self.check_error_for_resource_is_not_ready_msg(error.message):
-                raise DataprocResourceIsNotReadyError(error.message)
-            raise AirflowException(error)
+        except Exception as ex:
+            message = getattr(ex, "message", str(ex))
+            if self.check_error_for_resource_is_not_ready_msg(message):
+                raise DataprocResourceIsNotReadyError(message) from ex
+            raise AirflowException(ex) from ex
 
     @GoogleBaseHook.fallback_to_default_project_id
     def create_cluster(

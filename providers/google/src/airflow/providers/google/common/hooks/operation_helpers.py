@@ -37,7 +37,7 @@ class OperationHelper:
     @staticmethod
     def wait_for_operation_result(
         operation: Operation,
-        timeout: int | None = None,
+        timeout: float | int | None = None,
         polling: Retry | None = None,
         retry: Retry | None = None,
     ) -> Message:
@@ -57,10 +57,9 @@ class OperationHelper:
         try:
             return operation.result(timeout=timeout, polling=polling, retry=retry)
         except GoogleAPICallError as ex:
-            raise AirflowException("Google API error on operation result call") from ex
-        except Exception:
-            error = operation.exception(timeout=timeout)
-            raise AirflowException(error)
+            raise AirflowException(f"Google API error on operation result call: {ex}") from ex
+        except Exception as ex:
+            raise AirflowException(ex) from ex
 
     def wait_for_operation(
         self,

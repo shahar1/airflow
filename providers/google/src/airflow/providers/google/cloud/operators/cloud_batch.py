@@ -26,6 +26,7 @@ from airflow.providers.common.compat.sdk import AirflowException, conf
 from airflow.providers.google.cloud.hooks.cloud_batch import CloudBatchHook
 from airflow.providers.google.cloud.operators.cloud_base import GoogleCloudBaseOperator
 from airflow.providers.google.cloud.triggers.cloud_batch import CloudBatchJobFinishedTrigger
+from airflow.providers.google.common.hooks.operation_helpers import OperationHelper
 
 if TYPE_CHECKING:
     from google.api_core import operation
@@ -176,11 +177,7 @@ class CloudBatchDeleteJobOperator(GoogleCloudBaseOperator):
         self._wait_for_operation(operation)
 
     def _wait_for_operation(self, operation: operation.Operation):
-        try:
-            return operation.result(timeout=self.timeout)
-        except Exception:
-            error = operation.exception(timeout=self.timeout)
-            raise AirflowException(error)
+        return OperationHelper.wait_for_operation_result(operation=operation, timeout=self.timeout)
 
 
 class CloudBatchListJobsOperator(GoogleCloudBaseOperator):

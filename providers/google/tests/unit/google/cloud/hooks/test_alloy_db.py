@@ -129,7 +129,7 @@ class TestAlloyDbHook:
 
         mock_log.info.assert_called_once_with("Waiting for operation to complete...")
         mock_operation.result.assert_called_once_with(timeout=expected_timeout)
-        mock_operation.exception.assert_called_once_with(timeout=expected_timeout)
+        mock_operation.exception.assert_not_called()
 
     @mock.patch(HOOK_PATH.format("AlloyDbHook.get_alloy_db_admin_client"))
     def test_create_cluster(self, mock_client):

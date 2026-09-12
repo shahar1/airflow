@@ -66,10 +66,9 @@ class DataprocMetastoreHook(GoogleBaseHook):
             result = operation.result(timeout=timeout)
             self.log.info("Operation completed successfully")
             return result
-        except Exception as e:
-            self.log.error("Operation failed: %s", str(e))
-            error = operation.exception(timeout=timeout)
-            raise AirflowException(f"Operation failed: {error}")
+        except Exception as ex:
+            self.log.error("Operation failed: %s", str(ex))
+            raise AirflowException(f"Operation failed: {ex}") from ex
 
     @GoogleBaseHook.fallback_to_default_project_id
     def create_backup(

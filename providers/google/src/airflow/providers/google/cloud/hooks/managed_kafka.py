@@ -31,9 +31,9 @@ from google.api_core.gapic_v1.method import DEFAULT, _MethodDefault
 from google.auth.transport import requests as google_requests
 from google.cloud.managedkafka_v1 import Cluster, ConsumerGroup, ManagedKafkaClient, Topic, types
 
-from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.common.consts import CLIENT_INFO
 from airflow.providers.google.common.hooks.base_google import GoogleBaseHook
+from airflow.providers.google.common.hooks.operation_helpers import OperationHelper
 
 if TYPE_CHECKING:
     from google.api_core.operation import Operation
@@ -94,7 +94,7 @@ class ManagedKafkaTokenProvider:
         return self._get_kafka_access_token(credentials), time.time() + expiry_seconds
 
 
-class ManagedKafkaHook(GoogleBaseHook):
+class ManagedKafkaHook(GoogleBaseHook, OperationHelper):
     """Hook for Managed Service for Apache Kafka APIs."""
 
     def __init__(
@@ -115,11 +115,7 @@ class ManagedKafkaHook(GoogleBaseHook):
 
     def wait_for_operation(self, operation: Operation, timeout: float | None = None):
         """Wait for long-lasting operation to complete."""
-        try:
-            return operation.result(timeout=timeout)
-        except Exception:
-            error = operation.exception(timeout=timeout)
-            raise AirflowException(error)
+        return self.wait_for_operation_result(operation=operation, timeout=timeout)
 
     def get_confluent_token(self, config_str: str):
         """Get the authentication token for confluent client."""

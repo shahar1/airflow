@@ -217,7 +217,7 @@ providers/google/src/airflow/providers/google/cloud/hooks/compute.py::6
 providers/google/src/airflow/providers/google/cloud/hooks/compute_ssh.py::6
 providers/google/src/airflow/providers/google/cloud/hooks/dataflow.py::13
 providers/google/src/airflow/providers/google/cloud/hooks/dataform.py::4
-providers/google/src/airflow/providers/google/cloud/hooks/dataplex.py::2
+providers/google/src/airflow/providers/google/cloud/hooks/dataplex.py::1
 providers/google/src/airflow/providers/google/cloud/hooks/dataproc.py::5
 providers/google/src/airflow/providers/google/cloud/hooks/dataproc_metastore.py::1
 providers/google/src/airflow/providers/google/cloud/hooks/dlp.py::32
@@ -226,7 +226,6 @@ providers/google/src/airflow/providers/google/cloud/hooks/gcs.py::8
 providers/google/src/airflow/providers/google/cloud/hooks/gdm.py::1
 providers/google/src/airflow/providers/google/cloud/hooks/kubernetes_engine.py::2
 providers/google/src/airflow/providers/google/cloud/hooks/looker.py::8
-providers/google/src/airflow/providers/google/cloud/hooks/managed_kafka.py::1
 providers/google/src/airflow/providers/google/cloud/hooks/spanner.py::5
 providers/google/src/airflow/providers/google/cloud/hooks/stackdriver.py::2
 providers/google/src/airflow/providers/google/cloud/hooks/tasks.py::3
@@ -243,7 +242,7 @@ providers/google/src/airflow/providers/google/cloud/operators/alloy_db.py::16
 providers/google/src/airflow/providers/google/cloud/operators/bigquery.py::18
 providers/google/src/airflow/providers/google/cloud/operators/bigquery_dts.py::2
 providers/google/src/airflow/providers/google/cloud/operators/bigtable.py::5
-providers/google/src/airflow/providers/google/cloud/operators/cloud_batch.py::4
+providers/google/src/airflow/providers/google/cloud/operators/cloud_batch.py::3
 providers/google/src/airflow/providers/google/cloud/operators/cloud_build.py::4
 providers/google/src/airflow/providers/google/cloud/operators/cloud_composer.py::6
 providers/google/src/airflow/providers/google/cloud/operators/cloud_logging_sink.py::2

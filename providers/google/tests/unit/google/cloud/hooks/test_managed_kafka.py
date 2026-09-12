@@ -19,8 +19,10 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
 from google.api_core.gapic_v1.method import DEFAULT
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.cloud.hooks.managed_kafka import ManagedKafkaHook
 
 from unit.google.cloud.utils.base_gcp_mock import (
@@ -79,6 +81,15 @@ class TestManagedKafkaWithDefaultProjectIdHook:
             BASE_STRING.format("GoogleBaseHook.__init__"), new=mock_base_gcp_hook_default_project_id
         ):
             self.hook = ManagedKafkaHook(gcp_conn_id=TEST_GCP_CONN_ID)
+
+    def test_wait_for_operation_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = TimeoutError("operation did not complete in time")
+
+        with pytest.raises(AirflowException, match="operation did not complete in time"):
+            self.hook.wait_for_operation(operation=operation, timeout=10)
+
+        operation.exception.assert_not_called()
 
     @mock.patch(MANAGED_KAFKA_STRING.format("ManagedKafkaHook.get_managed_kafka_client"))
     def test_create_cluster(self, mock_client) -> None:

@@ -229,6 +229,21 @@ class TestCloudBatchDeleteJobOperator:
         operation.result.return_value = mock.MagicMock()
         return operation
 
+    def test_wait_for_operation_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = TimeoutError("operation did not complete in time")
+        operator = CloudBatchDeleteJobOperator(
+            task_id=TASK_ID,
+            project_id=PROJECT_ID,
+            region=REGION,
+            job_name=JOB_NAME,
+        )
+
+        with pytest.raises(AirflowException, match="operation did not complete in time"):
+            operator._wait_for_operation(operation)
+
+        operation.exception.assert_not_called()
+
 
 class TestCloudBatchListJobsOperator:
     @mock.patch(CLOUD_BATCH_HOOK_PATH)

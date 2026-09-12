@@ -61,9 +61,8 @@ class AlloyDbHook(GoogleBaseHook):
         _timeout: int | None = int(timeout) if timeout else None
         try:
             return operation.result(timeout=_timeout)
-        except Exception:
-            error = operation.exception(timeout=_timeout)
-            raise AirflowException(error)
+        except Exception as ex:
+            raise AirflowException(ex) from ex
 
     @GoogleBaseHook.fallback_to_default_project_id
     def create_cluster(

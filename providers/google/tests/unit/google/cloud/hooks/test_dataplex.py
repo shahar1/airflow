@@ -18,9 +18,11 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
 from google.api_core.gapic_v1.method import DEFAULT
 from google.protobuf.field_mask_pb2 import FieldMask
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.cloud.operators.dataplex import DataplexHook
 
 from unit.google.cloud.utils.base_gcp_mock import mock_base_gcp_hook_default_project_id
@@ -94,6 +96,15 @@ class TestDataplexHook:
                 gcp_conn_id=GCP_CONN_ID,
                 impersonation_chain=IMPERSONATION_CHAIN,
             )
+
+    def test_wait_for_operation_does_not_poll_again_on_failure(self):
+        operation = mock.MagicMock()
+        operation.result.side_effect = TimeoutError("operation did not complete in time")
+
+        with pytest.raises(AirflowException, match="operation did not complete in time"):
+            self.hook.wait_for_operation(operation=operation, timeout=10)
+
+        operation.exception.assert_not_called()
 
     @mock.patch(DATAPLEX_HOOK_CLIENT)
     def test_create_task(self, mock_client):

@@ -521,11 +521,10 @@ class CloudRunExecuteJobOperator(GoogleCloudBaseOperator):
     def _wait_for_operation(self, operation: operation.Operation):
         try:
             return operation.result(timeout=self.timeout_seconds)
-        except Exception:
+        except Exception as ex:
             if self.verbose:
                 self._log_container_output_for_operation(operation)
-            error = operation.exception(timeout=self.timeout_seconds)
-            raise AirflowException(error)
+            raise AirflowException(ex) from ex
 
 
 class CloudRunCreateServiceOperator(GoogleCloudBaseOperator):

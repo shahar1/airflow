@@ -138,11 +138,7 @@ class DataplexHook(GoogleBaseHook, OperationHelper):
 
     def wait_for_operation(self, operation: Operation, timeout: float | None = None):
         """Wait for long-lasting operation to complete."""
-        try:
-            return operation.result(timeout=timeout)
-        except Exception:
-            error = operation.exception(timeout=timeout)
-            raise AirflowException(error)
+        return self.wait_for_operation_result(operation=operation, timeout=timeout)
 
     @GoogleBaseHook.fallback_to_default_project_id
     def create_entry(
