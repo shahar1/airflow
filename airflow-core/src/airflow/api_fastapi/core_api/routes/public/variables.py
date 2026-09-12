@@ -173,7 +173,6 @@ def post_variable(
     session: SessionDep,
 ) -> VariableResponse:
     """Create a variable."""
-    # Check if the key already exists
     existing_variable = session.scalar(select(Variable).where(Variable.key == post_body.key).limit(1))
     if existing_variable:
         raise HTTPException(

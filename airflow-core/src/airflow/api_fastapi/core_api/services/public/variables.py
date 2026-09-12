@@ -65,7 +65,6 @@ def update_orm_from_pydantic(
             raise RequestValidationError(errors=e.errors())
     non_update_fields = {"key"}
 
-    # Apply patch via utility
     return cast(
         "Variable",
         BulkService.apply_patch_with_update_mask(

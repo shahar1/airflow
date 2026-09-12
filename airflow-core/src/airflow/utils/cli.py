@@ -103,7 +103,6 @@ def action_cli(func=None, check_db=True):
                 for handler in root_logger.handlers:
                     handler.setLevel(logging.DEBUG)
             try:
-                # Check and run migrations if necessary
                 if check_db:
                     from airflow.configuration import conf
                     from airflow.utils.db import check_and_run_migrations, synchronize_log_template

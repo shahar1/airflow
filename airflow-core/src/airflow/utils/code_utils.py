@@ -60,16 +60,13 @@ def prepare_code_snippet(file_path: Path, line_no: int, context_lines_count: int
     :return: str
     """
     code_lines = file_path.read_text().splitlines()
-    # Prepend line number
     code_lines = [
         f">{lno:3} | {line}" if line_no == lno else f"{lno:4} | {line}"
         for lno, line in enumerate(code_lines, 1)
     ]
-    # # Cut out the snippet
     start_line_no = max(0, line_no - context_lines_count - 1)
     end_line_no = line_no + context_lines_count
     code_lines = code_lines[start_line_no:end_line_no]
-    # Join lines
     code = "\n".join(code_lines)
     return code
 

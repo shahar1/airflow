@@ -73,7 +73,6 @@ def _get_logging_config() -> dict[str, Any]:
     try:
         logging_config = import_string(logging_class_path)
 
-        # Make sure that the variable is in scope
         if not isinstance(logging_config, dict):
             raise ValueError("Logging Config should be of dict type")
 
@@ -172,7 +171,6 @@ def configure_logging():
             "COLORED_LOG",
             conf.getboolean("logging", "colored_console_log", fallback=True),
         )
-        # Try to init logging
 
         log_fmt, callsite_params = translate_config_values(
             log_format=getattr(logging_config, "LOG_FORMAT", conf.get("logging", "log_format", fallback="")),

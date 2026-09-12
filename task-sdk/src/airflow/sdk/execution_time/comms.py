@@ -159,7 +159,6 @@ def _msgpack_enc_hook(obj: Any) -> Any:
     if isinstance(obj, BaseModel):
         return obj.model_dump(exclude_unset=True)
 
-    # Raise a NotImplementedError for other types
     raise NotImplementedError(f"Objects of type {type(obj)} are not supported")
 
 
@@ -291,7 +290,6 @@ class CommsDecoder(Generic[ReceiveMsgType, SendMsgType]):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._thread_lock.acquire)
             try:
-                # Async write to socket
                 await loop.sock_sendall(self.socket, frame_bytes)
 
                 if isinstance(msg, ResendLoggingFD):

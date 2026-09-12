@@ -312,7 +312,6 @@ class TaskInstanceOperations:
         """Tell the API server that this TI has been deferred."""
         body = TIDeferredStatePayload(**msg.model_dump(exclude_unset=True, exclude={"type"}))
 
-        # Create a deferred state payload from msg
         self.client.patch(f"task-instances/{id}/state", content=body.model_dump_json())
 
     def await_input(self, id: uuid.UUID, msg):
@@ -324,7 +323,6 @@ class TaskInstanceOperations:
         """Tell the API server that this TI has been reschduled."""
         body = TIRescheduleStatePayload(**msg.model_dump(exclude_unset=True, exclude={"type"}))
 
-        # Create a reschedule state payload from msg
         self.client.patch(f"task-instances/{id}/state", content=body.model_dump_json())
 
     def heartbeat(self, id: uuid.UUID, pid: int):
@@ -384,7 +382,6 @@ class TaskInstanceOperations:
             "states": states,
         }
 
-        # Remove None values from params
         params = {k: v for k, v in params.items() if v is not None}
 
         if map_index is not None and map_index >= 0:
@@ -438,7 +435,6 @@ class TaskInstanceOperations:
             "run_ids": run_ids,
         }
 
-        # Remove None values from params
         params = {k: v for k, v in params.items() if v is not None}
 
         if map_index is not None and map_index >= 0:
@@ -972,7 +968,6 @@ class DagRunOperations:
             "states": states,
         }
 
-        # Remove None values from params
         params = {k: v for k, v in params.items() if v is not None}
 
         resp = self.client.get("dag-runs/count", params=params)

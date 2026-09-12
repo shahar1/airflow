@@ -137,7 +137,6 @@ class ProvidersManagerTaskRuntime(LoggingMixin):
 
     def __init__(self):
         """Initialize the runtime manager."""
-        # skip initialization if already initialized
         if self.initialized():
             return
         super().__init__()

@@ -58,14 +58,12 @@ def truncate_rendered_value(rendered: str, max_length: int) -> str:
     if max_length < len(trunc_only):
         return trunc_only
 
-    # Compute available space for content
     overhead = len(TRUNCATE_PREFIX) + len(TRUNCATE_SUFFIX)
     available = max_length - overhead
 
     if available < TRUNCATE_MIN_CONTENT_LENGTH:
         return trunc_only
 
-    # Slice content to fit and construct final string
     content = rendered[:available].rstrip()
     result = f"{TRUNCATE_PREFIX}{content}{TRUNCATE_SUFFIX}"
 

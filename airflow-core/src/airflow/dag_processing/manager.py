@@ -594,7 +594,6 @@ class DagFileProcessorManager(LoggingMixin):
             self._cleanup_stale_bundle_versions()
             self.purge_inactive_dag_warnings()
 
-            # Update number of loop iteration.
             self._num_run += 1
 
             self.print_stats(known_files=known_files)

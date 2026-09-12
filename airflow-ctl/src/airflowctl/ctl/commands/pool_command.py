@@ -118,5 +118,4 @@ def _import_helper(api_client: Client, filepath: Path, action_on_existence: Bulk
         ]
     )
     result = api_client.pools.bulk(pools=bulk_body)
-    # Return the successful and failed entities directly from the response
     return result.create.success, result.create.errors

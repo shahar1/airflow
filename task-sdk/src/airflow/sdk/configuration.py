@@ -136,7 +136,6 @@ class AirflowSDKConfigParser(_SharedAirflowConfigParser):
 
         # Read Core's config.yml (Phase 1: shared config.yml)
         _configuration_description = retrieve_configuration_description()
-        # Create default values parser
         _default_values = create_default_config_parser(_configuration_description)
         super().__init__(
             _configuration_description,

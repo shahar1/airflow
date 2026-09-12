@@ -1005,7 +1005,6 @@ def ti_heartbeat(
             },
         )
 
-    # Update the last heartbeat time!
     session.execute(update(TI).where(TI.id == task_instance_id).values(last_heartbeat_at=timezone.utcnow()))
     log.debug("Heartbeat updated", state=previous_state)
 

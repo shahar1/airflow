@@ -460,7 +460,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     .where(DagModel.dag_id.in_(missing))
                 ).all()
 
-                # Create mapping from results
                 queried = {dag_id: team_name for dag_id, team_name in query_results}
 
                 # Cache all results, including None for dag_ids with no team
@@ -1280,7 +1279,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         # Route callbacks to executors using the generalized routing method
         executor_to_callbacks = self._executor_to_workloads(pending_callbacks, session)
 
-        # Enqueue callbacks for each executor
         for executor, callbacks in executor_to_callbacks.items():
             for callback in callbacks:
                 if not isinstance(callback, ExecutorCallback):
@@ -1466,7 +1464,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 cls.logger().error("Callback %s failed: %s", callback_id, callback.output)
             session.add(callback)
 
-        # Return if no finished tasks
         if not tis_with_right_state:
             cls._emit_executor_events_batch_metrics(num_events)
             return len(event_buffer)
@@ -2058,7 +2055,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         with prohibit_commit(session) as guard:
             # Without this, the session has an invalid view of the DB
             session.expunge_all()
-            # END: schedule TIs
 
             # Attempt to schedule even if some executors are full but not all.
             total_free_executor_slots = sum([executor.slots_available for executor in self.executors])
@@ -2487,7 +2483,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
         # commit the session - Release the write lock on DagModel table.
         guard.commit()
-        # END: create dagruns
 
     @provide_session
     def _mark_backfills_complete(self, *, session: Session = NEW_SESSION) -> None:

@@ -115,7 +115,6 @@ class BulkService(Generic[T], ABC):
 
         data = patch_body.model_dump(include=set(validated_data.keys()), by_alias=True)
 
-        # Update the model with the validated data
         for key, value in data.items():
             setattr(model, key, value)
 

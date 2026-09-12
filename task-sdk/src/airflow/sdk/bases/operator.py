@@ -369,7 +369,6 @@ else:
             task_default_args=kwargs.pop("default_args", None),
         )
 
-        # Create partial_kwargs from args and kwargs
         partial_kwargs: dict[str, Any] = {
             "task_id": task_id,
             "dag": dag,

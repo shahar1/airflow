@@ -123,16 +123,13 @@ def get_token(args, api_client=NEW_API_CLIENT) -> None:
 
 def list_envs(args) -> None:
     """List all CLI environments that the user has logged into."""
-    # Get AIRFLOW_HOME
     airflow_home = os.environ.get("AIRFLOW_HOME", os.path.expanduser("~/airflow"))
 
-    # Check if directory exists
     if not os.path.isdir(airflow_home):
         rich.print(f"[yellow]No AIRFLOW_HOME directory found at {airflow_home}[/yellow]")
         AirflowConsole().print_as(data=[], output=args.output)
         return
 
-    # Find all .json files
     config_files = glob.glob(os.path.join(airflow_home, "*.json"))
 
     environments = []
@@ -195,7 +192,6 @@ def list_envs(args) -> None:
             }
         )
 
-    # Sort by environment name
     environments.sort(key=lambda x: x.get("environment", ""))
 
     # Display results

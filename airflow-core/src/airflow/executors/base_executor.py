@@ -360,7 +360,6 @@ class BaseExecutor(LoggingMixin):
 
         self.trigger_connection_tests()
 
-        # Calling child class sync method
         self.log.debug("Calling the %s sync method", self.__class__)
         self.sync()
 

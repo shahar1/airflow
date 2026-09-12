@@ -124,7 +124,6 @@ class ExecutionAPISecretsBackend(BaseSecretsBackend):
                 # Variable not found or transient error — allow fallback.
                 return None
 
-            # Extract value from VariableResult
             if isinstance(msg, VariableResult):
                 return msg.value  # Already a string | None
             return None
@@ -185,7 +184,6 @@ class ExecutionAPISecretsBackend(BaseSecretsBackend):
                 # Variable not found or transient error — allow fallback.
                 return None
 
-            # Extract value from VariableResult
             if isinstance(msg, VariableResult):
                 return msg.value  # Already a string | None
             return None

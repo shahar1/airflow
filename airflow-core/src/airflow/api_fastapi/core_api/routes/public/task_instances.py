@@ -1243,7 +1243,6 @@ def patch_task_instance(
             update_mask=update_mask,
         )
     if "new_state" in data:
-        # Create BulkTaskInstanceBody object with map_index field
         bulk_ti_body = BulkTaskInstanceBody(
             task_id=task_id,
             map_index=map_index,

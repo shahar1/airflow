@@ -285,7 +285,6 @@ class BaseSensorOperator(BaseOperator):
 
             while cumulative_time <= elapsed_time:
                 estimated_poke_count += 1
-                # Calculate min_backoff for the current try number
                 min_backoff = max(int(self.poke_interval * (2 ** (estimated_poke_count - 2))), 1)
 
                 # Calculate the jitter
@@ -301,7 +300,6 @@ class BaseSensorOperator(BaseOperator):
                 # Calculate the jitter, which is used to prevent multiple sensors simultaneously poking
                 interval_with_jitter = min(modded_hash, timedelta.max.total_seconds() - 1)
 
-                # Add the interval to the cumulative time
                 cumulative_time += interval_with_jitter
 
             # Now we have an estimated_poke_count based on the elapsed time

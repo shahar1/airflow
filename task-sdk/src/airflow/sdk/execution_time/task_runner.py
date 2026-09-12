@@ -1051,8 +1051,6 @@ def parse(what: StartupDetails, log: Logger) -> RuntimeTaskInstance:
         _maybe_reschedule_startup_failure(ti_context=what.ti_context, log=log)
         sys.exit(1)
 
-    # install_loader()
-
     try:
         task = dag.task_dict[what.ti.task_id]
     except KeyError:

@@ -95,7 +95,6 @@ def team_create(args, *, session=NEW_SESSION):
     """Create a new team. Team names must be 3-50 characters long and contain only lower case alphanumeric characters, hyphens, and single underscores."""
     team_name = _extract_new_team_name(args)
 
-    # Check if team with this name already exists
     if session.scalar(select(Team).where(Team.name == team_name)):
         raise SystemExit(f"Team with name '{team_name}' already exists")
 
@@ -124,7 +123,6 @@ def team_delete(args, *, session=NEW_SESSION):
     """Delete a team after checking for associations."""
     team_name = _extract_team_name(args)
 
-    # Find the team
     team = session.scalar(select(Team).where(Team.name == team_name))
     if not team:
         raise SystemExit(f"Team '{team_name}' does not exist")
@@ -177,7 +175,6 @@ def team_delete(args, *, session=NEW_SESSION):
             print("Team deletion cancelled")
             return
 
-    # Delete the team
     try:
         session.delete(team)
 

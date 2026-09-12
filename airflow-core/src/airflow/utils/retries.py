@@ -39,7 +39,6 @@ def run_with_db_retries(max_retries: int = MAX_DB_RETRIES, logger: Logger | None
     """Return Tenacity Retrying object with project specific default."""
     import tenacity
 
-    # Default kwargs
     retry_kwargs = dict(
         retry=tenacity.retry_if_exception_type(exception_types=(DBAPIError, StaleDataError)),
         wait=tenacity.wait_random_exponential(multiplier=0.5, max=5),
@@ -87,7 +86,6 @@ def retry_db_transaction(_func: Callable | None = None, *, retries: int = MAX_DB
                 logger = args[0].log
             else:
                 logger = logging.getLogger(func.__module__)
-            # Get session from args or kwargs
             if "session" in kwargs:
                 session = kwargs["session"]
             elif len(args) > session_args_idx:

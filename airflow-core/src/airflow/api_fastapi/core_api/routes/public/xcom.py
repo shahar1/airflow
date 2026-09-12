@@ -361,7 +361,6 @@ def update_xcom_entry(
     session: SessionDep,
 ) -> XComResponseNative:
     """Update an existing XCom entry."""
-    # Check if XCom entry exists
     xcom_query = (
         select(XComModel)
         .where(
@@ -430,7 +429,6 @@ def delete_xcom_entry(
     map_index: Annotated[int, Query(ge=-1)] = -1,
 ):
     """Delete an XCom entry."""
-    # Delete XCom entry
     result = session.execute(
         delete(XComModel).where(
             XComModel.dag_id == dag_id,

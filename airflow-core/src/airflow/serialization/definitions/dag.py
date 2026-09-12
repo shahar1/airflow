@@ -730,7 +730,6 @@ class SerializedDAG:
         # Import here to avoid circular dependency
         from airflow.models.serialized_dag import SerializedDagModel
 
-        # Get the serialized_dag ID for this DAG
         serialized_dag_id = session.scalar(
             select(SerializedDagModel.id).where(
                 SerializedDagModel.dag_version_id == orm_dagrun.created_dag_version_id
@@ -740,7 +739,6 @@ class SerializedDAG:
         if not serialized_dag_id:
             return
 
-        # Query deadline alerts by serialized_dag_id
         deadline_alert_records = session.scalars(
             select(DeadlineAlertModel).where(DeadlineAlertModel.serialized_dag_id == serialized_dag_id)
         ).all()
@@ -1071,7 +1069,6 @@ class SerializedDAG:
             tis_full = select(TaskInstance)
             tis_full = tis_full.join(TaskInstance.dag_run)
 
-        # Apply common filters
         def apply_filters(query):
             if self.partial:
                 query = query.where(
@@ -1084,7 +1081,6 @@ class SerializedDAG:
             if start_date:
                 query = query.where(DagRun.logical_date >= start_date)
             if task_ids is not None:
-                # Use the selector condition directly without intermediate variable
                 query = query.where(TaskInstance.ti_selector_condition(task_ids))
             if end_date:
                 query = query.where(DagRun.logical_date <= end_date)

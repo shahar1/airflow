@@ -2160,11 +2160,10 @@ class InProcessTestSupervisor(ActivitySubprocess):
         :param client: optional Execution-API client to use. Defaults to the DB-backed
             in-process API server; pass an in-memory/dry-run client to run without a metadata DB.
         """
-        # Create supervisor instance
         supervisor = cls(
             id=what.id,
-            pid=os.getpid(),  # Use current process
-            process=psutil.Process(),  # Current process
+            pid=os.getpid(),
+            process=psutil.Process(),
             process_log=logger or structlog.get_logger(logger_name="task").bind(),
             client=client if client is not None else cls._api_client(task.dag),
             **kwargs,
@@ -2250,7 +2249,7 @@ class InProcessTestSupervisor(ActivitySubprocess):
         # Create a minimal supervisor instance for trigger execution
         supervisor = cls(
             id=ti.id,
-            pid=os.getpid(),  # Use current process
+            pid=os.getpid(),
             process=psutil.Process(),  # Current process - note the underscore prefix
             process_log=structlog.get_logger(logger_name="task").bind(),
             client=cls._api_client(),
@@ -2316,7 +2315,6 @@ def run_task_in_process(ti: TaskInstance, task, client: Client | None = None) ->
     :param client: optional Execution-API client (e.g. an in-memory/dry-run client to run
         without a metadata DB). Defaults to the DB-backed in-process API server.
     """
-    # Run the task
     return InProcessTestSupervisor.start(what=ti, task=task, client=client)
 
 
@@ -2343,7 +2341,7 @@ def make_buffered_socket_reader(
         while (newline_pos := buffer.find(b"\n")) != -1:
             line = buffer[: newline_pos + 1]
             gen.send(line)
-            buffer = buffer[newline_pos + 1 :]  # Update the buffer with remaining data
+            buffer = buffer[newline_pos + 1 :]
         return buffer
 
     # Flush any complete lines that arrived before the selector was running.
@@ -2352,7 +2350,6 @@ def make_buffered_socket_reader(
 
     def cb(sock: socket):
         nonlocal buffer, read_buffer
-        # Read up to `buffer_size` bytes of data from the socket
         n_received = sock.recv_into(read_buffer)
 
         if not n_received:
@@ -2480,7 +2477,6 @@ def forward_to_log(
 ) -> Generator[None, bytes | bytearray, None]:
     while True:
         line = yield
-        # Strip off new line
         line = line.rstrip()
         try:
             msg = line.decode("utf-8", errors="replace")

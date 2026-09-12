@@ -1158,7 +1158,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         for k_in, v_in in encoded_op.items():
             k = k_in  # surpass PLW2901
             v = v_in  # surpass PLW2901
-            # Use centralized field deserialization logic
             if k in encoded_op.get("template_fields", []):
                 pass  # Template fields are handled separately
             elif k == "_operator_extra_links":
@@ -1210,7 +1209,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                 else:
                     v = float(v)
             else:
-                # Apply centralized deserialization for all other fields
                 v = cls._deserialize_field_value(k, v)
 
             # Handle field differences between SerializedBaseOperator and MappedOperator
@@ -1225,7 +1223,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                 deserialized_partial_kwarg_defaults[k] = v
                 continue
 
-            # else use v as it is
             setattr(op, k, v)
 
         # Apply the fields that belong in partial_kwargs for MappedOperator
@@ -1582,7 +1579,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
 
         :return: client_defaults dictionary with only non-schema values
         """
-        # Get schema defaults for comparison
         schema_defaults = cls.get_schema_defaults("operator")
 
         client_defaults = {}
@@ -1631,7 +1627,6 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         elif field_name in _HAS_CALLBACK_FIELDS:
             return bool(value)
         elif field_name in {"retry_delay", "execution_timeout", "max_retry_delay"}:
-            # Reuse existing timedelta deserialization logic
             if value is not None:
                 return cls._deserialize_timedelta(value)
             return None
@@ -1873,11 +1868,9 @@ class DagSerialization(BaseSerialization):
                     v = frozenset(DagRunType(x) for x in v)
                 else:
                     v = None
-            # else use v as it is
 
             object.__setattr__(dag, k, v)
 
-        # Set _task_group
         if "task_group" in encoded_dag:
             tg = TaskGroupSerialization.deserialize_task_group(
                 encoded_dag["task_group"],
@@ -1986,7 +1979,6 @@ class DagSerialization(BaseSerialization):
             ("_access_control", "access_control"),
         ]
         task_renames = [("_task_type", "task_type"), ("task_display_name", "_task_display_name")]
-        #
         tasks_remove = [
             "_log_config_logger_name",
             "deps",
@@ -2128,7 +2120,6 @@ class DagSerialization(BaseSerialization):
         # Extract client_defaults for hierarchical defaults resolution
         client_defaults = serialized_obj.get("client_defaults", {})
 
-        # Pass client_defaults directly to deserialize_dag
         return cls.deserialize_dag(serialized_obj["dag"], client_defaults)
 
 

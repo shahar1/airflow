@@ -91,7 +91,6 @@ def update_orm_from_pydantic(
         except ValidationError as e:
             raise RequestValidationError(errors=e.errors())
 
-    # Delegate patch application to the common utility
     return cast(
         "Pool",
         BulkService.apply_patch_with_update_mask(

@@ -90,7 +90,6 @@ def _terminate_process_tree(
 
     try:
         parent = psutil.Process(process.pid)
-        # Get all child processes recursively
         children = parent.children(recursive=True)
 
         # Terminate all children first
@@ -98,13 +97,10 @@ def _terminate_process_tree(
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 child.terminate()
 
-        # Terminate the parent
         parent.terminate()
 
-        # Wait for all processes to terminate
         gone, alive = psutil.wait_procs(children + [parent], timeout=timeout)
 
-        # Force kill any remaining processes if requested
         if force_kill_remaining:
             for proc in alive:
                 try:
@@ -168,11 +164,9 @@ def _run_reloader(watch_paths: Sequence[str | Path]) -> None:
             _terminate_process_tree(process, timeout=5, force_kill_remaining=False)
         sys.exit(0)
 
-    # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start the initial process
     process = start_process()
 
     log.info("Hot-reload enabled. Watching for file changes...")
@@ -186,7 +180,6 @@ def _run_reloader(watch_paths: Sequence[str | Path]) -> None:
             log.info("Detected changes: %s", changes)
             log.info("Reloading...")
 
-            # Restart the process
             process = start_process()
 
     except KeyboardInterrupt:

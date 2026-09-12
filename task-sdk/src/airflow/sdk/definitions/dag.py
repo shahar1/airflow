@@ -1074,8 +1074,6 @@ class DAG:
 
         :param task: the task you want to add
         """
-        # FailStopDagInvalidTriggerRule.check(dag=self, trigger_rule=task.trigger_rule)
-
         from airflow.sdk.definitions._internal.contextmanager import TaskGroupContext
 
         # if the task has no start date, assign it the same as the Dag
@@ -1386,8 +1384,6 @@ class DAG:
             log.debug("starting dagrun")
             # Instead of starting a scheduler, we run the minimal loop possible to check
             # for task readiness and dependency management.
-            # Instead of starting a scheduler, we run the minimal loop possible to check
-            # for task readiness and dependency management.
 
             # ``Dag.test()`` works in two different modes depending on ``use_executor``:
             # - if ``use_executor`` is False, runs the task locally with no executor using ``_run_task``
@@ -1692,7 +1688,6 @@ def dag(dag_id_or_func=None, __DAG_class=DAG, __warnings_stacklevel_delta=2, **d
             # Apply defaults to capture default values if set.
             f_sig.apply_defaults()
 
-            # Initialize Dag with bound arguments
             with DAG(dag_id, **decorator_kwargs) as dag_obj:
                 # Set Dag documentation from function documentation if it exists and doc_md is not set.
                 if f.__doc__ and not dag_obj.doc_md:

@@ -49,7 +49,6 @@ def serve_logs(port=None):
 
     logger.info("Starting log server on %s", serve_log_uri)
 
-    # Get uvicorn logging configuration from Airflow settings
     uvicorn_log_level = conf.get("logging", "uvicorn_logging_level", fallback="info").lower()
 
     # Use uvicorn directly for ASGI applications.

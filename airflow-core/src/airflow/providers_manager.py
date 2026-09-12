@@ -410,7 +410,6 @@ class ProvidersManager(LoggingMixin):
 
     def __init__(self):
         """Initialize the manager."""
-        # skip initialization if already initialized
         if self.initialized():
             return
 

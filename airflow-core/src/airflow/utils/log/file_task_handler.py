@@ -628,7 +628,6 @@ class FileTaskHandler(logging.Handler):
             else:
                 # If the logs are in a different format, raise an error
                 raise TypeError("Logs should be either a list of strings or a generator of log lines.")
-            # Extend LogSourceInfo
             source_list.extend(sources)
 
         has_executor_log = False
@@ -957,7 +956,6 @@ class FileTaskHandler(logging.Handler):
                         f"Consider configuring remote logging (S3, GCS, etc.) for log persistence."
                     )
             else:
-                # Check if the resource was properly fetched
                 response.raise_for_status()
 
                 if int(response.headers.get("Content-Length", 0)) > 0:

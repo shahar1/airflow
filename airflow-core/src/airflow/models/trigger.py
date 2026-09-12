@@ -623,7 +623,6 @@ def handle_event_submit(event: TriggerEvent, *, task_instance: TaskInstance, ses
     # Remove ourselves as its trigger
     task_instance.trigger_id = None
 
-    # Set the state of the task instance to scheduled
     task_instance.state = TaskInstanceState.SCHEDULED
     task_instance.scheduled_dttm = timezone.utcnow()
     session.flush()

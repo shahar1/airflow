@@ -771,7 +771,6 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
             # bound shared-stream advance fails out and the broker redelivers.
             if entry.persist_seq is not None:
                 self.persisted_event_seqs.append(entry.persist_seq)
-            # Emit stat event
             stats.incr("triggers.succeeded", tags=prune_dict({"team_name": self.team_name}))
 
     def on_trigger_event(self, trigger_id: int, event: TriggerEvent) -> None:
@@ -792,7 +791,6 @@ class TriggerRunnerSupervisor(WatchedSubprocess):
             # Tell the model to fail this trigger's deps
             trigger_id, exc = self.failed_triggers.popleft()
             self.on_trigger_failure(trigger_id=trigger_id, exc=exc)
-            # Emit stat event
             stats.incr("triggers.failed", tags=prune_dict({"team_name": self.team_name}))
 
     def on_trigger_failure(self, trigger_id: int, exc: list[str] | None) -> None:
@@ -1266,8 +1264,6 @@ class TriggerRunner:
                 if self.comms_decoder._reader_task.done():
                     self.comms_decoder._reader_task.result()
                     raise RuntimeError("Supervisor connection lost")
-
-                # Run core logic
 
                 finished_ids = await self.cleanup_finished_triggers()
                 # This also loads the triggers we need to create or cancel

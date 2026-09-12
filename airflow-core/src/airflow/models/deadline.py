@@ -179,7 +179,6 @@ class Deadline(Base):
         from airflow.models import DagRun  # Avoids circular import
         from airflow.models.dag import DagModel
 
-        # Assemble the filter conditions.
         filter_conditions = [column == value for column, value in conditions.items()]
         if not filter_conditions:
             return 0
@@ -462,7 +461,6 @@ class ReferenceModels:
                 .order_by(DagRun.logical_date.desc())
             )
 
-            # Apply max_runs
             query = query.limit(self.max_runs)
 
             # Get all durations and calculate average

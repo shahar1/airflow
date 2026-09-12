@@ -53,7 +53,6 @@ class AirflowConsole(Console):
         # Set the width to constant to pipe whole output from console
         self._width = 200 if not is_tty() else self._width
 
-        # If show header in tables
         self.show_header = show_header
 
     def print_as_json(self, data: dict):

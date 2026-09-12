@@ -133,9 +133,7 @@ class StandaloneCommand:
     def update_output(self):
         """Drains the output queue and prints its contents to the screen."""
         while self.output_queue:
-            # Extract info
             name, line = self.output_queue.popleft()
-            # Make line printable
             line_str = line.decode("utf8").strip()
             self.print_output(name, line_str)
 

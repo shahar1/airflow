@@ -251,7 +251,6 @@ def action_logging(event: str | None = None):
 
         extra_fields["method"] = request.method
 
-        # Create log entry
         log = Log(
             event=event_name,
             task_instance=None,

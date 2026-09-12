@@ -112,7 +112,6 @@ class DeadlineAlert(Base):
         :param deadline_alert_id: The UUID of the DeadlineAlert to retrieve (as string or UUID object)
         :param session: Database session
         """
-        # Convert string to UUID if needed
         if isinstance(deadline_alert_id, str):
             deadline_alert_id = UUID(deadline_alert_id)
         result = session.scalar(select(cls).where(cls.id == deadline_alert_id))

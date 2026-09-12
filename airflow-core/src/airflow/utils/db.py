@@ -139,7 +139,6 @@ def timeout_with_traceback(seconds, message="Operation timed out"):
         """Exception raised when a timeout occurs."""
 
     def timeout_handler(signum, frame):
-        # Capture the full call stack
         stack_trace = "".join(traceback.format_stack(frame))
 
         # Log the timeout and stack trace
@@ -152,7 +151,6 @@ def timeout_with_traceback(seconds, message="Operation timed out"):
 
         raise TimeoutException(message)
 
-    # Set the signal handler
     timeout_supported = False
     try:
         old_handler = signal.signal(signal.SIGALRM, timeout_handler)
@@ -765,7 +763,6 @@ def _setup_debug_logging_if_needed():
     import faulthandler
     from contextlib import suppress
 
-    # Enable SQLA debug logging
     logging.getLogger("sqlalchemy.engine").setLevel(logging.DEBUG)
 
     # Enable faulthandler for debugging long-running threads and deadlocks,

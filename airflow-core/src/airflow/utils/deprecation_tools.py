@@ -78,7 +78,6 @@ def getattr_with_deprecation(
             message += f" {extra_message}."
     warnings.warn(message, DeprecatedImportWarning, stacklevel=2)
 
-    # Import and return the target attribute
     new_module, new_class_name = target_class_full_name.rsplit(".", 1)
     try:
         return getattr(importlib.import_module(new_module), new_class_name)
@@ -187,7 +186,6 @@ def add_deprecated_classes(
                 message_override=message or "",
             )
 
-            # Set the __getattr__ function on the current module
             setattr(module, "__getattr__", getattr_func)
         else:
             # Create virtual modules for submodule imports

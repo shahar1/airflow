@@ -104,7 +104,6 @@ def discover_remote_log_handler(
     try:
         logging_config = import_string(logging_class_path)
 
-        # Make sure that the variable is in scope
         if not isinstance(logging_config, dict):
             return None, None
 

@@ -204,7 +204,6 @@ def get_external_log_url(
     if not task_log_reader.supports_external_link:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Task log handler does not support external logs.")
 
-    # Fetch the task instance
     query = (
         select(TaskInstance)
         .where(

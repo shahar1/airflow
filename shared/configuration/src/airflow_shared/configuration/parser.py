@@ -1581,7 +1581,6 @@ class AirflowConfigParser(ConfigParser):
 
         :return: The object or None, if the option is empty
         """
-        # Fixed: use self.get() instead of conf.get()
         full_qualified_path = self.get(section=section, key=key, **kwargs)
         if not full_qualified_path:
             return None
