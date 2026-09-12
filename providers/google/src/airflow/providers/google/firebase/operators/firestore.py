@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.common.hooks.base_google import PROVIDE_PROJECT_ID
 from airflow.providers.google.firebase.hooks.firestore import CloudFirestoreHook
 from airflow.providers.google.version_compat import BaseOperator
@@ -81,7 +82,7 @@ class CloudFirestoreExportDatabaseOperator(BaseOperator):
 
     def _validate_inputs(self) -> None:
         if not self.body:
-            raise ValueError("The required parameter 'body' is missing")
+            raise AirflowException("The required parameter 'body' is missing")
 
     def execute(self, context: Context):
         self._validate_inputs()

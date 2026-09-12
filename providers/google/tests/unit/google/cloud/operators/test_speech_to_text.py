@@ -67,7 +67,7 @@ class TestCloudSpeechToTextRecognizeSpeechOperator:
         # Template rendering replaces the Jinja expression with the resolved value before execute.
         op.audio = ""
 
-        with pytest.raises(ValueError, match="The required parameter 'audio' is empty"):
+        with pytest.raises(AirflowException, match="The required parameter 'audio' is empty"):
             op.execute(context={"task_instance": Mock()})
         mock_hook.assert_not_called()
 

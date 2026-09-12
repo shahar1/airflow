@@ -22,6 +22,7 @@ from unittest.mock import ANY, MagicMock, Mock, PropertyMock, patch
 import pytest
 from google.api_core.gapic_v1.method import DEFAULT
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.cloud.operators.text_to_speech import CloudTextToSpeechSynthesizeOperator
 
 PROJECT_ID = "project-id"
@@ -97,7 +98,7 @@ class TestGcpTextToSpeech:
     ):
         mocked_context = Mock()
 
-        with pytest.raises(ValueError, match="is empty") as ctx:
+        with pytest.raises(AirflowException) as ctx:
             CloudTextToSpeechSynthesizeOperator(
                 project_id="project-id",
                 input_data=input_data,

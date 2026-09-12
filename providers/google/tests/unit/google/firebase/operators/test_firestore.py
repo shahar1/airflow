@@ -20,6 +20,7 @@ from unittest import mock
 
 import pytest
 
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.google.firebase.operators.firestore import CloudFirestoreExportDatabaseOperator
 
 TEST_OUTPUT_URI_PREFIX: str = "gs://example-bucket/path"
@@ -56,6 +57,6 @@ class TestCloudFirestoreExportDatabaseOperator:
         # Template rendering replaces the Jinja expression with the resolved value before execute.
         op.body = None
 
-        with pytest.raises(ValueError, match="The required parameter 'body' is missing"):
+        with pytest.raises(AirflowException, match="The required parameter 'body' is missing"):
             op.execute(mock.MagicMock())
         mock_firestore_hook.return_value.export_documents.assert_not_called()
