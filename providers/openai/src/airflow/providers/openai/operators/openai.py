@@ -17,14 +17,13 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal
 
 from airflow.providers.common.compat.sdk import BaseOperator, conf
 from airflow.providers.openai.exceptions import OpenAIBatchJobException
-from airflow.providers.openai.hooks.openai import OpenAIHook
+from airflow.providers.openai.hooks.openai import OpenAIHook, validate_execute_complete_event
 from airflow.providers.openai.triggers.openai import OpenAIBatchTrigger
 
 if TYPE_CHECKING:
@@ -94,6 +93,11 @@ class OpenAIResponseOperator(BaseOperator):
     :param model: The OpenAI model to use.
     :param response_kwargs: Additional keyword arguments to pass to the OpenAI ``create_response``
         method (for example ``instructions``, ``tools``, ``conversation`` or ``previous_response_id``).
+        Do not set ``background`` or ``stream`` here: ``background=True`` returns before the response
+        completes, so this operator logs a warning and the returned output text may be empty, while
+        ``stream=True`` returns an object without ``status`` or ``output_text``, so the task raises
+        ``AttributeError``. See :ref:`howto/operator:OpenAIResponseOperator` for these and other
+        options this operator can pass through, such as ``truncation`` and ``max_output_tokens``.
 
     .. seealso::
         For more information on how to use this operator, take a look at the guide:
@@ -194,7 +198,7 @@ class OpenAITriggerBatchOperator(BaseOperator):
                         conn_id=self.conn_id,
                         batch_id=self.batch_id,
                         poll_interval=60,
-                        end_time=time.time() + self.timeout,
+                        timeout=self.timeout,
                     ),
                     method_name="execute_complete",
                 )
@@ -210,7 +214,8 @@ class OpenAITriggerBatchOperator(BaseOperator):
         Relies on trigger to throw an exception, otherwise it assumes execution was
         successful.
         """
-        if event["status"] == "error":
+        event = validate_execute_complete_event(event)
+        if event["status"] != "success":
             raise OpenAIBatchJobException(event["message"])
 
         self.log.info("%s completed successfully.", self.task_id)
