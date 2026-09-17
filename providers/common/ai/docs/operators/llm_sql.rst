@@ -141,12 +141,17 @@ Human-in-the-Loop Approval
 Set ``require_approval=True`` to pause the task after SQL generation and wait
 for a human reviewer to approve the query before it is returned.
 When ``allow_modifications=True``, the reviewer can also edit the SQL — the
-modified query is re-validated against the same safety rules automatically:
+modified query is re-validated against the same safety rules automatically.
+``approval_timeout`` and ``on_approval_timeout`` behave as on
+:ref:`LLMOperator <howto/operator:llm>`:
 
 .. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_llm_sql.py
     :language: python
     :start-after: [START howto_operator_llm_sql_approval]
     :end-before: [END howto_operator_llm_sql_approval]
+
+``approval_timeout``, ``approval_notifiers``, and the rest of the approval
+behaviour are inherited from :ref:`LLMOperator <howto/operator:llm>`.
 
 SQL Safety Validation
 ---------------------
