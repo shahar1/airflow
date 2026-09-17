@@ -338,12 +338,7 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
       entry in the container's /etc/passwd; Docker would otherwise inherit the
       image's HOME (/root) which the non-root process cannot write to.
     * files/m2 is mounted directly as ~/.m2 so publishToMavenLocal writes
-      there without nesting, and its contents are visible on the host. The
-      -Dmaven.repo.local pin is required on top of HOME because a root (uid 0)
-      runner resolves the JVM user.home to
-      /root via /etc/passwd regardless of HOME, so mavenLocal() would otherwise
-      default to an ephemeral /root/.m2 and the published plugin would be lost
-      before the `bundle` step could find it.
+      there without nesting, and its contents are visible on the host.
     """
     if native:
         cwd = workdir
@@ -376,7 +371,6 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
             "eclipse-temurin:17-jdk",
             "/repo/java-sdk/gradlew",
             "--no-daemon",
-            "-Dmaven.repo.local=/workspace-home/.m2/repository",
             *gradle_argv,
         ]
     return subprocess.run(argv, cwd=cwd, check=True, capture_output=capture_output, text=True)
@@ -877,31 +871,12 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
 
 
 def _print_logs(compose_instance: DockerCompose):
-    # include_all=True so containers that already exited are shown too. The default
-    # (running-only) hides exactly the container that makes `docker compose up --wait` fail —
-    # e.g. an airflow service whose startup pip install was killed, or airflow-init exiting
-    # non-zero. The State/ExitCode summary distinguishes an OOM kill (137) from a real error.
-    try:
-        containers = compose_instance.get_containers(include_all=True)
-    except TypeError:
-        containers = compose_instance.get_containers()
-    console.print("::group:: Container states (incl. exited)")
-    for container in containers:
-        console.print(
-            f"{getattr(container, 'Name', '?')} service={getattr(container, 'Service', '?')} "
-            f"state={getattr(container, 'State', '?')} exit_code={getattr(container, 'ExitCode', '?')}",
-            style="yellow",
-            soft_wrap=True,
-            markup=False,
-        )
-    console.print("::endgroup::")
+    containers = compose_instance.get_containers()
     for container in containers:
         service = container.Service
         if service:
             stdout, _ = compose_instance.get_logs(service)
-            state = getattr(container, "State", "?")
-            exit_code = getattr(container, "ExitCode", "?")
-            console.print(f"::group:: {service} Logs (state={state}, exit={exit_code})")
+            console.print(f"::group:: {service} Logs")
             console.print(stdout, style="red", soft_wrap=True, markup=False)
             console.print("::endgroup::")
 
