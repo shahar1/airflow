@@ -68,13 +68,8 @@ runs:
       env:
         UV_VERSION: ${{ steps.versions.outputs.uv-version }}
         PREK_VERSION: ${{ steps.versions.outputs.prek-version }}
-      run: |  # zizmor: ignore[github-env]
+      run: |
         uv tool install prek==${PREK_VERSION} --with uv==${UV_VERSION}
-        # FORK / CodeBuild-runner test: ensure the uv tool bin dir is on PATH for
-        # later steps and downstream jobs. GitHub-hosted runners already have
-        # ~/.local/bin on PATH; self-hosted CodeBuild runs as root and does not,
-        # so prek would be "command not found". $HOME resolves on both.
-        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
       working-directory: ${{ github.workspace }}
     # We need to use tar file with archive to restore all the permissions and symlinks
     - name: "Delete ~.cache"
