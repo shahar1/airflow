@@ -330,15 +330,13 @@ jobs:
       - name: "Install Breeze from the ${{ inputs.ref }} reference"
         uses: ./.github/actions/breeze
         with:
-          python-version: "${{ needs.build-info.outputs.default-python-version }}"
-      # The image comes from the `build-ci-image` job, which builds it from this same ref and
-      # stashes it under the ref's own key - the shared per-branch stash holds main's image,
-      # not this ref's. The registry build restores the very same stash, so a run builds it
-      # once, and a run that had nothing to build restores what the previous publish left.
-      - name: >
-          Restore CI docker image built for ref ${{ inputs.ref }}
-          linux/amd64:${{ needs.build-info.outputs.default-python-version }}
-        uses: ./.github/actions/stash-s3-restore
+          python-version: "${{ needs.build-info.outputs.docs-python-version }}"
+      # Built here rather than in a job of its own: a separate job could only hand the image over
+      # as a multi-gigabyte artifact, for a single consumer. The image, the commit it was built
+      # from and the mount cache are still stashed under this ref, so the next publish of the same
+      # ref seeds its build from them - or skips the build outright when the sources have not moved.
+      - name: "Build CI image linux/amd64:${{ needs.build-info.outputs.docs-python-version }}"
+        uses: ./workflow-version/.github/actions/build_ci_image_with_cache
         with:
           python: "${{ needs.build-info.outputs.docs-python-version }}"
           platform: "linux/amd64"
