@@ -16,7 +16,7 @@
 # under the License.
 #
 ---
-# FORK / CodeBuild-runner test only. Self-owned, S3-backed drop-in for
+# FORK / self-hosted-runner test only. Self-owned, S3-backed drop-in for
 # apache/infrastructure-actions/stash/save. See stash-s3-restore for rationale.
 #
 # `path` may be a file, directory, or glob; matching entries are archived with
@@ -24,7 +24,7 @@
 # s3://<bucket>/<key>.tar.gz. `retention-days` is accepted for compatibility but
 # ignored — set an S3 lifecycle rule on the bucket for expiry instead.
 name: 'Save stash to S3'
-description: 'S3-backed drop-in for stash/save (CodeBuild fork test).'
+description: 'S3-backed drop-in for stash/save (self-hosted fork test).'
 inputs:
   key:
     description: 'Stash key; used as the S3 object name (slashes allowed).'

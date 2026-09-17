@@ -125,10 +125,10 @@ jobs:
         run: rm -rf dist/*
       - name: "Setup k8s/helm environment"
         run: breeze k8s setup-env
-      # FORK / CodeBuild-runner test: breeze installs helm to
+      # FORK / self-hosted-runner test: breeze installs helm to
       # $GITHUB_WORKSPACE/.venv/bin, but the host-level chart lint step
       # (verify_helm_chart_package.py) needs `helm` on PATH. GitHub-hosted
-      # runners ship helm preinstalled; the CodeBuild container does not.
+      # runners ship helm preinstalled; the EKS runner image does not.
       - name: "Put breeze helm on PATH"
         run: |  # zizmor: ignore[github-env]
           echo "${GITHUB_WORKSPACE}/.venv/bin" >> "${GITHUB_PATH}"
@@ -154,7 +154,7 @@ jobs:
         env:
           SIGN_WITH: dev@airflow.apache.org
       - name: "Fetch Git Tags"
-        # FORK / CodeBuild-runner test: the helm-chart release tags
+        # FORK / self-hosted-runner test: the helm-chart release tags
         # (helm-chart/1.15.0, /1.16.0, ...) that the issue-content step diffs
         # live in apache/airflow, not the fork, so fetch them explicitly here.
         run: |

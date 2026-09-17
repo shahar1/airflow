@@ -52,16 +52,13 @@ runs:
       run: ./scripts/ci/install_breeze.sh
       env:
         PYTHON_VERSION: "${{ inputs.python-version }}"
-    # FORK / CodeBuild-runner test: `breeze ci free-space` runs
-    # `docker system prune --all --force --volumes`, which on the CodeBuild
-    # Docker-in-Docker daemon leaves /var/lib/docker/tmp broken and makes the
-    # next `docker pull` fail (`open /var/lib/docker/tmp/GetImageBlob...: no such
-    # file or directory`), so the upstream step stays disabled here. But the
-    # provider-distributions Compat install (~100 wheels + apache-airflow) does
-    # exhaust the root volume (`No space left on device`), so reclaim space the
-    # CodeBuild-safe way: clear the uv cache and prune docker BUILD CACHE ONLY
-    # (no `--volumes`/`--all`, which is what broke DinD above). Re-enable the
-    # upstream `breeze ci free-space` before merging upstream.
+    # FORK / self-hosted-runner test: `breeze ci free-space` reclaims space by
+    # removing the hosted-runner tool trees and pruning the whole Docker daemon
+    # (`docker system prune --all --force --volumes`). The EKS runner pods start
+    # from an empty dind sidecar and have none of those trees, so the upstream
+    # step is disabled here and only the uv cache and the Docker build cache are
+    # cleared. Re-enable the upstream `breeze ci free-space` before merging
+    # upstream.
     # - name: "Free space"
     #   shell: bash
     #   run: breeze ci free-space

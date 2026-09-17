@@ -17,8 +17,8 @@
 # under the License.
 function make_mnt_writeable {
     set -x
-    # FORK / self-hosted-runner test: skip on AWS self-hosted runners (CodeBuild or
-    # the EKS/ARC pods) — there is no separate /mnt mount to prepare, and this is
+    # FORK / self-hosted-runner test: skip on the EKS/ARC runner pods — there is
+    # no separate /mnt mount to prepare, and this is
     # only needed for the GitHub-hosted docker-to-/mnt relocation, which is itself
     # skipped there.
     if [[ -n "${AIRFLOW_SELF_HOSTED_RUNNER:-}" ]]; then

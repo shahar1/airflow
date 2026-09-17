@@ -277,7 +277,7 @@ jobs:
       platform: ${{ needs.build-info.outputs.platform }}
       push-image: "false"
       upload-image-artifact: "true"
-      # FORK / CodeBuild-runner test: upstream only saves the Docker build
+      # FORK / self-hosted-runner test: upstream only saves the Docker build
       # mount cache on canary (scheduled main) runs, so on the fork it was
       # never saved and every build missed it. Save it on the fork too so
       # subsequent image builds reuse the uv/pip cache. Re-enable the

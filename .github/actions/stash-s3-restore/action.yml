@@ -16,21 +16,21 @@
 # under the License.
 #
 ---
-# FORK / CodeBuild-runner test only.
+# FORK / self-hosted-runner test only.
 #
 # Self-owned, S3-backed drop-in for apache/infrastructure-actions/stash/restore.
-# Self-hosted AWS CodeBuild runners can read/write an in-region S3 bucket for
-# essentially free (no GitHub 10 GB cache cap, no cross-cloud egress), so we
-# stash CI caches there instead of GitHub artifacts. Uses only bash + the AWS
-# CLI (present in the CodeBuild image, authenticated by the runner's service
-# role) — no third-party actions.
+# The EKS runner pods can read/write an in-region S3 bucket for essentially
+# free (no GitHub 10 GB cache cap, no cross-cloud egress), so we stash CI
+# caches there instead of GitHub artifacts. Uses only bash + the AWS CLI
+# (present in the runner image, authenticated through EKS Pod Identity) — no
+# third-party actions.
 #
 # Contract matches the original stash/restore: inputs `key` + `path`, output
 # `stash-hit`, and `fail-on-download`. `path` is accepted for compatibility;
 # the tarball is created with `tar -P` so entries restore to their original
 # (absolute or workspace-relative) locations regardless of `path`.
 name: 'Restore stash from S3'
-description: 'S3-backed drop-in for stash/restore (CodeBuild fork test).'
+description: 'S3-backed drop-in for stash/restore (self-hosted fork test).'
 inputs:
   key:
     description: 'Stash key; used as the S3 object name (slashes allowed).'

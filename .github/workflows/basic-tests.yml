@@ -304,7 +304,7 @@ jobs:
           SKIP: ${{ inputs.skip-prek-hooks }}
           COLUMNS: "202"
 
-  # FORK / CodeBuild-runner test: the CodeBuild project is x86/Ubuntu and cannot
+  # FORK / self-hosted-runner test: the EKS runners are Linux-only and cannot
   # serve Windows jobs, so this Windows-only smoke test is disabled on the fork.
   # Nothing else `needs` it. Re-enable before merging back to apache/airflow.
   # test-git-clone-on-windows:

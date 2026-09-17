@@ -17,8 +17,8 @@
 # under the License.
 function cleanup_runner {
     set -x
-    # FORK / self-hosted-runner test: skip on AWS self-hosted runners (CodeBuild or
-    # the EKS/ARC pods, which export AIRFLOW_SELF_HOSTED_RUNNER). These containers
+    # FORK / self-hosted-runner test: skip on the EKS/ARC runner pods (they export
+    # AIRFLOW_SELF_HOSTED_RUNNER). These containers
     # have no separate /mnt mount and no systemd, so `systemctl stop docker`
     # fails while `rm -rf /var/lib/docker` still wipes the daemon's storage,
     # leaving docker broken (next `docker pull` fails with

@@ -340,7 +340,7 @@ def _run_java_sdk_gradle(workdir, *gradle_argv, capture_output=False, native=Fal
     * files/m2 is mounted directly as ~/.m2 so publishToMavenLocal writes
       there without nesting, and its contents are visible on the host. The
       -Dmaven.repo.local pin is required on top of HOME because a root (uid 0)
-      runner — as on the CodeBuild container — resolves the JVM user.home to
+      runner resolves the JVM user.home to
       /root via /etc/passwd regardless of HOME, so mavenLocal() would otherwise
       default to an ephemeral /root/.m2 and the published plugin would be lost
       before the `bundle` step could find it.
