@@ -55,7 +55,7 @@ runs:
     # FORK / self-hosted-runner test: `breeze ci free-space` reclaims space by
     # removing the hosted-runner tool trees and pruning the whole Docker daemon
     # (`docker system prune --all --force --volumes`). The EKS runner pods start
-    # from an empty dind sidecar and have none of those trees, so the upstream
+    # from an empty Docker daemon and have none of those trees, so the upstream
     # step is disabled here and only the uv cache and the Docker build cache are
     # cleared. Re-enable the upstream `breeze ci free-space` before merging
     # upstream.

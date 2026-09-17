@@ -655,9 +655,6 @@ services:
         _set_var(_env, "CELERY_FLOWER", self.celery_flower)
         _set_var(_env, "CLEAN_AIRFLOW_INSTALLATION", self.clean_airflow_installation)
         _set_var(_env, "CI", None, "false")
-        # Forwarded so in-container tests can detect the EKS/ARC runner pods (e.g. to
-        # skip testcontainers-backed tests that hang under nested DinD).
-        _set_var(_env, "AIRFLOW_SELF_HOSTED_RUNNER", None, None)
         _set_var(_env, "CI_BUILD_ID", None, "0")
         _set_var(_env, "CI_EVENT_TYPE", None, GithubEvents.PULL_REQUEST.value)
         _set_var(_env, "CI_JOB_ID", None, "0")
