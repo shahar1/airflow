@@ -3209,6 +3209,10 @@ class TestDagFileProcessorManager:
             direct_mock.assert_not_called()
 
     @mock.patch("airflow.dag_processing.manager.stats.gauge")
+    # Interval 0 so each loop re-parses immediately: `touch()` alone loses the race when the
+    # coarse filesystem mtime is not newer than the sub-millisecond-old last_finish_time,
+    # which stalls the loop for the full interval and then trips the test timeout.
+    @conf_vars({("dag_processor", "min_file_process_interval"): "0"})
     def test_stats_total_parse_time(self, statsd_gauge_mock, tmp_path, configure_testing_dag_bundle):
         key = "dag_processing.total_parse_time"
         gauge_values = defaultdict(list)
