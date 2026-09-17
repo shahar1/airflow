@@ -31,7 +31,6 @@ from testcontainers.compose import DockerCompose
 from airflow_e2e_tests.constants import (
     AIRFLOW_ROOT_PATH,
     AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT,
-    AIRFLOW_UID,
     AWS_INIT_PATH,
     DOCKER_COMPOSE_HOST_PORT,
     DOCKER_COMPOSE_PATH,
@@ -129,7 +128,7 @@ def _setup_s3_integration(dot_env_file, tmp_dir):
     _copy_localstack_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         "AWS_DEFAULT_REGION=us-east-1\n"
         "AWS_ENDPOINT_URL_S3=http://localstack:4566\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
@@ -145,7 +144,7 @@ def _setup_elasticsearch_integration(dot_env_file, tmp_dir):
     _copy_elasticsearch_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
         "AIRFLOW__ELASTICSEARCH__HOST=http://elasticsearch:9200\n"
         "AIRFLOW__ELASTICSEARCH__WRITE_STDOUT=false\n"
@@ -160,7 +159,7 @@ def _setup_opensearch_integration(dot_env_file, tmp_dir):
     _copy_opensearch_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         "AIRFLOW__LOGGING__REMOTE_LOGGING=true\n"
         "AIRFLOW__OPENSEARCH__HOST=http://opensearch:9200\n"
         "AIRFLOW__OPENSEARCH__PORT=9200\n"
@@ -236,7 +235,7 @@ def _setup_event_driven_integration(dot_env_file, tmp_dir):
     )
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         f"AIRFLOW_CONN_KAFKA_DEFAULT='{kafka_conn}'\n"
         f"_PIP_ADDITIONAL_REQUIREMENTS={' '.join(provider_paths)}\n"
     )
@@ -268,7 +267,7 @@ def _setup_xcom_object_storage_integration(dot_env_file, tmp_dir):
     _copy_localstack_files(tmp_dir)
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         # XComObjectStorageBackend requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as env vars
         # because `universal-path` uses boto3's native S3 client, which relies on environment variables
         # for authentication rather than parsing credentials from the connection URI
@@ -527,7 +526,7 @@ def _setup_java_sdk_integration(dot_env_file, tmp_dir):
     )
 
     dot_env_file.write_text(
-        f"AIRFLOW_UID={AIRFLOW_UID}\n"
+        f"AIRFLOW_UID={os.getuid()}\n"
         # Single-quote the JSON values so Docker Compose reads them literally.
         f"AIRFLOW__SDK__COORDINATORS='{coordinator_config}'\n"
         f"AIRFLOW__SDK__QUEUE_TO_COORDINATOR='{queue_to_coordinator}'\n"
@@ -792,13 +791,7 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
     console.print(f"[yellow]Creating subfolders:[/ {subfolders}")
 
     for subdir in subfolders:
-        path = tmp_dir / subdir
-        path.mkdir()
-        # When the host runs as root the containers run as the airflow user (AIRFLOW_UID=50000,
-        # not the host's uid), so make the bind-mounted dirs writable by it — otherwise airflow
-        # cannot write its logs into the root-owned mount.
-        if os.getuid() != AIRFLOW_UID:
-            path.chmod(0o777)
+        (tmp_dir / subdir).mkdir()
 
     _E2ETestState.airflow_logs_path = tmp_dir / "logs"
     _E2ETestState.airflow_dags_path = tmp_dir / "dags"
@@ -810,7 +803,7 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
         copytree(E2E_DAGS_FOLDER, tmp_dir / "dags", dirs_exist_ok=True)
 
     dot_env_file = tmp_dir / ".env"
-    dot_env_file.write_text(f"AIRFLOW_UID={AIRFLOW_UID}\n")
+    dot_env_file.write_text(f"AIRFLOW_UID={os.getuid()}\n")
 
     console.print(f"[yellow]Creating .env file :[/ {dot_env_file}")
 
