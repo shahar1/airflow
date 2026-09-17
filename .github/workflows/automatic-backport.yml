@@ -26,9 +26,7 @@ permissions:
 jobs:
   get-pr-info:
     name: "Get PR information"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ubuntu-slim
     outputs:
       branches: ${{ steps.pr-info.outputs.branches }}
       commit-sha: ${{ github.sha }}

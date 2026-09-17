@@ -3212,7 +3212,7 @@ class TestDagFileProcessorManager:
     def test_stats_total_parse_time(self, statsd_gauge_mock, tmp_path, configure_testing_dag_bundle):
         key = "dag_processing.total_parse_time"
         gauge_values = defaultdict(list)
-        statsd_gauge_mock.side_effect = lambda name, value: gauge_values[name].append(value)
+        statsd_gauge_mock.side_effect = lambda name, value, *args, **kwargs: gauge_values[name].append(value)
 
         dag_path = tmp_path / "temp_dag.py"
         dag_code = textwrap.dedent(

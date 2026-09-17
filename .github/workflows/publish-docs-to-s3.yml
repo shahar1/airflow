@@ -75,9 +75,7 @@ jobs:
   build-info:
     timeout-minutes: 10
     name: "Build Info"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ["ubuntu-24.04"]
     env:
       VERBOSE: true
       REF: ${{ inputs.ref }}
@@ -260,9 +258,7 @@ jobs:
     needs: [build-info]
     timeout-minutes: 150
     name: "Build documentation"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
@@ -444,9 +440,7 @@ jobs:
     needs: [build-info]
     timeout-minutes: 30
     name: "Build Java SDK Javadoc"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
@@ -580,9 +574,7 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ubuntu-latest
     env:
       GITHUB_REPOSITORY: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

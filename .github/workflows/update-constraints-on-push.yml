@@ -73,9 +73,7 @@ env:
 jobs:
   build-info:
     name: "Build info"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ["ubuntu-22.04"]
     # Automatic uv.lock-push runs are unrestricted; manual (workflow_dispatch)
     # runs are limited to release managers (same allowlist as the prod image
     # release workflow) because they push to the protected constraints-* branches.
@@ -194,9 +192,7 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   update-constraints:
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ["ubuntu-22.04"]
     timeout-minutes: 20
     name: "Commit and push constraints"
     needs: [build-info, generate-constraints]
@@ -238,9 +234,7 @@ jobs:
 
   notify-on-failure:
     name: "Notify on failure"
-    runs-on:
-      - codebuild-airflow-ci-runner-test-${{ github.run_id }}-${{ github.run_attempt }}
-      - buildspec-override:true
+    runs-on: ["ubuntu-slim"]
     needs: [build-info, build-ci-images, generate-constraints, update-constraints]
     if: failure()
     env:
