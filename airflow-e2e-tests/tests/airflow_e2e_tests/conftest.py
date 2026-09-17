@@ -176,41 +176,6 @@ def _setup_opensearch_integration(dot_env_file, tmp_dir):
     os.environ["ENV_FILE_PATH"] = str(dot_env_file)
 
 
-def _write_codebuild_health_override(tmp_dir: Path) -> None:
-    """Write a compose override that relaxes health-check timing on CodeBuild runners.
-
-    CodeBuild's EBS-backed storage and shared CPUs make container startup much slower than
-    on GitHub-hosted runners, which exhausts the default health-check windows in two places:
-
-    * postgres runs a two-phase init cycle (a temporary server to run the init scripts, then
-      the permanent server). With the default ``start_period: 5s`` the first health check
-      passes against the temporary server, airflow-init starts migrating, and the migration
-      breaks when the temporary server shuts down ~30s in.
-    * the airflow services install ``_PIP_ADDITIONAL_REQUIREMENTS`` at startup for the
-      event_driven and xcom test modes (now that they run as non-root — see AIRFLOW_UID — the
-      install actually runs instead of crash-looping). Five services install concurrently,
-      which on CodeBuild can take longer than the apiserver's default 180s window
-      (``start_period 30s + 5 × interval 30s``), so the apiserver could be marked unhealthy
-      before the install finishes and the server starts.
-
-    ``start_period`` only suppresses *failing* probes during the window — a service that
-    becomes healthy earlier is still detected immediately — so enlarging it is free for the
-    fast test modes. Applied only when ``CODEBUILD_BUILD_ID`` is set.
-    """
-    # postgres needs less time than the airflow services (no startup pip install).
-    start_periods = {"postgres": 120}
-    start_periods.update({service: 300 for service in AIRFLOW_SERVICES_FOR_PROVIDER_MOUNT})
-    lines = ["---", "services:"]
-    for service, start_period in start_periods.items():
-        lines += [
-            f"  {service}:",
-            "    healthcheck:",
-            f"      start_period: {start_period}s",
-            "      retries: 10",
-        ]
-    (tmp_dir / "codebuild-health-override.yml").write_text("\n".join(lines) + "\n")
-
-
 def _copy_kafka_files(tmp_dir):
     """Copy the Kafka compose file and broker init script into the temp directory."""
     copyfile(KAFKA_DIR_PATH.parent / "kafka.yml", tmp_dir / "kafka.yml")
@@ -851,10 +816,6 @@ def spin_up_airflow_environment(tmp_path_factory: pytest.TempPathFactory):
 
     os.environ["AIRFLOW_IMAGE_NAME"] = DOCKER_IMAGE
     compose_file_names = ["docker-compose.yaml"]
-
-    if os.environ.get("CODEBUILD_BUILD_ID"):
-        _write_codebuild_health_override(tmp_dir)
-        compose_file_names.append("codebuild-health-override.yml")
 
     if E2E_TEST_MODE == "remote_log":
         compose_file_names.append("localstack.yml")

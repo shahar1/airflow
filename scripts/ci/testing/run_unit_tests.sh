@@ -36,7 +36,7 @@ TEST_SCOPE=${2}
 # `breeze testing ... --use-xdist` runs `-n 16` instead. 16 (not the wasteful 8) keeps the box
 # busy while staying well under the memory ceiling; tune upward in follow-up runs. Re-enable a
 # proper memory-aware cap upstream before merging.
-if [[ -n "${CODEBUILD_BUILD_ID:-}${AIRFLOW_SELF_HOSTED_RUNNER:-}" && -z "${PARALLELISM:-}" ]]; then
+if [[ -n "${AIRFLOW_SELF_HOSTED_RUNNER:-}" && -z "${PARALLELISM:-}" ]]; then
     export PARALLELISM=16
 fi
 
