@@ -304,19 +304,16 @@ jobs:
           SKIP: ${{ inputs.skip-prek-hooks }}
           COLUMNS: "202"
 
-  # FORK / self-hosted-runner test: the EKS runners are Linux-only and cannot
-  # serve Windows jobs, so this Windows-only smoke test is disabled on the fork.
-  # Nothing else `needs` it. Re-enable before merging back to apache/airflow.
-  # test-git-clone-on-windows:
-  #   timeout-minutes: 5
-  #   name: "Test git clone on Windows"
-  #   runs-on: ["windows-2025"]
-  #   steps:
-  #     - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
-  #       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-  #       with:
-  #         fetch-depth: 2
-  #         persist-credentials: false
+  test-git-clone-on-windows:
+    timeout-minutes: 5
+    name: "Test git clone on Windows"
+    runs-on: ["windows-2025"]
+    steps:
+      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
 
   test-airflow-release-commands:
     timeout-minutes: 80
