@@ -132,7 +132,10 @@ on:  # yamllint disable-line rule:truthy
       job-timeout-minutes:
         description: "How long the job may run before GitHub cancels it"
         required: false
-        default: 65
+        # FORK / self-hosted-runner test: upstream default is 65. Self-hosted runners are
+        # slower and more CPU-contended, so serial DB suites (e.g. MySQL API...CLI with
+        # use_xdist=False) exceed 65 minutes and GitHub cancels them. Revert before upstreaming.
+        default: 120
         type: number
 permissions:
   contents: read

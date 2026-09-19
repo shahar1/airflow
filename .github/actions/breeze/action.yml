@@ -52,11 +52,27 @@ runs:
       run: ./scripts/ci/install_breeze.sh
       env:
         PYTHON_VERSION: "${{ inputs.python-version }}"
-    - name: "Free space"
+    # FORK / self-hosted-runner test: `breeze ci free-space` reclaims space by
+    # removing the hosted-runner tool trees and pruning the whole Docker daemon
+    # (`docker system prune --all --force --volumes`). The EKS runner pods start
+    # from an empty Docker daemon and have none of those trees, so the upstream
+    # step is disabled here and only the uv cache and the Docker build cache are
+    # cleared. Re-enable the upstream `breeze ci free-space` before merging
+    # upstream.
+    # - name: "Free space"
+    #   shell: bash
+    #   run: breeze ci free-space
+    #   env:
+    #     AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
+    - name: "Free space (self-hosted-safe)"
       shell: bash
-      run: breeze ci free-space
-      env:
-        AIRFLOW_ROOT_PATH: "${{ github.workspace }}"
+      run: |
+        # Guard in-shell on the runner pod's OS env var, mirroring
+        # scripts/ci/make_mnt_writeable.sh / move_docker_to_mnt.sh.
+        if [[ -n "${AIRFLOW_SELF_HOSTED_RUNNER:-}" ]]; then
+          uv cache clean || true
+          docker builder prune --all --force || true
+        fi
     - name: "Get Python version"
       shell: bash
       run: >

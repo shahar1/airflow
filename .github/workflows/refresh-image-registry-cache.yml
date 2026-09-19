@@ -132,6 +132,7 @@ jobs:
     with:
       runners: '["ubuntu-22.04-arm"]'
       platform: "linux/arm64"
+      runner-arch: arm
       cache-type: "Refresh"
       include-prod-images: "false"
       push-latest-images: "false"

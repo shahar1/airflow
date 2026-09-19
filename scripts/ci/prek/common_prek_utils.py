@@ -41,6 +41,19 @@ AIRFLOW_PROVIDERS_ROOT_PATH = AIRFLOW_ROOT_PATH / "providers"
 AIRFLOW_TASK_SDK_ROOT_PATH = AIRFLOW_ROOT_PATH / "task-sdk"
 AIRFLOW_TASK_SDK_SOURCES_PATH = AIRFLOW_TASK_SDK_ROOT_PATH / "src"
 
+# Env vars whose values must never be printed to (world-readable) CI logs. Matched against the
+# variable NAME so the "With environment:" debug dump stays useful while secrets are hidden.
+# A bare "PAT" is intentionally omitted (it would also redact PATH); "TOKEN" covers DOCKERHUB_TOKEN.
+SENSITIVE_ENV_KEY_PATTERN = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_?KEY", re.IGNORECASE
+)
+
+
+def redacted_env_for_log(env: dict[str, str]) -> dict[str, str]:
+    """Return a copy of ``env`` with secret-looking values masked, for safe logging."""
+    return {k: ("***" if SENSITIVE_ENV_KEY_PATTERN.search(k) else v) for k, v in env.items()}
+
+
 DEFAULT_PYTHON_MAJOR_MINOR_VERSION = "3.10"
 
 # Maps a platform string (as declared in ``provider.yaml`` under ``excluded-platforms``)
@@ -476,11 +489,11 @@ def run_command_via_breeze_shell(
                 f"[magenta]Running command: {' '.join([shlex.quote(item) for item in subprocess_cmd])}[/]"
             )
             console.print("[magenta]With environment:[/]")
-            console.print(new_env)
+            console.print(redacted_env_for_log(new_env))
         else:
             print(f"Running command: {' '.join([shlex.quote(item) for item in subprocess_cmd])}")
             print("With environment:")
-            print(new_env)
+            print(redacted_env_for_log(new_env))
     try:
         return subprocess.run(
             subprocess_cmd,
@@ -549,11 +562,11 @@ def run_command_via_breeze_run(
                 f"[magenta]Running command: {' '.join([shlex.quote(item) for item in subprocess_cmd])}[/]"
             )
             console.print("[magenta]With environment:[/]")
-            console.print(new_env)
+            console.print(redacted_env_for_log(new_env))
         else:
             print(f"Running command: {' '.join([shlex.quote(item) for item in subprocess_cmd])}")
             print("With environment:")
-            print(new_env)
+            print(redacted_env_for_log(new_env))
     return subprocess.run(
         subprocess_cmd,
         check=False,
