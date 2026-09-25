@@ -82,8 +82,7 @@ runs:
         echo
       shell: bash
     - name: "Restore prek cache"
-      # yamllint disable-line rule:line-length
-      uses: apache/infrastructure-actions/stash/restore@61dcea11f19e2bbe1263f14d72235e8da17d3ad0  # restore/v1.0.0
+      uses: ./.github/actions/stash-s3-restore
       with:
         key: ${{ steps.cache-key.outputs.key }}
         path: /tmp/
@@ -165,7 +164,7 @@ runs:
         inputs.save-cache == 'true'
         && (steps.restore-prek-tar.outputs.tar-restored != 'true' || github.event_name != 'pull_request')
     - name: "Save prek cache"
-      uses: apache/infrastructure-actions/stash/save@61dcea11f19e2bbe1263f14d72235e8da17d3ad0  # save/v1.0.0
+      uses: ./.github/actions/stash-s3-save
       with:
         key: ${{ steps.cache-key.outputs.key }}
         path: /tmp/cache-prek.tar.gz
