@@ -71,7 +71,7 @@ const TasksTable = ({
 // TODO: Make a front-end only unconnected table component with client side ordering and pagination
 const ActionAccordion = ({ affectedTasks, groupByRunId = false, note, selection, setNote }: Props) => {
   const showTaskSection = affectedTasks !== undefined;
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
 
   // Group task instances by dag_run_id when requested
   const runGroups = (() => {
@@ -120,7 +120,7 @@ const ActionAccordion = ({ affectedTasks, groupByRunId = false, note, selection,
                         <Text fontSize="sm" fontWeight="semibold">
                           {translate("runId")}: {runId}{" "}
                           <Text as="span" color="fg.subtle" fontWeight="normal">
-                            ({tis.length})
+                            ({tis.length.toLocaleString(i18n.language)})
                           </Text>
                         </Text>
                       </Accordion.ItemTrigger>

@@ -17,6 +17,7 @@
  * under the License.
  */
 import { HStack, Badge, Text, Skeleton } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 import { Link, type To } from "react-router-dom";
 
 import { TrendCountChart, type ChartEvent } from "./TrendCountChart";
@@ -41,8 +42,10 @@ export const TrendCountButton = ({
   label,
   route,
   startDate,
-}: Props) =>
-  isLoading ? (
+}: Props) => {
+  const { i18n } = useTranslation();
+
+  return isLoading ? (
     <Skeleton borderRadius={4} height="45px" width="350px" />
   ) : (
     <Link to={route}>
@@ -57,7 +60,7 @@ export const TrendCountButton = ({
         width="350px"
       >
         <Badge borderRadius="md" colorPalette={colorPalette} variant="solid">
-          {count}
+          {count.toLocaleString(i18n.language)}
         </Badge>
         <Text fontSize="sm" fontWeight="bold">
           {label}
@@ -66,3 +69,4 @@ export const TrendCountButton = ({
       </HStack>
     </Link>
   );
+};

@@ -20,6 +20,7 @@ import { forwardRef, type ReactNode } from "react";
 
 import type { CollectionItem } from "@chakra-ui/react";
 import { Select as ChakraSelect } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 
 type ValueTextProps = {
   readonly children?: (items: Array<CollectionItem>) => ReactNode;
@@ -27,6 +28,7 @@ type ValueTextProps = {
 
 export const ValueText = forwardRef<HTMLSpanElement, ValueTextProps>((props, ref) => {
   const { children, ...rest } = props;
+  const { i18n } = useTranslation();
 
   return (
     <ChakraSelect.ValueText {...rest} ref={ref}>
@@ -44,7 +46,7 @@ export const ValueText = forwardRef<HTMLSpanElement, ValueTextProps>((props, ref
             return select.collection.stringifyItem(items[0]);
           }
 
-          return `${items.length} selected`;
+          return `${items.length.toLocaleString(i18n.language)} selected`;
         }}
       </ChakraSelect.Context>
     </ChakraSelect.ValueText>

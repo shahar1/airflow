@@ -34,7 +34,7 @@ type PoolBarCardProps = {
 };
 
 const PoolBarCard = ({ pool }: PoolBarCardProps) => {
-  const { t: translate } = useTranslation("admin");
+  const { i18n, t: translate } = useTranslation("admin");
 
   return (
     <Box borderColor="border.emphasized" borderRadius={8} borderWidth={1} mb={2} overflow="hidden">
@@ -42,8 +42,8 @@ const PoolBarCard = ({ pool }: PoolBarCardProps) => {
         <VStack align="start" flex="1">
           <HStack justifyContent="space-between" width="100%">
             <Text fontSize="lg" fontWeight="bold" whiteSpace="normal" wordBreak="break-word">
-              {pool.name} ({pool.slots === UNLIMITED_SLOTS ? "∞" : pool.slots} {translate("pools.form.slots")}
-              ){pool.team_name !== null && ` (${pool.team_name})`}
+              {pool.name} ({pool.slots === UNLIMITED_SLOTS ? "∞" : pool.slots.toLocaleString(i18n.language)}{" "}
+              {translate("pools.form.slots")}){pool.team_name !== null && ` (${pool.team_name})`}
               {pool.include_deferred ? (
                 <Tooltip content={translate("pools.deferredSlotsIncluded")}>
                   <StateIcon size={18} state="deferred" style={{ display: "inline", marginLeft: 6 }} />

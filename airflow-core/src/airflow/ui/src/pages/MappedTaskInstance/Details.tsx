@@ -30,7 +30,7 @@ import { useDurationFormat } from "src/utils";
 
 export const Details = () => {
   const { dagId = "", taskId = "" } = useParams();
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { formatElapsed } = useDurationFormat();
 
   // The aggregate summary (per-state counts, dates) is streamed once by the parent page and
@@ -67,7 +67,7 @@ export const Details = () => {
                     height="10px"
                     width="10px"
                   />
-                  {count}
+                  {count.toLocaleString(i18n.language)}
                 </Flex>
               </Table.Cell>
             </Table.Row>

@@ -19,6 +19,7 @@
 import type { CSSProperties } from "react";
 
 import { Box, type TextProps } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 import { FiArrowDownRight, FiArrowUpRight } from "react-icons/fi";
 
 import type { NodeResponse } from "openapi/requests/types.gen";
@@ -49,6 +50,8 @@ export const TaskName = ({
   setupTeardownType,
   ...rest
 }: TaskNameProps) => {
+  const { i18n } = useTranslation();
+
   if (isGroup) {
     return (
       <Box
@@ -75,7 +78,7 @@ export const TaskName = ({
       {...rest}
     >
       {label}
-      {isMapped ? ` [${childCount ?? " "}]` : undefined}
+      {isMapped ? ` [${childCount?.toLocaleString(i18n.language) ?? " "}]` : undefined}
       {setupTeardownType === "setup" && <FiArrowUpRight size={isZoomedOut ? 24 : 15} style={iconStyle} />}
       {setupTeardownType === "teardown" && (
         <FiArrowDownRight size={isZoomedOut ? 24 : 15} style={iconStyle} />

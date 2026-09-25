@@ -60,7 +60,7 @@ const IconTeamName = ({ teamName }: { readonly teamName?: string | null }) => {
 };
 
 export const DependencyPopover = ({ dependencies, type }: Props) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const dependencyKey = type.toLowerCase() as "dag" | "task";
 
   return (
@@ -68,7 +68,8 @@ export const DependencyPopover = ({ dependencies, type }: Props) => {
     <Popover.Root autoFocus={false} lazyMount unmountOnExit>
       <Popover.Trigger asChild disabled={dependencies.length === 0}>
         <Button variant="outline">
-          {dependencies.length} {translate(dependencyKey, { count: dependencies.length })}
+          {dependencies.length.toLocaleString(i18n.language)}{" "}
+          {translate(dependencyKey, { count: dependencies.length })}
         </Button>
       </Popover.Trigger>
       <Popover.Content css={{ "--popover-bg": "colors.bg.emphasized" }} width="fit-content">

@@ -237,7 +237,7 @@ const runColumns = ({ dagId, multiTeam, open, translate }: ColumnProps): Array<C
 ];
 
 export const DagRuns = () => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { dagId } = useParams();
 
   // Only the standalone list page owns the tab title; the Dag-scoped tab inherits the Dag page's title.
@@ -399,7 +399,7 @@ export const DagRuns = () => {
       <ActionBar.Root closeOnInteractOutside={false} open={Boolean(selectedRows.size)}>
         <ActionBar.Content>
           <ActionBar.SelectionTrigger>
-            {selectedRows.size} {translate("selected")}
+            {selectedRows.size.toLocaleString(i18n.language)} {translate("selected")}
           </ActionBar.SelectionTrigger>
           <ActionBar.Separator />
           <BulkClearDagRunsButton deselectKeys={deselectKeys} selectedDagRuns={selectedDagRuns} />

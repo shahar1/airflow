@@ -44,6 +44,7 @@ type FileRow = { row: { original: DagBundleFileResponse } };
 // parameter and the table offers none.
 const createColumns = (
   translate: TFunction,
+  language: string,
   onShowImportError: (relativeFileloc: string) => void,
 ): Array<ColumnDef<DagBundleFileResponse>> => [
   {
@@ -54,6 +55,7 @@ const createColumns = (
   },
   {
     accessorKey: "dag_count",
+    cell: ({ row: { original } }: FileRow) => original.dag_count.toLocaleString(language),
     enableSorting: false,
     header: translate("common:dag_other"),
   },
@@ -102,7 +104,7 @@ const createColumns = (
 ];
 
 export const BundleFiles = ({ bundleName }: { readonly bundleName: string }) => {
-  const { t: translate } = useTranslation(["browse", "common"]);
+  const { i18n, t: translate } = useTranslation(["browse", "common"]);
   const refetchInterval = useDagBundleRefetchInterval();
 
   const { setTableURLState, tableURLState } = useTableURLState();
@@ -129,7 +131,7 @@ export const BundleFiles = ({ bundleName }: { readonly bundleName: string }) => 
         relativeFileloc={errorFileloc}
       />
       <DataTable
-        columns={createColumns(translate, setErrorFileloc)}
+        columns={createColumns(translate, i18n.language, setErrorFileloc)}
         data={data?.dag_bundle_files ?? []}
         errorMessage={<ErrorAlert error={error} />}
         initialState={tableURLState}

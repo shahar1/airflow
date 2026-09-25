@@ -139,7 +139,7 @@ const getColumns = ({
 };
 
 export const Variables = () => {
-  const { t: translate } = useTranslation("admin");
+  const { i18n, t: translate } = useTranslation("admin");
 
   useDocumentTitle(translate("common:admin.Variables"));
 
@@ -242,7 +242,7 @@ export const Variables = () => {
       <ActionBar.Root closeOnInteractOutside={false} open={Boolean(selectedRows.size)}>
         <ActionBar.Content>
           <ActionBar.SelectionTrigger>
-            {selectedRows.size} {translate("deleteActions.selected")}
+            {selectedRows.size.toLocaleString(i18n.language)} {translate("deleteActions.selected")}
           </ActionBar.SelectionTrigger>
           <ActionBar.Separator />
           <Tooltip content={translate("variables.delete.tooltip")}>

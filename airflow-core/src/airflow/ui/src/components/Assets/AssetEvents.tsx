@@ -60,7 +60,7 @@ export const AssetEvents = ({
   titleKey,
   ...rest
 }: AssetEventProps & BoxProps) => {
-  const { t: translate } = useTranslation(["dashboard", "common", "dag"]);
+  const { i18n, t: translate } = useTranslation(["dashboard", "common", "dag"]);
   const assetSortOptions = createListCollection({
     items: [
       { label: translate("sortBy.newestFirst"), value: "-timestamp" },
@@ -80,7 +80,7 @@ export const AssetEvents = ({
           <HStack>
             <StateBadge colorPalette="brand" fontSize="md" variant="solid">
               <FiDatabase />
-              {data?.total_entries ?? " "}
+              {data?.total_entries.toLocaleString(i18n.language) ?? " "}
             </StateBadge>
             <Heading marginEnd="auto" size="md">
               {translate(titleKey ?? "common:assetEvent", { count: data?.total_entries ?? 0 })}

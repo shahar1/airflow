@@ -33,7 +33,7 @@ import { useDurationFormat } from "src/utils";
 
 export const Header = ({ taskInstance }: { readonly taskInstance: LightGridTaskInstanceSummary }) => {
   const { dagId = "", runId = "" } = useParams();
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { formatElapsed } = useDurationFormat();
   const entries: Array<{ key?: string; label: string; value: number | ReactNode | string }> = [];
   let taskCount: number = 0;
@@ -52,7 +52,7 @@ export const Header = ({ taskInstance }: { readonly taskInstance: LightGridTaskI
             height="10px"
             width="10px"
           />
-          {count}
+          {count.toLocaleString(i18n.language)}
         </HStack>
       ),
     });
@@ -89,7 +89,7 @@ export const Header = ({ taskInstance }: { readonly taskInstance: LightGridTaskI
       state={taskInstance.state}
       stats={stats}
       subTitle={<Time datetime={taskInstance.min_start_date} />}
-      title={`${taskInstance.task_display_name} [${taskCount}]`}
+      title={`${taskInstance.task_display_name} [${taskCount.toLocaleString(i18n.language)}]`}
       type="taskInstance"
     />
   );
