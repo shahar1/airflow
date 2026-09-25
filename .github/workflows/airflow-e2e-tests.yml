@@ -59,6 +59,11 @@ on:  # yamllint disable-line rule:truthy
 
   workflow_call:
     inputs:
+      runner-arch:
+        description: "Runner architecture label prefix (amd or arm)"
+        required: false
+        default: "amd"
+        type: string
       workflow-name:
         description: "Name of the test"
         type: string
