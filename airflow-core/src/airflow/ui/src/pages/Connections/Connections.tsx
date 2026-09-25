@@ -135,7 +135,7 @@ const getColumns = ({
 };
 
 export const Connections = () => {
-  const { t: translate } = useTranslation(["admin", "common"]);
+  const { i18n, t: translate } = useTranslation(["admin", "common"]);
 
   useDocumentTitle(translate("common:admin.Connections"));
 
@@ -217,7 +217,7 @@ export const Connections = () => {
       <ActionBar.Root closeOnInteractOutside={false} open={Boolean(selectedRows.size)}>
         <ActionBar.Content>
           <ActionBar.SelectionTrigger>
-            {selectedRows.size} {translate("deleteActions.selected")}
+            {selectedRows.size.toLocaleString(i18n.language)} {translate("deleteActions.selected")}
           </ActionBar.SelectionTrigger>
           <ActionBar.Separator />
           <Tooltip content={translate("deleteActions.tooltip")}>

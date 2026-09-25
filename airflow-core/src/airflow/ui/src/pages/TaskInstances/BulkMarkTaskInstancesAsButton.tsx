@@ -41,7 +41,7 @@ type Props = {
 };
 
 const BulkMarkTaskInstancesAsButton = ({ deselectKeys, selectedTaskInstances }: Props) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { onClose, onOpen, open } = useDisclosure();
   const [state, setState] = useState<TaskInstanceState>("success");
   const [selectedOptions, setSelectedOptions] = useState<Array<string>>([]);
@@ -113,7 +113,7 @@ const BulkMarkTaskInstancesAsButton = ({ deselectKeys, selectedTaskInstances }: 
                 <HStack justify="space-between" width="full">
                   <StateBadge state={menuState}>{translate(`common:states.${menuState}`)}</StateBadge>
                   <Badge colorPalette="gray" variant="subtle">
-                    {count}
+                    {count.toLocaleString(i18n.language)}
                   </Badge>
                 </HStack>
               </Menu.Item>

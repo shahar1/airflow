@@ -16,31 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Badge, Text } from "@chakra-ui/react";
-import { useTranslation } from "react-i18next";
+import "@testing-library/jest-dom";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
 
-type Props = {
-  readonly count: number | null;
-};
+import { Wrapper } from "src/utils/Wrapper";
 
-/**
- * An import-error count, flagged red only when there is something to flag.
- *
- * Null is not zero: it means the caller may not read import errors, so it renders as unknown
- * rather than as a clean bill of health.
- */
-export const ImportErrorCount = ({ count }: Props) => {
-  const { i18n } = useTranslation();
+import { ImportErrorCount } from "./ImportErrorCount";
 
-  if (count === null) {
-    return <Text color="fg.muted">-</Text>;
-  }
+describe("ImportErrorCount", () => {
+  it("groups thousands in the count", () => {
+    render(<ImportErrorCount count={1234} />, { wrapper: Wrapper });
 
-  return count === 0 ? (
-    <Text color="fg.muted">0</Text>
-  ) : (
-    <Badge colorPalette="failed" variant="solid">
-      {count.toLocaleString(i18n.language)}
-    </Badge>
-  );
-};
+    expect(screen.getByText("1,234")).toBeInTheDocument();
+  });
+});

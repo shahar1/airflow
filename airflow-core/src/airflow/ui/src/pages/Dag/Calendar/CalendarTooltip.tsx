@@ -39,7 +39,7 @@ const stateColorMap = {
 };
 
 export const CalendarTooltip = ({ cellData, viewMode = "total" }: Props) => {
-  const { t: translate } = useTranslation(["dag", "common"]);
+  const { i18n, t: translate } = useTranslation(["dag", "common"]);
 
   if (!cellData) {
     return undefined;
@@ -93,7 +93,7 @@ export const CalendarTooltip = ({ cellData, viewMode = "total" }: Props) => {
                 width={SQUARE_SIZE}
               />
               <Text fontSize="xs">
-                {count} {state}
+                {count.toLocaleString(i18n.language)} {state}
               </Text>
             </HStack>
           ))}

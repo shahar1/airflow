@@ -38,7 +38,7 @@ type Props = {
 };
 
 export const DagRunStateCounts = ({ compact = false, counts, dagId, isLoading, stateCountLimit }: Props) => {
-  const { t: translate } = useTranslation(["dags", "common"]);
+  const { i18n, t: translate } = useTranslation(["dags", "common"]);
   const gap = compact ? 0.5 : 1;
   const fontSize = compact ? "xs" : "sm";
 
@@ -62,7 +62,7 @@ export const DagRunStateCounts = ({ compact = false, counts, dagId, isLoading, s
     const count = counts[state] ?? 0;
     // A count that reached the API cap is only a lower bound; suffix it with "+".
     const isCapped = stateCountLimit !== undefined && count >= stateCountLimit;
-    const formattedCount = `${count}${isCapped ? "+" : ""}`;
+    const formattedCount = `${count.toLocaleString(i18n.language)}${isCapped ? "+" : ""}`;
 
     return {
       formattedCount,

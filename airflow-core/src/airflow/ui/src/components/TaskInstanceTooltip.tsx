@@ -45,7 +45,7 @@ type Props = {
 } & Omit<TooltipProps, "content">;
 
 const TaskInstanceTooltip = ({ children, positioning, runId, taskInstance, tooltip, ...rest }: Props) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { formatElapsed, renderDuration } = useDurationFormat();
 
   const hasTooltip = tooltip !== undefined && tooltip !== null;
@@ -148,7 +148,7 @@ const TaskInstanceTooltip = ({ children, positioning, runId, taskInstance, toolt
                         width="10px"
                       />
                       <Text fontSize="xs">
-                        {count} {translate(`common:states.${state}`)}
+                        {count.toLocaleString(i18n.language)} {translate(`common:states.${state}`)}
                       </Text>
                     </HStack>
                   ))}

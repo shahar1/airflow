@@ -32,26 +32,30 @@ type ListPopoverProps = {
   readonly noun: string;
 };
 
-const ListPopover = ({ items, noun }: ListPopoverProps) => (
-  // eslint-disable-next-line jsx-a11y/no-autofocus
-  <Popover.Root autoFocus={false} lazyMount unmountOnExit>
-    <Popover.Trigger asChild disabled={items.length === 0}>
-      <Button variant="outline">
-        {items.length} {noun}
-      </Button>
-    </Popover.Trigger>
-    <Popover.Content css={{ "--popover-bg": "colors.bg.emphasized" }} width="fit-content">
-      <Popover.Arrow />
-      <Popover.Body>
-        {items.map(({ key, label }) => (
-          <Text key={key} py={2}>
-            {label}
-          </Text>
-        ))}
-      </Popover.Body>
-    </Popover.Content>
-  </Popover.Root>
-);
+const ListPopover = ({ items, noun }: ListPopoverProps) => {
+  const { i18n } = useTranslation();
+
+  return (
+    // eslint-disable-next-line jsx-a11y/no-autofocus
+    <Popover.Root autoFocus={false} lazyMount unmountOnExit>
+      <Popover.Trigger asChild disabled={items.length === 0}>
+        <Button variant="outline">
+          {items.length.toLocaleString(i18n.language)} {noun}
+        </Button>
+      </Popover.Trigger>
+      <Popover.Content css={{ "--popover-bg": "colors.bg.emphasized" }} width="fit-content">
+        <Popover.Arrow />
+        <Popover.Body>
+          {items.map(({ key, label }) => (
+            <Text key={key} py={2}>
+              {label}
+            </Text>
+          ))}
+        </Popover.Body>
+      </Popover.Content>
+    </Popover.Root>
+  );
+};
 
 export const AliasesPopover = ({ aliases }: { readonly aliases: Array<AssetAliasResponse> }) => {
   const { t: translate } = useTranslation("assets");

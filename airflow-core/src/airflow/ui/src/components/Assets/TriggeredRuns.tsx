@@ -36,7 +36,7 @@ const DagRunGroup = ({
   readonly dagRuns: Array<DagRunAssetReference>;
   readonly prefix: string;
 }) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
 
   return dagRuns.length === 1 ? (
     <Flex flexWrap="wrap" gap={1}>
@@ -51,7 +51,7 @@ const DagRunGroup = ({
     <Popover.Root autoFocus={false} lazyMount unmountOnExit>
       <Popover.Trigger asChild>
         <Button variant="outline">
-          {`${dagRuns.length} ${prefix} ${translate("dagRun_other", { count: dagRuns.length })}`}
+          {`${dagRuns.length.toLocaleString(i18n.language)} ${prefix} ${translate("dagRun_other", { count: dagRuns.length })}`}
         </Button>
       </Popover.Trigger>
       <Popover.Content css={{ "--popover-bg": "colors.bg.emphasized" }} width="fit-content">

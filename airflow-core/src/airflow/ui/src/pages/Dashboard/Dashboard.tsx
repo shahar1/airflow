@@ -48,7 +48,7 @@ const defaultHour = "24";
 
 export const Dashboard = () => {
   const alerts = useConfig("dashboard_alert") as Array<UIAlert>;
-  const { t: translate } = useTranslation("dashboard");
+  const { i18n, t: translate } = useTranslation("dashboard");
 
   useDocumentTitle(translate("common:nav.home"));
 
@@ -106,7 +106,7 @@ export const Dashboard = () => {
                   <IconButton
                     aria-label={
                       isCollapsed
-                        ? `Show ${restAlerts.length} more alert${restAlerts.length === 1 ? "" : "s"}`
+                        ? `Show ${restAlerts.length.toLocaleString(i18n.language)} more alert${restAlerts.length === 1 ? "" : "s"}`
                         : "Show fewer alerts"
                     }
                     onClick={() => setIsCollapsed((previous) => !previous)}

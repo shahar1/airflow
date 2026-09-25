@@ -33,7 +33,7 @@ type Props = {
 };
 
 export const NeedsReviewBadge = ({ pendingActions }: Props) => {
-  const { t: translate } = useTranslation("hitl");
+  const { i18n, t: translate } = useTranslation("hitl");
   const { onClose, onOpen, open } = useDisclosure();
 
   if (pendingActions.length === 0) {
@@ -46,7 +46,7 @@ export const NeedsReviewBadge = ({ pendingActions }: Props) => {
         <Button data-testid="needs-review-badge" onClick={onOpen} variant="plain">
           <StateBadge colorPalette="awaiting_input" fontSize="md" variant="solid">
             <LuUserRoundPen />
-            {pendingActions.length}
+            {pendingActions.length.toLocaleString(i18n.language)}
           </StateBadge>
         </Button>
       </Tooltip>

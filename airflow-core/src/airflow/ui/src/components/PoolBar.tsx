@@ -40,7 +40,7 @@ export const PoolBar = ({
   readonly poolsWithSlotType?: Slots;
   readonly totalSlots: number;
 }) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
 
   const isUnlimited = totalSlots === UNLIMITED_SLOTS;
   const isDashboard = Boolean(poolsWithSlotType);
@@ -100,7 +100,7 @@ export const PoolBar = ({
               >
                 {slot.icon}
                 <Text fontSize="xs" fontWeight="bold" truncate>
-                  {slot.slotValue === Infinity ? "∞" : slot.slotValue}
+                  {slot.slotValue === Infinity ? "∞" : slot.slotValue.toLocaleString(i18n.language)}
                 </Text>
               </Flex>
             </Tooltip>
@@ -129,7 +129,7 @@ export const PoolBar = ({
             <HStack gap={1} key={slot.key}>
               <StateIcon size={12} state={slot.slotType as TaskInstanceState} />
               <Text color="fg.muted" fontSize="xs" fontWeight="medium">
-                {slot.label}: {slot.slotValue}
+                {slot.label}: {slot.slotValue.toLocaleString(i18n.language)}
               </Text>
             </HStack>
           ))}

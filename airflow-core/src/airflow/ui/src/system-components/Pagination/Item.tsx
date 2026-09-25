@@ -20,6 +20,7 @@ import { forwardRef } from "react";
 
 import type { ButtonProps } from "@chakra-ui/react";
 import { Button, Pagination as ChakraPagination, usePaginationContext } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 
 import { paginationContext } from "./context";
 
@@ -33,6 +34,7 @@ export type PaginationRootProps = {
 } & Omit<ChakraPagination.RootProps, "type">;
 
 export const Item = forwardRef<HTMLButtonElement, ChakraPagination.ItemProps>((props, ref) => {
+  const { i18n } = useTranslation();
   const { page } = usePaginationContext();
   const { size, variantMap } = useRootProps();
 
@@ -42,7 +44,7 @@ export const Item = forwardRef<HTMLButtonElement, ChakraPagination.ItemProps>((p
   return (
     <ChakraPagination.Item ref={ref} {...props} asChild>
       <Button size={size} variant={variant}>
-        {props.value}
+        {props.value.toLocaleString(i18n.language)}
       </Button>
     </ChakraPagination.Item>
   );

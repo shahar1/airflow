@@ -62,7 +62,7 @@ export const PluginImportErrors = ({ iconOnly = false }: { readonly iconOnly?: b
           title={translate("plugins.importError", { count: importErrorsCount })}
         >
           <LuPlug size={8} />
-          {importErrorsCount}
+          {importErrorsCount.toLocaleString(i18n.language)}
         </StateBadge>
       ) : (
         <StatsCard

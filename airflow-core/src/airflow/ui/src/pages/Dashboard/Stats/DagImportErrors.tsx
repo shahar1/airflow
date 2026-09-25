@@ -58,7 +58,7 @@ export const DagImportErrors = ({ iconOnly = false }: { readonly iconOnly?: bool
           title={translate("importErrors.dagImportError", { count: importErrorsCount })}
         >
           <LuFileWarning size={8} />
-          {importErrorsCount}
+          {importErrorsCount.toLocaleString(i18n.language)}
         </StateBadge>
       ) : (
         <StatsCard

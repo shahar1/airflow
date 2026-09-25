@@ -36,7 +36,7 @@ type Props = {
 };
 
 const BulkDeleteTaskInstancesButton = ({ deselectKeys, selectedTaskInstances }: Props) => {
-  const { t: translate } = useTranslation();
+  const { i18n, t: translate } = useTranslation();
   const { onClose, onOpen, open } = useDisclosure();
   const { bulkAction, data, error, isPending } = useBulkTaskInstances({
     deselectKeys,
@@ -111,7 +111,7 @@ const BulkDeleteTaskInstancesButton = ({ deselectKeys, selectedTaskInstances }: 
                     <Text fontSize="sm" fontWeight="semibold">
                       {translate("runId")}: {runId}{" "}
                       <Text as="span" color="fg.subtle" fontWeight="normal">
-                        ({tis.length})
+                        ({tis.length.toLocaleString(i18n.language)})
                       </Text>
                     </Text>
                   </Accordion.ItemTrigger>

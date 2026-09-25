@@ -17,6 +17,7 @@
  * under the License.
  */
 import { Box, HStack, Text } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 import { FiDatabase } from "react-icons/fi";
 import { PiRectangleDashed } from "react-icons/pi";
 
@@ -39,6 +40,7 @@ export const AssetNode = ({
   readonly asset: AssetExpressionAlias | AssetExpressionAsset;
   readonly event?: NextRunAssetEventResponse;
 }) => {
+  const { i18n } = useTranslation();
   const isFullyReceived = Boolean(event?.last_update);
   const isPartial =
     !isFullyReceived &&
@@ -90,7 +92,8 @@ export const AssetNode = ({
         </Text>
       ) : isPartial ? (
         <Text color="warning.fg" fontSize="sm">
-          {event?.received_count} / {event?.required_count}
+          {event?.received_count?.toLocaleString(i18n.language)} /{" "}
+          {event?.required_count?.toLocaleString(i18n.language)}
         </Text>
       ) : undefined}
     </Box>
