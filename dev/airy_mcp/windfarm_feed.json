@@ -1,0 +1,14 @@
+{
+  "site": "Clyde Moor Wind Farm",
+  "export_date": "30/09/2026",
+  "readings": [
+    {"turbine": "WTG-01", "energy_mwh": 41.3, "avg_wind_ms": 10.8},
+    {"turbine": "WTG-02", "energy_mwh": 39.7, "avg_wind_ms": 10.5},
+    {"turbine": "WTG-03", "energy_mwh": 43.9, "avg_wind_ms": 11.2},
+    {"turbine": "WTG-04", "energy_mwh": 38.2, "avg_wind_ms": 10.3},
+    {"turbine": "WTG-05", "energy_mwh": 12.6, "avg_wind_ms": 10.9},
+    {"turbine": "WTG-06", "energy_mwh": 48.1, "avg_wind_ms": 11.4},
+    {"turbine": "WTG-07", "energy_mwh": 50.4, "avg_wind_ms": 11.7},
+    {"turbine": "WTG-08", "energy_mwh": 46.8, "avg_wind_ms": 11.1}
+  ]
+}

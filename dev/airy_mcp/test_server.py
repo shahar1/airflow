@@ -139,6 +139,8 @@ class FakeAirflow:
         self.omit_failure_scan_total: bool = False
         self.assets: list[dict] = []
         self.bump_version_on_reparse = True
+        # A code-only change: Airflow updates the parsed source but mints no version.
+        self.source_follows_disk = False
         self.fail_reparse: Exception | None = None
         self.reparse_status = 0
         self.tasks: list[dict] = []
@@ -362,8 +364,8 @@ class FakeAirflow:
                 raise self.fail_reparse
             if self.bump_version_on_reparse:
                 self.version += 1
-                if self.dags_dir is not None:
-                    self.parsed_source = (self.dags_dir / "sales_summary.py").read_text()
+            if (self.bump_version_on_reparse or self.source_follows_disk) and self.dags_dir is not None:
+                self.parsed_source = (self.dags_dir / "sales_summary.py").read_text()
             return None
         if path == f"/dags/{DAG_ID}/dagRuns":
             if method == "POST":
@@ -1673,9 +1675,9 @@ def test_a_reparsed_dag_that_lost_a_task_the_change_never_mentioned_is_put_back(
 
     original_reparse = codechange._force_reparse
 
-    def _reparse(dag_id, file_token, previous):
+    def _reparse(dag_id, file_token, previous, **kwargs):
         _lose_report()
-        return original_reparse(dag_id, file_token, previous)
+        return original_reparse(dag_id, file_token, previous, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(codechange, "_force_reparse", _reparse)
@@ -1736,6 +1738,22 @@ def test_a_clean_apply_says_which_post_write_checks_actually_answered(airflow, t
     assert result["applied"] is True
     assert result["post_write_checks"] == {"imports": "clean", "task_graph": "as predicted"}
     assert result["post_write_checks_unread"] == []
+
+
+def test_apply_dag_code_changes_lands_a_source_only_change_without_a_new_version(airflow):
+    """A change that leaves the serialized Dag identical mints no new version, and must not
+    wait out the timeout for one: the parsed source carrying the written bytes is the landing."""
+    airflow.bump_version_on_reparse = False
+    airflow.source_follows_disk = True
+    result = _apply(('"column": "ammount"', '"column": "amount"'))
+
+    assert result["applied"] is True
+    assert result["reparse"] == (
+        "reparsed — Dag version 1 unchanged: the serialized Dag is the same, "
+        "so Airflow updated the source of version 1 in place"
+    )
+    # The Code view shows the rewritten source only after a refetch.
+    assert result["ui_updates"] == [{"kind": "dag_definition", "dag_id": DAG_ID, "version_number": 1}]
 
 
 def test_apply_dag_code_changes_reports_a_reparse_that_never_lands(airflow):
@@ -10845,6 +10863,7 @@ _NOT_THE_SERVER = {
     "demo_dag.py": "a Dag the demo loads; an input to the server, not part of it",
     "incident_digest_dag.py": "a Dag the demo loads; an input to the server, not part of it",
     "incident_triage_dag.py": "a Dag the demo loads; an input to the server, not part of it",
+    "windfarm_daily_report.py": "a Dag the demo loads; an input to the server, not part of it",
 }
 
 
@@ -16481,8 +16500,15 @@ def _spellings_the_httpx_layer_misses(tmp_path, monkeypatch):
                 for (owner, name), real in _REAL_HTTPX_SEND.items():
                     patch.setattr(owner, name, real)
 
-                def counted(self, request, *args, _real=_REAL_HTTPX_SEND[(httpx.Client, "send")], **kwargs):
-                    reached.append(request)
+                def counted(
+                    self,
+                    request,
+                    *args,
+                    _real=_REAL_HTTPX_SEND[(httpx.Client, "send")],
+                    _reached=reached,
+                    **kwargs,
+                ):
+                    _reached.append(request)
                     return _real(self, request, *args, **kwargs)
 
                 patch.setattr(httpx.Client, "send", counted)
@@ -18007,9 +18033,9 @@ def test_matrix_A6_a_reparsed_graph_that_differs_unexpectedly_is_put_back(airflo
     airflow.tasks = DEMO_TASKS
     original_reparse = codechange._force_reparse
 
-    def _reparse(dag_id, file_token, previous):
+    def _reparse(dag_id, file_token, previous, **kwargs):
         airflow.tasks = [task for task in DEMO_TASKS if task["task_id"] != "report"]
-        return original_reparse(dag_id, file_token, previous)
+        return original_reparse(dag_id, file_token, previous, **kwargs)
 
     _OBSERVED_WRITES.clear()
     with pytest.MonkeyPatch.context() as patch:

@@ -320,7 +320,11 @@ source.  Propose them one at a time and let the user answer each.
    `plan_dag_code_changes` call carrying *every* fix, followed by exactly ONE
    `apply_dag_code_changes`.  Base every `old` string on the source a tool
    returned in this conversation — call `diagnose_dag` first if you have not
-   seen the current source; never reconstruct code from memory or logs.  Never split fixes for the same Dag into separate
+   seen the current source; never reconstruct code from memory or logs.  Tool
+   results are not carried between messages: when a message asks for a change,
+   read the source again in that same message before planning, even if you
+   diagnosed the Dag earlier, and copy `old` character for character from the
+   `source` it returns.  Never split fixes for the same Dag into separate
    plans or applies — a second plan made after the first one lands was computed
    against source that no longer exists, and the second apply is refused.  If a
    plan or apply is refused because the source moved or a plan already exists,

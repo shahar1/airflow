@@ -25,6 +25,7 @@
   - [Withdrawn: the broad recovery surface](#withdrawn-the-broad-recovery-surface)
   - [Setup (Breeze)](#setup-breeze)
   - [Showcase: incident_triage and incident_digest](#showcase-incident_triage-and-incident_digest)
+  - [Showcase: windfarm_daily_report (Community over Code 2026)](#showcase-windfarm_daily_report-community-over-code-2026)
   - [Demo run-book](#demo-run-book)
   - [Deliberate shortcuts](#deliberate-shortcuts)
   - [Tests](#tests)
@@ -247,6 +248,35 @@ fails loudly, and its error names the record and both recoveries:
 2. **Fix the feed and re-run** — `plan`/`apply_dag_code_changes` replacing the
    malformed literal with a parseable timestamp, then `rerun_dag` for the
    replacement run.
+
+## Showcase: windfarm_daily_report (Community over Code 2026)
+
+The five-minute "analyze and fix an actual failure" demo. `windfarm_daily_report`
+reads yesterday's turbine readings from `windfarm_feed.json` next to the Dag
+file, computes each turbine's capacity factor, and publishes the daily report
+for the grid operator. The feed now stamps its day as `30/09/2026`; the Dag
+still parses it with `"%Y-%m-%d"`, so `publish_grid_report` fails
+with `ValueError: time data '30/09/2026' does not match format '%Y-%m-%d'` and
+the report never goes out. Two green tasks, one red.
+
+The fix is a one-token change inside the task body, which leaves the
+serialized Dag untouched — and Airflow mints **no new Dag version** for that
+(`SerializedDagModel.write_dag` compares the serialized hash and updates the
+latest version's source in place). `apply_dag_code_changes` used to wait out
+its full 45 s reparse timeout on exactly this case; `_force_reparse` now also
+treats "the parsed source is the bytes we wrote" as the reparse landing, so a
+code-only fix reports `Dag version N unchanged … updated in place` within a
+second or two. Workers read the file from the bundle, so the replacement run
+executes the fixed code either way.
+
+Stage it: copy both files into the bundle, unpause, trigger once. Fix it from
+the drawer: *"Read the current Dag source, then make the smallest change that
+makes it accept the feed's new date format (30/09/2026). Show me the diff
+before anything is written."* — then *"Now trigger one replacement run."* and
+*"Did the replacement run publish the grid report?"*. Asking the model to read
+the source first matters: the drawer carries text history only, and a small
+model that plans from memory spells the `old` string wrong; the plan refusal
+now names the closest real line so the retry copies it verbatim.
 
 ## Demo run-book
 

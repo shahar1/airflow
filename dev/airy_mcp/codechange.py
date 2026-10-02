@@ -238,7 +238,9 @@ def revert_dag_code(
         backup.unlink()
     version_after = version_before_write
     try:
-        reparse, version_after = _force_reparse(dag_id, dag["file_token"], version_before_write)
+        reparse, version_after = _force_reparse(
+            dag_id, dag["file_token"], version_before_write, expected_source=original
+        )
     except Exception as e:  # the restore already landed; never raise past it
         reparse = f"file restored, but the reparse request failed: {_explain_error(e)}"
     return {
@@ -247,7 +249,9 @@ def revert_dag_code(
         "file": str(path),
         "diff": _build_revert_diff(path, current, original),
         "reparse": reparse,
-        **_definition_updates(dag_id, version_before_write, version_after),
+        **_definition_updates(
+            dag_id, version_before_write, version_after, landed=reparse.startswith("reparsed")
+        ),
     }
 
 
@@ -627,7 +631,9 @@ def apply_dag_code_changes(
     )
     version_after = version_before_write
     try:
-        reparse, version_after = _force_reparse(dag_id, dag["file_token"], version_before_write)
+        reparse, version_after = _force_reparse(
+            dag_id, dag["file_token"], version_before_write, expected_source=patched
+        )
     except Exception as e:  # the write already landed; never raise past it
         reparse = f"file patched, but the reparse request failed: {_explain_error(e)}"
     # Only NOW is there anything to check: a compile in memory says the bytes are
@@ -674,7 +680,9 @@ def apply_dag_code_changes(
             )
         ),
         **({"warning": backup_failure} if backup_failure else {}),
-        **_definition_updates(dag_id, version_before_write, version_after),
+        **_definition_updates(
+            dag_id, version_before_write, version_after, landed=reparse.startswith("reparsed")
+        ),
     }
 
 

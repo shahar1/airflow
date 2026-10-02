@@ -190,7 +190,9 @@ def _read_reviewed_file(dag_id: str, path: Path, source_digest: str | None = Non
     return on_disk
 
 
-def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -> tuple[str, int | None]:
+def _force_reparse(
+    dag_id: str, file_token: str, previous_version: int | None, expected_source: str | None = None
+) -> tuple[str, int | None]:
     """Ask the Dag processor to re-read the file *now*, and wait for it to land.
 
     Deliberately the opposite of disabling the processor: ``/files/dags`` is a
@@ -212,6 +214,16 @@ def _force_reparse(dag_id: str, file_token: str, previous_version: int | None) -
         current = _latest_version(dag_id)
         if current != previous_version:
             return f"reparsed — Dag version {previous_version} → {current}", current
+        # A change that leaves the serialized Dag identical mints no new version:
+        # Airflow rewrites the latest version's source in place instead
+        # (SerializedDagModel.write_dag). The parsed source carrying the written
+        # bytes is the landing to wait for there, not a number that will not move.
+        if expected_source is not None and _parsed_source(dag_id) == expected_source:
+            return (
+                f"reparsed — Dag version {previous_version} unchanged: the serialized Dag is the same, "
+                f"so Airflow updated the source of version {previous_version} in place",
+                previous_version,
+            )
     return (
         f"reparse requested, but the Dag version did not change within {REPARSE_TIMEOUT_S:g}s",
         previous_version,
@@ -421,14 +433,18 @@ def _downstream_task_ids(task_id: str, edges: dict[str, list[str]]) -> list[str]
     return sorted(reached)
 
 
-def _definition_updates(dag_id: str, before: int | None, after: int | None) -> dict[str, Any]:
+def _definition_updates(
+    dag_id: str, before: int | None, after: int | None, landed: bool = False
+) -> dict[str, Any]:
     """The UI refresh a landed source change earns — and only once it has landed.
 
     A write whose reparse has not produced a new version yet has not changed
     anything the Graph or Code view shows, so refreshing them would only promise
-    the user that what they are looking at is current.
+    the user that what they are looking at is current. ``landed`` is the other
+    way a change lands: the version number stays and Airflow rewrote its source
+    in place, which the Code view shows only after a refetch.
     """
-    if after is None or after == before:
+    if after is None or (after == before and not landed):
         return {"ui_updates": []}
     return {"ui_updates": [{"kind": "dag_definition", "dag_id": dag_id, "version_number": after}]}
 
@@ -448,6 +464,34 @@ def _normalized_changes(changes: Any) -> list[tuple[str, str]] | None:
     return pairs
 
 
+def _closest_line(source: str, snippet: str) -> str | None:
+    """The source line sharing the most tokens with ``snippet``, or ``None`` if none share any.
+
+    Token overlap first, then similarity: a plain ratio over whole lines favours
+    short lines, and ``report = {`` is not what a misspelt ``date_format = ...`` meant.
+    """
+    tokens = set(re.findall(r"[\w%/-]+", snippet))
+    lines = [line.strip() for line in source.splitlines() if line.strip()]
+    if not tokens or not lines:
+        return None
+
+    def score(line: str) -> tuple[int, float]:
+        shared = len(tokens & set(re.findall(r"[\w%/-]+", line)))
+        return shared, difflib.SequenceMatcher(None, snippet.strip(), line).ratio()
+
+    best = max(lines, key=score)
+    return best if score(best)[0] else None
+
+
+def _absent(old: str, closest: str | None) -> str:
+    hint = (
+        f"; the closest line in the current source is {closest!r} - copy `old` verbatim from the source"
+        if closest
+        else ""
+    )
+    return f"{old!r} appears 0 times at the point it is applied; it must appear exactly once{hint}"
+
+
 def _patch(source: str, pairs: list[tuple[str, str]]) -> tuple[str | None, str | None]:
     """Apply every replacement in order, or explain which one cannot be trusted.
 
@@ -456,6 +500,13 @@ def _patch(source: str, pairs: list[tuple[str, str]]) -> tuple[str | None, str |
     otherwise pass a batch preflight and then hit a file the first edit changed.
     """
     patched = source
+    # A small model spells `old` from memory - single quotes for double, spaces
+    # around `=` the file does not have - and a plan of several changes usually
+    # has one real line among the invented ones. Every absent snippet is named
+    # with the nearest real line, so one refusal is enough to copy from.
+    missing = [old for old, _ in pairs if old not in patched]
+    if missing:
+        return None, "; also: ".join(_absent(old, _closest_line(patched, old)) for old in missing)
     for old, new in pairs:
         occurrences = patched.count(old)
         if occurrences != 1:
