@@ -1,8 +1,10 @@
 aarch
 abc
+AbstractCapability
 AbstractFileSystem
 AbstractToolset
 accessor
+accessors
 AccessSecretVersionResponse
 aci
 Ack
@@ -15,6 +17,7 @@ actionCard
 Acyclic
 acyclic
 adb
+adbc
 additionalProperties
 adf
 adhoc
@@ -51,6 +54,7 @@ alibaba
 alibabacloud
 allAuthenticatedUsers
 allowlist
+allowlists
 allUsers
 alphanumerics
 amazonaws
@@ -175,7 +179,9 @@ baseoperatorlink
 BaseView
 BaseXCom
 bashrc
+BatchClient
 batchGet
+BatchNodeState
 BatchServiceClient
 bc
 bcc
@@ -238,6 +244,7 @@ chatbot
 chatbots
 CheckOperator
 checkpointed
+checkpointing
 checksums
 childs
 chmod
@@ -312,6 +319,7 @@ containerConfiguration
 containerd
 ContainerGroup
 containerinstance
+containerised
 ContainerPort
 contentUrl
 contextmgr
@@ -319,6 +327,7 @@ contrib
 convertToIri
 cooldown
 copyable
+coreutils
 CoreV
 coroutine
 cosmosdb
@@ -391,6 +400,8 @@ dataframes
 DataFusion
 Datafusion
 datafusion
+Datagram
+datagram
 Datalake
 datamodel
 Datanodes
@@ -461,9 +472,11 @@ deliverability
 deltalake
 denylist
 dep
+dependant
 DependencyMixin
 Deprecations
 deprecations
+deprioritize
 deps
 deques
 deregister
@@ -478,6 +491,8 @@ deserializer
 deserializes
 deserializing
 dest
+destructures
+destructuring
 dev
 devel
 DevOps
@@ -618,6 +633,7 @@ ExaConnection
 Exasol
 exasol
 exc
+execd
 executables
 exitcode
 expanduser
@@ -760,6 +776,7 @@ gsuite
 gte
 Gunicorn
 gunicorn
+gVisor
 gz
 Gzip
 gzipped
@@ -787,6 +804,7 @@ hiveserver
 hmsclient
 hoc
 homebrew
+honoured
 hookimpl
 hookspec
 HostAliases
@@ -903,6 +921,7 @@ jdk
 jenkins
 JenkinsRequest
 Jetson
+Jev
 Jiajie
 Jinja
 jinja
@@ -930,6 +949,7 @@ Json
 json
 jsonl
 JsonValue
+jti
 juli
 Jupyter
 jupyter
@@ -940,6 +960,7 @@ jwt
 Kafka
 kafka
 Kamil
+Kata
 KEDA
 keepalive
 keepalives
@@ -1027,6 +1048,7 @@ logstash
 longblob
 lookups
 loopback
+lowercased
 lshift
 lte
 lxml
@@ -1069,15 +1091,19 @@ metastore
 metavar
 mget
 mgmt
+MiB
 microservice
 microservices
 microsoft
+microVM
+microVMs
 middleware
 middlewares
 midnights
 milli
 millis
 milton
+minification
 minikube
 misconfiguration
 misconfigured
@@ -1146,6 +1172,8 @@ nohup
 nonnegative
 nonterminal
 noqa
+Normalised
+normalised
 normalizer
 NotFound
 notificationChannels
@@ -1189,6 +1217,7 @@ openfaas
 OpenID
 openjdk
 openlineage
+opensandbox
 OpenSearch
 opensearch
 OpenTelemetry
@@ -1313,6 +1342,7 @@ pretify
 prev
 Proc
 proc
+procfs
 productionalize
 ProductSearchClient
 profiler
@@ -1327,6 +1357,7 @@ protobuf
 provisioner
 proxied
 proxies
+proxying
 psql
 psrp
 psycopg
@@ -1360,6 +1391,7 @@ pyproject
 pypsrp
 pyspark
 pytest
+PythonAgentTool
 pythonic
 PythonOperator
 pythonpath
@@ -1396,6 +1428,7 @@ ReadOnlyCredentials
 readthedocs
 Realtime
 realtime
+rebalance
 rebase
 Rebasing
 Recency
@@ -1421,6 +1454,7 @@ renderers
 renewer
 reparse
 reparsed
+reparsing
 replicaSet
 repo
 repos
@@ -1431,6 +1465,8 @@ requeue
 requeued
 requeues
 requeuing
+rerank
+reranking
 reserialize
 Reserializing
 resetdb
@@ -1464,6 +1500,7 @@ rtype
 ru
 ruleset
 runAsUser
+RunContext
 runnable
 RunQueryOperator
 RunQuerySensor
@@ -1485,6 +1522,7 @@ sanitization
 sas
 Sasl
 sasl
+sbx
 scala
 scalability
 scalable
@@ -1518,6 +1556,7 @@ sendgrid
 sentimentMax
 ser
 serde
+serialisation
 serialise
 serializable
 SerializedDAG
@@ -1554,6 +1593,7 @@ SlackHook
 SlackResponse
 slas
 smtp
+SNI
 SnowflakeHook
 Snowpark
 snowpark
@@ -1586,6 +1626,7 @@ Splunk
 Sql
 sql
 sqla
+sqladmin
 Sqlalchemy
 sqlalchemy
 sqlglot
@@ -1611,6 +1652,7 @@ Stackdriver
 stackdriver
 stacklevel
 stacktrace
+Starlette
 starttls
 stateful
 StatefulSet
@@ -1815,6 +1857,7 @@ uncompress
 undeploy
 undeployed
 Undeploys
+unescaped
 unicode
 unicodecsv
 unindent
@@ -1882,6 +1925,7 @@ Vertica
 vertica
 Vespa
 vespa
+Vianet
 videointelligence
 views
 virtualenv
@@ -1912,6 +1956,7 @@ webpage
 Webserver
 webserver
 webservers
+webViewLink
 Werkzeug
 werkzeug
 whitespace
