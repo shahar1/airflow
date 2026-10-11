@@ -154,6 +154,31 @@ class SerializedKwargsTrigger(BaseTrigger):
         yield TriggerEvent(True)
 
 
+class SlowShutdownTrigger(BaseTrigger):
+    """Never fires; on_kill() and cleanup() each take ``delay`` seconds and record whether they finished."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.on_kill_done = False
+        self.cleanup_done = False
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        return ("tests.unit.jobs.test_triggerer_job.SlowShutdownTrigger", {"delay": self.delay})
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        await asyncio.Event().wait()
+        yield TriggerEvent(True)  # pragma: no cover
+
+    async def on_kill(self) -> None:
+        await asyncio.sleep(self.delay)
+        self.on_kill_done = True
+
+    async def cleanup(self) -> None:
+        await asyncio.sleep(self.delay)
+        self.cleanup_done = True
+
+
 @pytest.fixture(autouse=True)
 def _force_bare_fork(monkeypatch):
     """
@@ -1566,6 +1591,61 @@ class TestTriggerRunner:
         reassigned_task.cancel.assert_called_once_with(_REASSIGNED_CANCEL_MSG)
         assert not trigger_runner.to_cancel
         assert not trigger_runner.to_release
+
+    @pytest.mark.asyncio
+    async def test_cancel_triggers_applies_resent_cancel_once_and_only_once(self) -> None:
+        """
+        The supervisor re-sends a cancelled id on every heartbeat until the runner reports it finished.
+
+        A cancel that arrives before the trigger task exists must still land on a later pass, but once
+        it has been applied the following re-sends must not cancel the task again.
+        """
+        trigger_runner = TriggerRunner()
+        trigger_runner.to_cancel.append(1)
+        await trigger_runner.cancel_triggers()
+
+        task = MagicMock(spec=asyncio.Task)
+        trigger_runner.triggers = {1: {"task": task, "is_watcher": False, "name": "late", "events": 0}}
+        trigger_runner.to_cancel.append(1)
+        await trigger_runner.cancel_triggers()
+        trigger_runner.to_cancel.append(1)
+        trigger_runner.to_release.append(1)
+        await trigger_runner.cancel_triggers()
+
+        task.cancel.assert_called_once_with(_USER_ACTION_CANCEL_MSG)
+        assert trigger_runner.triggers[1]["cancel_requested"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queue_name", "expect_on_kill"),
+        [
+            pytest.param("to_cancel", True, id="user-action-cancel-during-on_kill"),
+            pytest.param("to_release", False, id="reassign-release-during-cleanup"),
+        ],
+    )
+    async def test_cancel_triggers_resent_cancel_does_not_interrupt_on_kill_or_cleanup(
+        self, queue_name, expect_on_kill
+    ) -> None:
+        trigger_runner = TriggerRunner()
+        trigger = SlowShutdownTrigger(delay=0.2)
+        task = asyncio.create_task(trigger_runner.run_trigger(1, trigger))
+        trigger_runner.triggers = {1: {"task": task, "is_watcher": False, "name": "slow", "events": 0}}
+        queue = getattr(trigger_runner, queue_name)
+        # Let run_trigger() reach the await inside trigger.run() before cancelling.
+        await asyncio.sleep(0.05)
+
+        queue.append(1)
+        await trigger_runner.cancel_triggers()
+        # The first cancel has landed and on_kill() (user action) or cleanup() (release) is mid-sleep
+        # when the supervisor re-sends the same id on its next heartbeat.
+        await asyncio.sleep(0.1)
+        queue.append(1)
+        await trigger_runner.cancel_triggers()
+        await asyncio.wait([task])
+
+        assert task.cancelled()
+        assert trigger.on_kill_done is expect_on_kill
+        assert trigger.cleanup_done is True
 
     @pytest.mark.asyncio
     async def test_sync_state_to_supervisor_queues_released_triggers(self) -> None:
