@@ -1735,14 +1735,9 @@ class TriggerRunner:
                     event_stream = trigger.run()
 
                 async for event in event_stream:
-                    # Avoid logging the full payload at INFO — it may contain sensitive data and
-                    # inflate log storage on every execution. DEBUG is used instead so developers
-                    # can still inspect the payload when needed without cluttering production logs.
-                    await self.log.ainfo("Trigger fired event", name=self.triggers[trigger_id]["name"])
-                    await self.log.adebug(
-                        "Trigger fired event payload", name=self.triggers[trigger_id]["name"], result=event
-                    )
-
+                    # Queue the event before any await: a cancel (reassignment, shutdown) landing
+                    # in the log calls below would otherwise drop an event the trigger already
+                    # produced, and consuming triggers commit before they yield.
                     self.triggers[trigger_id]["events"] += 1
                     seq: int | None = None
                     if shared_key is not None:
@@ -1751,6 +1746,14 @@ class TriggerRunner:
                         # event bound but not yet queued (or vice versa).
                         seq = self._shared_streams.bind_pending_event(trigger_id=trigger_id, key=shared_key)
                     self.events.append(TriggerEventEntry(trigger_id=trigger_id, event=event, persist_seq=seq))
+
+                    # Avoid logging the full payload at INFO — it may contain sensitive data and
+                    # inflate log storage on every execution. DEBUG is used instead so developers
+                    # can still inspect the payload when needed without cluttering production logs.
+                    await self.log.ainfo("Trigger fired event", name=self.triggers[trigger_id]["name"])
+                    await self.log.adebug(
+                        "Trigger fired event payload", name=self.triggers[trigger_id]["name"], result=event
+                    )
                 span.set_status(Status(StatusCode.OK))
             except asyncio.CancelledError as e:
                 # A trigger can be cancelled for three reasons:
