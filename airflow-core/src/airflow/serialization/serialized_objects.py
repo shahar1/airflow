@@ -1935,6 +1935,17 @@ class DagSerialization(BaseSerialization):
         for t in dag.task_dict.values():
             OperatorSerialization.set_task_dag_references(t, dag)
 
+        # AIP-106 Phase 1 prototype: precompute, once per Dag version, which direct upstreams of each
+        # task carry a success_threshold. Skipped entirely for Dags without the field.
+        thresholded = {
+            t.task_id for t in dag.task_dict.values() if getattr(t, "success_threshold", None) is not None
+        }
+        if thresholded:
+            for t in dag.task_dict.values():
+                ids = frozenset(t.upstream_task_ids & thresholded)
+                if ids:
+                    t.thresholded_upstream_ids = ids
+
         return dag
 
     @classmethod

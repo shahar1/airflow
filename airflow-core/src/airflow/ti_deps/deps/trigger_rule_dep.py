@@ -78,6 +78,38 @@ class _UpstreamTIStates(NamedTuple):
             counter.update(curr_state)
             if ti.task.is_setup:
                 setup_counter.update(curr_state)
+        return cls._from_counters(counter, setup_counter)
+
+    @classmethod
+    def calculate_split(
+        cls, finished_upstreams: Iterator[TaskInstance], thresholded_ids: frozenset[str]
+    ) -> tuple[_UpstreamTIStates, dict[str, Counter[str]]]:
+        """
+        Tally like ``calculate`` but keep thresholded upstreams' instances per task id (AIP-106 prototype).
+
+        Second loop body, selected once per evaluation; the global counters exclude those instances.
+        """
+        counter: Counter[str] = Counter()
+        setup_counter: Counter[str] = Counter()
+        per_task: dict[str, Counter[str]] = {}
+        for ti in finished_upstreams:
+            if TYPE_CHECKING:
+                assert ti.task
+                assert ti.state
+            if ti.task_id in thresholded_ids:
+                c = per_task.get(ti.task_id)
+                if c is None:
+                    c = per_task[ti.task_id] = Counter()
+                c[ti.state] += 1
+                continue
+            curr_state = {ti.state: 1}
+            counter.update(curr_state)
+            if ti.task.is_setup:
+                setup_counter.update(curr_state)
+        return cls._from_counters(counter, setup_counter), per_task
+
+    @classmethod
+    def _from_counters(cls, counter: Counter[str], setup_counter: Counter[str]) -> _UpstreamTIStates:
         return _UpstreamTIStates(
             success=counter.get(TaskInstanceState.SUCCESS, 0),
             skipped=counter.get(TaskInstanceState.SKIPPED, 0),
@@ -414,7 +446,15 @@ class TriggerRuleDep(BaseTIDep):
                 )
                 if _is_relevant_upstream(upstream=finished_ti, relevant_ids=task.upstream_task_ids)
             )
-            upstream_states = _UpstreamTIStates.calculate(finished_upstream_tis)
+            # AIP-106 Phase 1 prototype: upstreams carrying a success_threshold are folded below.
+            thresholded_ids: frozenset[str] = getattr(task, "thresholded_upstream_ids", frozenset())
+            per_task_tally: dict[str, Counter[str]] = {}
+            if thresholded_ids:
+                upstream_states, per_task_tally = _UpstreamTIStates.calculate_split(
+                    finished_upstream_tis, thresholded_ids
+                )
+            else:
+                upstream_states = _UpstreamTIStates.calculate(finished_upstream_tis)
 
             success = upstream_states.success
             skipped = upstream_states.skipped
@@ -462,6 +502,73 @@ class TriggerRuleDep(BaseTIDep):
                 upstream = sum(count for _, count in task_id_counts)
                 upstream_setup = sum(c for t, c in task_id_counts if upstream_tasks[t].is_setup)
 
+            # AIP-106 Phase 1 prototype: fold each thresholded upstream into one logical upstream.
+            route_success = success
+            route_removed = removed
+            fold_pending = False
+            if thresholded_ids:
+                expected_by_task: dict[str, int] = (
+                    dict(task_id_counts)
+                    if task_id_counts is not None
+                    and any(t.get_needs_expansion() for t in upstream_tasks.values())
+                    else {tid: 1 for tid in thresholded_ids}
+                )
+                for tid in thresholded_ids:
+                    expected = expected_by_task.get(tid, 0)
+                    tally = per_task_tally.get(tid) or Counter()
+                    s_ = tally.get(TaskInstanceState.SUCCESS, 0)
+                    f_ = tally.get(TaskInstanceState.FAILED, 0)
+                    uf_ = tally.get(TaskInstanceState.UPSTREAM_FAILED, 0)
+                    sk_ = tally.get(TaskInstanceState.SKIPPED, 0)
+                    rm_ = tally.get(TaskInstanceState.REMOVED, 0)
+                    done_ = s_ + f_ + uf_ + sk_ + rm_
+                    if expected == 0:  # row 1: contributes nothing
+                        upstream -= expected_by_task.get(tid, 0)
+                        continue
+                    upstream -= expected - 1
+                    live = expected - rm_ - sk_
+                    thr = getattr(upstream_tasks[tid], "success_threshold", None)
+                    if isinstance(thr, str) and thr.endswith("%"):
+                        need = max(1, (int(thr[:-1]) * live + 99) // 100)
+                    else:
+                        need = int(thr) if thr is not None else 1
+                    if done_ < expected:  # row 2: not done
+                        fold_pending = True
+                        continue
+                    done += 1
+                    route_success += expected - rm_
+                    route_removed += rm_
+                    if live == 0:  # row 3
+                        if rm_ > 0 and sk_ == 0:
+                            removed += 1
+                        else:
+                            skipped += 1
+                    elif s_ >= need:  # row 4
+                        success += 1
+                    elif f_ == 0 and uf_ > 0 and s_ == 0 and sk_ == 0:  # row 5
+                        upstream_failed += 1
+                    elif f_ + uf_ > 0:  # row 6
+                        failed += 1
+                    elif sk_ > 0:  # row 7
+                        skipped += 1
+                    else:  # row 8
+                        failed += 1
+                upstream_states = upstream_states._replace(
+                    success=success,
+                    skipped=skipped,
+                    failed=failed,
+                    upstream_failed=upstream_failed,
+                    removed=removed,
+                    done=done,
+                )
+                if fold_pending:
+                    yield self._failing_status(
+                        reason=(
+                            f"Task's upstream(s) {sorted(thresholded_ids)} carry a success_threshold and are not "
+                            f"yet complete. upstream_states={upstream_states}"
+                        )
+                    )
+
             upstream_done = done >= upstream
 
             changed = False
@@ -470,10 +577,10 @@ class TriggerRuleDep(BaseTIDep):
                 if trigger_rule == TR.ALL_SUCCESS:
                     if upstream_failed or failed:
                         new_state = TaskInstanceState.UPSTREAM_FAILED
-                    elif skipped:
+                    elif skipped and not fold_pending:
                         new_state = TaskInstanceState.SKIPPED
-                    elif removed and success and map_index > -1:
-                        if map_index >= success:
+                    elif route_removed and route_success and map_index > -1 and not fold_pending:
+                        if map_index >= route_success:
                             new_state = TaskInstanceState.REMOVED
                 elif trigger_rule == TR.ALL_FAILED:
                     if success or skipped:

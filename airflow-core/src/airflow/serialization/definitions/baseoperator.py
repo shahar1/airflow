@@ -145,6 +145,8 @@ class SerializedBaseOperator(DAGNode):
     template_fields_renderers: dict[str, str] = {}
 
     trigger_rule: str | TriggerRule = "all_success"
+    # AIP-106 Phase 1 prototype: direct upstreams carrying a success_threshold (set at deserialization).
+    thresholded_upstream_ids: frozenset[str] = frozenset()
 
     # TODO: Remove the following, they aren't used anymore
     ui_color: str = "#fff"
