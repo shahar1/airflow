@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 import airflow.sdk
-from airflow.sdk import DAG, Atom, TaskInstanceState, Threshold, task, task_group
+from airflow.sdk import DAG, DONE, FAILED_ANY, Atom, TaskInstanceState, Threshold, task, task_group
 from airflow.sdk.bases.operator import BASEOPERATOR_ARGS_EXPECTED_TYPES
 from airflow.sdk.definitions._internal.contextmanager import TaskGroupContext
 from airflow.sdk.definitions.mappedoperator import MappedOperator
@@ -54,6 +54,19 @@ def test_atom_valid(args, expected):
     assert atom.count == frozenset(expected)
     assert all(isinstance(state, str) and not hasattr(state, "value") for state in atom.count)
     assert atom.route == "upstream_failed"
+
+
+def test_threshold_accepts_a_single_atom():
+    assert Threshold(Atom({"success"}, ">=", 1)) == Threshold((Atom({"success"}, ">=", 1),))
+
+
+def test_atom_accepts_a_single_state_name():
+    assert Atom("success", ">=", 1).count == frozenset({"success"})
+
+
+def test_state_set_constants_are_exported():
+    assert {"DONE", "FAILED_ANY"} <= set(airflow.sdk.__all__)
+    assert FAILED_ANY < DONE
 
 
 @pytest.mark.parametrize("route", ["upstream_failed", "skipped", None])

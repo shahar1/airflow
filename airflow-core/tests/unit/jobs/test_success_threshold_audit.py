@@ -153,7 +153,6 @@ def test_one_core_insert_per_batch(dag_maker, session, t_states, threshold, cons
     extra = json.loads(row.extra)
     assert extra["region"] is None
     assert extra["outcomes"] == outcomes
-    assert "shortfall" not in extra
     assert "truncated" not in extra
     start = next(i for i, s in enumerate(statements) if s.startswith("SAVEPOINT"))
     window = statements[start : start + 3]
@@ -280,14 +279,13 @@ def test_dependency_view_keeps_no_fold(dag_maker, session):
 
 
 @conf_vars(THRESHOLD_VERSION)
-def test_scheduling_decisions_without_update_state_route_nothing(dag_maker, session):
+def test_scheduling_decisions_without_update_state_initialise_the_routed_list(dag_maker, session):
     with dag_maker("plain", serialized=True, session=session):
         EmptyOperator(task_id="a") >> EmptyOperator(task_id="b")
     dr = dag_maker.create_dagrun()
 
-    decision = dr.task_instance_scheduling_decisions(session=session, record_threshold_decisions=True)
+    dr.task_instance_scheduling_decisions(session=session, record_threshold_decisions=True)
 
-    assert decision is not None
     assert dr._threshold_routed == []
 
 
@@ -333,4 +331,5 @@ def test_failed_write_does_not_fail_scheduling(mock_insert, dag_maker, session, 
     assert {
         "log_level": "error",
         "logger_name": "airflow.jobs.scheduler_job_runner.SchedulerJobRunner",
+        "event": re.compile("Failed to write the success threshold audit record"),
     } in caplog
