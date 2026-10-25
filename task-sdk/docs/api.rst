@@ -152,6 +152,20 @@ Tasks & Operators
 
 .. autoclass:: airflow.sdk.TriggerRule
 
+.. autoapiclass:: airflow.sdk.Threshold
+
+.. autoapiclass:: airflow.sdk.Atom
+
+See the "Composable trigger rules with Threshold" section of the Dags page in the core docs for how a rule is evaluated and when it is rejected.
+
+.. data:: airflow.sdk.DONE
+
+   Every upstream state an ``Atom`` can count: ``success``, ``failed``, ``upstream_failed``, ``skipped`` and ``removed``.
+
+.. data:: airflow.sdk.FAILED_ANY
+
+   The failed subset of ``DONE``: ``failed`` and ``upstream_failed``.
+
 .. autoapifunction:: airflow.sdk.get_current_context
 
 .. autoapifunction:: airflow.sdk.get_parsing_context

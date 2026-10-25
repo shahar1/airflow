@@ -30,7 +30,9 @@ MAX_ATOMS = 6
 OPS = (">=", ">", "<=", "<", "==")
 ROUTES = ("upstream_failed", "skipped", None)
 
+#: Every upstream state an :class:`Atom` can count; the ``count`` of an atom is a subset of it.
 DONE = frozenset({"success", "failed", "upstream_failed", "skipped", "removed"})
+#: The failed subset of ``DONE``: ``failed`` plus ``upstream_failed``.
 FAILED_ANY = frozenset({"failed", "upstream_failed"})
 
 
