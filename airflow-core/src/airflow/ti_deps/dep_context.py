@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from airflow.models.dagrun import DagRun
     from airflow.models.task_coordinates import TaskCoordinateResolver
     from airflow.models.taskinstance import TaskInstance
+    from airflow.utils.state import TaskInstanceState
 
 
 @attr.define
@@ -70,6 +71,8 @@ class DepContext:
         trigger rule
     :param ignore_ti_state: Ignore the task instance's previous failure/success
     :param finished_tis: A list of all the finished task instances of this run
+    :param record_threshold_decisions: Keep the success-threshold fold of each evaluated task instance
+        for the scheduler's audit record; only the scheduler's run-scheduling pass sets it
     """
 
     deps: set = attr.ib(factory=set)
@@ -84,6 +87,7 @@ class DepContext:
     ignore_unmapped_tasks: bool = False
     finished_tis: list[TaskInstance] | None = None
     description: str | None = None
+    record_threshold_decisions: bool = False
 
     have_changed_ti_states: bool = False
     """Have any of the TIs state's been changed as a result of evaluating dependencies"""
@@ -108,6 +112,11 @@ class DepContext:
     :meth:`~airflow.models.taskinstance.TaskInstance.are_dependencies_met` evolves the context for
     every ``UP_FOR_RESCHEDULE`` task instance. With ``init=False`` those instances would each get a
     fresh empty dict, so they would neither read the memo nor warm it for anything else.
+    """
+    threshold_routed: list[tuple[TaskInstance, TaskInstanceState]] = attr.ib(factory=list, repr=False)
+    """
+    Task instances the success-threshold fold routed to a terminal state, with that state. ``init=True``
+    for the same reasons as :attr:`upstream_task_id_counts`.
     """
     regional_runs: dict[tuple[str, str], bool] = attr.ib(factory=dict, repr=False)
     producer_tis: dict[tuple[str, str, UUID | None, UUID, int, str], tuple[TaskInstance, ...]] = attr.ib(

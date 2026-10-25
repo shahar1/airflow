@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import multiprocessing
 import operator
@@ -42,6 +43,7 @@ from sqlalchemy import (
     delete,
     exists,
     func,
+    insert,
     inspect,
     or_,
     select,
@@ -3340,7 +3342,9 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         dag_run.scheduled_by_job_id = self.job.id
 
         # TODO[HA]: Rename update_state -> schedule_dag_run, ?? something else?
-        schedulable_tis, callback_to_run = dag_run.update_state(session=session, execute_callbacks=False)
+        schedulable_tis, callback_to_run = dag_run.update_state(
+            session=session, execute_callbacks=False, record_threshold_decisions=True
+        )
 
         if dag_run.state in State.finished_dr_states and dag_run.run_type != DagRunType.BACKFILL_JOB:
             self._set_exceeds_max_active_runs(dag_model=dag_model, session=session)
@@ -3361,8 +3365,67 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 ],
             )
         dag_run.schedule_tis(schedulable_tis, session=session, max_tis_per_query=self.job.max_tis_per_query)
+        self._record_threshold_decisions(dag_run, schedulable_tis, session=session)
 
         return callback_to_run
+
+    def _record_threshold_decisions(
+        self, dag_run: DagRun, schedulable_tis: list[TI], *, session: Session
+    ) -> None:
+        """Write one audit row per consumer task and region for this pass's success-threshold decisions."""
+        routed = getattr(dag_run, "_threshold_routed", None)
+        if not routed and not any(getattr(ti, "_threshold_fold", None) is not None for ti in schedulable_tis):
+            return
+        outcomes = getattr(dag_run, "_schedule_tis_outcomes", {})
+        outcome_by_id = {ti_id: outcome for outcome, ids in outcomes.items() for ti_id in ids}
+        decided = [(ti, outcome_by_id.get(ti.id)) for ti in schedulable_tis]
+        decided += [(ti, state.value) for ti, state in routed or ()]
+        groups: dict[tuple[str, str | None], tuple[dict[str, Any], defaultdict[str, list[int]]]] = {}
+        for ti, outcome in decided:
+            fold = getattr(ti, "_threshold_fold", None)
+            if fold is None or outcome is None:
+                continue
+            region, map_index, upstreams = fold
+            groups.setdefault((ti.task_id, region), (upstreams, defaultdict(list)))[1][outcome].append(
+                map_index
+            )
+        now = timezone.utcnow()
+        rows = []
+        for (task_id, region), (upstreams, map_indexes) in groups.items():
+            ranges = {}
+            for outcome, indexes in map_indexes.items():
+                runs = (list(g) for _, g in groupby(enumerate(sorted(indexes)), key=lambda p: p[1] - p[0]))
+                ranges[outcome] = [[run[0][1], run[-1][1]] for run in runs]
+            payload: dict[str, Any] = {"region": region, "outcomes": ranges, "upstreams": upstreams}
+            extra = json.dumps(payload)
+            # The Text column holds 64 KB on MySQL.
+            if len(extra) > 65000:
+                payload["outcomes"] = {outcome: r[:100] for outcome, r in ranges.items()}
+                payload["upstreams"] = dict(sorted(upstreams.items())[:50])
+                payload["truncated"] = True
+                extra = json.dumps(payload)
+            rows.append(
+                {
+                    "dttm": now,
+                    "event": "success_threshold_decision",
+                    "dag_id": dag_run.dag_id,
+                    "task_id": task_id,
+                    "run_id": dag_run.run_id,
+                    "logical_date": dag_run.logical_date,
+                    "owner": "scheduler",
+                    "owner_display_name": "Scheduler",
+                    "extra": extra,
+                    "team_name": getattr(dag_run, "_team_name", None),
+                }
+            )
+        # Core insert: no ORM before_insert lookups and no primary-key RETURNING. The connection-level
+        # savepoint keeps a failed write from failing the scheduling transaction, without a session flush.
+        try:
+            connection = session.connection()
+            with connection.begin_nested():
+                connection.execute(insert(Log).inline(), rows)
+        except Exception:
+            self.log.exception("Failed to write the success threshold audit record for %s", dag_run)
 
     def _verify_integrity_if_dag_changed(self, dag_run: DagRun, session: Session) -> bool:
         """

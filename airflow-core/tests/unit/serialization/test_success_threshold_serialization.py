@@ -104,11 +104,13 @@ class TestReadSide:
         assert dag.task_dict["t"].thresholded_upstream_ids == frozenset()
         assert dag.task_dict["plain"].thresholded_upstream_ids == frozenset()
 
-    def test_version_3_payload_with_the_field_ignores_it(self, v4_payload):
+    def test_version_3_payload_with_the_field_ignores_it(self, v4_payload, caplog):
         v4_payload["__version"] = 3
         before = copy.deepcopy(v4_payload)
 
         dag = DagSerialization.from_dict(v4_payload)
+
+        assert {"log_level": "warning", "logger": "airflow.serialization.serialized_objects"} in caplog
 
         assert v4_payload == before
         assert dag.task_dict["t"].success_threshold is None

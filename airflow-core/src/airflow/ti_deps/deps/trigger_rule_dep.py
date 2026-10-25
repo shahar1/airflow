@@ -89,6 +89,26 @@ class _UpstreamTIStates(NamedTuple):
             skipped_setup=setup_counter.get(TaskInstanceState.SKIPPED, 0),
         )
 
+    @classmethod
+    def calculate_split(
+        cls, finished_upstreams: Iterator[TaskInstance], thresholded_ids: frozenset[str]
+    ) -> tuple[_UpstreamTIStates, Counter[tuple[str, str | None]]]:
+        """
+        Calculate states like ``calculate``, leaving out the instances of ``thresholded_ids``.
+
+        Those are tallied separately by task id and state instead.
+        """
+        tally: Counter[tuple[str, str | None]] = Counter()
+
+        def _iter_unthresholded() -> Iterator[TaskInstance]:
+            for ti in finished_upstreams:
+                if ti.task_id in thresholded_ids:
+                    tally[ti.task_id, ti.state] += 1
+                else:
+                    yield ti
+
+        return cls.calculate(_iter_unthresholded()), tally
+
 
 class TriggerRuleDep(BaseTIDep):
     """Determines if a task's upstream tasks are in a state that allows a given task instance to run."""
@@ -409,7 +429,14 @@ class TriggerRuleDep(BaseTIDep):
                 )
                 if _is_relevant_upstream(upstream=finished_ti, relevant_ids=task.upstream_task_ids)
             )
-            upstream_states = _UpstreamTIStates.calculate(finished_upstream_tis)
+            # Unserialized SDK operators, as some unit tests pass here, lack this attribute.
+            thresholded_ids: frozenset[str] = getattr(task, "thresholded_upstream_ids", frozenset())
+            if thresholded_ids:
+                upstream_states, threshold_tally = _UpstreamTIStates.calculate_split(
+                    finished_upstream_tis, thresholded_ids
+                )
+            else:
+                upstream_states = _UpstreamTIStates.calculate(finished_upstream_tis)
 
             success = upstream_states.success
             skipped = upstream_states.skipped
@@ -471,6 +498,90 @@ class TriggerRuleDep(BaseTIDep):
             ):
                 return
 
+            # AIP-106: each thresholded upstream counts as one logical upstream, decided only once
+            # all its instances are finished.
+            route_success = success
+            route_removed = removed
+            fold_pending = False
+            fold: dict[str, dict[str, int | str]] = {}
+            fold_record: tuple[str | None, int, dict[str, dict[str, int | str]]] | None = None
+            if thresholded_ids:
+                expected_counts = dict(task_id_counts or ())
+                for tid in sorted(thresholded_ids):
+                    expected = expected_counts.get(tid, 0)
+                    if not expected:
+                        continue
+                    upstream -= expected - 1
+                    s = threshold_tally[tid, TaskInstanceState.SUCCESS]
+                    f = threshold_tally[tid, TaskInstanceState.FAILED]
+                    uf = threshold_tally[tid, TaskInstanceState.UPSTREAM_FAILED]
+                    sk = threshold_tally[tid, TaskInstanceState.SKIPPED]
+                    rm = threshold_tally[tid, TaskInstanceState.REMOVED]
+                    live = expected - rm - sk
+                    threshold = upstream_tasks[tid].success_threshold
+                    if isinstance(threshold, str):
+                        need = max(1, (int(threshold[:-1]) * live + 99) // 100)
+                    else:
+                        need = threshold or 1
+                    pending = expected - s - f - uf - sk - rm
+                    if pending > 0:
+                        fold_pending = True
+                        yield self._failing_status(
+                            reason=(
+                                f"Task's upstream {tid!r} has a success threshold and is not done: "
+                                f"success={s}, live={live}, skipped={sk}, pending={pending}, need={need}"
+                            )
+                        )
+                        continue
+                    done += 1
+                    # The removed route sees a decided thresholded upstream as an all-success one.
+                    route_success += expected - rm
+                    route_removed += rm
+                    if not live:
+                        if rm and not sk:
+                            removed += 1
+                            folded_state = TaskInstanceState.REMOVED
+                        else:
+                            skipped += 1
+                            folded_state = TaskInstanceState.SKIPPED
+                    elif s >= need:
+                        success += 1
+                        folded_state = TaskInstanceState.SUCCESS
+                    elif uf and not (f or s or sk):
+                        upstream_failed += 1
+                        folded_state = TaskInstanceState.UPSTREAM_FAILED
+                    elif sk and not (f or uf):
+                        skipped += 1
+                        folded_state = TaskInstanceState.SKIPPED
+                    else:
+                        failed += 1
+                        folded_state = TaskInstanceState.FAILED
+                    fold[tid] = {
+                        "s": s,
+                        "f": f,
+                        "uf": uf,
+                        "sk": sk,
+                        "rm": rm,
+                        "expected": expected,
+                        "need": need,
+                        "state": folded_state.value,
+                    }
+                upstream_states = upstream_states._replace(
+                    success=success,
+                    skipped=skipped,
+                    failed=failed,
+                    upstream_failed=upstream_failed,
+                    removed=removed,
+                    done=done,
+                )
+                if dep_context.record_threshold_decisions:
+                    if fold:
+                        fold_record = (str(ti.region_id) if regional else None, map_index, fold)
+                    # A rescheduling sensor's re-entry that passes is not a new decision; a routing is.
+                    ti._threshold_fold = (
+                        None if ti.state == TaskInstanceState.UP_FOR_RESCHEDULE else fold_record
+                    )
+
             upstream_done = done >= upstream
 
             changed = False
@@ -479,10 +590,10 @@ class TriggerRuleDep(BaseTIDep):
                 if trigger_rule == TR.ALL_SUCCESS:
                     if upstream_failed or failed:
                         new_state = TaskInstanceState.UPSTREAM_FAILED
-                    elif skipped:
+                    elif skipped and not fold_pending:
                         new_state = TaskInstanceState.SKIPPED
-                    elif removed and success and map_index > -1:
-                        if map_index >= success:
+                    elif route_removed and route_success and map_index > -1 and not fold_pending:
+                        if map_index >= route_success:
                             new_state = TaskInstanceState.REMOVED
                 elif trigger_rule == TR.ALL_FAILED:
                     if success or skipped:
@@ -546,6 +657,9 @@ class TriggerRuleDep(BaseTIDep):
                         )
                         return
                 changed = ti.set_state(new_state, session=session)
+                if changed and fold and dep_context.record_threshold_decisions:
+                    ti._threshold_fold = fold_record
+                    dep_context.threshold_routed.append((ti, new_state))
 
             if changed:
                 dep_context.have_changed_ti_states = True
