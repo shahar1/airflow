@@ -53,7 +53,7 @@ from airflow.exceptions import AirflowException, DeserializationError, Serializa
 from airflow.models.connection import Connection
 from airflow.models.expandinput import NotFullyPopulated, SchedulerMappedArgument, create_expand_input
 from airflow.models.taskinstancekey import TaskInstanceKey
-from airflow.sdk import DAG, Asset, AssetAlias, BaseOperator, XComArg
+from airflow.sdk import DAG, Asset, AssetAlias, BaseOperator, Threshold, XComArg
 from airflow.sdk.bases.operator import OPERATOR_DEFAULTS  # TODO: Copy this into the scheduler?
 from airflow.sdk.definitions._internal.expandinput import MappedArgument
 from airflow.sdk.definitions._internal.loop import LoopTaskGroup  # noqa: SDK001
@@ -115,6 +115,7 @@ from airflow.task.priority_strategy import (
     get_weight_rule_from_priority_weight_strategy,
     validate_and_load_priority_weight_strategy,
 )
+from airflow.task.threshold import PREFIX as THRESHOLD_PREFIX, encode_threshold, parse_threshold
 from airflow.timetables.base import DagRunInfo, Timetable
 from airflow.triggers.base import StartTriggerArgs
 from airflow.utils.code_utils import get_python_source
@@ -404,7 +405,7 @@ class BaseSerialization:
     _CONSTRUCTOR_PARAMS: dict[str, Parameter] = {}
 
     SERIALIZER_VERSION = 3
-    MAX_SERIALIZER_VERSION = 4
+    MAX_SERIALIZER_VERSION = 5
 
     @classmethod
     def to_json(cls, var: Any) -> str:
@@ -569,6 +570,8 @@ class BaseSerialization:
             return cls._encode(encode_deadline_alert(var), type_=DAT.DEADLINE_ALERT)
         elif isinstance(var, Resources):
             return var.to_dict()
+        elif isinstance(var, Threshold):
+            return encode_threshold(var)
         elif isinstance(var, MappedOperator):
             return cls._encode(OperatorSerialization.serialize_mapped_operator(var), type_=DAT.OP)
         elif isinstance(var, BaseOperator):
@@ -1289,6 +1292,9 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         setattr(op, "start_trigger_args", start_trigger_args)
         setattr(op, "start_from_trigger", bool(encoded_op.get("start_from_trigger", False)))
 
+        if isinstance(op.trigger_rule, str) and op.trigger_rule.startswith(THRESHOLD_PREFIX):
+            op.trigger_rule_compiled = parse_threshold(op.trigger_rule)
+
     @staticmethod
     def set_task_dag_references(task: SerializedOperator | MappedOperator, dag: SerializedDAG) -> None:
         """
@@ -1997,14 +2003,23 @@ class DagSerialization(BaseSerialization):
         OperatorSerialization.generate_client_defaults.cache_clear()
 
         serialized_dag = cls.serialize_dag(var)
-        version = cls.SERIALIZER_VERSION
-        if any("success_threshold" in task[Encoding.VAR] for task in serialized_dag["tasks"]):
-            version = 4
-            if (ceiling := cls._get_max_write_version()) < version:
-                raise ValueError(
-                    f"Dag {var.dag_id!r} needs serialized Dag format version {version} for its success "
-                    f"thresholds, but [core] serialized_dag_max_write_version is {ceiling}"
-                )
+        version, reason = cls.SERIALIZER_VERSION, ""
+        if any(
+            isinstance(rule, str) and rule.startswith(THRESHOLD_PREFIX)
+            for task in serialized_dag["tasks"]
+            for rule in (
+                task[Encoding.VAR].get("trigger_rule"),
+                task[Encoding.VAR].get("partial_kwargs", {}).get("trigger_rule"),
+            )
+        ):
+            version, reason = 5, "Threshold trigger rules"
+        elif any("success_threshold" in task[Encoding.VAR] for task in serialized_dag["tasks"]):
+            version, reason = 4, "success thresholds"
+        if reason and (ceiling := cls._get_max_write_version()) < version:
+            raise ValueError(
+                f"Dag {var.dag_id!r} needs serialized Dag format version {version} for its {reason}, "
+                f"but [core] serialized_dag_max_write_version is {ceiling}"
+            )
         json_dict = {"__version": version, "dag": serialized_dag}
 
         # Add client_defaults section with only values that differ from schema defaults
@@ -2230,8 +2245,10 @@ class DagSerialization(BaseSerialization):
         It must match the JSON schema, have unique task ids and deserialize. Like a Dag built with the SDK,
         it must not set a ``max_active_runs`` its timetable forbids, nor ``catchup`` without a
         ``start_date``, and its task graph must have no cycle. Its format version must not exceed
-        ``[core] serialized_dag_max_write_version`` and is 4 exactly when a task sets ``success_threshold``,
-        which must be valid for that task. *serialized_obj* is not changed.
+        ``[core] serialized_dag_max_write_version``. It is 5 exactly when a task has a Threshold trigger rule,
+        which must parse and, like in the SDK, not be on a teardown task, in a ``fail_fast`` Dag or need more
+        upstreams than an unmapped task has. Otherwise it is 4 exactly when a task sets
+        ``success_threshold``, which must be valid for that task. *serialized_obj* is not changed.
 
         :return: The deserialized Dag.
         :raises DeserializationError: if it does not.
@@ -2295,6 +2312,38 @@ class DagSerialization(BaseSerialization):
         downstream = {task_id: task.downstream_task_ids for task_id, task in deserialized.task_dict.items()}
         if (task_id := detect_cycle(downstream, downstream.__getitem__)) is not None:
             raise DeserializationError(dag_id, f"Dag {dag_id!r} has a cycle through task {task_id!r}")
+        threshold_rules = [
+            (task, rule) for task in deserialized.task_dict.values() if (rule := task.trigger_rule_compiled)
+        ]
+        if threshold_rules and version < 5:
+            raise DeserializationError(
+                dag_id,
+                f"Dag {dag_id!r} has a Threshold trigger rule in serialized Dag format version {version}",
+            )
+        if version == 5 and not threshold_rules:
+            raise DeserializationError(
+                dag_id, f"Dag {dag_id!r} has serialized Dag format version 5 but no Threshold trigger rule"
+            )
+        for task, rule in threshold_rules:
+            upstream_count = len(task.upstream_task_ids)
+            if task.is_teardown:
+                reason = "it is a teardown task"
+            elif deserialized.fail_fast:
+                reason = "the Dag has fail_fast=True"
+            elif not any(
+                deserialized.task_dict[upstream_id].get_needs_expansion()
+                for upstream_id in task.upstream_task_ids
+            ) and any(
+                n is not None and op in (">=", ">", "==") and n + (op == ">") > upstream_count
+                for _, op, n, _ in rule.atoms
+            ):
+                reason = f"an atom needs more than its {upstream_count} upstream tasks"
+            else:
+                continue
+            raise DeserializationError(
+                dag_id,
+                f"Dag {dag_id!r}: task {task.task_id!r} cannot have a Threshold trigger rule: {reason}",
+            )
         for task_id, threshold in thresholds.items():
             task = deserialized.task_dict[task_id]
             group = task.task_group
