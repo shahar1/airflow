@@ -33,6 +33,7 @@ from airflow.sdk.definitions._internal.mixins import DependencyMixin, ResolveMix
 from airflow.sdk.definitions._internal.setup_teardown import SetupTeardownContext
 from airflow.sdk.definitions._internal.types import NOTSET, is_arg_set
 from airflow.sdk.definitions.mappedoperator import MappedOperator
+from airflow.sdk.definitions.threshold import Threshold
 from airflow.sdk.exceptions import AirflowException, XComNotFound
 from airflow.sdk.execution_time.lazy_sequence import LazyXComSequence
 from airflow.sdk.execution_time.xcom import BaseXCom
@@ -302,6 +303,10 @@ class PlainXComArg(XComArg):
         on_failure_fail_dagrun: bool | None = None,
     ):
         for operator, _ in self.iter_references():
+            if isinstance(operator.trigger_rule, Threshold):
+                raise ValueError(
+                    f"Task {operator.task_id!r} has a Threshold trigger rule and cannot be a teardown"
+                )
             operator.is_teardown = True
             operator.trigger_rule = TriggerRule.ALL_DONE_SETUP_SUCCESS
             if on_failure_fail_dagrun is not None:
