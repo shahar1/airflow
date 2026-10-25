@@ -31,6 +31,7 @@ import attrs
 from airflow.sdk import TriggerRule
 from airflow.sdk._shared.dagnode.node import TaskGroupMixin
 from airflow.sdk.definitions._internal.node import DAGNode, validate_group_key
+from airflow.sdk.definitions.threshold import Threshold
 from airflow.sdk.exceptions import (
     DuplicateTaskIdFound,
     NodeNotFound,
@@ -766,6 +767,11 @@ class MappedTaskGroup(TaskGroup):
                 raise ValueError(
                     "Task-generated mapping within a mapped task group is not "
                     "allowed with trigger rule 'always'"
+                )
+            if isinstance(rule := getattr(child, "trigger_rule", None), Threshold) and not rule.atoms:
+                raise ValueError(
+                    "Task-generated mapping within a mapped task group is not "
+                    "allowed with an empty Threshold trigger rule"
                 )
             yield from self._iter_child(child)
 

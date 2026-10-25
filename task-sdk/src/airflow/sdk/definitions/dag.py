@@ -822,9 +822,15 @@ class DAG:
             raise ValueError(f"Task {task.task_id!r} cannot have a success threshold: {reason}")
 
         for task in self.task_dict.values():
-            if not isinstance(task.trigger_rule, Threshold) or any(
-                upstream.get_needs_expansion() for upstream in task.upstream_list
-            ):
+            if not isinstance(task.trigger_rule, Threshold):
+                continue
+            for upstream in task.upstream_list:
+                if isinstance(upstream, MappedOperator) and upstream.success_threshold is not None:
+                    raise ValueError(
+                        f"Task {task.task_id!r} cannot consume {upstream.task_id!r}: a Threshold rule "
+                        "cannot consume a mapped task with a success threshold"
+                    )
+            if any(upstream.get_needs_expansion() for upstream in task.upstream_list):
                 continue
             for atom in task.trigger_rule.atoms:
                 if atom.n != ALL and atom.get_feasible_interval()[0] > len(task.upstream_task_ids):
