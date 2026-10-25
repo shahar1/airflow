@@ -347,7 +347,7 @@ def test_json_value_encoding_tracks_serializer() -> None:
 def test_supported_schema_versions_track_serializer() -> None:
     # A serializer bump without a matching conversion in _canonicalize_payload_v1 would otherwise
     # turn every stored Dag in a deployment into unsupported_serialized_dag_schema_version.
-    supported_by_serializer = frozenset(range(1, DagSerialization.SERIALIZER_VERSION + 1))
+    supported_by_serializer = frozenset(range(1, DagSerialization.MAX_SERIALIZER_VERSION + 1))
 
     assert supported_by_serializer == SUPPORTED_SERIALIZED_DAG_SCHEMA_VERSIONS
 
