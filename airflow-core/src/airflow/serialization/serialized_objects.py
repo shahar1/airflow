@@ -2246,7 +2246,8 @@ class DagSerialization(BaseSerialization):
         it must not set a ``max_active_runs`` its timetable forbids, nor ``catchup`` without a
         ``start_date``, and its task graph must have no cycle. Its format version must not exceed
         ``[core] serialized_dag_max_write_version``. It is 5 exactly when a task has a Threshold trigger rule,
-        which must parse and, like in the SDK, not be on a teardown task, in a ``fail_fast`` Dag or need more
+        which must parse and, like in the SDK, not be on a teardown task, in a ``fail_fast`` Dag, have no atoms
+        on a task directly in a mapped task group, consume a mapped task with a ``success_threshold`` or need more
         upstreams than an unmapped task has. Otherwise it is 4 exactly when a task sets
         ``success_threshold``, which must be valid for that task. *serialized_obj* is not changed.
 
@@ -2330,6 +2331,15 @@ class DagSerialization(BaseSerialization):
                 reason = "it is a teardown task"
             elif deserialized.fail_fast:
                 reason = "the Dag has fail_fast=True"
+            elif not rule.atoms and isinstance(task.task_group, SerializedMappedTaskGroup):
+                reason = "it has no atoms and is in a mapped task group"
+            elif thresholded := sorted(
+                up for up in task.thresholded_upstream_ids if deserialized.task_dict[up].is_mapped
+            ):
+                reason = (
+                    f"it consumes {thresholded[0]!r}: a Threshold rule cannot consume a mapped task "
+                    "with a success threshold"
+                )
             elif not any(
                 deserialized.task_dict[upstream_id].get_needs_expansion()
                 for upstream_id in task.upstream_task_ids
