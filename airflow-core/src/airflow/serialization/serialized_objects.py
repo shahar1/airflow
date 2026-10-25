@@ -28,6 +28,7 @@ import enum
 import itertools
 import logging
 import math
+import re
 import sys
 import weakref
 from collections.abc import Collection, Iterable, Mapping
@@ -50,7 +51,7 @@ from airflow.callbacks.callback_requests import DagCallbackRequest, TaskCallback
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException, DeserializationError, SerializationError
 from airflow.models.connection import Connection
-from airflow.models.expandinput import SchedulerMappedArgument, create_expand_input
+from airflow.models.expandinput import NotFullyPopulated, SchedulerMappedArgument, create_expand_input
 from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.sdk import DAG, Asset, AssetAlias, BaseOperator, XComArg
 from airflow.sdk.bases.operator import OPERATOR_DEFAULTS  # TODO: Copy this into the scheduler?
@@ -403,6 +404,7 @@ class BaseSerialization:
     _CONSTRUCTOR_PARAMS: dict[str, Parameter] = {}
 
     SERIALIZER_VERSION = 3
+    MAX_SERIALIZER_VERSION = 4
 
     @classmethod
     def to_json(cls, var: Any) -> str:
@@ -1045,6 +1047,8 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             )
             del serialized_op["partial_kwargs"]["python_callable"]
 
+        if op.success_threshold is not None:
+            serialized_op["success_threshold"] = op.success_threshold
         serialized_op["_is_mapped"] = True
         return serialized_op
 
@@ -1935,6 +1939,14 @@ class DagSerialization(BaseSerialization):
         for t in dag.task_dict.values():
             OperatorSerialization.set_task_dag_references(t, dag)
 
+        thresholded = {
+            t.task_id for t in dag.task_dict.values() if getattr(t, "success_threshold", None) is not None
+        }
+        if thresholded:
+            for t in dag.task_dict.values():
+                if ids := frozenset(t.upstream_task_ids & thresholded):
+                    t.thresholded_upstream_ids = ids
+
         return dag
 
     @classmethod
@@ -1984,7 +1996,16 @@ class DagSerialization(BaseSerialization):
         # Clear lru_cache for client defaults
         OperatorSerialization.generate_client_defaults.cache_clear()
 
-        json_dict = {"__version": cls.SERIALIZER_VERSION, "dag": cls.serialize_dag(var)}
+        serialized_dag = cls.serialize_dag(var)
+        version = cls.SERIALIZER_VERSION
+        if any("success_threshold" in task[Encoding.VAR] for task in serialized_dag["tasks"]):
+            version = 4
+            if (ceiling := cls._get_max_write_version()) < version:
+                raise ValueError(
+                    f"Dag {var.dag_id!r} needs serialized Dag format version {version} for its success "
+                    f"thresholds, but [core] serialized_dag_max_write_version is {ceiling}"
+                )
+        json_dict = {"__version": version, "dag": serialized_dag}
 
         # Add client_defaults section with only values that differ from schema defaults
         # for tasks
@@ -1995,6 +2016,13 @@ class DagSerialization(BaseSerialization):
         # Validate Serialized DAG with Json Schema. Raises Error if it mismatches
         cls.validate_schema(json_dict)
         return json_dict
+
+    @staticmethod
+    def _get_max_write_version() -> int:
+        ceiling = conf.getint("core", "serialized_dag_max_write_version")
+        if ceiling not in (3, 4, 5):
+            raise ValueError(f"[core] serialized_dag_max_write_version must be 3, 4 or 5, not {ceiling}")
+        return ceiling
 
     @staticmethod
     def conversion_v1_to_v2(ser_obj: dict):
@@ -2137,12 +2165,24 @@ class DagSerialization(BaseSerialization):
     def from_dict(cls, serialized_obj: dict) -> SerializedDAG:
         """Deserializes a python dict in to the DAG and operators it contains."""
         ver = serialized_obj.get("__version", "<not present>")
-        if ver not in (1, 2, 3):
+        if ver not in range(1, cls.MAX_SERIALIZER_VERSION + 1):
             raise ValueError(f"Unsure how to deserialize version {ver!r}")
         if ver == 1:
             cls.conversion_v1_to_v2(serialized_obj)
         if ver == 2:
             cls.conversion_v2_to_v3(serialized_obj)
+        if ver < 4 and any(
+            "success_threshold" in task.get(Encoding.VAR, {})
+            for task in serialized_obj["dag"].get("tasks", [])
+        ):
+            log.warning(
+                "Ignoring success_threshold in Dag %r: serialized Dag format version %s does not carry it",
+                serialized_obj["dag"].get("dag_id"),
+                ver,
+            )
+            serialized_obj = copy.deepcopy(serialized_obj)
+            for task in serialized_obj["dag"]["tasks"]:
+                task.get(Encoding.VAR, {}).pop("success_threshold", None)
 
         # Extract client_defaults for hierarchical defaults resolution
         client_defaults = serialized_obj.get("client_defaults", {})
@@ -2189,7 +2229,9 @@ class DagSerialization(BaseSerialization):
 
         It must match the JSON schema, have unique task ids and deserialize. Like a Dag built with the SDK,
         it must not set a ``max_active_runs`` its timetable forbids, nor ``catchup`` without a
-        ``start_date``, and its task graph must have no cycle. *serialized_obj* is not changed.
+        ``start_date``, and its task graph must have no cycle. Its format version must not exceed
+        ``[core] serialized_dag_max_write_version`` and is 4 exactly when a task sets ``success_threshold``,
+        which must be valid for that task. *serialized_obj* is not changed.
 
         :return: The deserialized Dag.
         :raises DeserializationError: if it does not.
@@ -2208,6 +2250,26 @@ class DagSerialization(BaseSerialization):
         if duplicates := sorted(task_id for task_id, count in task_ids.items() if count > 1):
             raise DeserializationError(
                 dag_id, f"Dag {dag_id!r} has more than one task with id {', '.join(map(repr, duplicates))}"
+            )
+        thresholds = {
+            task[Encoding.VAR]["task_id"]: task[Encoding.VAR]["success_threshold"]
+            for task in serialized_obj["dag"]["tasks"]
+            if "success_threshold" in task[Encoding.VAR]
+        }
+        version = serialized_obj["__version"]
+        if version > (ceiling := cls._get_max_write_version()):
+            raise DeserializationError(
+                dag_id,
+                f"Dag {dag_id!r} has serialized Dag format version {version}, "
+                f"above [core] serialized_dag_max_write_version {ceiling}",
+            )
+        if thresholds and version < 4:
+            raise DeserializationError(
+                dag_id, f"Dag {dag_id!r} sets success_threshold in serialized Dag format version {version}"
+            )
+        if version == 4 and not thresholds:
+            raise DeserializationError(
+                dag_id, f"Dag {dag_id!r} has serialized Dag format version 4 but no success_threshold"
             )
         try:
             deserialized = cls.from_dict(copy.deepcopy(serialized_obj))
@@ -2233,6 +2295,41 @@ class DagSerialization(BaseSerialization):
         downstream = {task_id: task.downstream_task_ids for task_id, task in deserialized.task_dict.items()}
         if (task_id := detect_cycle(downstream, downstream.__getitem__)) is not None:
             raise DeserializationError(dag_id, f"Dag {dag_id!r} has a cycle through task {task_id!r}")
+        for task_id, threshold in thresholds.items():
+            task = deserialized.task_dict[task_id]
+            group = task.task_group
+            while group is not None and not isinstance(
+                group, (SerializedMappedTaskGroup, SerializedLoopTaskGroup)
+            ):
+                group = group.parent_group
+            if not (
+                (type(threshold) is int and threshold >= 1)
+                or (
+                    isinstance(threshold, str)
+                    and re.fullmatch(r"\d+%", threshold)
+                    and 1 <= int(threshold[:-1]) <= 100
+                )
+            ):
+                reason = f"{threshold!r} is not an int >= 1 or a string 'N%' with an integer N from 1 to 100"
+            elif not task.is_mapped:
+                reason = "it is not mapped"
+            elif task.is_setup or task.is_teardown:
+                reason = "it is a setup or teardown task"
+            elif group is not None:
+                reason = "it is inside a mapped task group or a loop task group"
+            elif deserialized.fail_fast:
+                reason = "the Dag has fail_fast=True"
+            else:
+                try:
+                    count = task.get_parse_time_mapped_ti_count()
+                except NotFullyPopulated:
+                    continue
+                if not isinstance(threshold, int) or threshold <= count:
+                    continue
+                reason = f"it expands into only {count} instances"
+            raise DeserializationError(
+                dag_id, f"Dag {dag_id!r}: task {task_id!r} cannot have a success threshold: {reason}"
+            )
         return deserialized
 
 

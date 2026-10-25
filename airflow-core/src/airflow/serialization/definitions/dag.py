@@ -408,6 +408,7 @@ class SerializedDAG:
             # make the cut
             t.upstream_task_ids.intersection_update(dag.task_dict)
             t.downstream_task_ids.intersection_update(dag.task_dict)
+            t.thresholded_upstream_ids &= t.upstream_task_ids
 
         dag.partial = len(dag.tasks) < len(self.tasks)
 
