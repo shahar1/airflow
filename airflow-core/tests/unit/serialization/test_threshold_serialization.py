@@ -24,7 +24,7 @@ from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import DAG, Atom, BaseOperator, Threshold, task_group
 from airflow.serialization.definitions.mappedoperator import SerializedMappedOperator
 from airflow.serialization.serialized_objects import DagSerialization, create_scheduler_operator
-from airflow.task.threshold import encode_threshold, parse_threshold
+from airflow.task.threshold import COUNTED, encode_threshold, parse_threshold
 from airflow.utils.state import TaskInstanceState
 
 from tests_common.test_utils.config import conf_vars
@@ -181,6 +181,16 @@ class TestVersionStamping:
 
         assert _serialize(dag)["__version"] == expected
 
+    def test_threshold_on_a_mapped_consumer_stamps_version_5(self):
+        with DAG("mapped_consumer", schedule=None) as dag:
+            BashOperator.partial(task_id="consumer", trigger_rule=NONE_FAILED_MIN_ONE_SUCCESS).expand(
+                bash_command=["echo 1"]
+            )
+
+        assert _serialize(dag)["__version"] == 5
+        with pytest.raises(ValueError, match=r"version 5.*serialized_dag_max_write_version is 4"):
+            _serialize(dag, ceiling="4")
+
     def test_dag_without_threshold_is_unchanged_by_the_feature(self):
         def build():
             with DAG("untouched", schedule=None) as dag:
@@ -241,6 +251,18 @@ class TestValidateSerializedDag:
 
     def test_accepts_an_int_n_above_the_upstream_count_for_a_mapped_upstream(self, v5_payload):
         _edit_rule("threshold/2:success>=3->upstream_failed:shrink_route=false")(v5_payload)
+
+        assert DagSerialization.validate_serialized_dag(v5_payload)
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "threshold/2:success>=1->upstream_failed;success<=3->skipped:shrink_route=false",
+            "threshold/2:success==0->skipped;success==all->none:shrink_route=false",
+        ],
+    )
+    def test_accepts_overlapping_or_mixed_count_and_all_atoms(self, v5_payload, rule):
+        _edit_rule(rule)(v5_payload)
 
         assert DagSerialization.validate_serialized_dag(v5_payload)
 
@@ -322,6 +344,26 @@ class TestValidateSerializedDag:
                 "between 0 and 10000",
                 id="n-too-large",
             ),
+            pytest.param(
+                _edit_rule("threshold/2:success>all->none:shrink_route=false"),
+                "can never hold",
+                id="gt-all",
+            ),
+            pytest.param(
+                _edit_rule("threshold/2:success<0->upstream_failed:shrink_route=false"),
+                "can never hold",
+                id="lt-zero",
+            ),
+            pytest.param(
+                _edit_rule("threshold/2:success==0->skipped;success>=1->upstream_failed:shrink_route=false"),
+                "can never both hold",
+                id="disjoint-eq-ge",
+            ),
+            pytest.param(
+                _edit_rule("threshold/2:success<=2->skipped;success>5->upstream_failed:shrink_route=false"),
+                "can never both hold",
+                id="disjoint-le-gt",
+            ),
             pytest.param(_edit_teardown, "it is a teardown task", id="teardown"),
             pytest.param(_edit_fail_fast, "the Dag has fail_fast=True", id="fail-fast"),
             pytest.param(
@@ -395,6 +437,23 @@ class TestCompiledPlan:
         assert compiled.is_fast_triggered is is_fast_triggered
         assert compiled.defers_to_expanded_tis is defers_to_expanded_tis
 
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            pytest.param("threshold/2:success>=all->upstream_failed:shrink_route=false", id="ge-all"),
+            pytest.param(
+                "threshold/2:failed+upstream_failed==0->upstream_failed;success>=all->upstream_failed"
+                ":shrink_route=false",
+                id="eq-zero-and-ge-all",
+            ),
+        ],
+    )
+    def test_all_bound_is_not_a_lower_bound(self, rule):
+        compiled = parse_threshold(rule)
+
+        assert compiled.is_fast_triggered is False
+        assert compiled.defers_to_expanded_tis is False
+
     def test_preset_operators_keep_no_compiled_plan(self):
         plain = create_scheduler_operator(BaseOperator(task_id="p", trigger_rule="one_success"))
         mapped = create_scheduler_operator(
@@ -406,8 +465,13 @@ class TestCompiledPlan:
 
 
 def _evaluate(rule, counts, *, done, upstream, flag_upstream_failed=True, map_index=-1):
-    return parse_threshold(rule).evaluate(
-        counts, done=done, upstream=upstream, flag_upstream_failed=flag_upstream_failed, map_index=map_index
+    passed, state, _ = _decide(rule, counts, done, upstream, flag_upstream_failed, map_index)
+    return passed, state
+
+
+def _decide(rule, counts, done, upstream, flag_upstream_failed, map_index):
+    return parse_threshold(rule).decide(
+        tuple(counts[s] for s in COUNTED), done, upstream, flag_upstream_failed, map_index
     )
 
 
@@ -536,6 +600,28 @@ class TestEvaluate:
         assert passed is True
         assert state is expected
 
+    @pytest.mark.parametrize(
+        ("atom", "counts", "expected"),
+        [
+            pytest.param(
+                Atom(FAILED_ANY, "==", 0, None),
+                _counts(failed=1, success=1, removed=1),
+                (False, None),
+                id="false-atom-without-route-bars-shrink-route",
+            ),
+            pytest.param(
+                Atom(DONE, "==", "all", None),
+                _counts(success=1, removed=2),
+                (True, TaskInstanceState.REMOVED),
+                id="true-atom-keeps-shrink-route",
+            ),
+        ],
+    )
+    def test_false_atom_without_route_bars_the_shrink_route(self, atom, counts, expected):
+        rule = encode_threshold(Threshold((atom,), shrink_route=True))
+
+        assert _evaluate(rule, counts, done=3, upstream=3, map_index=2) == expected
+
     def test_without_flag_upstream_failed_nothing_routes(self):
         passed, state = _evaluate(
             SINGLE_ATOM_RULE, _counts(failed=1), done=1, upstream=1, flag_upstream_failed=False
@@ -576,4 +662,6 @@ class TestDescribeUnmet:
         ],
     )
     def test_describe_unmet(self, rule, counts, done, upstream, expected):
-        assert parse_threshold(rule).describe_unmet(counts, done=done, upstream=upstream) == expected
+        _, _, unmet = _decide(rule, counts, done, upstream, False, -1)
+
+        assert unmet == expected
