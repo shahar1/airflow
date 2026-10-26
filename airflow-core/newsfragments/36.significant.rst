@@ -1,0 +1,22 @@
+Mapped tasks can declare a ``success_threshold``; Dags that use it are stored at serialized format version 4
+
+A mapped task may now call ``.with_success_threshold(value)`` on the object ``expand()`` or ``expand_kwargs()`` returns, so that downstream dependency evaluation counts it as one succeeded upstream once enough instances succeeded. Nothing changes for Dags that do not call it: their serialized payload, hash and Dag version stay the same.
+
+Upgrade steps:
+
+* Before the first Dag calls ``with_success_threshold``, raise ``[core] serialized_dag_max_write_version`` from its default ``3`` to ``4`` on every Dag processor, scheduler, API server and triggerer. While the ceiling is ``3``, a Dag file that uses the feature is recorded as an import error for the whole file, and every Dag in that file stops scheduling until the ceiling is raised or the call removed. Raise the ceiling only after every component that reads serialized Dags runs this release or later: an older reader cannot load a version-4 row.
+* Workers need a Task SDK of this release or later to parse a Dag file that calls ``with_success_threshold``; an older SDK fails every task in that file at parse time.
+* Run outcomes change for Dags that use the feature: a consumer of a thresholded mapped task is decided only when every instance of that task has finished, skipped and removed instances do not count against the quorum, and a run whose leaf consumer runs under a met threshold succeeds although instances of the mapped task failed. An ``int`` threshold above the number of non-removed instances fails the consumer where today it would run.
+* Each scheduling decision taken under a threshold writes an audit log row (event ``success_threshold_decision``); ``airflow db clean`` purges it with the rest of the ``log`` table.
+* Downgrading the metadata database below this release runs a pre-flight on ``serialized_dag``: every version-4 row not referenced by a queued or running Dag run has its ``success_threshold`` fields removed, is stamped version 3 and gets its hash recomputed; if any version-4 row is referenced by an unfinished run, the downgrade stops with a message listing those Dags and runs, and nothing is changed. Finish or fail those runs first. In offline mode (``airflow db downgrade --show-sql-only``) the migration only prints a comment: version-4 rows must be handled online.
+
+* Types of change
+
+  * [x] Dag changes
+  * [x] Config changes
+  * [ ] API changes
+  * [ ] CLI changes
+  * [x] Behaviour changes
+  * [ ] Plugin changes
+  * [ ] Dependency changes
+  * [x] Code interface changes
