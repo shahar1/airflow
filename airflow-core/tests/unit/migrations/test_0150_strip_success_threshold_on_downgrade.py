@@ -153,6 +153,8 @@ def database_at_head():
 
 def _payload(version):
     threshold = {"success_threshold": 2} if version == 4 else {}
+    if version == 5:
+        threshold = {"trigger_rule": "threshold/2:success>=1->upstream_failed:shrink_route=false"}
     return {
         "__version": version,
         "dag": {
@@ -262,6 +264,21 @@ def test_downgrade_refuses_while_an_unfinished_run_uses_a_version_4_row(
     assert _read_rows(database_at_head) == before
 
 
+@pytest.mark.parametrize("version_5_compressed", [False, True], ids=["in-data", "compressed"])
+def test_downgrade_refuses_while_a_version_5_row_exists(database_at_head, version_5_compressed):
+    with database_at_head.begin() as connection:
+        _add_version(connection, 1, 4)
+        _add_version(
+            connection, 2, 5, compressed=version_5_compressed, run_state="success", run_link="created"
+        )
+    before = _read_rows(database_at_head)
+
+    with pytest.raises(RuntimeError, match=f"Threshold trigger rule.*Delete the Dags.*{DAG_ID}"):
+        downgrade(to_revision=PREVIOUS_REVISION)
+
+    assert _read_rows(database_at_head) == before
+
+
 def test_offline_downgrade_only_states_that_version_4_rows_need_online(capsys, monkeypatch):
     monkeypatch.setattr(settings, "SQL_ALCHEMY_CONN", "postgresql://")
 
@@ -269,4 +286,6 @@ def test_offline_downgrade_only_states_that_version_4_rows_need_online(capsys, m
 
     emitted = capsys.readouterr().out
     assert "Version-4 rows must be handled online" in emitted
+    assert "Version-5 rows (Threshold trigger rules)" in emitted
+    assert "block the downgrade until the Dags that own them are deleted" in emitted
     assert "serialized_dag SET" not in emitted
