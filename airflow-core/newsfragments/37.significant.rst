@@ -1,0 +1,22 @@
+``Threshold`` trigger rules for distinct upstreams; Dags that use one are stored at serialized format version 5
+
+``trigger_rule`` now also accepts ``airflow.sdk.Threshold``, a rule built from ordered ``Atom`` objects that count upstream states against a bound and name the state the task gets when the atom fails. The thirteen preset rules are unchanged and are never evaluated through a ``Threshold``.
+
+Upgrade steps:
+
+* Before the first Dag uses a ``Threshold``, raise ``[core] serialized_dag_max_write_version`` to ``5`` on every component that reads serialized Dags, after all of them run this release or later. While the ceiling is lower, a Dag file that uses a ``Threshold`` is recorded as an import error for the whole file.
+* Workers need a Task SDK of this release or later to parse a Dag file that imports ``Threshold`` or ``Atom``.
+* A ``Threshold`` is rejected on teardowns, directly downstream of a setup, in ``fail_fast`` Dags, as an atom-less rule inside a mapped task group, and on a consumer of a mapped task that carries a ``success_threshold``. A bound larger than the number of upstreams is rejected when no upstream is mapped.
+* Downgrading the metadata database below this release refuses while any stored Dag version carries a ``Threshold`` (version-5 ``serialized_dag`` rows; a ``Threshold`` cannot be rewritten as a preset). The message lists the Dags. Re-parsing a Dag without the ``Threshold`` does not clear its earlier stored versions, so delete those Dags before downgrading.
+* REST clients and Dag-version diffs see the rule as the string ``threshold/2:...``; the atoms appear in authored order, so changing their order changes the Dag hash and creates a new Dag version.
+
+* Types of change
+
+  * [x] Dag changes
+  * [x] Config changes
+  * [ ] API changes
+  * [ ] CLI changes
+  * [x] Behaviour changes
+  * [ ] Plugin changes
+  * [ ] Dependency changes
+  * [x] Code interface changes
