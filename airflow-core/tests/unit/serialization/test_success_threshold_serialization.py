@@ -56,8 +56,8 @@ def v4_payload():
 class TestWriteSide:
     def test_constants(self):
         assert DagSerialization.SERIALIZER_VERSION == 3
-        assert DagSerialization.MAX_SERIALIZER_VERSION == 4
-        assert frozenset(range(1, 5)) == SUPPORTED_SERIALIZED_DAG_SCHEMA_VERSIONS
+        assert DagSerialization.MAX_SERIALIZER_VERSION == 5
+        assert frozenset(range(1, 6)) == SUPPORTED_SERIALIZED_DAG_SCHEMA_VERSIONS
 
     @pytest.mark.parametrize("ceiling", ["4", "5"])
     def test_thresholded_dag_is_version_4(self, ceiling, v4_payload):
@@ -116,10 +116,10 @@ class TestReadSide:
         assert dag.task_dict["t"].success_threshold is None
         assert dag.task_dict["consumer"].thresholded_upstream_ids == frozenset()
 
-    def test_version_5_is_rejected(self, v4_payload):
-        v4_payload["__version"] = 5
+    def test_version_6_is_rejected(self, v4_payload):
+        v4_payload["__version"] = 6
 
-        with pytest.raises(ValueError, match="Unsure how to deserialize version 5"):
+        with pytest.raises(ValueError, match="Unsure how to deserialize version 6"):
             DagSerialization.from_dict(v4_payload)
 
     @pytest.mark.parametrize(

@@ -18,7 +18,7 @@
 
 
 """
-Strip success_threshold from serialized Dags on downgrade.
+Strip success_threshold from serialized Dags on downgrade; refuse Threshold rules.
 
 Revision ID: 53092df95325
 Revises: c71065a1b14f
@@ -48,6 +48,7 @@ airflow_version = "3.5.0"
 serialized_dag = sa.table(
     "serialized_dag",
     sa.column("id", sa.Uuid()),
+    sa.column("dag_id", sa.String(250)),
     sa.column("dag_version_id", sa.Uuid()),
     sa.column("data", sa.JSON().with_variant(JSONB(), "postgresql")),
     sa.column("data_compressed", sa.LargeBinary()),
@@ -73,13 +74,19 @@ def upgrade():
 
 
 def downgrade():
-    """Rewrite format-version-4 serialized Dags as version 3, refusing while unfinished Dag runs use them."""
+    """
+    Rewrite format-version-4 serialized Dags as version 3, refusing while unfinished Dag runs use them.
+
+    A version-5 row carries a Threshold trigger rule, which no preset can stand in for, so the downgrade
+    refuses while any exists.
+    """
     if context.is_offline_mode():
         print(
             """
             --  WARNING: serialized Dags at format version 4 (success_threshold) cannot be rewritten offline.
             --  Version-4 rows must be handled online: run this downgrade step online before the older
-            --  Airflow version reads the serialized_dag table.
+            --  Airflow version reads the serialized_dag table. Version-5 rows (Threshold trigger rules)
+            --  block the downgrade until the Dags that own them are deleted.
             """
         )
         return
@@ -88,9 +95,11 @@ def downgrade():
     # Uncompressed rows are filtered in SQL; compressed rows have to be read to learn their version.
     # shortcut: holds every version-4 payload in memory; fine while few Dags use success_threshold.
     rows = []
+    threshold_dag_ids = set()
     for row in conn.execute(
         sa.select(
             serialized_dag.c.id,
+            serialized_dag.c.dag_id,
             serialized_dag.c.dag_version_id,
             serialized_dag.c.data,
             serialized_dag.c.data_compressed,
@@ -98,14 +107,24 @@ def downgrade():
         .where(
             sa.or_(
                 serialized_dag.c.data_compressed.isnot(None),
-                serialized_dag.c.data["__version"].as_integer() == 4,
+                serialized_dag.c.data["__version"].as_integer() >= 4,
             )
         )
         .execution_options(yield_per=200)
     ):
         payload = json.loads(zlib.decompress(row.data_compressed)) if row.data_compressed else row.data
-        if payload and payload.get("__version") == 4:
+        version = payload.get("__version") if payload else None
+        if version == 4:
             rows.append((row, payload))
+        elif version == 5:
+            threshold_dag_ids.add(row.dag_id)
+    if threshold_dag_ids:
+        # Every stored Dag version keeps its row, so re-parsing without the Threshold does not clear them.
+        raise RuntimeError(
+            "Cannot downgrade: stored versions of these Dags carry a Threshold trigger rule, which older "
+            "Airflow versions cannot read and no preset can stand in for. Delete the Dags (this removes "
+            f"their stored versions), then retry: {sorted(threshold_dag_ids)}"
+        )
     if not rows:
         return
 

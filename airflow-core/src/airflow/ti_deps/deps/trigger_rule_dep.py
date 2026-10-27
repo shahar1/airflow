@@ -158,6 +158,12 @@ class TriggerRuleDep(BaseTIDep):
         task = ti.task
         if TYPE_CHECKING:
             assert task
+        # Unserialized SDK operators lack this attribute too.
+        compiled = getattr(task, "trigger_rule_compiled", None)
+        # An atom-less Threshold is the always equivalent.
+        if compiled is not None and not compiled.atoms:
+            yield self._passing_status(reason="The task's Threshold trigger rule has no atoms.")
+            return
 
         regional = dep_context.has_regions(ti, session=session)
         map_index = (
@@ -223,11 +229,12 @@ class TriggerRuleDep(BaseTIDep):
             # plain task groups inside the mapped one (see #39801), so check the closest
             # mapped ancestor rather than only the immediate parent group.
             if map_index < 0 and task.get_closest_mapped_task_group() is not None:
+                # A Threshold one upstream instance can satisfy behaves as the ONE_* rules.
                 is_fast_triggered = task.trigger_rule in (
                     TR.ONE_SUCCESS,
                     TR.ONE_FAILED,
                     TR.ONE_DONE,
-                )
+                ) or (compiled is not None and compiled.is_fast_triggered)
                 if is_fast_triggered and upstream_id not in set(
                     _iter_expansion_dependencies(task_group=task.task_group)
                 ):
@@ -491,7 +498,11 @@ class TriggerRuleDep(BaseTIDep):
             # which is why other rules still decide here.
             if (
                 map_index < 0
-                and trigger_rule in (TR.ALL_DONE_MIN_ONE_SUCCESS, TR.NONE_FAILED_MIN_ONE_SUCCESS)
+                and (
+                    trigger_rule in (TR.ALL_DONE_MIN_ONE_SUCCESS, TR.NONE_FAILED_MIN_ONE_SUCCESS)
+                    # A Threshold needing a success that also waits for completion behaves as these two.
+                    or (compiled is not None and compiled.defers_to_expanded_tis)
+                )
                 and task_id_counts is not None
                 and len(task_id_counts) < len(upstream_tasks)
                 and task.get_closest_mapped_task_group() is not None
@@ -586,7 +597,15 @@ class TriggerRuleDep(BaseTIDep):
 
             changed = False
             new_state = None
-            if dep_context.flag_upstream_failed:
+            if compiled is not None:
+                threshold_passed, new_state, unmet = compiled.decide(
+                    (success, skipped, failed, upstream_failed, removed),
+                    done,
+                    upstream,
+                    dep_context.flag_upstream_failed,
+                    map_index,
+                )
+            elif dep_context.flag_upstream_failed:
                 if trigger_rule == TR.ALL_SUCCESS:
                     if upstream_failed or failed:
                         new_state = TaskInstanceState.UPSTREAM_FAILED
@@ -664,6 +683,16 @@ class TriggerRuleDep(BaseTIDep):
             if changed:
                 dep_context.have_changed_ti_states = True
 
+            if compiled is not None:
+                if not threshold_passed:
+                    yield self._failing_status(
+                        reason=(
+                            f"Task's trigger rule '{trigger_rule_str}' is not met: "
+                            f"{unmet}; "
+                            f"upstream_states={upstream_states}, upstream_task_ids={task.upstream_task_ids}"
+                        )
+                    )
+                return
             if trigger_rule == TR.ONE_SUCCESS:
                 if success <= 0:
                     yield self._failing_status(

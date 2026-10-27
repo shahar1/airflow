@@ -112,6 +112,12 @@ from airflow.sdk.definitions.retry_policy import (
 )
 from airflow.sdk.definitions.taskgroup import TaskGroup as TaskGroup
 from airflow.sdk.definitions.template import literal as literal
+from airflow.sdk.definitions.threshold import (
+    DONE as DONE,
+    FAILED_ANY as FAILED_ANY,
+    Atom as Atom,
+    Threshold as Threshold,
+)
 from airflow.sdk.definitions.timetables.assets import (
     AssetAndTimeSchedule,
     AssetOrTimeSchedule,
@@ -152,6 +158,7 @@ __all__ = [
     "AssetTriggeredTimetable",
     "AssetWatcher",
     "AsyncCallback",
+    "Atom",
     "BaseAsyncOperator",
     "BaseBranchOperator",
     "BaseHook",
@@ -175,9 +182,11 @@ __all__ = [
     "DeadlineReference",
     "DeltaDataIntervalTimetable",
     "DeltaTriggerTimetable",
+    "DONE",
     "EdgeModifier",
     "EventsTimetable",
     "ExceptionRetryPolicy",
+    "FAILED_ANY",
     "FanOutMapper",
     "FixedKeyMapper",
     "HourWindow",
@@ -215,6 +224,7 @@ __all__ = [
     "SyncCallback",
     "TaskGroup",
     "TaskInstanceState",
+    "Threshold",
     "TriggerRule",
     "Variable",
     "WaitForAll",

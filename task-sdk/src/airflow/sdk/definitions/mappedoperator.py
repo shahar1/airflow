@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions.operator_resources import Resources
     from airflow.sdk.definitions.param import ParamsDict
     from airflow.sdk.definitions.retry_policy import RetryPolicy
+    from airflow.sdk.definitions.threshold import Threshold
     from airflow.sdk.types import WeightRuleParam
     from airflow.triggers.base import StartTriggerArgs
 
@@ -449,7 +450,7 @@ class MappedOperator(AbstractOperator):
         self.partial_kwargs["map_index_template"] = value
 
     @property
-    def trigger_rule(self) -> TriggerRule:
+    def trigger_rule(self) -> TriggerRule | Threshold:
         return self.partial_kwargs.get("trigger_rule", DEFAULT_TRIGGER_RULE)
 
     @trigger_rule.setter

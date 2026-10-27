@@ -31,6 +31,7 @@ __all__ = [
     "AssetTriggeredTimetable",
     "AssetWatcher",
     "AsyncCallback",
+    "Atom",
     "BaseAsyncOperator",
     "BaseBranchOperator",
     "BaseDeadlineReference",
@@ -55,9 +56,11 @@ __all__ = [
     "DeadlineReference",
     "DeltaDataIntervalTimetable",
     "DeltaTriggerTimetable",
+    "DONE",
     "EdgeModifier",
     "EventsTimetable",
     "ExceptionRetryPolicy",
+    "FAILED_ANY",
     "FanOutMapper",
     "FixedKeyMapper",
     "HourWindow",
@@ -96,6 +99,7 @@ __all__ = [
     "TaskGroup",
     "TaskInstance",
     "TaskInstanceState",
+    "Threshold",
     "TriggerRule",
     "Variable",
     "WaitForAll",
@@ -210,6 +214,7 @@ if TYPE_CHECKING:
     )
     from airflow.sdk.definitions.taskgroup import TaskGroup
     from airflow.sdk.definitions.template import literal
+    from airflow.sdk.definitions.threshold import DONE, FAILED_ANY, Atom, Threshold
     from airflow.sdk.definitions.timetables.assets import (
         AssetAndTimeSchedule,
         AssetOrTimeSchedule,
@@ -249,6 +254,7 @@ __lazy_imports: dict[str, str] = {
     "AssetTriggeredTimetable": ".definitions.timetables.assets",
     "AssetWatcher": ".definitions.asset",
     "AsyncCallback": ".definitions.callback",
+    "Atom": ".definitions.threshold",
     "BaseAsyncOperator": ".bases.operator",
     "BaseBranchOperator": ".bases.branch",
     "BaseDeadlineReference": ".definitions.deadline",
@@ -273,9 +279,11 @@ __lazy_imports: dict[str, str] = {
     "DeadlineReference": ".definitions.deadline",
     "DeltaDataIntervalTimetable": ".definitions.timetables.interval",
     "DeltaTriggerTimetable": ".definitions.timetables.trigger",
+    "DONE": ".definitions.threshold",
     "EdgeModifier": ".definitions.edges",
     "EventsTimetable": ".definitions.timetables.events",
     "ExceptionRetryPolicy": ".definitions.retry_policy",
+    "FAILED_ANY": ".definitions.threshold",
     "FanOutMapper": ".definitions.partition_mappers.temporal",
     "FixedKeyMapper": ".definitions.partition_mappers.fixed_key",
     "HourWindow": ".definitions.partition_mappers.window",
@@ -314,6 +322,7 @@ __lazy_imports: dict[str, str] = {
     "TaskGroup": ".definitions.taskgroup",
     "TaskInstance": ".types",
     "TaskInstanceState": ".api.datamodels._generated",
+    "Threshold": ".definitions.threshold",
     "TriggerRule": ".api.datamodels._generated",
     "Variable": ".definitions.variable",
     "WaitForAll": ".definitions.partition_mappers.wait_policy",

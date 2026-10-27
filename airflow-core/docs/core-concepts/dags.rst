@@ -509,6 +509,86 @@ You can also combine this with the :ref:`concepts:depends-on-past` functionality
 
     .. image:: ../img/ui-light/branch_with_trigger.png
 
+Composable trigger rules with ``Threshold``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 3.4
+
+When none of the presets fits, build your own rule with ``trigger_rule=Threshold((Atom(...), ...), shrink_route=False)``, importing both from ``airflow.sdk``. A rule has at most 6 atoms.
+
+An ``Atom(count, op, n, route)`` counts the upstream tasks that are in any of the states in ``count`` and compares that number with ``n`` using ``op``:
+
+* ``count`` is a set of states chosen from ``success``, ``skipped``, ``failed``, ``upstream_failed`` and ``removed``. ``DONE`` is all five, and ``FAILED_ANY`` is ``failed`` plus ``upstream_failed``. Import them with ``from airflow.sdk import Threshold, Atom, DONE, FAILED_ANY``.
+* ``op`` is one of ``>=``, ``>``, ``<=``, ``<`` or ``==``.
+* ``n`` is an integer from 0 to 10000, or ``"all"`` for the number of upstream tasks.
+* ``route`` is the state the task gets when this atom is the first to fail: ``"upstream_failed"`` (the default), ``"skipped"``, or ``None`` to leave the task waiting. If that atom can never hold again, the task never runs and the Dag run fails once no task can run, the same stall that ``all_skipped`` has with a removed upstream task.
+
+On every scheduling pass each atom is evaluated against the upstream tasks that are still pending. An atom is true when it holds for every way the pending upstream tasks could finish, false when it holds for none of them, and undecided otherwise. The rule passes when every atom is true. Otherwise the task waits, except that the first false atom in the authored order routes the task to its ``route``. A ``None`` route still counts as the rule's routing decision: no later atom and not ``shrink_route`` can move the task afterwards, and the task simply waits as described for ``None``. Two conventions apply on top: if every upstream task finished ``skipped`` the task is skipped whatever the route, and ``shrink_route=True`` makes a mapped consumer whose index is beyond the number of succeeded upstream instances ``removed`` when some upstream instances were removed, which is what ``all_success`` does.
+
+To wait for all upstream tasks to complete, add the atom ``Atom(DONE, "==", "all", None)``. Without it a rule decides as soon as its atoms can be decided, like ``one_success``.
+
+Most presets can be written as a ``Threshold``:
+
+.. list-table::
+    :header-rows: 1
+    :widths: 30 70
+
+    * - Preset
+      - Equivalent atoms (``count op n -> route``)
+    * - ``always``
+      - no atoms, ``Threshold(())``
+    * - ``all_done``
+      - ``DONE == all``
+    * - ``one_success``
+      - ``success >= 1 -> upstream_failed``
+    * - ``one_failed``
+      - ``FAILED_ANY >= 1 -> skipped``
+    * - ``one_done``
+      - ``{success, failed} >= 1 -> skipped``
+    * - ``none_failed``
+      - ``FAILED_ANY == 0 -> upstream_failed``; ``DONE == all``
+    * - ``none_failed_min_one_success``
+      - ``FAILED_ANY == 0 -> upstream_failed``; ``success >= 1 -> upstream_failed``; ``DONE == all``
+    * - ``none_skipped``
+      - ``skipped == 0 -> skipped``; ``DONE == all``
+    * - ``all_failed``
+      - ``success == 0 -> skipped``; ``skipped == 0 -> skipped``; ``DONE == all``
+    * - ``all_success``
+      - ``FAILED_ANY == 0 -> upstream_failed``; ``skipped == 0 -> skipped``; ``DONE == all``, with ``shrink_route=True``
+    * - ``all_done_min_one_success``
+      - ``skipped == 0 -> skipped``; ``success >= 1 -> upstream_failed``; ``DONE == all``
+    * - ``all_skipped``
+      - ``success == 0 -> skipped``; ``FAILED_ANY == 0 -> skipped``; ``DONE == all``
+
+``all_skipped`` and its ``Threshold`` differ only when an upstream instance was removed: the preset then never decides, while the ``Threshold`` passes. ``Threshold(())``, a rule with no atoms, is the equivalent of ``always`` and takes the same short cut, so it is refused wherever ``always`` is refused: inside a mapped task group with task-generated mapping. Only ``all_done_setup_success`` has no equivalent. The presets themselves are unchanged, and they are not evaluated through a ``Threshold``.
+
+The first example writes ``none_failed_min_one_success`` out so that the routing order is visible:
+
+.. exampleinclude:: /../tests/system/core/example_threshold_min_one_success.py
+    :language: python
+    :start-after: [START howto_threshold_min_one_success]
+    :end-before: [END howto_threshold_min_one_success]
+
+The second example is a rule that no preset expresses, "no failures and at most one skipped":
+
+.. exampleinclude:: /../tests/system/core/example_threshold_quorum.py
+    :language: python
+    :start-after: [START howto_threshold_quorum]
+    :end-before: [END howto_threshold_quorum]
+
+A ``Threshold`` is rejected in these cases:
+
+* on the direct downstream tasks of setup tasks, like any trigger rule other than ``all_success``;
+* on teardown tasks (``as_teardown()`` raises);
+* in Dags with ``fail_fast`` enabled;
+* with no atoms, inside a mapped task group or with task-generated mapping;
+* on a consumer of a mapped task that has a ``success_threshold``;
+* when an atom's bound exceeds the number of upstream tasks while none of them is mapped.
+
+Contradictory atoms on the same set of states are rejected when the rule is built.
+
+Dags that use a ``Threshold`` are stored with serialized format version 5. Before using one, raise :ref:`core.serialized_dag_max_write_version <config:core__serialized_dag_max_write_version>` to ``5``; otherwise the Dag file gets an import error. The REST API and Dag version diffs show the rule as a string such as ``threshold/2:...``, with the atoms in the authored order.
+
 
 Setup and teardown
 ~~~~~~~~~~~~~~~~~~

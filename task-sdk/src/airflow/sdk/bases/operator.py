@@ -65,6 +65,7 @@ from airflow.sdk.definitions._internal.types import NOTSET, validate_instance_ar
 from airflow.sdk.definitions.edges import EdgeModifier
 from airflow.sdk.definitions.mappedoperator import OperatorPartial, validate_mapping_kwargs
 from airflow.sdk.definitions.param import ParamsDict
+from airflow.sdk.definitions.threshold import Threshold
 from airflow.sdk.exceptions import RemovedInAirflow4Warning
 
 # Databases do not support arbitrary precision integers, so we need to limit the range of priority weights.
@@ -306,7 +307,7 @@ if TYPE_CHECKING:
         email: None | str | Iterable[str] = ...,
         params: collections.abc.MutableMapping | None = None,
         resources: dict[str, Any] | None = ...,
-        trigger_rule: str = ...,
+        trigger_rule: str | Threshold = ...,
         depends_on_past: bool = ...,
         ignore_first_depends_on_past: bool = ...,
         wait_for_past_depends_before_skipping: bool = ...,
@@ -634,7 +635,7 @@ BASEOPERATOR_ARGS_EXPECTED_TYPES = {
     "queue": str,
     "pool": str,
     "pool_slots": int,
-    "trigger_rule": str,
+    "trigger_rule": (str, Threshold),
     "run_as_user": str,
     "task_concurrency": int,
     "map_index_template": str,
@@ -918,7 +919,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
     on_skipped_callback: Sequence[TaskStateChangeCallback] = ()
     _pre_execute_hook: TaskPreExecuteHook | None = None
     _post_execute_hook: TaskPostExecuteHook | None = None
-    trigger_rule: TriggerRule = DEFAULT_TRIGGER_RULE
+    trigger_rule: TriggerRule | Threshold = DEFAULT_TRIGGER_RULE
     resources: dict[str, Any] | None = None
     run_as_user: str | None = None
     task_concurrency: int | None = None
@@ -1084,7 +1085,7 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
         on_skipped_callback: None | TaskStateChangeCallback | Collection[TaskStateChangeCallback] = None,
         pre_execute: TaskPreExecuteHook | None = None,
         post_execute: TaskPostExecuteHook | None = None,
-        trigger_rule: str = DEFAULT_TRIGGER_RULE,
+        trigger_rule: str | Threshold = DEFAULT_TRIGGER_RULE,
         resources: dict[str, Any] | None = None,
         run_as_user: str | None = None,
         map_index_template: str | None = None,
@@ -1187,15 +1188,16 @@ class BaseOperator(AbstractOperator, metaclass=BaseOperatorMeta):
                 stacklevel=2,
             )
 
-        try:
-            TriggerRule(trigger_rule)
-        except ValueError:
-            raise ValueError(
-                f"The trigger_rule must be one of {[rule.value for rule in TriggerRule]},"
-                f"'{dag.dag_id if dag else ''}.{task_id}'; received '{trigger_rule}'."
-            )
-
-        self.trigger_rule: TriggerRule = TriggerRule(trigger_rule)
+        if isinstance(trigger_rule, Threshold):
+            self.trigger_rule: TriggerRule | Threshold = trigger_rule
+        else:
+            try:
+                self.trigger_rule = TriggerRule(trigger_rule)
+            except ValueError:
+                raise ValueError(
+                    f"The trigger_rule must be one of {[rule.value for rule in TriggerRule]},"
+                    f"'{dag.dag_id if dag else ''}.{task_id}'; received '{trigger_rule}'."
+                )
 
         self.depends_on_past: bool = depends_on_past
         self.ignore_first_depends_on_past: bool = ignore_first_depends_on_past

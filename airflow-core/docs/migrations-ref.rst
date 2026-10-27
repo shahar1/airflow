@@ -39,7 +39,8 @@ Here's the list of all the Database Migrations that are executed via when you ru
 +-------------------------+------------------+-------------------+--------------------------------------------------------------+
 | Revision ID             | Revises ID       | Airflow Version   | Description                                                  |
 +=========================+==================+===================+==============================================================+
-| ``53092df95325`` (head) | ``c71065a1b14f`` | ``3.5.0``         | Strip success_threshold from serialized Dags on downgrade.   |
+| ``53092df95325`` (head) | ``c71065a1b14f`` | ``3.5.0``         | Strip success_threshold from serialized Dags on downgrade;   |
+|                         |                  |                   | refuse Threshold rules.                                      |
 +-------------------------+------------------+-------------------+--------------------------------------------------------------+
 | ``c71065a1b14f``        | ``ee86eed19e24`` | ``3.5.0``         | Add session_id and registration_id to Job.                   |
 +-------------------------+------------------+-------------------+--------------------------------------------------------------+
