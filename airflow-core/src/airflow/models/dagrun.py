@@ -1277,7 +1277,11 @@ class DagRun(Base, LoggingMixin):
 
     @provide_session
     def update_state(
-        self, *, session: Session = NEW_SESSION, execute_callbacks: bool = True
+        self,
+        *,
+        session: Session = NEW_SESSION,
+        execute_callbacks: bool = True,
+        record_threshold_decisions: bool = False,
     ) -> tuple[list[TI], DagCallbackRequest | None]:
         """
         Determine the overall state of the DagRun based on the state of its TaskInstances.
@@ -1285,6 +1289,8 @@ class DagRun(Base, LoggingMixin):
         :param session: Sqlalchemy ORM Session
         :param execute_callbacks: Should dag callbacks (success/failure, SLA etc.) be invoked
             directly (default: true) or recorded as a pending request in the ``returned_callback`` property
+        :param record_threshold_decisions: Keep the success-threshold folds of this pass for the scheduler's
+            audit record: on each evaluated task instance, and the instances they routed on this run
         :return: Tuple containing tis that can be scheduled in the current loop & `returned_callback` that
             needs to be executed
         """
@@ -1325,7 +1331,9 @@ class DagRun(Base, LoggingMixin):
             tags=self.stats_tags,
         ):
             dag = self.get_dag()
-            info = self.task_instance_scheduling_decisions(session=session)
+            info = self.task_instance_scheduling_decisions(
+                session=session, record_threshold_decisions=record_threshold_decisions
+            )
 
             tis = info.tis
             schedulable_tis = info.schedulable_tis
@@ -1338,7 +1346,10 @@ class DagRun(Base, LoggingMixin):
                 # small speed up
                 if not are_runnable_tasks:
                     are_runnable_tasks, changed_by_upstream = self._are_premature_tis(
-                        unfinished.tis, finished_tis, session
+                        unfinished.tis,
+                        finished_tis,
+                        session,
+                        record_threshold_decisions=record_threshold_decisions,
                     )
                     if changed_by_upstream:  # Something changed, we need to recalculate!
                         unfinished = unfinished.recalculate()
@@ -1478,7 +1489,10 @@ class DagRun(Base, LoggingMixin):
         return schedulable_tis, callback
 
     @provide_session
-    def task_instance_scheduling_decisions(self, *, session: Session = NEW_SESSION) -> TISchedulingDecision:
+    def task_instance_scheduling_decisions(
+        self, *, session: Session = NEW_SESSION, record_threshold_decisions: bool = False
+    ) -> TISchedulingDecision:
+        self._threshold_routed: list[tuple[TI, TaskInstanceState]] = []
         tis = self.get_task_instances(session=session, state=State.task_states)
         self.log.debug("number of tis tasks for %s: %s task(s)", self, len(tis))
 
@@ -1506,6 +1520,7 @@ class DagRun(Base, LoggingMixin):
                 schedulable_tis,
                 finished_tis,
                 session=session,
+                record_threshold_decisions=record_threshold_decisions,
             )
 
             # During expansion, we may change some tis into non-schedulable
@@ -1722,6 +1737,7 @@ class DagRun(Base, LoggingMixin):
         schedulable_tis: list[TI],
         finished_tis: list[TI],
         session: Session,
+        record_threshold_decisions: bool = False,
     ) -> tuple[list[TI], bool, bool]:
         old_states: dict[UUID, Any] = {}
         ready_tis: list[TI] = []
@@ -1737,6 +1753,7 @@ class DagRun(Base, LoggingMixin):
             flag_upstream_failed=True,
             ignore_unmapped_tasks=True,  # Ignore this Dep, as we will expand it if we can.
             finished_tis=finished_tis,
+            record_threshold_decisions=record_threshold_decisions,
         )
 
         def _expand_mapped_task_if_needed(ti: TI) -> Iterable[TI] | None:
@@ -1824,6 +1841,8 @@ class DagRun(Base, LoggingMixin):
             fresh_tis = session.scalars(select(TI).where(TI.id.in_(old_states))).all()
             changed_tis = any(ti.state != old_states[ti.id] for ti in fresh_tis)
 
+        if record_threshold_decisions:
+            self._threshold_routed.extend(dep_context.threshold_routed)
         return ready_tis, changed_tis, expansion_happened
 
     def _are_premature_tis(
@@ -1831,19 +1850,23 @@ class DagRun(Base, LoggingMixin):
         unfinished_tis: Sequence[TI],
         finished_tis: list[TI],
         session: Session,
+        record_threshold_decisions: bool = False,
     ) -> tuple[bool, bool]:
         dep_context = DepContext(
             flag_upstream_failed=True,
             ignore_in_retry_period=True,
             ignore_in_reschedule_period=True,
             finished_tis=finished_tis,
+            record_threshold_decisions=record_threshold_decisions,
         )
         # there might be runnable tasks that are up for retry and for some reason(retry delay, etc.) are
         # not ready yet, so we set the flags to count them in
-        return (
-            any(ut.are_dependencies_met(dep_context=dep_context, session=session) for ut in unfinished_tis),
-            dep_context.have_changed_ti_states,
+        are_runnable = any(
+            ut.are_dependencies_met(dep_context=dep_context, session=session) for ut in unfinished_tis
         )
+        if record_threshold_decisions:
+            self._threshold_routed.extend(dep_context.threshold_routed)
+        return are_runnable, dep_context.have_changed_ti_states
 
     def _emit_true_scheduling_delay_stats_for_finished_state(self, finished_tis: list[TI]) -> None:
         """
@@ -2671,6 +2694,7 @@ class DagRun(Base, LoggingMixin):
         # tasks using EmptyOperator and without on_execute_callback / on_success_callback
         empty_ti_ids: list[UUID] = []
         schedulable_ti_ids: list[UUID] = []
+        deferred_ti_ids: list[UUID] = []
         debug_try_number_check = self.log.isEnabledFor(logging.DEBUG)
         expected_try_number_by_ti_id: dict[UUID, tuple[int, int, str | None]] = {}
         for ti in schedulable_tis:
@@ -2693,6 +2717,8 @@ class DagRun(Base, LoggingMixin):
                         ti.try_number,
                         ti.state,
                     )
+            else:
+                deferred_ti_ids.append(ti.id)
 
         count = 0
         # Don't only check if the TI.id is in id_chunk
@@ -2779,6 +2805,12 @@ class DagRun(Base, LoggingMixin):
                 )
                 count += getattr(result, "rowcount", 0)
 
+        # The ids each outcome was decided for, for the scheduler's success-threshold audit record.
+        self._schedule_tis_outcomes = {
+            "scheduled": schedulable_ti_ids,
+            "success": empty_ti_ids,
+            "deferred": deferred_ti_ids,
+        }
         return count
 
     @provide_session

@@ -32,6 +32,7 @@ from airflow.sdk.definitions._internal.loop import is_loop_task_read_from_outsid
 from airflow.sdk.definitions._internal.mixins import DependencyMixin, ResolveMixin
 from airflow.sdk.definitions._internal.setup_teardown import SetupTeardownContext
 from airflow.sdk.definitions._internal.types import NOTSET, is_arg_set
+from airflow.sdk.definitions.mappedoperator import MappedOperator
 from airflow.sdk.exceptions import AirflowException, XComNotFound
 from airflow.sdk.execution_time.lazy_sequence import LazyXComSequence
 from airflow.sdk.execution_time.xcom import BaseXCom
@@ -310,6 +311,15 @@ class PlainXComArg(XComArg):
                 for s in setups:
                     s.is_setup = True
                     s >> operator
+        return self
+
+    def with_success_threshold(self, value: int | str) -> PlainXComArg:
+        """Set the success threshold of the mapped task this references; see ``MappedOperator``."""
+        if not isinstance(self.operator, MappedOperator):
+            raise ValueError(
+                f"with_success_threshold() needs a mapped task, but {self.operator.task_id!r} is not mapped"
+            )
+        self.operator.with_success_threshold(value)
         return self
 
     def iter_references(self) -> Iterator[tuple[Operator, str]]:

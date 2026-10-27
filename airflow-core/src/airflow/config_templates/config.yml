@@ -410,6 +410,18 @@ core:
       type: integer
       example: ~
       default: "30"
+    serialized_dag_max_write_version:
+      description: |
+        Highest serialized Dag format version the Dag processor writes. ``3`` keeps every Dag readable
+        by Airflow versions that predate format version 4. Set ``4`` once every component reads
+        format version 4, to allow Dags whose mapped tasks use ``with_success_threshold()``. A Dag
+        that needs a higher version than this is not serialized, and the failure is reported as an
+        import error for its Dag file. A Dag a Lang-SDK runtime submits above this version is
+        rejected the same way. ``5`` is reserved for a later format. Allowed values: 3, 4 and 5.
+      version_added: 3.4.0
+      type: integer
+      example: ~
+      default: "3"
     compress_serialized_dags:
       description: |
         If ``True``, serialized DAGs are compressed before writing to DB.

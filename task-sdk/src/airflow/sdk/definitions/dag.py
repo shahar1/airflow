@@ -23,6 +23,7 @@ import functools
 import itertools
 import json
 import logging
+import math
 import os
 import sys
 import warnings
@@ -782,11 +783,42 @@ class DAG:
         This is called by the Dag bag before bagging the Dag.
         """
         # Imported here because taskgroup imports this module.
-        from airflow.sdk.definitions._internal.loop import check_expansions_over_loop_tasks
+        from airflow.sdk.definitions._internal.expandinput import DictOfListsExpandInput
+        from airflow.sdk.definitions._internal.loop import (
+            check_expansions_over_loop_tasks,
+            get_enclosing_loop,
+        )
+        from airflow.sdk.definitions.mappedoperator import MappedOperator
 
         self.timetable.validate()
         self.validate_setup_teardown()
         check_expansions_over_loop_tasks(self)
+
+        for task in self.task_dict.values():
+            if not isinstance(task, MappedOperator) or (threshold := task.success_threshold) is None:
+                continue
+            expand_input = task._get_specified_expand_input()
+            literals = (
+                list(expand_input.value.values())
+                if isinstance(expand_input, DictOfListsExpandInput)
+                else [expand_input.value]
+            )
+            lengths = [len(v) for v in literals if isinstance(v, abc.Sized)]
+            if task.is_setup or task.is_teardown:
+                reason = "it is a setup or teardown task"
+            elif task.get_closest_mapped_task_group() is not None or get_enclosing_loop(task) is not None:
+                reason = "it is inside a mapped task group or a loop task group"
+            elif self.fail_fast:
+                reason = "the Dag has fail_fast=True"
+            elif (
+                isinstance(threshold, int)
+                and len(lengths) == len(literals)
+                and threshold > math.prod(lengths)
+            ):
+                reason = f"it expands into only {math.prod(lengths)} instances"
+            else:
+                continue
+            raise ValueError(f"Task {task.task_id!r} cannot have a success threshold: {reason}")
 
         # We validate owner links on set, but since it's a dict it could be mutated without calling the
         # setter. Validate again here

@@ -54,7 +54,7 @@ from airflow.sdk.definitions.mappedoperator import (
     ensure_xcomarg_return_value,
     prevent_duplicates,
 )
-from airflow.sdk.definitions.xcom_arg import XComArg
+from airflow.sdk.definitions.xcom_arg import PlainXComArg, XComArg
 
 if TYPE_CHECKING:
     from airflow.sdk.definitions._internal.expandinput import (
@@ -600,7 +600,7 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
 
         super()._validate_arg_names(func, kwargs)
 
-    def expand(self, **map_kwargs: OperatorExpandArgument) -> XComArg:
+    def expand(self, **map_kwargs: OperatorExpandArgument) -> PlainXComArg:
         if self.kwargs.get("trigger_rule") == TriggerRule.ALWAYS and any(
             [isinstance(expanded, XComArg) for expanded in map_kwargs.values()]
         ):
@@ -619,7 +619,7 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
             self.kwargs.update(trigger_rule=TriggerRule.ALL_DONE_SETUP_SUCCESS)
         return self._expand(DictOfListsExpandInput(map_kwargs), strict=False)
 
-    def expand_kwargs(self, kwargs: OperatorExpandKwargsArgument, *, strict: bool = True) -> XComArg:
+    def expand_kwargs(self, kwargs: OperatorExpandKwargsArgument, *, strict: bool = True) -> PlainXComArg:
         if (
             self.kwargs.get("trigger_rule") == TriggerRule.ALWAYS
             and not isinstance(kwargs, XComArg)
@@ -643,7 +643,7 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
             raise TypeError(f"expected XComArg or list[dict], not {type(kwargs).__name__}")
         return self._expand(ListOfDictsExpandInput(kwargs), strict=strict)
 
-    def _expand(self, expand_input: ExpandInput, *, strict: bool) -> XComArg:
+    def _expand(self, expand_input: ExpandInput, *, strict: bool) -> PlainXComArg:
         ensure_xcomarg_return_value(expand_input.value)
 
         task_kwargs = self.kwargs.copy()
@@ -748,7 +748,7 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
         )
         if self.returns_dag_result:
             check_dag_result_outside_loop(operator)
-        return XComArg(operator=operator)
+        return PlainXComArg(operator=operator)
 
     def partial(self, **kwargs: Any) -> _TaskDecorator[FParams, FReturn, OperatorSubclass]:
         self._validate_arg_names("partial", kwargs)
@@ -822,9 +822,9 @@ class Task(Protocol, Generic[FParams, FReturn]):
 
     def partial(self, **kwargs: Any) -> Task[FParams, FReturn]: ...
 
-    def expand(self, **kwargs: OperatorExpandArgument) -> XComArg: ...
+    def expand(self, **kwargs: OperatorExpandArgument) -> PlainXComArg: ...
 
-    def expand_kwargs(self, kwargs: OperatorExpandKwargsArgument, *, strict: bool = True) -> XComArg: ...
+    def expand_kwargs(self, kwargs: OperatorExpandKwargsArgument, *, strict: bool = True) -> PlainXComArg: ...
 
     def override(self, **kwargs: Any) -> Task[FParams, FReturn]: ...
 

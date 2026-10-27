@@ -158,7 +158,7 @@ log = structlog.get_logger(__name__)
 DIFF_SCHEMA_VERSION = 1
 DEFAULT_MAX_CHANGES = 500
 MAX_ALLOWED_CHANGES = 5000
-SUPPORTED_SERIALIZED_DAG_SCHEMA_VERSIONS = frozenset((1, 2, 3))
+SUPPORTED_SERIALIZED_DAG_SCHEMA_VERSIONS = frozenset(range(1, DagSerialization.MAX_SERIALIZER_VERSION + 1))
 
 DiffCategory = Literal[
     "asset",
