@@ -33,7 +33,18 @@ from contextlib import contextmanager, suppress
 from datetime import datetime
 from socket import socket
 from traceback import format_exception
-from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NamedTuple, TextIO, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    BinaryIO,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    NotRequired,
+    TextIO,
+    TypedDict,
+)
 from uuid import uuid4
 
 import anyio
@@ -1183,6 +1194,9 @@ class TriggerDetails(TypedDict):
     is_watcher: bool
     name: str
     events: int
+    # Set once task.cancel() has been called; the supervisor keeps re-sending the id until the
+    # task finishes, and a second cancel would interrupt on_kill() or cleanup() mid-flight.
+    cancel_requested: NotRequired[bool]
 
 
 @attrs.define(kw_only=True)
@@ -1566,8 +1580,10 @@ class TriggerRunner:
         ):
             while queue:
                 trigger_id = queue.popleft()
-                if trigger_id in self.triggers:
-                    self.triggers[trigger_id]["task"].cancel(cancel_msg)
+                details = self.triggers.get(trigger_id)
+                if details is not None and not details.get("cancel_requested"):
+                    details["cancel_requested"] = True
+                    details["task"].cancel(cancel_msg)
                 await asyncio.sleep(0)
 
     async def cleanup_finished_triggers(self) -> list[int]:
