@@ -9494,6 +9494,7 @@ dev = [
     { name = "apache-airflow-providers-common-sql" },
     { name = "apache-airflow-providers-standard" },
     { name = "pandas" },
+    { name = "rfc3339-validator" },
 ]
 docs = [
     { name = "apache-airflow-devel-common", extra = ["docs"] },
@@ -9563,6 +9564,7 @@ dev = [
     { name = "pandas", marker = "python_full_version < '3.13'", specifier = ">=2.1.2" },
     { name = "pandas", marker = "python_full_version == '3.13.*'", specifier = ">=2.2.3" },
     { name = "pandas", marker = "python_full_version >= '3.14'", specifier = ">=2.3.3" },
+    { name = "rfc3339-validator", specifier = ">=0.1.4" },
 ]
 docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
 mypy = [{ name = "apache-airflow-devel-common", extras = ["mypy"], editable = "devel-common" }]
