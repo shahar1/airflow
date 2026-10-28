@@ -295,8 +295,10 @@ class DagFileProcessorManager(LoggingMixin):
         """Register signals that stop child processes."""
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
-        # So that we ignore the debug dump signal, making it easier to send
-        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
+        # So that we ignore the debug dump signal, making it easier to send.
+        # SIGUSR2 does not exist on Windows.
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
     def _get_team_names(self, bundle_names: Collection[str]) -> dict[str, str | None]:
         if not self._multi_team or not bundle_names:
@@ -318,7 +320,7 @@ class DagFileProcessorManager(LoggingMixin):
         self.terminate()
         self.end()
         self.log.debug("Finished terminating DAG processors.")
-        sys.exit(os.EX_OK)
+        sys.exit(0)
 
     def sync_bundles(self) -> None:
         """Sync configured DAG bundles to the metadata database."""
