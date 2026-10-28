@@ -489,7 +489,7 @@ Balance the workload for HA Triggerers
 
 .. versionadded:: 3.2.0
 
-A Triggerer will select only ``[triggerer] max_trigger_to_select_per_loop`` triggers per loop to avoid starving other Triggerers in HA deployments. It is recommended to set this value significantly lower than ``[triggerer] capacity`` to help keep the load balanced across Triggerers. Currently, the default value of ``max_trigger_to_select_per_loop`` is ``50``, while the default ``capacity`` is ``1000``.
+A Triggerer limits how many triggers it selects per loop to ``[triggerer] max_trigger_to_select_per_loop`` to avoid starving other Triggerers in HA deployments. The limit applies separately to each trigger category: callback triggers, task instance triggers and asset triggers. A single loop can therefore claim up to three times this value, still bounded by the remaining ``[triggerer] capacity``. It is recommended to set this value significantly lower than ``[triggerer] capacity`` to help keep the load balanced across Triggerers. Currently, the default value of ``max_trigger_to_select_per_loop`` is ``50``, while the default ``capacity`` is ``1000``.
 
 According to `benchmarks <https://github.com/apache/airflow/pull/58803#pullrequestreview-3549403487>`_, two Triggerers can still claim 1,000 triggers within one second while maintaining an almost even load distribution with the default settings.
 

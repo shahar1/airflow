@@ -3164,8 +3164,11 @@ triggerer:
       default: "0.2"
     max_trigger_to_select_per_loop:
       description: |
-        Maximum number of triggers to select per loop. Set this notably lower than ``[triggerer] capacity``
-        to keep load balanced across triggerers in HA deployments.
+        Maximum number of triggers to select per loop. The limit applies separately to each trigger
+        category: callback triggers, task instance triggers and asset triggers. A single loop can therefore
+        claim up to three times this value, still bounded by the remaining ``[triggerer] capacity``.
+        Set this notably lower than ``[triggerer] capacity`` to keep load balanced across triggerers
+        in HA deployments.
         Benchmarks show that two triggerers can still claim about 1,000 triggers within one second by default.
       version_added: 3.2.0
       type: integer
