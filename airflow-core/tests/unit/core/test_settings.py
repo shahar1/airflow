@@ -514,12 +514,12 @@ _local_db_path_error = pytest.raises(AirflowConfigException, match=r"Cannot use 
         pytest.param(
             "sqlite:///C:/path/to/db",
             _local_db_path_error,
-            marks=pytest.mark.skipif(sys.platform.startswith("win"), reason="Skip on Windows"),
+            marks=pytest.mark.platform("posix"),
         ),
         pytest.param(
             r"sqlite:///C:\path\to\db",
             _local_db_path_error,
-            marks=pytest.mark.skipif(sys.platform.startswith("win"), reason="Skip on Windows"),
+            marks=pytest.mark.platform("posix"),
         ),
         ("sqlite://", contextlib.nullcontext()),
     ],
