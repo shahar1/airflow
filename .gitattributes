@@ -1,3 +1,11 @@
+# Shell scripts and Dockerfiles must keep LF line endings even on Windows checkouts
+# with core.autocrlf=true: Breeze bind-mounts them into Linux containers where bash
+# and Dockerfile heredocs fail on CRLF.
+*.sh text eol=lf
+*.bash text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+
 chart/charts/** export-ignore
 clients export-ignore
 contributing-docs/ export-ignore
