@@ -820,6 +820,21 @@ def init_log_folder(directory: str | os.PathLike[str], new_folder_permissions: i
         )
 
 
+def sanitize_log_path(local_relative_path: str | os.PathLike[str]) -> str:
+    """
+    Make a rendered per-TI log path creatable on Windows.
+
+    Run ids are timestamps, so the default log filename template produces path segments
+    with colons (and users can template in other characters Windows reserves). Writers
+    and readers must both apply this so they agree on the file name; it is a no-op on
+    POSIX.
+    """
+    path = os.fspath(local_relative_path)
+    if os.name != "nt":
+        return path
+    return re.sub(r'[:<>"|?*]', "_", path)
+
+
 def init_log_file(
     base_log_folder: str | os.PathLike[str],
     local_relative_path: str | os.PathLike[str],
@@ -834,7 +849,7 @@ def init_log_file(
 
     See above ``init_log_folder`` method for more detailed explanation.
     """
-    full_path = _PatchedPath(base_log_folder, local_relative_path)
+    full_path = _PatchedPath(base_log_folder, sanitize_log_path(local_relative_path))
     init_log_folder(full_path.parent, new_folder_permissions)
 
     try:
