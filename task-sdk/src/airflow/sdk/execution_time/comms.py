@@ -225,12 +225,26 @@ class _ResponseFrame(_FrameMixin, msgspec.Struct, array_like=True, frozen=True, 
     error: dict[str, Any] | None = None
 
 
+_WIN_CHILD_COMMS_SOCKET: socket | None = None
+"""The supervision requests socket, set by ``supervisor._child_win_main`` before the target runs.
+
+On Windows the supervisor hands sockets over via ``socket.share()`` and a SOCKET handle is not a
+CRT fd, so the requests channel cannot sit on FD 0 the way it does after a fork/posix_spawn.
+"""
+
+
+def _default_comms_socket() -> socket:
+    if _WIN_CHILD_COMMS_SOCKET is not None:
+        return _WIN_CHILD_COMMS_SOCKET
+    return socket(fileno=0)
+
+
 @attrs.define()
 class CommsDecoder(Generic[ReceiveMsgType, SendMsgType]):
     """Handle communication between the task in this process and the supervisor parent process."""
 
     log: Logger = attrs.field(repr=False, factory=structlog.get_logger)
-    socket: socket = attrs.field(factory=lambda: socket(fileno=0))
+    socket: socket = attrs.field(factory=_default_comms_socket)
 
     resp_decoder: msgspec.msgpack.Decoder[_ResponseFrame] = attrs.field(
         factory=lambda: msgspec.msgpack.Decoder(_ResponseFrame), repr=False
