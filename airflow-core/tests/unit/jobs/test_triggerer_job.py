@@ -1735,6 +1735,46 @@ class TestTriggerRunner:
         mock_trigger.on_kill.assert_awaited_once()
         mock_trigger.cleanup.assert_awaited_once()
 
+    def test_run_trigger_queues_event_before_logging_so_cancel_cannot_drop_it(self, session) -> None:
+        """An event the trigger already yielded survives a cancel that lands while the runner logs it."""
+
+        class _OneEventTrigger(BaseTrigger):
+            def serialize(self):
+                return (f"{type(self).__module__}.{type(self).__qualname__}", {})
+
+            async def run(self):
+                yield TriggerEvent(True)
+                await asyncio.Event().wait()
+
+        trigger_runner = TriggerRunner()
+        trigger_runner.triggers = {
+            1: {"task": MagicMock(spec=asyncio.Task), "is_watcher": False, "name": "one_event", "events": 0}
+        }
+        trigger_runner.log = MagicMock(spec=FilteringBoundLogger)
+        trigger_runner.log.adebug = AsyncMock()
+
+        async def _drive():
+            logging_event = asyncio.Event()
+
+            async def slow_ainfo(*args, **kwargs):
+                # Structlog's async methods hand the write to an executor, which suspends the task.
+                logging_event.set()
+                await asyncio.sleep(0.1)
+
+            trigger_runner.log.ainfo = AsyncMock(side_effect=slow_ainfo)
+            run_task = asyncio.create_task(trigger_runner.run_trigger(1, _OneEventTrigger()))
+            await asyncio.wait_for(logging_event.wait(), timeout=5)
+            run_task.cancel(_REASSIGNED_CANCEL_MSG)
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+        asyncio.run(_drive())
+
+        assert trigger_runner.triggers[1]["events"] == 1
+        assert [(trigger_id, event) for trigger_id, event, _seq in trigger_runner.events] == [
+            (1, TriggerEvent(True))
+        ]
+
     def test_run_trigger_routes_shared_stream_trigger_through_manager(self, session) -> None:
         """A BaseEventTrigger that opts into a shared stream consumes filter_shared_stream()."""
         from airflow.triggers.base import BaseEventTrigger, TriggerEvent
