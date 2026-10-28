@@ -393,7 +393,7 @@ def test_pycache_volume_compose_file_is_included_only_when_requested(
 
 
 def test_include_mypy_volume_adds_mypy_compose_file():
-    compose_files = ShellParams(include_mypy_volume=True).compose_file.split(":")
+    compose_files = ShellParams(include_mypy_volume=True).compose_file.split(os.pathsep)
     assert str(SCRIPTS_CI_DOCKER_COMPOSE_PATH / "mypy.yml") in compose_files
 
 
