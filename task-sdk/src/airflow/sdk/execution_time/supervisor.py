@@ -385,16 +385,21 @@ def _reset_signals():
     sys.excepthook = sys.__excepthook__
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+    if hasattr(signal, "SIGUSR2"):
+        signal.signal(signal.SIGUSR2, signal.SIG_DFL)
 
 
-def _configure_logs_over_json_channel(log_fd: int):
+def _configure_logs_over_json_channel(log_fd: int | socket):
     # A channel that the task can send JSON-formatted logs over.
     #
     # JSON logs sent this way will be handled nicely
     from airflow.sdk.log import configure_logging, reset_logging
 
-    log_io = os.fdopen(log_fd, "wb", buffering=0)
+    if isinstance(log_fd, socket):
+        # Windows: a SOCKET handle is not a CRT fd, so it cannot be fdopen'd.
+        log_io: BinaryIO = cast("BinaryIO", log_fd.makefile("wb", buffering=0))
+    else:
+        log_io = os.fdopen(log_fd, "wb", buffering=0)
     reset_logging()
     configure_logging(json_output=True, output=log_io, sending_to_supervisor=True)
 
@@ -402,6 +407,15 @@ def _configure_logs_over_json_channel(log_fd: int):
 def _reopen_std_io_handles(child_stdin, child_stdout, child_stderr):
     # Ensure that sys.stdout et al (and the underlying filehandles for C libraries etc) are connected to the
     # pipes from the supervisor
+    if sys.platform == "win32":
+        # A SOCKET handle is not a CRT fd on Windows, so the sockets cannot be dup2'd
+        # onto fds 0/1/2. Replace the Python-level handles only.
+        # ponytail: C-level writes of native libraries to fds 1/2 still go to the
+        # inherited console, not the supervisor; revisit if that output matters.
+        for handle_name, sock in (("stdin", child_stdin), ("stdout", child_stdout), ("stderr", child_stderr)):
+            binary = cast("BinaryIO", sock.makefile("wb", buffering=0))
+            setattr(sys, handle_name, io.TextIOWrapper(binary, line_buffering=True))
+        return
     for handle_name, fd, sock, mode in (
         # Yes, we want to re-open stdin in write mode! This is cause it is a bi-directional socket, so we can
         # read and write to it.
@@ -524,7 +538,7 @@ def _fork_main(
     requests: socket,
     child_stdout: socket,
     child_stderr: socket,
-    log_fd: int,
+    log_fd: int | socket,
     target: Callable[[], None],
 ) -> NoReturn:
     """
@@ -562,9 +576,15 @@ def _fork_main(
         # Explicitly close the child-end of our supervisor sockets so
         # the parent sees EOF on "logs" channel.
         with suppress(OSError):
-            os.close(log_fd)
+            if isinstance(log_fd, socket):
+                log_fd.close()
+            else:
+                os.close(log_fd)
         with suppress(OSError):
-            os.close(requests.fileno())
+            if sys.platform == "win32":
+                requests.close()
+            else:
+                os.close(requests.fileno())
         os._exit(n)
 
     if hasattr(atexit, "_clear"):
@@ -693,6 +713,42 @@ _CHILD_EXEC_BOOTSTRAP = _CHILD_EXEC_PRELUDE + (
     "from airflow.sdk.execution_time.supervisor import _child_exec_main\n_child_exec_main()\n"
 )
 
+_CHILD_WIN_BOOTSTRAP = (
+    "from airflow.sdk.execution_time.supervisor import _child_win_main\n_child_win_main()\n"
+)
+
+
+def _child_win_main():
+    """
+    Entry point for the child process on Windows.
+
+    There is no fork and no way to place a socket on a fixed FD, so the supervisor
+    spawns a fresh interpreter and sends the four supervision sockets as
+    ``socket.share()`` blobs pickled over the child's real stdin pipe; they are
+    reconstructed here with ``socket.fromshare()``. The target to run is named in
+    ``_AIRFLOW_CHILD_TARGET`` (``module:qualname``), exactly as in the posix_spawn
+    path.
+    """
+    import pickle
+    from socket import fromshare
+
+    # The parent is trusted; this pipe only ever carries the four socket blobs.
+    blobs = pickle.load(sys.stdin.buffer)
+    child_requests = fromshare(blobs["requests"])
+    child_stdout = fromshare(blobs["stdout"])
+    child_stderr = fromshare(blobs["stderr"])
+    child_logs = fromshare(blobs["logs"])
+
+    # CommsDecoder cannot find the requests channel on FD 0 here (a Windows SOCKET
+    # handle is not a CRT fd), so publish it for comms to pick up instead.
+    comms._WIN_CHILD_COMMS_SOCKET = child_requests
+
+    target = _resolve_child_target(os.environ.pop("_AIRFLOW_CHILD_TARGET", ""))
+
+    # _fork_main always exits via os._exit(), so the socket objects above are
+    # never GC'd (which would close their underlying handles).
+    _fork_main(child_requests, child_stdout, child_stderr, child_logs, target)
+
 
 def _child_exec_main():
     """
@@ -790,7 +846,23 @@ def signal_process_tree(pid: int, sig: signal.Signals, *, fallback: Callable[[si
     Calls *fallback* instead when the group cannot be resolved or signalled, and -- critically --
     when *pid* is still in the caller's own process group, because ``killpg`` on our own group
     would signal the caller itself and its siblings.
+
+    On Windows there are no process groups to signal; the whole tree is terminated via psutil
+    instead (TerminateProcess -- there is no graceful POSIX-style signal delivery there).
     """
+    if sys.platform == "win32":
+        # ponytail: hard-terminates for any requested signal; a CTRL_BREAK_EVENT based
+        # graceful path can be added if Windows tasks need cleanup time.
+        try:
+            root = psutil.Process(pid)
+            procs = [*root.children(recursive=True), root]
+        except psutil.NoSuchProcess:
+            fallback(sig)
+            return
+        for proc in procs:
+            with suppress(psutil.NoSuchProcess):
+                proc.terminate()
+        return
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError):
@@ -925,10 +997,10 @@ class WatchedSubprocess:
             ``os.killpg``. Task execution opts in; DAG processor and triggerer
             keep the supervisor's process group and are signalled directly.
         """
-        if use_exec and "<" in getattr(target, "__qualname__", "<"):
+        if (use_exec or sys.platform == "win32") and "<" in getattr(target, "__qualname__", "<"):
             # Closures/lambdas (``<locals>`` / ``<lambda>`` in the qualname) and
             # objects without a qualname can't be named for the spawned child.
-            raise ValueError(f"use_exec=True requires a top-level importable target, got {target!r}")
+            raise ValueError(f"A spawned child requires a top-level importable target, got {target!r}")
         # Create socketpairs/"pipes" to connect to the stdin and out from the subprocess
         child_stdout, read_stdout = socketpair()
         child_stderr, read_stderr = socketpair()
@@ -939,7 +1011,33 @@ class WatchedSubprocess:
         # Open the socketpair before starting the child, so that it is open when we do.
         child_logs, read_logs = socketpair()
 
-        if use_exec:
+        if sys.platform == "win32":
+            # No fork on Windows: always spawn a fresh interpreter and hand the four
+            # sockets over as socket.share() blobs pickled onto the child's stdin pipe
+            # (they cannot be remapped onto fixed FDs the way posix_spawn does it).
+            import pickle
+            import subprocess
+
+            child_env = dict(os.environ, _AIRFLOW_CHILD_TARGET=f"{target.__module__}:{target.__qualname__}")
+            child_popen = subprocess.Popen(
+                [sys.executable, "-c", _CHILD_WIN_BOOTSTRAP],
+                env=child_env,
+                stdin=subprocess.PIPE,
+                # Approximates new_process_group: the child gets its own console process
+                # group. Tree termination is done via psutil in signal_process_tree.
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if new_process_group else 0,
+            )
+            pid = child_popen.pid
+            shared = {
+                "requests": child_requests.share(pid),
+                "stdout": child_stdout.share(pid),
+                "stderr": child_stderr.share(pid),
+                "logs": child_logs.share(pid),
+            }
+            assert child_popen.stdin is not None
+            pickle.dump(shared, child_popen.stdin)
+            child_popen.stdin.close()
+        elif use_exec:
             # file_actions run as part of the spawn itself -- no forked child to run
             # imperative dup2 code in. All four source FDs here are guaranteed >= 3
             # (0/1/2 are already open in every launch path), so no dup2 target below
@@ -1297,7 +1395,9 @@ class WatchedSubprocess:
         When ``new_process_group`` was set at ``start()`` time, the signal reaches the subprocesses
         the child spawned too (venv children, bash shells, etc.); see issue #65505.
         """
-        if self._new_process_group:
+        if self._new_process_group or sys.platform == "win32":
+            # Windows always goes through the tree variant: psutil's send_signal only
+            # accepts SIGTERM/CTRL_*_EVENT there, and children must not be orphaned.
             signal_process_tree(self._process.pid, sig, fallback=self._process.send_signal)
         else:
             self._process.send_signal(sig)
@@ -1362,8 +1462,13 @@ class WatchedSubprocess:
         if self._exit_code is not None:
             return
 
-        # Escalation sequence: SIGINT -> SIGTERM -> SIGKILL
-        escalation_path: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
+        # Escalation sequence: SIGINT -> SIGTERM -> SIGKILL (no SIGKILL on Windows,
+        # where every step hard-terminates the process tree anyway)
+        escalation_path: list[signal.Signals] = [
+            signal.SIGINT,
+            signal.SIGTERM,
+            getattr(signal, "SIGKILL", signal.SIGTERM),
+        ]
 
         if force and signal_to_send in escalation_path:
             # Start from `signal_to_send` and escalate to the end of the escalation path
@@ -1492,7 +1597,7 @@ class WatchedSubprocess:
             elif name := getattr(self._exit_code, "name", None):
                 message = "Process terminated by signal."
                 level = logging.ERROR
-                if self._exit_code == -signal.SIGKILL:
+                if sys.platform != "win32" and self._exit_code == -signal.SIGKILL:
                     message += " Likely out of memory error (OOM)."
                     level = logging.CRITICAL
                 message += " For more information, see https://airflow.apache.org/docs/apache-airflow/stable/troubleshooting.html#process-terminated-by-signal."
@@ -1748,7 +1853,7 @@ class ActivitySubprocess(WatchedSubprocess):
             self._last_successful_heartbeat = time.monotonic()
         except Exception as e:
             # On any error kill that subprocess!
-            self.kill(signal.SIGKILL)
+            self.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
             if _is_start_rejected_as_cleared(e):
                 self.process_log.info(_START_REJECTED_AS_CLEARED_MESSAGE)
                 self._terminal_state = SERVER_TERMINATED
