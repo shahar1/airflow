@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import os
 from unittest import mock
 
 import pytest
@@ -362,7 +363,8 @@ class TestLangSdkFetchUpstreamSdkSources:
 
         gradlew = java_sdk / "gradlew"
         assert gradlew.read_bytes() == b"fake-gradlew"
-        assert gradlew.stat().st_mode & 0o111, "gradlew must be executable"
+        if os.name != "nt":  # the executable bit does not exist on Windows
+            assert gradlew.stat().st_mode & 0o111, "gradlew must be executable"
         assert (java_sdk / "gradlew.bat").read_bytes() == b"fake-gradlew-bat"
         assert (java_sdk / "gradle" / "wrapper" / "gradle-wrapper.jar").read_bytes() == b"fake-jar-bytes"
         show_cmds = [call.args[0] for call in mock_run.call_args_list[5:8]]

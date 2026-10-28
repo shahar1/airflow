@@ -144,7 +144,9 @@ def run_command(
         title = "<" + " ".join(shortened_command[:5]) + ">"  # max 4 args
     workdir: str = str(cwd) if cwd else os.getcwd()
     cmd_env = os.environ.copy()
-    cmd_env.setdefault("HOME", str(Path.home()))
+    # On Windows Path.home() raises when USERPROFILE is missing from the environment
+    with contextlib.suppress(RuntimeError):
+        cmd_env.setdefault("HOME", str(Path.home()))
     if env:
         cmd_env.update(env)
     if output:
