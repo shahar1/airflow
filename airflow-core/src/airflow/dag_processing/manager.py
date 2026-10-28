@@ -1283,7 +1283,7 @@ class DagFileProcessorManager(LoggingMixin):
                         }
                     ),
                 )
-                processor.kill(signal.SIGKILL)
+                processor.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
                 processor.close()
                 self._file_stats.pop(file, None)
 
@@ -1746,7 +1746,7 @@ class DagFileProcessorManager(LoggingMixin):
                         }
                     ),
                 )
-                processor.kill(signal.SIGKILL)
+                processor.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
 
                 processors_to_remove.append(file)
 
