@@ -187,12 +187,16 @@ dependencies = [
     "graphviz>=0.20; sys_platform != 'darwin'",
 ]
 "kerberos"  = [
-    "pykerberos>=1.1.13",
+    # pykerberos builds from source against MIT Kerberos headers and does not support Windows;
+    # winkerberos is the SSPI-based equivalent there - the same split the apache-hive provider uses.
+    "pykerberos>=1.1.13; sys_platform != 'win32'",
+    "winkerberos>=0.7.0; sys_platform == 'win32'",
     "requests-kerberos>=0.14.0",
     "thrift-sasl>=0.4.2",
 ]
 "memray" = [
-    "memray>=1.19.0",
+    # memray only supports Linux and macOS and publishes no Windows wheels
+    "memray>=1.19.0; sys_platform != 'win32'",
 ]
 "gunicorn" = [
     "gunicorn>=23.0.0,!=25.1.0",
