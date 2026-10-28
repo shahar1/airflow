@@ -448,13 +448,17 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         resetter = ExitStack()
         prev_int = signal.signal(signal.SIGINT, self._exit_gracefully)
         prev_term = signal.signal(signal.SIGTERM, self._exit_gracefully)
-        prev_usr2 = signal.signal(signal.SIGUSR2, self._debug_dump)
 
         resetter.callback(signal.signal, signal.SIGINT, prev_int)
         resetter.callback(signal.signal, signal.SIGTERM, prev_term)
-        resetter.callback(signal.signal, signal.SIGUSR2, prev_usr2)
 
-        if self._enable_tracemalloc:
+        # SIGUSR1/SIGUSR2 do not exist on Windows; the debug-dump and tracemalloc
+        # triggers are simply unavailable there.
+        if hasattr(signal, "SIGUSR2"):
+            prev_usr2 = signal.signal(signal.SIGUSR2, self._debug_dump)
+            resetter.callback(signal.signal, signal.SIGUSR2, prev_usr2)
+
+        if self._enable_tracemalloc and hasattr(signal, "SIGUSR1"):
             prev = signal.signal(signal.SIGUSR1, self._log_memory_usage)
             resetter.callback(signal.signal, signal.SIGUSR1, prev)
 
@@ -570,7 +574,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             tracemalloc.stop()
 
         self.log.info("Exiting gracefully upon receiving signal %s", signum)
-        sys.exit(os.EX_OK)
+        sys.exit(0)
 
     def _log_memory_usage(self, signum: int, frame: FrameType | None) -> None:
         import tracemalloc

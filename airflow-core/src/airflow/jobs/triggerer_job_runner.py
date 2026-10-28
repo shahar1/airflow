@@ -273,8 +273,9 @@ class TriggererJobRunner(BaseJobRunner, LoggingMixin):
         else:
             self.log.warning("Forcing exit due to second exit signal %s", signum)
             if self.trigger_runner:
-                self.trigger_runner.kill(signal.SIGKILL)
-            sys.exit(os.EX_SOFTWARE)
+                # SIGKILL does not exist on Windows; SIGTERM is the strongest signal there.
+                self.trigger_runner.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
+            sys.exit(getattr(os, "EX_SOFTWARE", 70))
 
     def _execute(self) -> int | None:
         # Mark as server context for secrets backend detection when handling GetConnection

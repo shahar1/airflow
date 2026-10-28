@@ -20,9 +20,6 @@ import signal
 from argparse import Namespace
 from collections.abc import Callable
 
-from daemon import daemon
-from daemon.pidfile import TimeoutPIDLockFile
-
 from airflow import settings
 from airflow.utils.cli import setup_locations, setup_logging, sigint_handler, sigquit_handler
 from airflow.utils.process_utils import check_if_pidfile_process_is_running
@@ -49,6 +46,11 @@ def run_command_with_daemon_option(
         If not specified, a file path is generated with the default pattern.
     """
     if args.daemon:
+        # python-daemon is POSIX-only (it imports pwd/grp), so only import it when
+        # daemon mode is actually requested; the foreground path works on Windows too.
+        from daemon import daemon
+        from daemon.pidfile import TimeoutPIDLockFile
+
         pid = pid_file or args.pid if pid_file is not None or args.pid is not None else None
         pid, stdout, stderr, log_file = setup_locations(
             process=process_name, pid=pid, stdout=args.stdout, stderr=args.stderr, log=args.log_file
@@ -78,5 +80,6 @@ def run_command_with_daemon_option(
     else:
         signal.signal(signal.SIGINT, sigint_handler)
         signal.signal(signal.SIGTERM, sigint_handler)
-        signal.signal(signal.SIGQUIT, sigquit_handler)
+        if hasattr(signal, "SIGQUIT"):
+            signal.signal(signal.SIGQUIT, sigquit_handler)
         callback()
