@@ -1543,7 +1543,13 @@ class WatchedSubprocess:
         """
         # Ensure minimum timeout to prevent CPU spike with tight loop when timeout is 0 or negative
         timeout = max(0.01, max_wait_time)
-        events = self.selector.select(timeout=timeout)
+        if self.selector.get_map():
+            events = self.selector.select(timeout=timeout)
+        else:
+            # select() on Windows errors out on an empty socket set (all channels hit
+            # EOF already); just wait for the process exit check below.
+            time.sleep(timeout)
+            events = []
         for key, _ in events:
             # Retrieve the handler responsible for processing this file object (e.g., stdout, stderr)
             socket_handler, on_close = key.data

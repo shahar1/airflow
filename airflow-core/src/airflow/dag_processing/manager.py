@@ -623,6 +623,11 @@ class DagFileProcessorManager(LoggingMixin):
 
         All the parsing processes socket handlers are registered into a single Selector
         """
+        if not self.selector.get_map():
+            # select() on Windows errors out on an empty socket set; nothing to wait for anyway.
+            if timeout:
+                time.sleep(timeout)
+            return
         events = self.selector.select(timeout=timeout)
         for key, _ in events:
             socket_handler, on_close = key.data
