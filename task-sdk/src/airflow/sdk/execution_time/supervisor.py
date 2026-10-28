@@ -839,6 +839,39 @@ class PsutilTracker(ProcessTracker):
         return self._impl.wait(timeout)
 
 
+class PopenTracker(ProcessTracker):
+    """
+    Process tracker backed by :class:`subprocess.Popen` (the Windows spawn path).
+
+    Keeping the Popen object (and with it the process handle) alive matters on Windows:
+    once the last handle to an exited process closes, its exit code is no longer
+    retrievable and ``psutil.Process.wait`` returns None instead of the code.
+
+    :meta private:
+    """
+
+    ProcessNotFound = psutil.NoSuchProcess
+    TimeoutExpired = psutil.TimeoutExpired
+
+    def __init__(self, impl) -> None:
+        self._impl = impl
+
+    @property
+    def pid(self) -> int:
+        return self._impl.pid
+
+    def send_signal(self, s: signal.Signals) -> None:
+        self._impl.send_signal(s)
+
+    def wait(self, timeout: float | None) -> int:
+        import subprocess
+
+        try:
+            return self._impl.wait(timeout)
+        except subprocess.TimeoutExpired:
+            raise psutil.TimeoutExpired(timeout, pid=self._impl.pid) from None
+
+
 def signal_process_tree(pid: int, sig: signal.Signals, *, fallback: Callable[[signal.Signals], None]) -> None:
     """
     Deliver ``sig`` to *pid*'s process group, so every process it spawned is reached too.
@@ -1037,6 +1070,7 @@ class WatchedSubprocess:
             assert child_popen.stdin is not None
             pickle.dump(shared, child_popen.stdin)
             child_popen.stdin.close()
+            process_tracker: ProcessTracker = PopenTracker(child_popen)
         elif use_exec:
             # file_actions run as part of the spawn itself -- no forked child to run
             # imperative dup2 code in. All four source FDs here are guaranteed >= 3
@@ -1113,10 +1147,12 @@ class WatchedSubprocess:
         cls._close_unused_sockets(child_stdout, child_stderr, child_logs)
 
         logger = logger or cast("FilteringBoundLogger", structlog.get_logger(logger_name="task").bind())
+        if sys.platform != "win32":
+            process_tracker = PsutilTracker(psutil.Process(pid))
         proc = cls(
             pid=pid,
             stdin=read_requests,
-            process=PsutilTracker(psutil.Process(pid)),
+            process=process_tracker,
             process_log=logger,
             start_time=time.monotonic(),
             new_process_group=new_process_group,
