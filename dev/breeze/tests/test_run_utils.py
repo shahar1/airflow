@@ -38,6 +38,9 @@ from airflow_breeze.utils.run_utils import (
 )
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Group/other permission bits are not meaningful on Windows"
+)
 def test_change_file_permission(tmp_path):
     tmpfile = tmp_path / "test.config"
     tmpfile.write_text("content")
@@ -47,6 +50,9 @@ def test_change_file_permission(tmp_path):
     assert not (mode & stat.S_IWOTH)
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Group/other permission bits are not meaningful on Windows"
+)
 def test_change_directory_permission(tmp_path):
     subdir = tmp_path / "testdir"
     subdir.mkdir()

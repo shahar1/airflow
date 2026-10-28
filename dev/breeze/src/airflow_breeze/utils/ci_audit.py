@@ -76,7 +76,8 @@ def run_tool(command: Sequence[str]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(list(command), capture_output=True, text=True, check=False)
     except OSError as e:
-        return subprocess.CompletedProcess(list(command), 127, stdout="", stderr=str(e))
+        # Name the tool explicitly: Windows' OSError text omits the filename.
+        return subprocess.CompletedProcess(list(command), 127, stdout="", stderr=f"{command[0]}: {e}")
 
 
 def _ok(result: subprocess.CompletedProcess) -> bool:
