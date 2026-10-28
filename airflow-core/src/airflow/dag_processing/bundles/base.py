@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import shutil
@@ -27,7 +26,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
-from fcntl import LOCK_SH, LOCK_UN, flock
 from operator import attrgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +34,8 @@ import pendulum
 from pendulum.parsing import ParserError
 
 from airflow.configuration import conf
+from airflow.utils.file_locks import LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, flock
+from airflow.utils.platform import IS_WINDOWS
 
 if TYPE_CHECKING:
     from pendulum import DateTime
@@ -167,14 +167,22 @@ class BundleUsageTrackingManager:
         try:
             log_info("removing stale bundle.")
             with open(info.lock_file_path, "a") as f:
-                flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)  # exclusive lock, do not wait
+                flock(f, LOCK_EX | LOCK_NB)  # exclusive lock, do not wait
                 # remove the actual bundle copy
                 shutil.rmtree(bundle_version_path)
-                # remove the lock file
-                os.remove(info.lock_file_path)
+                if not IS_WINDOWS:
+                    # remove the lock file while still holding the lock
+                    os.remove(info.lock_file_path)
         except BlockingIOError:
             log_info("could not obtain lock. stale bundle will not be removed.")
             return
+        if IS_WINDOWS:
+            # Windows cannot delete an open file, so remove it after closing. If another
+            # process reopened it in the meantime, removal fails and the file stays.
+            try:
+                os.remove(info.lock_file_path)
+            except OSError:
+                log_info("could not remove lock file.")
 
     def _find_candidates(self, found):
         """Remove the recently used bundles."""
@@ -436,14 +444,16 @@ class BaseDagBundle(ABC):
         lock_dir_path.mkdir(parents=True, exist_ok=True)
         lock_file_path = lock_dir_path / f"{self.name}.lock"
 
-        with open(lock_file_path, "w") as lock_file:
+        # Append mode: "w" would truncate, and on Windows truncating a file whose first
+        # byte another process holds locked fails instead of waiting for the lock.
+        with open(lock_file_path, "a") as lock_file:
             # Exclusive lock - blocks until it is available
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            flock(lock_file, LOCK_EX)
             try:
                 self._locked = True
                 yield
             finally:
-                fcntl.flock(lock_file, LOCK_UN)
+                flock(lock_file, LOCK_UN)
                 self._locked = False
 
     def __repr__(self):
@@ -488,7 +498,13 @@ class BundleVersionLock:
             temp_file = Path(td, self.lock_file_path)
             now = pendulum.now(tz=pendulum.UTC)
             temp_file.write_text(now.isoformat())
-            os.replace(temp_file, self.lock_file_path)
+            try:
+                os.replace(temp_file, self.lock_file_path)
+            except PermissionError:
+                if not IS_WINDOWS:
+                    raise
+                # Windows refuses to replace a file another process holds open and locked;
+                # that holder has just written a fresh timestamp, so the file can stay.
 
     def acquire(self):
         if not self.version:
