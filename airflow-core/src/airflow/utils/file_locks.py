@@ -98,6 +98,6 @@ if sys.platform == "win32":
             raise ctypes.WinError(error)
 
 else:
-    from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, flock  # noqa: F401
+    from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, flock
 
 __all__ = ["LOCK_EX", "LOCK_NB", "LOCK_SH", "LOCK_UN", "flock"]
