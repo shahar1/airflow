@@ -251,13 +251,24 @@ Forking and cloning Project
    and the CI in your fork; see `CI in your fork <18_contribution_workflow.rst#ci-in-your-fork>`__.
 
 .. note::
-    For windows based machines, on cloning, the Git line endings may be different from unix based systems
-    and might lead to unexpected behaviour on running breeze tooling. Manually setting a property will mitigate this issue.
-    Set it to true for windows.
+    On Windows, configure Git **before cloning** so that the checkout works with Breeze and with
+    the Linux containers it starts:
+
+    * ``core.autocrlf`` must be ``input`` (or ``false``), never ``true``: shell scripts and
+      Dockerfiles from the checkout are bind-mounted into Linux containers, and CRLF line
+      endings break them there.
+    * ``core.longpaths`` must be ``true``: the repository contains paths longer than the
+      260-character Windows default, and the checkout is incomplete without it.
+    * ``core.symlinks`` should be ``true``, which requires enabling Windows Developer Mode
+      first: the ``airflow-core`` and ``task-sdk`` source trees contain ``_shared`` packages
+      checked in as symbolic links. Without it they are checked out as plain text files and
+      ``import airflow`` fails.
 
 .. code-block:: bash
 
-  git config core.autocrlf true
+  git config --global core.autocrlf input
+  git config --global core.longpaths true
+  git config --global core.symlinks true
 
 Configuring prek
 ----------------
