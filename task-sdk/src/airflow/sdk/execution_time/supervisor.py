@@ -1067,7 +1067,8 @@ class WatchedSubprocess:
                 "stderr": child_stderr.share(pid),
                 "logs": child_logs.share(pid),
             }
-            assert child_popen.stdin is not None
+            if child_popen.stdin is None:
+                raise RuntimeError("child stdin pipe was not created")
             pickle.dump(shared, child_popen.stdin)
             child_popen.stdin.close()
             process_tracker: ProcessTracker = PopenTracker(child_popen)
