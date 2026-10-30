@@ -565,7 +565,9 @@ apache-airflow = "airflow.__main__:main"
     "apache-airflow-providers-fab[oauth]",
 ]
 "ldap" = [
-    "python-ldap>=3.4.4",
+    # python-ldap builds from source against OpenLDAP headers and publishes no Windows
+    # wheels, so the ldap extra installs nothing (and the feature is unavailable) on Windows
+    "python-ldap>=3.4.4; sys_platform != 'win32'",
 ]
 "pandas" = [
     "apache-airflow-providers-common-sql[pandas]",
@@ -1443,7 +1445,8 @@ docs-gen = [
 # special case for google's leveldb dependency that is notriously difficult to install
 # we are not installing it by default we only install it in CI image when image is built
 leveldb = [
-    "plyvel>=1.5.1"
+    # plyvel builds against leveldb headers and publishes no Windows wheels
+    "plyvel>=1.5.1; sys_platform != 'win32'"
 ]
 
 # Aggregate of every group the CI image installs by default. Single source of

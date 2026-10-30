@@ -1149,7 +1149,7 @@ all = [
     { name = "apache-airflow-providers-zendesk" },
     { name = "atlasclient" },
     { name = "cloudpickle" },
-    { name = "python-ldap" },
+    { name = "python-ldap", marker = "sys_platform != 'win32'" },
     { name = "sentry-sdk" },
     { name = "uv" },
 ]
@@ -1373,7 +1373,7 @@ keycloak = [
     { name = "apache-airflow-providers-keycloak" },
 ]
 ldap = [
-    { name = "python-ldap" },
+    { name = "python-ldap", marker = "sys_platform != 'win32'" },
 ]
 memray = [
     { name = "apache-airflow-core", extra = ["memray"] },
@@ -1566,7 +1566,7 @@ ci-image = [
     { name = "apache-airflow-shared-timezones" },
     { name = "apache-airflow-task-sdk", extra = ["all"] },
     { name = "apache-airflow-task-sdk-integration-tests" },
-    { name = "plyvel" },
+    { name = "plyvel", marker = "sys_platform != 'win32'" },
 ]
 dev = [
     { name = "apache-airflow", extra = ["all"] },
@@ -1603,7 +1603,7 @@ docs-gen = [
     { name = "apache-airflow-devel-common", extra = ["docs-gen"] },
 ]
 leveldb = [
-    { name = "plyvel" },
+    { name = "plyvel", marker = "sys_platform != 'win32'" },
 ]
 
 [package.metadata]
@@ -1849,7 +1849,7 @@ requires-dist = [
     { name = "apache-airflow-task-sdk", extras = ["all"], marker = "extra == 'all-task-sdk'", editable = "task-sdk" },
     { name = "atlasclient", marker = "extra == 'apache-atlas'", specifier = ">=0.1.2" },
     { name = "cloudpickle", marker = "extra == 'cloudpickle'", specifier = ">=2.2.1,<3.1.2" },
-    { name = "python-ldap", marker = "extra == 'ldap'", specifier = ">=3.4.4" },
+    { name = "python-ldap", marker = "sys_platform != 'win32' and extra == 'ldap'", specifier = ">=3.4.4" },
     { name = "sentry-sdk", marker = "extra == 'sentry'", specifier = ">=2.30.0" },
     { name = "uv", marker = "extra == 'uv'", specifier = ">=0.13.4" },
 ]
@@ -1885,7 +1885,7 @@ ci-image = [
     { name = "apache-airflow-shared-timezones", editable = "shared/timezones" },
     { name = "apache-airflow-task-sdk", extras = ["all"], editable = "task-sdk" },
     { name = "apache-airflow-task-sdk-integration-tests", editable = "task-sdk-integration-tests" },
-    { name = "plyvel", specifier = ">=1.5.1" },
+    { name = "plyvel", marker = "sys_platform != 'win32'", specifier = ">=1.5.1" },
 ]
 dev = [
     { name = "apache-airflow", extras = ["all"], editable = "." },
@@ -1917,7 +1917,7 @@ dev = [
 ]
 docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
 docs-gen = [{ name = "apache-airflow-devel-common", extras = ["docs-gen"], editable = "devel-common" }]
-leveldb = [{ name = "plyvel", specifier = ">=1.5.1" }]
+leveldb = [{ name = "plyvel", marker = "sys_platform != 'win32'", specifier = ">=1.5.1" }]
 
 [[package]]
 name = "apache-airflow-breeze"
@@ -2067,10 +2067,11 @@ all = [
     { name = "graphviz", marker = "sys_platform != 'darwin'" },
     { name = "gunicorn" },
     { name = "opentelemetry-exporter-prometheus" },
-    { name = "pykerberos" },
+    { name = "pykerberos", marker = "sys_platform != 'win32'" },
     { name = "requests-kerberos" },
     { name = "statsd" },
     { name = "thrift-sasl" },
+    { name = "winkerberos", marker = "sys_platform == 'win32'" },
 ]
 async = [
     { name = "eventlet" },
@@ -2085,12 +2086,13 @@ gunicorn = [
     { name = "gunicorn" },
 ]
 kerberos = [
-    { name = "pykerberos" },
+    { name = "pykerberos", marker = "sys_platform != 'win32'" },
     { name = "requests-kerberos" },
     { name = "thrift-sasl" },
+    { name = "winkerberos", marker = "sys_platform == 'win32'" },
 ]
 memray = [
-    { name = "memray" },
+    { name = "memray", marker = "sys_platform != 'win32'" },
 ]
 otel = [
     { name = "opentelemetry-exporter-prometheus" },
@@ -2164,7 +2166,7 @@ requires-dist = [
     { name = "libcst", marker = "python_full_version >= '3.14'", specifier = ">=1.8.6" },
     { name = "linkify-it-py", specifier = ">=2.0.0" },
     { name = "lockfile", specifier = ">=0.12.2" },
-    { name = "memray", marker = "extra == 'memray'", specifier = ">=1.19.0" },
+    { name = "memray", marker = "sys_platform != 'win32' and extra == 'memray'", specifier = ">=1.19.0" },
     { name = "methodtools", specifier = ">=0.4.7" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "natsort", specifier = ">=8.4.0" },
@@ -2181,7 +2183,7 @@ requires-dist = [
     { name = "pygments", specifier = ">=2.0.1,!=2.19.0" },
     { name = "pygtrie", specifier = ">=2.5.0" },
     { name = "pyjwt", specifier = ">=2.11.0" },
-    { name = "pykerberos", marker = "extra == 'kerberos'", specifier = ">=1.1.13" },
+    { name = "pykerberos", marker = "sys_platform != 'win32' and extra == 'kerberos'", specifier = ">=1.1.13" },
     { name = "python-daemon", specifier = ">=3.0.0" },
     { name = "python-dateutil", specifier = ">=2.7.0" },
     { name = "python-slugify", specifier = ">=5.0" },
@@ -2204,6 +2206,7 @@ requires-dist = [
     { name = "universal-pathlib", specifier = ">=0.3.8" },
     { name = "uuid6", specifier = ">=2024.7.10" },
     { name = "uvicorn", specifier = ">=0.37.0" },
+    { name = "winkerberos", marker = "sys_platform == 'win32' and extra == 'kerberos'", specifier = ">=0.7.0" },
 ]
 provides-extras = ["async", "graphviz", "kerberos", "memray", "gunicorn", "otel", "statsd", "all"]
 
