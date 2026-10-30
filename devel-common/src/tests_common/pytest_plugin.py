@@ -782,7 +782,7 @@ def skip_if_not_marked_with_backend(selected_backend, item):
 
 
 def skip_if_platform_doesnt_match(marker):
-    allowed_platforms = ("linux", "breeze")
+    allowed_platforms = ("linux", "posix", "breeze")
     if not (args := marker.args):
         pytest.fail(f"No platform specified, expected one of: {', '.join(map(repr, allowed_platforms))}")
     elif not all(a in allowed_platforms for a in args):
@@ -793,6 +793,9 @@ def skip_if_platform_doesnt_match(marker):
     if "linux" in args:
         if not sys.platform.startswith("linux"):
             pytest.skip("Test expected to run on Linux platform.")
+    if "posix" in args:
+        if os.name != "posix":
+            pytest.skip("Test expected to run on a POSIX platform (not Windows).")
     if "breeze" in args:
         if not os.path.isfile("/.dockerenv") or os.environ.get("BREEZE", "").lower() != "true":
             raise pytest.skip(
