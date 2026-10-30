@@ -281,7 +281,9 @@ def test_decide(event: GateEvent, config_overrides: dict, expected: Decision):
 
 
 def test_canonical_branch_filters_match_pull_request_release_branches():
-    workflow = yaml.safe_load((AIRFLOW_ROOT_PATH / ".github" / "workflows" / "ci-amd.yml").read_text())
+    workflow = yaml.safe_load(
+        (AIRFLOW_ROOT_PATH / ".github" / "workflows" / "ci-amd.yml").read_text(encoding="utf-8")
+    )
     # PyYAML parses the bare `on:` key as boolean True.
     pull_request_branches = workflow[True]["pull_request"]["branches"]
     release_prep_branches = [

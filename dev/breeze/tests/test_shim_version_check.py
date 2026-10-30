@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -247,6 +248,12 @@ def test_detect_legacy_global_breeze_install_corrupted_uv_tool(tmp_path):
 
 SETUP_BREEZE_SCRIPT = ACTUAL_AIRFLOW_SOURCES / "scripts" / "tools" / "setup_breeze"
 
+# The tests below run setup_breeze (a bash script) via its shebang with fake bash uv/pipx
+# executables on PATH, none of which exists on Windows.
+setup_breeze_runs = pytest.mark.skipif(
+    os.name == "nt", reason="setup_breeze is a bash script run via shebang (POSIX only)"
+)
+
 
 def _write_executable(path: Path, body: str) -> None:
     path.write_text(body)
@@ -294,6 +301,7 @@ def _run_setup_breeze(env: dict[str, str]) -> subprocess.CompletedProcess:
     return subprocess.run([str(SETUP_BREEZE_SCRIPT)], env=env, text=True, capture_output=True, check=False)
 
 
+@setup_breeze_runs
 @pytest.mark.parametrize("entry_point_installed", [True, False])
 def test_setup_breeze_reports_uv_tool_install_missing_from_listing(tmp_path, entry_point_installed):
     result = _run_setup_breeze(
@@ -304,6 +312,7 @@ def test_setup_breeze_reports_uv_tool_install_missing_from_listing(tmp_path, ent
     assert "uv tool uninstall apache-airflow-breeze" in result.stdout
 
 
+@setup_breeze_runs
 def test_setup_breeze_replaces_entry_point_left_by_uv_tool_uninstall(tmp_path):
     # An entry point with no tool directory under it is the dangling symlink uv leaves behind.
     env = _sandbox_env(tmp_path, breeze_tool_installed=False, entry_point_installed=True)
@@ -314,6 +323,7 @@ def test_setup_breeze_replaces_entry_point_left_by_uv_tool_uninstall(tmp_path):
     assert BREEZE_SHIM_MARKER in shim.read_text()
 
 
+@setup_breeze_runs
 def test_setup_breeze_refuses_a_broken_symlink_uv_does_not_own(tmp_path):
     env = _sandbox_env(tmp_path, breeze_tool_installed=False, entry_point_installed=True)
     shim = Path(env["HOME"]) / ".local" / "bin" / "breeze"
@@ -325,6 +335,7 @@ def test_setup_breeze_refuses_a_broken_symlink_uv_does_not_own(tmp_path):
     assert shim.is_symlink()
 
 
+@setup_breeze_runs
 def test_setup_breeze_installs_shim_when_uv_owns_no_breeze_tool(tmp_path):
     env = _sandbox_env(tmp_path, breeze_tool_installed=False)
     result = _run_setup_breeze(env)

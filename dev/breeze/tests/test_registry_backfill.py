@@ -42,17 +42,17 @@ class TestFindProviderYaml:
     def test_simple_provider(self):
         path = _find_provider_yaml("amazon")
         assert path.name == "provider.yaml"
-        assert "providers/amazon" in str(path)
+        assert "providers/amazon" in path.as_posix()
 
     def test_hyphenated_provider(self):
         path = _find_provider_yaml("microsoft-azure")
         assert path.name == "provider.yaml"
-        assert "providers/microsoft/azure" in str(path)
+        assert "providers/microsoft/azure" in path.as_posix()
 
     def test_triple_hyphenated_provider(self):
         path = _find_provider_yaml("apache-beam")
         assert path.name == "provider.yaml"
-        assert "providers/apache/beam" in str(path) or "providers/apache-beam" in str(path)
+        assert "providers/apache/beam" in path.as_posix() or "providers/apache-beam" in path.as_posix()
 
     def test_unknown_provider_raises(self):
         with pytest.raises(Exception, match="provider.yaml not found"):

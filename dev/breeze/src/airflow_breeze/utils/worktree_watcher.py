@@ -164,7 +164,7 @@ def watch(worktree: Path, host: str, poll_interval: float, idle_timeout: float) 
             return
         if list_resources("container", worktree, host):
             last_seen_containers = time.monotonic()
-        elif time.monotonic() - last_seen_containers > idle_timeout:
+        elif time.monotonic() - last_seen_containers >= idle_timeout:
             return
         time.sleep(poll_interval)
 
