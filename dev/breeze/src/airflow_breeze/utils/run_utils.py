@@ -563,7 +563,11 @@ def _find_local_port_listeners(ports: Iterable[str]) -> dict[str, tuple[int, str
     for process in psutil.process_iter():
         with contextlib.suppress(psutil.Error):
             for connection in process.net_connections(kind="tcp"):
-                if connection.status != psutil.CONN_LISTEN or connection.laddr.port not in ports_by_number:
+                # Windows reports some listening sockets as CONN_NONE in the TCP table
+                if (
+                    connection.status not in (psutil.CONN_LISTEN, psutil.CONN_NONE)
+                    or connection.laddr.port not in ports_by_number
+                ):
                     continue
                 command_line = " ".join(process.cmdline()) or process.name()
                 listeners[ports_by_number[connection.laddr.port]] = (process.pid, command_line)
