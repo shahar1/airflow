@@ -16,12 +16,17 @@
 # under the License.
 from __future__ import annotations
 
+import os
 import signal
 from unittest import mock
 
 import pytest
 
 from airflow_breeze.utils import cdxgen
+
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "fork"), reason="fork_cdxgen_server is fork-based (POSIX only)"
+)
 
 RM_SERVER = mock.call(
     ["docker", "rm", "--force", "airflow-cdxgen-server-8081"], check=False, capture_output=True, quiet=True

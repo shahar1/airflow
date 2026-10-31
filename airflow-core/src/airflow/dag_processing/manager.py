@@ -295,8 +295,10 @@ class DagFileProcessorManager(LoggingMixin):
         """Register signals that stop child processes."""
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
-        # So that we ignore the debug dump signal, making it easier to send
-        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
+        # So that we ignore the debug dump signal, making it easier to send.
+        # SIGUSR2 does not exist on Windows.
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
     def _get_team_names(self, bundle_names: Collection[str]) -> dict[str, str | None]:
         if not self._multi_team or not bundle_names:
@@ -318,7 +320,7 @@ class DagFileProcessorManager(LoggingMixin):
         self.terminate()
         self.end()
         self.log.debug("Finished terminating DAG processors.")
-        sys.exit(os.EX_OK)
+        sys.exit(0)
 
     def sync_bundles(self) -> None:
         """Sync configured DAG bundles to the metadata database."""
@@ -621,6 +623,11 @@ class DagFileProcessorManager(LoggingMixin):
 
         All the parsing processes socket handlers are registered into a single Selector
         """
+        if not self.selector.get_map():
+            # select() on Windows errors out on an empty socket set; nothing to wait for anyway.
+            if timeout:
+                time.sleep(timeout)
+            return
         events = self.selector.select(timeout=timeout)
         for key, _ in events:
             socket_handler, on_close = key.data
@@ -1276,7 +1283,7 @@ class DagFileProcessorManager(LoggingMixin):
                         }
                     ),
                 )
-                processor.kill(signal.SIGKILL)
+                processor.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
                 processor.close()
                 self._file_stats.pop(file, None)
 
@@ -1739,7 +1746,7 @@ class DagFileProcessorManager(LoggingMixin):
                         }
                     ),
                 )
-                processor.kill(signal.SIGKILL)
+                processor.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
 
                 processors_to_remove.append(file)
 

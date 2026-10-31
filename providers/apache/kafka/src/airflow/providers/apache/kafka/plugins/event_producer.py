@@ -175,7 +175,9 @@ def _reset_state_after_fork() -> None:
     _topic_check_retry_after = 0.0
 
 
-os.register_at_fork(after_in_child=_reset_state_after_fork)
+if hasattr(os, "register_at_fork"):
+    # No fork on Windows: children are spawned fresh and start with clean module state anyway.
+    os.register_at_fork(after_in_child=_reset_state_after_fork)
 
 
 def _get_producer() -> Producer | None:

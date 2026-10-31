@@ -27,8 +27,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import IO
@@ -38,14 +38,34 @@ WORKTREE_LABEL = "org.apache.airflow.breeze.worktree"
 HOST_LABEL = "org.apache.airflow.breeze.host"
 DOCKER_TIMEOUT_SECONDS = 120
 
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_handle_nonblocking(handle: IO[str]) -> bool:
+        """Take an exclusive lock on the first byte; it is released when the handle closes."""
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+else:
+    import fcntl
+
+    def _lock_handle_nonblocking(handle: IO[str]) -> bool:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
 
 def try_lock(lock_file: Path) -> IO[str] | None:
     """Take the watcher lock, or return ``None`` when another process holds it."""
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_file.open("a")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    if not _lock_handle_nonblocking(handle):
         handle.close()
         return None
     return handle
@@ -144,7 +164,7 @@ def watch(worktree: Path, host: str, poll_interval: float, idle_timeout: float) 
             return
         if list_resources("container", worktree, host):
             last_seen_containers = time.monotonic()
-        elif time.monotonic() - last_seen_containers > idle_timeout:
+        elif time.monotonic() - last_seen_containers >= idle_timeout:
             return
         time.sleep(poll_interval)
 

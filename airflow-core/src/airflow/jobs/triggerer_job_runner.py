@@ -273,8 +273,9 @@ class TriggererJobRunner(BaseJobRunner, LoggingMixin):
         else:
             self.log.warning("Forcing exit due to second exit signal %s", signum)
             if self.trigger_runner:
-                self.trigger_runner.kill(signal.SIGKILL)
-            sys.exit(os.EX_SOFTWARE)
+                # SIGKILL does not exist on Windows; SIGTERM is the strongest signal there.
+                self.trigger_runner.kill(getattr(signal, "SIGKILL", signal.SIGTERM))
+            sys.exit(getattr(os, "EX_SOFTWARE", 70))
 
     def _execute(self) -> int | None:
         # Mark as server context for secrets backend detection when handling GetConnection
@@ -1434,10 +1435,16 @@ class TriggerRunner:
         This also sets up the SUPERVISOR_COMMS so that TaskSDK code can work as expected too (but that will
         need to be wrapped in an ``sync_to_async()`` call)
         """
-        from airflow.sdk.execution_time import task_runner
+        from airflow.sdk.execution_time import (
+            comms as sdk_comms,
+            task_runner,
+        )
 
         # Yes, we read and write to stdin! It's a socket, not a normal stdin.
-        reader, writer = await asyncio.open_connection(sock=socket(fileno=0))
+        # On Windows the supervisor hands the socket over via socket.share() instead
+        # of placing it on FD 0; _child_win_main publishes it on the comms module.
+        sock = sdk_comms._WIN_CHILD_COMMS_SOCKET or socket(fileno=0)
+        reader, writer = await asyncio.open_connection(sock=sock)
 
         self.comms_decoder = TriggerCommsDecoder(
             async_writer=writer,

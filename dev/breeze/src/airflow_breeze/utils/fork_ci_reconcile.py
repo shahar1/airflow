@@ -1189,7 +1189,7 @@ def load_workflow_triggers(workflows_dir: Path) -> dict[str, frozenset[str]]:
     """Map each workflow file name of a checkout to the events that trigger it."""
     triggers = {}
     for path in sorted(workflows_dir.glob("*.y*ml")):
-        workflow = yaml.safe_load(path.read_text()) or {}
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         triggers[path.name] = get_workflow_triggers(workflow if isinstance(workflow, dict) else {})
     return triggers
 

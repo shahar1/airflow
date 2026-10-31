@@ -150,6 +150,10 @@ def test_main_exits_when_another_watcher_holds_the_lock(watch, tmp_path):
     watch.assert_called_once_with(tmp_path, "this-host", 30, 3600)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="The fake docker is a shell script and CreateProcess only finds .exe files on PATH",
+)
 def test_watcher_runs_standalone_without_breeze_on_the_path(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

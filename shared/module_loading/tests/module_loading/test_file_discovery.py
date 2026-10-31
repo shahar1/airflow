@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -70,9 +71,12 @@ class TestFindPathFromDirectory:
             f"Detected recursive loop when walking DAG directory {test_dir}: "
             f"{Path(recursing_tgt).resolve()} has appeared more than once."
         )
-        with pytest.raises(RuntimeError, match=error_message):
+        with pytest.raises(RuntimeError, match=re.escape(error_message)):
             list(find_path_from_directory(test_dir, ignore_list_file, ignore_file_syntax="glob"))
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="os.replace cannot atomically replace a directory symlink on Windows"
+    )
     def test_find_path_from_directory_keeps_inherited_rules_on_symlink_switch(self, tmp_path):
         """Ignore rules inherited by a subdirectory still apply if the Dag folder symlink is switched mid-walk."""
         for revision in ("rev1", "rev2"):

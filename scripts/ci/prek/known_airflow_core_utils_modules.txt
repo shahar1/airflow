@@ -16,6 +16,7 @@ edgemodifier
 email
 event_scheduler
 file
+file_locks
 hashlib_wrapper
 helpers
 json

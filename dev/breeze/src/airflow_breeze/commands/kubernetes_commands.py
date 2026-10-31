@@ -2682,6 +2682,14 @@ def _lang_sdk_fetch_upstream_sdk_sources(staging: Path, output: Output | None) -
     return extracted / "go-sdk", extracted / "java-sdk"
 
 
+def _lang_sdk_docker_user_args() -> list[str]:
+    # Map the container user to the host uid/gid so bind-mount outputs are not root-owned.
+    # Windows has no uids and Docker Desktop mounts do not need the remap.
+    if hasattr(os, "getuid"):
+        return ["--user", f"{os.getuid()}:{os.getgid()}"]
+    return []
+
+
 def _lang_sdk_build_go_bundle(
     staging: Path, go_sdk_source: Path, output: Output | None, *, native: bool = False
 ) -> None:
@@ -2756,7 +2764,6 @@ def _lang_sdk_build_go_bundle(
             check=True,
         )
     else:
-        uid_gid = f"{os.getuid()}:{os.getgid()}"
         go_example_ctr = f"/repo/{example_rel.as_posix()}"
         # USER/HOME must be set because the SDK calls user.Current() at init; with cgo disabled Go's
         # pure-Go resolver reads those env vars and panics if either is empty. HOME is mounted from
@@ -2769,8 +2776,7 @@ def _lang_sdk_build_go_bundle(
                 "docker",
                 "run",
                 "--rm",
-                "--user",
-                uid_gid,
+                *_lang_sdk_docker_user_args(),
                 "-e",
                 f"HOME={go_example_ctr}/.home",
                 "-e",
@@ -2849,7 +2855,6 @@ def _lang_sdk_build_ts_bundles(staging: Path, output: Output | None, *, native: 
         get_console(output=output).print("[info]Packing the TypeScript bundles with the host Node toolchain")
         run_command(["sh", "-c", build], cwd=ts_sdk_path, output=output, check=True)
     else:
-        uid_gid = f"{os.getuid()}:{os.getgid()}"
         # The container user cannot write to the image's HOME or /usr/local/bin, so HOME is a
         # gitignored dir that also keeps the pnpm and corepack caches between runs.
         home = AIRFLOW_ROOT_PATH / "files" / "pnpm-home"
@@ -2867,8 +2872,7 @@ def _lang_sdk_build_ts_bundles(staging: Path, output: Output | None, *, native: 
                 "docker",
                 "run",
                 "--rm",
-                "-u",
-                uid_gid,
+                *_lang_sdk_docker_user_args(),
                 "-v",
                 f"{AIRFLOW_ROOT_PATH}:{AIRFLOW_ROOT_PATH}",
                 "-w",
@@ -2980,7 +2984,6 @@ def _lang_sdk_build_java_jars(
                 check=True,
             )
     else:
-        uid_gid = f"{os.getuid()}:{os.getgid()}"
         # --user keeps build outputs owned by the host user; HOME is set explicitly because that UID has
         # no /etc/passwd entry. GRADLE_USER_HOME and the mounted ~/.m2 persist the Gradle distribution
         # and dependency caches between runs -- outside /repo/java-sdk, which is remounted to the
@@ -2991,8 +2994,7 @@ def _lang_sdk_build_java_jars(
             "docker",
             "run",
             "--rm",
-            "--user",
-            uid_gid,
+            *_lang_sdk_docker_user_args(),
             "-e",
             "GRADLE_USER_HOME=/workspace-home/.gradle",
             "-e",

@@ -355,6 +355,75 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
+  basic-tests-on-windows:
+    timeout-minutes: 45
+    name: "Basic tests on Windows"
+    runs-on: ["windows-2025"]
+    if: inputs.run-generic-basic-tests == 'true'
+    env:
+      # Without a pin uv picks the runner's system Python, which can be older than Airflow supports.
+      UV_PYTHON: "${{ inputs.default-python-version }}"
+      SHARED_DISTRIBUTIONS: ${{ join(fromJSON(inputs.shared-distributions-as-json), ' ') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: "Configure git for a working Windows checkout"
+        # The same settings the contributing docs require: symlinks for the _shared source
+        # trees (runners are elevated, so no Developer Mode is needed), LF endings so that
+        # scripts stay runnable in Linux containers, and long paths for deep test paths.
+        run: |
+          git config --global core.symlinks true
+          git config --global core.autocrlf input
+          git config --global core.longpaths true
+      - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Breeze selective-checks tests need the full history
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Install uv"
+        # Extract uv version from uv.lock. The format is stable: the line
+        # immediately after `name = "uv"` is `version = "<X.Y.Z>"`.
+        run: |
+          UV_VERSION=$(sed -n '/^name = "uv"$/{n;s/^version = "\(.*\)"$/\1/p;}' uv.lock)
+          if [[ -z "${UV_VERSION}" ]]; then
+            echo "Failed to extract uv version from uv.lock" >&2
+            exit 1
+          fi
+          echo "Installing uv==${UV_VERSION}"
+          pip install "uv==${UV_VERSION}"
+      - name: "Airflow CLI smoke test"
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}\airflow-home
+        run: |
+          uv sync --package apache-airflow-core --no-default-groups
+          .venv/Scripts/airflow version
+          .venv/Scripts/airflow config list > /dev/null
+          .venv/Scripts/airflow db migrate
+      - name: "Breeze tests"
+        run: |
+          uv run --locked breeze --help > /dev/null
+          uv run --locked pytest -n auto --color=yes
+        working-directory: ./dev/breeze/
+      - name: "Shared distributions tests"
+        # pytest-timeouts cannot even configure itself without SIGALRM, so tests run
+        # without timeouts on Windows (the job timeout is the backstop)
+        run: |
+          failed=()
+          for dist in ${SHARED_DISTRIBUTIONS}; do
+            echo "::group::Shared ${dist} tests"
+            if ! (cd "shared/${dist}" && uv run --exact --group dev \
+              pytest --color=yes -n auto -p no:timeouts); then
+              failed+=("${dist}")
+            fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::Shared distribution tests failed: ${failed[*]}"
+            exit 1
+          fi
+
   test-airflow-release-commands:
     timeout-minutes: 80
     name: "Test Airflow release commands"

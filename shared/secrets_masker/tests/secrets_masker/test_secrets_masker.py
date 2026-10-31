@@ -662,7 +662,7 @@ class TestSecretsMasker:
     def test_redact_filehandles(self, caplog):
         filt = SecretsMasker()
         configure_secrets_masker_for_test(filt)
-        with open("/dev/null", "w") as handle:
+        with open(os.devnull, "w") as handle:
             assert filt.redact(handle, None) == handle
 
         # We shouldn't have logged a warning here
