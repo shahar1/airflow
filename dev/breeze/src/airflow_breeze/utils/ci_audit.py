@@ -190,7 +190,7 @@ def find_idle_fork_workflows(workflows_dir: Path) -> frozenset[str]:
     """
     idle = set()
     for path in workflows_dir.glob("*.y*ml"):
-        workflow = yaml.safe_load(path.read_text())
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
         # YAML 1.1 reads an unquoted `on` key as True.
         triggers = workflow.get("on", workflow.get(True)) or []
         automatic = set([triggers] if isinstance(triggers, str) else triggers) - {"workflow_dispatch"}
