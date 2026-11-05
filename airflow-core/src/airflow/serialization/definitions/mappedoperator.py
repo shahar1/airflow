@@ -93,6 +93,8 @@ class SerializedMappedOperator(DAGNode):
     # Stores minimal class type information (task_type, _operator_name) instead of full serialized data
     operator_class: dict[str, Any]
     partial_kwargs: dict[str, Any] = attrs.field(init=False, factory=dict)
+    success_threshold: int | str | None = attrs.field(init=False, default=None)
+    thresholded_upstream_ids: frozenset[str] = attrs.field(init=False, factory=frozenset)
 
     # Needed for serialization.
     task_id: str

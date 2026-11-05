@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import re
 import warnings
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
@@ -318,6 +319,7 @@ class MappedOperator(AbstractOperator):
     start_from_trigger: bool
     _needs_expansion: bool = True
     returns_dag_result: bool = False
+    success_threshold: int | str | None = attrs.field(init=False, default=None)
 
     dag: DAG | None
     task_group: TaskGroup | None
@@ -380,7 +382,25 @@ class MappedOperator(AbstractOperator):
             "partial_kwargs",
             "operator_extra_links",
             "is_stub",
+            "success_threshold",
         }
+
+    def with_success_threshold(self, value: int | str) -> MappedOperator:
+        """
+        Let the mapped task succeed when at least ``value`` of its instances succeed.
+
+        :param value: An ``int`` of at least 1, or a string ``"N%"`` with an integer ``N`` from 1 to 100.
+        """
+        if isinstance(value, bool) or not (
+            (isinstance(value, int) and value >= 1)
+            or (isinstance(value, str) and re.fullmatch(r"\d+%", value) and 1 <= int(value[:-1]) <= 100)
+        ):
+            raise ValueError(
+                f"success threshold must be an int >= 1 or a string 'N%' with an integer N "
+                f"from 1 to 100, not {value!r}"
+            )
+        self.success_threshold = value
+        return self
 
     @property
     def operator_name(self) -> str:

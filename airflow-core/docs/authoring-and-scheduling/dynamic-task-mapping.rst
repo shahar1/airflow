@@ -604,6 +604,47 @@ The Dag, however, would be both more scalable and easier to inspect if the tasks
 
 This creates one single task to expand against both lists instead. You can ``concat`` an arbitrary number of iterables together (e.g. ``foo.concat(bar, rex)``); alternatively, since the return value is also an XCom reference, the ``concat`` calls can be chained (e.g. ``foo.concat(bar).concat(rex)``) to achieve the same result: one single iterable that concatenates all of them in order, similar to Python's :func:`itertools.chain`.
 
+Tolerating failed instances with a success threshold
+====================================================
+
+.. versionadded:: 3.4
+
+By default a mapped task is successful only if every mapped instance succeeds. To let downstream tasks run when enough instances succeed, call ``with_success_threshold(value)`` on the object returned by ``expand()`` or ``expand_kwargs()``. It works for classic operators and ``@task`` functions, and returns the same object, so chaining and passing the result to other tasks work as before. It is not a ``partial()`` keyword.
+
+- An ``int`` is the minimum number of succeeded instances (at least 1).
+- A string such as ``"70%"`` is the minimum share of live instances, as an integer percentage from 1 to 100. The required count is ``max(1, ceil(N * live / 100))``, so ``"7%"`` of 100 live instances requires 7.
+
+.. exampleinclude:: /../tests/system/core/example_success_threshold.py
+    :language: python
+    :start-after: [START howto_success_threshold]
+    :end-before: [END howto_success_threshold]
+
+Downstream tasks see the mapped task as one upstream, which is decided only when every instance has finished. Consumers with the ``one_success`` or ``one_failed`` trigger rule therefore no longer fire early because of it; ``always`` is unaffected. Skipped and removed instances do not count against the quorum: live instances are all instances minus the skipped and the removed ones. The task ends up as follows. The first matching rule applies:
+
+- ``removed`` if all instances are removed.
+- ``success`` if the quorum is met.
+- ``upstream_failed`` if the task never ran because its own upstream failed, so no instance succeeded, failed or was skipped.
+- ``failed`` if any instance failed or was upstream-failed and the quorum is missed. A consumer with ``all_success`` then becomes ``upstream_failed``.
+- ``skipped`` if the quorum is missed, nothing failed, and some instances were skipped. This also applies when all instances are skipped.
+- ``failed`` if an ``int`` threshold is larger than the number of non-removed instances and nothing failed. This is stricter than the behaviour without a threshold.
+
+With ``all_success``, a skip coming from another upstream of the consumer is held back until the mapped task is decided.
+
+The Dag run state follows its leaf tasks. If the consumer is the leaf, the run can succeed although some instances of the mapped task failed, and the grid still shows them as failed. If the mapped task is itself a leaf, the run still fails on any failed instance. The run's ``on_success_callback`` and the ``max_consecutive_failed_dag_runs`` accounting follow the changed run outcome, so a run that succeeds this way fires ``on_success_callback`` and does not count towards consecutive failures.
+
+The consumer receives only the outputs of the succeeded instances, in map-index order and without gaps. A consumer mapped over that output therefore has one instance per succeeded upstream instance: fewer than the mapped task when some instances did not succeed, and with map indexes that no longer line up with the failed partitions.
+
+The following are rejected when the Dag is validated:
+
+- a threshold on a setup or teardown task;
+- a threshold inside a mapped task group or a loop task group;
+- a threshold in a Dag with ``fail_fast`` enabled;
+- an ``int`` threshold above the length of a literal expansion.
+
+Dags that use a threshold are stored with serialized format version 4. Before using one, raise :ref:`core.serialized_dag_max_write_version <config:core__serialized_dag_max_write_version>` from its default of ``3`` to ``4``; otherwise the Dag file gets an import error.
+
+Each scheduling decision taken under a threshold writes an audit log entry with the event ``success_threshold_decision`` and the instance counts, visible in the audit log.
+
 What data types can be expanded?
 ================================
 
