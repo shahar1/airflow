@@ -54,6 +54,7 @@ from airflow.sdk.definitions.mappedoperator import (
     ensure_xcomarg_return_value,
     prevent_duplicates,
 )
+from airflow.sdk.definitions.threshold import Threshold
 from airflow.sdk.definitions.xcom_arg import PlainXComArg, XComArg
 
 if TYPE_CHECKING:
@@ -601,11 +602,15 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
         super()._validate_arg_names(func, kwargs)
 
     def expand(self, **map_kwargs: OperatorExpandArgument) -> PlainXComArg:
-        if self.kwargs.get("trigger_rule") == TriggerRule.ALWAYS and any(
+        rule = self.kwargs.get("trigger_rule")
+        if (rule == TriggerRule.ALWAYS or (isinstance(rule, Threshold) and not rule.atoms)) and any(
             [isinstance(expanded, XComArg) for expanded in map_kwargs.values()]
         ):
+            rule_desc = (
+                "trigger rule 'always'" if rule == TriggerRule.ALWAYS else "an empty Threshold trigger rule"
+            )
             raise ValueError(
-                "Task-generated mapping within a task using 'expand' is not allowed with trigger rule 'always'."
+                f"Task-generated mapping within a task using 'expand' is not allowed with {rule_desc}."
             )
         if not map_kwargs:
             raise TypeError("no arguments to expand against")
@@ -620,8 +625,9 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
         return self._expand(DictOfListsExpandInput(map_kwargs), strict=False)
 
     def expand_kwargs(self, kwargs: OperatorExpandKwargsArgument, *, strict: bool = True) -> PlainXComArg:
+        rule = self.kwargs.get("trigger_rule")
         if (
-            self.kwargs.get("trigger_rule") == TriggerRule.ALWAYS
+            (rule == TriggerRule.ALWAYS or (isinstance(rule, Threshold) and not rule.atoms))
             and not isinstance(kwargs, XComArg)
             and any(
                 [
@@ -632,8 +638,11 @@ class _TaskDecorator(ExpandableFactory, Generic[FParams, FReturn, OperatorSubcla
                 ]
             )
         ):
+            rule_desc = (
+                "trigger rule 'always'" if rule == TriggerRule.ALWAYS else "an empty Threshold trigger rule"
+            )
             raise ValueError(
-                "Task-generated mapping within a task using 'expand_kwargs' is not allowed with trigger rule 'always'."
+                f"Task-generated mapping within a task using 'expand_kwargs' is not allowed with {rule_desc}."
             )
         if isinstance(kwargs, Sequence):
             for item in kwargs:

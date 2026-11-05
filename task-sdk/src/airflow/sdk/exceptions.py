@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection
 
     from airflow.sdk.definitions.asset import AssetNameRef, AssetUniqueKey, AssetUriRef
+    from airflow.sdk.definitions.threshold import Threshold
     from airflow.sdk.execution_time.comms import ErrorResponse
 
 
@@ -409,7 +410,7 @@ class FailFastDagInvalidTriggerRule(AirflowException):
     _allowed_rules = (TriggerRule.ALL_SUCCESS, TriggerRule.ALL_DONE_SETUP_SUCCESS)
 
     @classmethod
-    def check(cls, *, fail_fast: bool, trigger_rule: TriggerRule):
+    def check(cls, *, fail_fast: bool, trigger_rule: TriggerRule | Threshold):
         """
         Check that fail_fast dag tasks have allowable trigger rules.
 

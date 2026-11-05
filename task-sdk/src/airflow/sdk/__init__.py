@@ -31,6 +31,7 @@ __all__ = [
     "AssetTriggeredTimetable",
     "AssetWatcher",
     "AsyncCallback",
+    "Atom",
     "BaseAsyncOperator",
     "BaseBranchOperator",
     "BaseDeadlineReference",
@@ -57,9 +58,11 @@ __all__ = [
     "DeadlineReference",
     "DeltaDataIntervalTimetable",
     "DeltaTriggerTimetable",
+    "DONE",
     "EdgeModifier",
     "EventsTimetable",
     "ExceptionRetryPolicy",
+    "FAILED_ANY",
     "FanOutMapper",
     "FixedKeyMapper",
     "HourWindow",
@@ -98,6 +101,7 @@ __all__ = [
     "TaskGroup",
     "TaskInstance",
     "TaskInstanceState",
+    "Threshold",
     "TriggerRule",
     "Variable",
     "WaitForAll",
@@ -221,6 +225,7 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions.task_handlers.registry import task_handler
     from airflow.sdk.definitions.taskgroup import TaskGroup
     from airflow.sdk.definitions.template import literal
+    from airflow.sdk.definitions.threshold import DONE, FAILED_ANY, Atom, Threshold
     from airflow.sdk.definitions.timetables.assets import (
         AssetAndTimeSchedule,
         AssetOrTimeSchedule,
@@ -262,6 +267,7 @@ __lazy_imports: dict[str, tuple[str, str]] = {
     "AssetTriggeredTimetable": (".definitions.timetables.assets", "AssetTriggeredTimetable"),
     "AssetWatcher": (".definitions.asset", "AssetWatcher"),
     "AsyncCallback": (".definitions.callback", "AsyncCallback"),
+    "Atom": (".definitions.threshold", "Atom"),
     "BaseAsyncOperator": (".bases.operator", "BaseAsyncOperator"),
     "BaseBranchOperator": (".bases.branch", "BaseBranchOperator"),
     "BaseDeadlineReference": (".definitions.deadline", "BaseDeadlineReference"),
@@ -288,9 +294,11 @@ __lazy_imports: dict[str, tuple[str, str]] = {
     "DeadlineReference": (".definitions.deadline", "DeadlineReference"),
     "DeltaDataIntervalTimetable": (".definitions.timetables.interval", "DeltaDataIntervalTimetable"),
     "DeltaTriggerTimetable": (".definitions.timetables.trigger", "DeltaTriggerTimetable"),
+    "DONE": (".definitions.threshold", "DONE"),
     "EdgeModifier": (".definitions.edges", "EdgeModifier"),
     "EventsTimetable": (".definitions.timetables.events", "EventsTimetable"),
     "ExceptionRetryPolicy": (".definitions.retry_policy", "ExceptionRetryPolicy"),
+    "FAILED_ANY": (".definitions.threshold", "FAILED_ANY"),
     "FanOutMapper": (".definitions.partition_mappers.temporal", "FanOutMapper"),
     "FixedKeyMapper": (".definitions.partition_mappers.fixed_key", "FixedKeyMapper"),
     "HourWindow": (".definitions.partition_mappers.window", "HourWindow"),
@@ -329,6 +337,7 @@ __lazy_imports: dict[str, tuple[str, str]] = {
     "TaskGroup": (".definitions.taskgroup", "TaskGroup"),
     "TaskInstance": (".types", "TaskInstance"),
     "TaskInstanceState": (".api.datamodels._generated", "TaskInstanceState"),
+    "Threshold": (".definitions.threshold", "Threshold"),
     "TriggerRule": (".api.datamodels._generated", "TriggerRule"),
     "Variable": (".definitions.variable", "Variable"),
     "WaitForAll": (".definitions.partition_mappers.wait_policy", "WaitForAll"),

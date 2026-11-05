@@ -32,9 +32,38 @@ pytestmark = pytest.mark.db_test
 EXAMPLES_FOLDER = Path(__file__).parents[2] / "system" / "core"
 
 
-@pytest.mark.parametrize("example", ["example_success_threshold"])
-@conf_vars({("core", "serialized_dag_max_write_version"): "4"})
-def test_example_runs_with_a_failed_partition(example, configure_dag_bundles, session):
+SUCCESS = TaskInstanceState.SUCCESS
+SKIPPED = TaskInstanceState.SKIPPED
+FAILED = TaskInstanceState.FAILED
+
+# example -> {(task_id, map_index): expected state}
+EXPECTED_STATES = {
+    "example_success_threshold": {
+        ("process", 0): SUCCESS,
+        ("process", 1): SUCCESS,
+        ("process", 2): FAILED,
+        ("process", 3): SUCCESS,
+        ("aggregate", -1): SUCCESS,
+    },
+    "example_threshold_min_one_success": {
+        ("check_schema", -1): SUCCESS,
+        ("check_freshness", -1): SUCCESS,
+        ("check_optional_source", -1): SKIPPED,
+        ("publish", -1): SUCCESS,
+    },
+    "example_threshold_quorum": {
+        ("copy_eu", -1): SUCCESS,
+        ("copy_us", -1): SUCCESS,
+        ("copy_ap", -1): SKIPPED,
+        ("copy_sa", -1): SUCCESS,
+        ("notify", -1): SUCCESS,
+    },
+}
+
+
+@pytest.mark.parametrize("example", list(EXPECTED_STATES))
+@conf_vars({("core", "serialized_dag_max_write_version"): "5"})
+def test_example_runs_with_expected_states(example, configure_dag_bundles, session):
     dag = import_string(f"system.core.{example}.dag")
 
     with configure_dag_bundles({"examples": EXAMPLES_FOLDER}):
@@ -42,10 +71,7 @@ def test_example_runs_with_a_failed_partition(example, configure_dag_bundles, se
 
     dag_run = session.scalar(select(DagRun).where(DagRun.dag_id == dag.dag_id))
     tis = session.scalars(select(TaskInstance).where(TaskInstance.dag_id == dag.dag_id)).all()
-    mapped = [ti for ti in tis if ti.task_id == "process"]
-    states = sorted(ti.state for ti in mapped)
     assert dag_run.state == DagRunState.SUCCESS
-    assert {ti.task_id: ti.state for ti in tis if ti.task_id == "aggregate"} == {
-        "aggregate": TaskInstanceState.SUCCESS
-    }
-    assert states == sorted([TaskInstanceState.FAILED] + [TaskInstanceState.SUCCESS] * 3)
+    assert {(ti.task_id, ti.map_index): ti.state for ti in tis if ti.task_id != "watcher"} == (
+        EXPECTED_STATES[example]
+    )

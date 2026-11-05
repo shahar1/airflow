@@ -35,6 +35,7 @@ from airflow.sdk.definitions._internal.node import DAGNode
 from airflow.sdk.definitions._internal.setup_teardown import SetupTeardownContext
 from airflow.sdk.definitions._internal.templater import Templater
 from airflow.sdk.definitions.context import Context
+from airflow.sdk.definitions.threshold import Threshold
 
 if TYPE_CHECKING:
     import jinja2
@@ -108,7 +109,7 @@ class AbstractOperator(Templater, DAGNode):
     outlets: list
     inlets: list
 
-    trigger_rule: TriggerRule
+    trigger_rule: TriggerRule | Threshold
     _needs_expansion: bool | None = None
     _on_failure_fail_dagrun = False
     is_setup: bool = False
@@ -210,6 +211,8 @@ class AbstractOperator(Templater, DAGNode):
         setups: BaseOperator | Iterable[BaseOperator] | None = None,
         on_failure_fail_dagrun: bool | None = None,
     ):
+        if isinstance(self.trigger_rule, Threshold):
+            raise ValueError(f"Task {self.task_id!r} has a Threshold trigger rule and cannot be a teardown")
         self.is_teardown = True
         self.trigger_rule = TriggerRule.ALL_DONE_SETUP_SUCCESS
         if on_failure_fail_dagrun is not None:

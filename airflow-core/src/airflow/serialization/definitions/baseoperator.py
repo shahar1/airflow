@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from airflow.serialization.definitions.dag import SerializedDAG
     from airflow.serialization.definitions.mappedoperator import SerializedMappedOperator
     from airflow.serialization.definitions.taskgroup import SerializedMappedTaskGroup, SerializedTaskGroup
+    from airflow.task.threshold import CompiledThreshold
     from airflow.task.trigger_rule import TriggerRule
     from airflow.ti_deps.deps.base_ti_dep import BaseTIDep
     from airflow.triggers.base import StartTriggerArgs
@@ -145,6 +146,7 @@ class SerializedBaseOperator(DAGNode):
     template_fields_renderers: dict[str, str] = {}
 
     trigger_rule: str | TriggerRule = "all_success"
+    trigger_rule_compiled: CompiledThreshold | None = None
     success_threshold: int | str | None = None
     thresholded_upstream_ids: frozenset[str] = frozenset()
 

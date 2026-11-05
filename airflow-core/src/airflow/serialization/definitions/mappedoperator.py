@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions._internal.node import DAGNode as TaskSDKDAGNode
     from airflow.sdk.definitions.operator_resources import Resources
     from airflow.serialization.definitions.dag import SerializedDAG
+    from airflow.task.threshold import CompiledThreshold
     from airflow.task.trigger_rule import TriggerRule
     from airflow.ti_deps.deps.base_ti_dep import BaseTIDep
     from airflow.triggers.base import StartTriggerArgs
@@ -95,6 +96,7 @@ class SerializedMappedOperator(DAGNode):
     partial_kwargs: dict[str, Any] = attrs.field(init=False, factory=dict)
     success_threshold: int | str | None = attrs.field(init=False, default=None)
     thresholded_upstream_ids: frozenset[str] = attrs.field(init=False, factory=frozenset)
+    trigger_rule_compiled: CompiledThreshold | None = attrs.field(init=False, default=None)
 
     # Needed for serialization.
     task_id: str
