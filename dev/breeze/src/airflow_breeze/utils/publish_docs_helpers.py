@@ -30,7 +30,10 @@ PROVIDER_DATA_SCHEMA_PATH = AIRFLOW_ROOT_PATH / "airflow" / "provider.yaml.schem
 
 def pretty_format_path(path: str, start: str) -> str:
     """Formats path nicely."""
-    relpath = os.path.relpath(path, start)
+    try:
+        relpath = os.path.relpath(path, start)
+    except ValueError:  # no relative path exists, e.g. across Windows drives
+        return path
     if relpath == path:
         return path
     return f"{start}/{relpath}"

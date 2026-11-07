@@ -509,8 +509,13 @@ def test_apply_version_suffix_to_provider_pyproject_toml(
 
     # Mock get_provider_details to return a modified version with temporary path
     def mock_get_provider_details(provider_id: str):
-        # Use NamedTuple's _replace() method to create a copy with modified root_provider_path
-        return original_provider_details._replace(root_provider_path=temp_provider_path)
+        # Use NamedTuple's _replace() method to create a copy with modified root_provider_path.
+        # The documentation path moves along with it: on Windows CI the repo and the temp dir
+        # are on different drives, and no relative path exists between them.
+        return original_provider_details._replace(
+            root_provider_path=temp_provider_path,
+            documentation_provider_distribution_path=temp_provider_path / "docs",
+        )
 
     with patch("airflow_breeze.utils.packages.get_provider_details", side_effect=mock_get_provider_details):
         with apply_version_suffix_to_provider_pyproject_toml(

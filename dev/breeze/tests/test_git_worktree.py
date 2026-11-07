@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -217,6 +218,9 @@ class TestGetHostId:
         ):
             assert get_host_id() == "written-first"
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="Directory write access cannot be dropped via mode bits on Windows"
+    )
     def test_falls_back_to_host_name_when_the_id_cannot_be_stored(self, tmp_path):
         read_only = tmp_path / "read-only"
         read_only.mkdir(mode=0o500)

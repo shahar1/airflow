@@ -52,7 +52,8 @@ SETUP_BREEZE_SHIM_VERSION_PREFIX = "SHIM_VERSION="
 
 
 def search_upwards_for_airflow_root_path(start_from: Path) -> Path | None:
-    root = Path(start_from.root)
+    # anchor, not root: on Windows .root lacks the drive, so the walk would never reach it
+    root = Path(start_from.anchor)
     directory = start_from
     while directory != root:
         airflow_candidate_init_py = directory / "airflow-core" / "src" / "airflow" / "__init__.py"
