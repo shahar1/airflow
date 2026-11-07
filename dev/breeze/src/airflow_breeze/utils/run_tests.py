@@ -390,7 +390,7 @@ def find_all_other_tests() -> list[str]:
     all_named_test_folders.extend(NO_RECURSE_DIRS)
 
     all_current_test_folders = [
-        str(path.relative_to(AIRFLOW_ROOT_PATH))
+        path.relative_to(AIRFLOW_ROOT_PATH).as_posix()
         for path in AIRFLOW_ROOT_PATH.glob("airflow-core/tests/unit/*")
         if path.is_dir() and path.name != "__pycache__"
     ]
