@@ -603,7 +603,10 @@ class FileTaskHandler(logging.Handler):
 
         if not (remote_logs and ti.state not in State.unfinished):
             # when finished, if we have remote logs, no need to check local
-            worker_log_full_path = Path(self.local_base, worker_log_rel_path)
+            from airflow._shared.logging.structlog import sanitize_log_path
+
+            # the writer sanitized the rendered path for the local filesystem (a no-op on POSIX)
+            worker_log_full_path = Path(self.local_base, sanitize_log_path(worker_log_rel_path))
             sources, local_logs = self._read_from_local(worker_log_full_path)
             source_list.extend(sources)
         if ti.state in (TaskInstanceState.RUNNING, TaskInstanceState.DEFERRED) and not has_executor_log:

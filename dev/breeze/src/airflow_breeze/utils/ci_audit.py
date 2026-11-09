@@ -80,7 +80,8 @@ def run_tool(command: Sequence[str]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(list(command), capture_output=True, text=True, check=False)
     except OSError as e:
-        return subprocess.CompletedProcess(list(command), 127, stdout="", stderr=str(e))
+        # Name the tool explicitly: Windows' OSError text omits the filename.
+        return subprocess.CompletedProcess(list(command), 127, stdout="", stderr=f"{command[0]}: {e}")
 
 
 def _ok(result: subprocess.CompletedProcess) -> bool:
@@ -189,7 +190,7 @@ def find_idle_fork_workflows(workflows_dir: Path) -> frozenset[str]:
     """
     idle = set()
     for path in workflows_dir.glob("*.y*ml"):
-        workflow = yaml.safe_load(path.read_text())
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
         # YAML 1.1 reads an unquoted `on` key as True.
         triggers = workflow.get("on", workflow.get(True)) or []
         automatic = set([triggers] if isinstance(triggers, str) else triggers) - {"workflow_dispatch"}

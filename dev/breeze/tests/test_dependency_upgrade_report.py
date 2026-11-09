@@ -339,6 +339,9 @@ def test_explain_prepares_the_disk_like_the_image_build_jobs():
         assert steps[names.index(name)]["run"] == build[name]["run"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="a bare bash is the WSL launcher on Windows (System32 shadows Git Bash)"
+)
 @pytest.mark.parametrize(
     ("independent_report", "report_args"),
     [

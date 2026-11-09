@@ -17,7 +17,6 @@
 # under the License.
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -43,6 +42,7 @@ from airflow.api_fastapi.auth.managers.simple.user import SimpleAuthManagerUser
 from airflow.api_fastapi.common.types import MenuItem
 from airflow.configuration import AIRFLOW_HOME, conf
 from airflow.models.asset import AssetModel
+from airflow.utils.file_locks import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from airflow.utils.session import NEW_SESSION, provide_session
 
 if TYPE_CHECKING:
@@ -194,7 +194,7 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
                     # Non-blocking exclusive lock on this file
                     # Fastapi spins up N workers, so this method is called N times in N different processes
                     # This needs to be called only once so we use the file ``password_file`` as locking mechanism
-                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    flock(file, LOCK_EX | LOCK_NB)
                     passwords = self._get_passwords(stream=file)
                     changed = False
                     for user in users:
@@ -212,7 +212,7 @@ class SimpleAuthManager(BaseAuthManager[SimpleAuthManagerUser]):
                         file.write(json.dumps(passwords) + "\n")
                 finally:
                     # Release lock
-                    fcntl.flock(file, fcntl.LOCK_UN)
+                    flock(file, LOCK_UN)
         except BlockingIOError:
             # The file is locked, another process called this method already, skipping
             pass

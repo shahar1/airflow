@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest import mock
 
 import pytest
@@ -250,7 +251,7 @@ def test_load_restores_snapshot_with_the_checks_of_an_image_file_load(
 
     commands = [call.args[0] for call in mock_run_command.call_args_list]
     assert commands[0][1:] == ["restore", str(snapshot_file)]
-    assert commands[0][0].endswith("scripts/ci/docker_data_root_snapshot.sh")
+    assert commands[0][0].replace(os.sep, "/").endswith("scripts/ci/docker_data_root_snapshot.sh")
     assert commands[1] == ["docker", "image", "inspect", "--format", "{{.Id}}", CI_IMAGE]
     assert not [command for command in commands if command[:3] == ["docker", "image", "load"]]
     mock_perform_environment_checks.assert_called_once()
@@ -293,7 +294,7 @@ def test_save_creates_snapshot_with_the_snapshot_script(
 
     commands = [call.args[0] for call in mock_run_command.call_args_list]
     assert len(commands) == 1
-    assert commands[0][0].endswith("scripts/ci/docker_data_root_snapshot.sh")
+    assert commands[0][0].replace(os.sep, "/").endswith("scripts/ci/docker_data_root_snapshot.sh")
     assert commands[0][1:] == ["create", str(snapshot_file)]
     mock_perform_environment_checks.assert_called_once()
 
