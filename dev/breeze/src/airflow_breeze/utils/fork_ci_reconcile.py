@@ -107,7 +107,6 @@ GATE_PROTECTED_PATHS = frozenset(
         "dev/breeze/src/airflow_breeze/utils/fork_ci_messages.py",
         "dev/breeze/src/airflow_breeze/utils/fork_ci_reconcile.py",
         ".github/workflows/fork-ci-monitor.yml",
-        ".github/workflows/fork-ci-project-ci-label.yml",
     }
 )
 GATE_JOB_NAME = "Fork CI gate"
@@ -598,7 +597,13 @@ def classify(
             plan.draft = False
         since = marker.since if marker and marker.state == state.value else now
         _set_marker_comment(plan, pr, comment(Marker(state.value, pr.head_sha, since)))
-        _set_status(plan, pr, state.value, f"https://github.com/{repo}/pull/{pr.number}/checks")
+        checks_url = f"https://github.com/{repo}/pull/{pr.number}/checks"
+        _set_status(plan, pr, state.value, checks_url)
+        # The pull request must not merge on the fork result once a maintainer moves it to project
+        # CI. Revoked here, in the run that sees the label, rather than only by
+        # ``report_project_ci_passed``, whose search lags behind a new label by minutes.
+        if state == ForkState.RELEASED and pr.ci_passed_state == "success":
+            plan.ci_passed = ("pending", checks_url, CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION)
         return plan
 
     if LABEL_USE_PROJECT_CI in labels:
@@ -1320,7 +1325,7 @@ def report_project_ci_passed(
                 state, description = rest_status.get("state"), rest_status.get("description")
                 passed_url = read_project_ci_passed_url(client, repo, node["headRefOid"])
             # Both the status and the project check run must pass when they share a name, so a
-            # status the monitor or the label workflow never posted is not created here.
+            # status the monitor never posted is not created here.
             if not state:
                 continue
             if passed_url:
@@ -1590,8 +1595,8 @@ def report_orphaned_ci_passed(
 
     A pull request that left the gated flow, for example by losing `use project ci` or `use fork ci`
     while the gate is off, keeps the `pending` or fork status the reconciler wrote, and a status and
-    a check run of one name must both pass. Only a status written here or by the label workflow
-    counts, and only discovery's 24 hour window sees the pull request.
+    a check run of one name must both pass. Only a status the reconciler wrote counts, and only
+    discovery's 24 hour window sees the pull request.
     """
     commit = ((node.get("commits") or {}).get("nodes") or [{}])[0].get("commit") or {}
     if commit.get("oid") == node["headRefOid"]:

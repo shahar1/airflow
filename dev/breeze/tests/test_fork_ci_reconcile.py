@@ -19,13 +19,11 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
-import subprocess
 from datetime import UTC, datetime, timedelta, timezone
 from unittest import mock
 from urllib.parse import quote
 
 import pytest
-import yaml
 from click.testing import CliRunner
 
 from airflow_breeze.commands.ci_commands import fork_ci_reconcile
@@ -691,6 +689,33 @@ def test_release_with_use_project_ci():
     )
     assert plan.attention == []
     find_bypass.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("ci_passed_state", "revoked"),
+    [
+        pytest.param("success", True, id="fork-success-is-revoked"),
+        pytest.param("pending", False, id="pending-is-kept"),
+        pytest.param(None, False, id="no-status-is-not-created"),
+    ],
+)
+def test_release_with_use_project_ci_revokes_a_fork_success(ci_passed_state, revoked):
+    pr = _pr(labels=("fork ci required", "use project ci"), ci_passed_state=ci_passed_state)
+
+    plan, _, _ = _classify(pr, GREEN)
+
+    expected = (
+        "pending",
+        "https://github.com/apache/airflow/pull/42/checks",
+        CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION,
+    )
+    assert plan.ci_passed == (expected if revoked else None)
+
+
+def test_base_branch_without_gate_keeps_the_ci_passed_status():
+    plan, _, _ = _classify(_pr(base_ref="v2-10-test", ci_passed_state="success"), GREEN, config=None)
+
+    assert plan.ci_passed is None
 
 
 def test_base_branch_without_gate_releases():
@@ -4013,17 +4038,6 @@ def test_find_project_ci_label_heads(client):
     assert 'label:"use project ci"' in client.graphql.call_args.args[1]["q"]
 
 
-def test_label_workflow_uses_the_messages_of_the_reconciler():
-    text = (AIRFLOW_ROOT_PATH / ".github" / "workflows" / "fork-ci-project-ci-label.yml").read_text()
-
-    for expected in (
-        f'"{CI_PASSED_CONTEXT}"',
-        f'"{CI_PASSED_PROJECT_DESCRIPTION}"',
-        f'"{CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION}"',
-    ):
-        assert expected in text
-
-
 LIVE_PULL_REQUEST = {"head": {"sha": "shared"}, "labels": []}
 
 
@@ -4034,6 +4048,7 @@ def _run_reconcile_with_green_pull_requests(
     live=LIVE_PULL_REQUEST,
     same_branch=(),
     ci_passed=("success", RUN_URL, CI_PASSED_DESCRIPTION),
+    state=ForkState.GREEN,
 ):
     """Reconcile gated, fork-green pull requests that all have head commit ``shared``."""
     nodes = [_pr_node(n, headRefOid="shared") for n in numbers]
@@ -4053,7 +4068,7 @@ def _run_reconcile_with_green_pull_requests(
         if "/status" in path
         else {"state": "active"}
     )
-    plan = Plan(state=ForkState.GREEN, ci_passed=ci_passed)
+    plan = Plan(state=state, ci_passed=ci_passed)
     with (
         mock.patch("airflow_breeze.utils.fork_ci_reconcile.classify", autospec=True, return_value=plan),
         mock.patch("airflow_breeze.utils.fork_ci_reconcile.JobStatusReporter", autospec=True) as reporter,
@@ -4096,6 +4111,31 @@ def test_run_reconcile_posts_no_fork_success_on_a_head_with_use_project_ci(
         c for c in client.set_status.call_args_list if c.kwargs.get("context") == CI_PASSED_CONTEXT
     ]
     assert bool(posted_calls) is posted
+
+
+@pytest.mark.parametrize(
+    ("heads", "posted"),
+    [
+        pytest.param(set(), True, id="label-not-yet-in-the-search-index"),
+        pytest.param(GitHubError("HTTP 502"), True, id="heads-unknown"),
+        pytest.param({"shared"}, False, id="left-to-report-project-ci-passed"),
+    ],
+)
+def test_run_reconcile_revokes_a_fork_success_in_the_run_that_releases_to_project_ci(
+    mock_project_ci_heads, client, tmp_path, heads, posted
+):
+    if isinstance(heads, Exception):
+        mock_project_ci_heads.side_effect = heads
+    else:
+        mock_project_ci_heads.return_value = heads
+    revoke = ("pending", f"https://github.com/{REPO}/pull/1/checks", CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION)
+
+    _run_reconcile_with_green_pull_requests(client, tmp_path, 1, state=ForkState.RELEASED, ci_passed=revoke)
+
+    posted_calls = [
+        c for c in client.set_status.call_args_list if c.kwargs.get("context") == CI_PASSED_CONTEXT
+    ]
+    assert posted_calls == ([mock.call(1, "shared", *revoke, context=CI_PASSED_CONTEXT)] if posted else [])
 
 
 @pytest.mark.parametrize(
@@ -4239,92 +4279,3 @@ def test_report_project_ci_passed_counts_only_the_successes_that_were_written(cl
     client.set_status.side_effect = [GitHubError("HTTP 502"), None, None]
 
     assert report_project_ci_passed(client, repo=REPO, attention=[], budget=1) == [2]
-
-
-LABEL_WORKFLOW = AIRFLOW_ROOT_PATH / ".github" / "workflows" / "fork-ci-project-ci-label.yml"
-
-FAKE_GH = """#!/bin/bash
-echo "$*" >> "$GH_LOG"
-case "$*" in
-  *"-X POST"*) printf 'pending\\tWaiting' > "$STATUS_FILE" ;;
-  *"/status?"*) cat "$STATUS_FILE" ;;
-  *"fork-ci-monitor.yml"*) echo 0 ;;
-esac
-"""
-
-
-@pytest.mark.parametrize(
-    ("status", "posts"),
-    [
-        pytest.param("success\tFork CI passed for this commit", 1, id="fork-success-is-revoked-once"),
-        pytest.param("success\tProject CI passed for this commit", 0, id="project-success-is-kept"),
-        pytest.param("pending\tWaiting for project CI (use project ci)", 0, id="pending-is-kept"),
-        pytest.param("", 0, id="no-status-is-not-created"),
-    ],
-)
-def test_label_workflow_script_revokes_only_a_fork_success(tmp_path, status, posts):
-    steps = yaml.safe_load(LABEL_WORKFLOW.read_text())["jobs"]["revoke-fork-ci-passed"]["steps"]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "gh").write_text(FAKE_GH)
-    (bin_dir / "sleep").write_text("#!/bin/bash\n")
-    for tool in bin_dir.iterdir():
-        tool.chmod(0o755)
-    status_file = tmp_path / "status"
-    status_file.write_text(status)
-    log = tmp_path / "gh.log"
-
-    subprocess.run(
-        ["bash", "-c", steps[0]["run"]],
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "GH_LOG": str(log),
-            "STATUS_FILE": str(status_file),
-            "REPOSITORY": REPO,
-            "HEAD_SHA": "abc",
-            "PR_NUMBER": "1",
-        },
-        check=True,
-    )
-
-    posted = [line for line in log.read_text().splitlines() if "-X POST" in line]
-    assert len(posted) == posts
-    if posts:
-        assert f"repos/{REPO}/statuses/abc" in posted[0]
-        assert "state=pending" in posted[0]
-
-
-def test_label_workflow_script_does_not_wait_for_stuck_monitor_runs(tmp_path):
-    steps = yaml.safe_load(LABEL_WORKFLOW.read_text())["jobs"]["revoke-fork-ci-passed"]["steps"]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    # Three monitor runs are queued for good; none was created in the last 20 minutes.
-    (bin_dir / "gh").write_text(
-        FAKE_GH.replace(
-            '*"fork-ci-monitor.yml"*) echo 0 ;;',
-            '*"fork-ci-monitor.yml"*"created=>="*) echo 0 ;;\n  *"fork-ci-monitor.yml"*) echo 3 ;;',
-        )
-    )
-    (bin_dir / "sleep").write_text("#!/bin/bash\n")
-    for tool in bin_dir.iterdir():
-        tool.chmod(0o755)
-    status_file = tmp_path / "status"
-    status_file.write_text("success\tFork CI passed for this commit")
-    log = tmp_path / "gh.log"
-
-    subprocess.run(
-        ["bash", "-c", steps[0]["run"]],
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "GH_LOG": str(log),
-            "STATUS_FILE": str(status_file),
-            "REPOSITORY": REPO,
-            "HEAD_SHA": "abc",
-            "PR_NUMBER": "1",
-        },
-        check=True,
-        timeout=30,
-    )
-
-    monitor_reads = [line for line in log.read_text().splitlines() if "fork-ci-monitor.yml" in line]
-    assert len(monitor_reads) == 2

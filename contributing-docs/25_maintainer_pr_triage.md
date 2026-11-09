@@ -274,10 +274,11 @@ Everything else the skill does (quality criteria, pings, suspicious-change flags
 usual. The `Fork CI / Tests (AMD)` commit status shows the fork CI state and links to the run in
 the fork. To move a single pull request back to project CI, add `use project ci`; the reconciler
 releases it on its next run; removing `fork ci required` by hand is not enough, the next run
-labels a gated pull request again. Until project CI has passed on the head commit the pull request
-cannot merge (its `CI passed` status stays `pending`), and after it has passed the status turns
-`success` on the next monitor run, within about 15 minutes. Adding the label does not start project
-CI by itself, and the
+labels a gated pull request again. The run that releases the pull request sets its `CI passed`
+status to `pending` until project CI has passed on the head commit, so the pull request cannot
+merge on the fork result from then on (until that run, within about 15 minutes of the label, it
+still can); after project CI has passed the status turns `success` on the next monitor run, within
+about 15 minutes. Adding the label does not start project CI by itself, and the
 reconciler deletes the gated `Tests (AMD)` runs, so there is usually nothing to re-run: close and
 reopen the pull request (`gh pr close <n> -R apache/airflow && gh pr reopen <n> -R apache/airflow`),
 or ask the author to push. Pull requests that change CI-defining files are not drafted

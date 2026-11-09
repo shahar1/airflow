@@ -73,10 +73,8 @@ Non-goals:
 - The one-time reset of the open pull request backlog (AIP-120 §9.1). The design makes it a
   configuration change, but it is decided separately.
 - Any change to how committer, collaborator or exempted-organisation pull requests are tested.
-- Event-driven mutation of pull requests. The only exception is `fork-ci-project-ci-label.yml`,
-  a `pull_request_target` workflow that revokes the fork-derived `CI passed` success when `use
-  project ci` is added (see "The `CI passed` check"). All other writes come from the scheduled
-  reconciler.
+- Event-driven mutation of pull requests. Nothing in this design uses `pull_request_target`.
+  All writes come from the scheduled reconciler.
 
 ## Overview
 
@@ -240,9 +238,9 @@ Consequences for the other components:
   reconciler removes `fork ci required`, undrafts it if the bot drafted it, edits the state
   comment to say project CI is in use, and posts a `success` status with the description
   "Project CI in use (label `use project ci`)". Project CI then runs on the next push, or when
-  a maintainer closes and reopens the pull request. Until project CI has passed on the head
-  commit the pull request cannot merge: its `CI passed` status is `pending` (see "The `CI passed`
-  check").
+  a maintainer closes and reopens the pull request. From that run on, and until project CI has
+  passed on the head commit, the pull request cannot merge: its `CI passed` status is `pending`
+  (see "The `CI passed` check").
 - Both override labels on one pull request resolve to project CI and are reported to Slack as
   a conflict.
 
@@ -956,13 +954,13 @@ is the source the ruleset accepts.
   posted earlier is overwritten with `pending` so the pull request cannot merge on it.
 - A pull request carrying `use project ci` cannot merge on the fork result. GitHub requires both to
   pass when a check run and a commit status have the same name and that name is required, so the
-  `CI passed` status and project CI's `CI passed` check run must both succeed. When the label is
-  added, or a labelled pull request gets a new head commit or is reopened, `fork-ci-project-ci-label.yml`
-  (a `pull_request_target` workflow with only `statuses: write` and `actions: read`, which checks
-  nothing out and reads only the head SHA from the event) overwrites a fork `success` with `pending`
-  ("Waiting for project CI (use project ci)"). The new head commit case matters because the commit
-  can already carry a fork `success` posted for another gated pull request on it, and project CI's
-  check run does not exist while it runs.
+  `CI passed` status and project CI's `CI passed` check run must both succeed. The run that
+  releases the pull request (see "Override labels") overwrites a fork `success` on its head commit
+  with `pending` ("Waiting for project CI (use project ci)"). It reads the labels from the pull
+  request itself, so it does not wait for the search index, which lags behind a new label by
+  minutes. A labelled pull request that gets a new head commit can already carry a fork `success`
+  posted for another gated pull request on that commit, while project CI's check run does not exist
+  until it runs; the pass over labelled pull requests below overwrites that one.
 - Every monitor run also searches the open pull requests carrying the label, as they have left the
   state machine, and keeps the status in line with project CI. It only writes when the head commit
   already has a `CI passed` status: the project check run alone decides otherwise, and a `pending`
@@ -992,16 +990,15 @@ is the source the ruleset accepts.
   pull requests of the same head branch (the listing that finds fork pull requests), and skips the
   post when one now carries the label or the head commit is new. A duplicate pull request from
   another branch at the same commit is not found this way.
-- The protection is eventual with a bounded window, not atomic. A monitor write between its live
-  read and its POST, or a monitor run that outlasts the label workflow's wait, can leave a fork
-  `success` for up to one monitor cycle (15 minutes). The label workflow revokes once at once and
-  again after the monitor runs that were under way have finished, waiting for up to 12 minutes (a
-  monitor run takes about 2). It does not wait for monitor runs created more than 20 minutes
-  before, which are stuck: GitHub can leave a run queued for good, and no API call removes it.
-  This depends on the workflow running. A strict merge-time guarantee
-  needs a required check bound to a source, which is out of scope here.
-  Revoking a `success` is never limited by the per-run budget of commit statuses; posting the
-  project CI `success` is.
+- The protection is eventual with a bounded window, not atomic. Nothing reacts to the label when
+  it is added (`pull_request_target` is not used, see "Non-goals"), so a fork `success` posted
+  before the label stays until the next monitor run, up to one cadence (15 minutes), and the pull
+  request can merge on the fork result in that window. A maintainer who adds the label to a pull
+  request whose fork CI is green waits for the `pending` before enabling auto-merge, or starts the
+  monitor by hand (`workflow_dispatch`). A monitor write between its live read and its POST can
+  also leave a fork `success` for one more cycle. A strict merge-time guarantee needs a required
+  check bound to a source, which is out of scope here. Revoking a `success` is never limited by
+  the per-run budget of commit statuses; posting the project CI `success` is.
 - Known limitation: the ruleset accepts `CI passed` from any source, so a pull request that changes
   workflows can make its own project CI run produce a `CI passed` check run. This holds for every
   pull request that runs project CI; reviewers must check changes to CI files before adding
@@ -1280,9 +1277,7 @@ as a failed check rather than a crash.
 - `pull_request` runs the workflow file from the pull request's merge commit, so a pull
   request can edit `ci-amd.yml` to remove the gate or add a workflow with a `pull_request`
   trigger. The gate job cannot prevent that; `pull_request_target` was deliberately not used
-  for the gate itself, to avoid running any logic with write permissions in reaction to an
-  untrusted event; the one `pull_request_target` workflow only revokes a status on a label added
-  by a maintainer and executes no pull request content. The
+  to avoid running any logic with write permissions in reaction to an untrusted event. The
   cost is bounded instead: the reconciler closes such a pull request within one cadence (see
   "Gate tampering"), and a closed pull request no longer triggers `pull_request` runs, so
   one push buys at most one run. The change is also visible in review and covered by the
