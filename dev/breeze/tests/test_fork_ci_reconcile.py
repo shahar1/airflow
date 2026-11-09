@@ -692,15 +692,21 @@ def test_release_with_use_project_ci():
 
 
 @pytest.mark.parametrize(
-    ("ci_passed_state", "revoked"),
+    ("ci_passed_state", "ci_passed_description", "revoked"),
     [
-        pytest.param("success", True, id="fork-success-is-revoked"),
-        pytest.param("pending", False, id="pending-is-kept"),
-        pytest.param(None, False, id="no-status-is-not-created"),
+        pytest.param("success", CI_PASSED_DESCRIPTION, True, id="fork-success-is-revoked"),
+        pytest.param("success", None, True, id="success-without-description-is-revoked"),
+        pytest.param("success", CI_PASSED_PROJECT_DESCRIPTION, False, id="project-success-is-kept"),
+        pytest.param("pending", CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION, False, id="pending-is-kept"),
+        pytest.param(None, None, False, id="no-status-is-not-created"),
     ],
 )
-def test_release_with_use_project_ci_revokes_a_fork_success(ci_passed_state, revoked):
-    pr = _pr(labels=("fork ci required", "use project ci"), ci_passed_state=ci_passed_state)
+def test_release_with_use_project_ci_revokes_a_fork_success(ci_passed_state, ci_passed_description, revoked):
+    pr = _pr(
+        labels=("fork ci required", "use project ci"),
+        ci_passed_state=ci_passed_state,
+        ci_passed_description=ci_passed_description,
+    )
 
     plan, _, _ = _classify(pr, GREEN)
 
@@ -1554,6 +1560,36 @@ def test_read_head_status_reads_ci_run_started(client):
     pr = dataclasses.replace(parse_pull_request(_pr_node(1)), head_status_unread=True)
 
     assert read_head_status(client, REPO, pr).ci_run_started_state == "success"
+
+
+def test_parse_pull_request_reads_the_ci_passed_description():
+    node = _pr_node(
+        1,
+        commits={
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": "sha1",
+                        "status": {
+                            "context": None,
+                            "ciPassed": {"state": "SUCCESS", "description": CI_PASSED_PROJECT_DESCRIPTION},
+                        },
+                    }
+                }
+            ]
+        },
+    )
+
+    assert parse_pull_request(node).ci_passed_description == CI_PASSED_PROJECT_DESCRIPTION
+
+
+def test_read_head_status_reads_the_ci_passed_description(client):
+    client.rest_get.return_value = [
+        {"context": CI_PASSED_CONTEXT, "state": "success", "description": CI_PASSED_PROJECT_DESCRIPTION}
+    ]
+    pr = dataclasses.replace(parse_pull_request(_pr_node(1)), head_status_unread=True)
+
+    assert read_head_status(client, REPO, pr).ci_passed_description == CI_PASSED_PROJECT_DESCRIPTION
 
 
 def _branch_run(created_at: str, head_repo: str = "someone/airflow") -> dict:
@@ -4114,15 +4150,15 @@ def test_run_reconcile_posts_no_fork_success_on_a_head_with_use_project_ci(
 
 
 @pytest.mark.parametrize(
-    ("heads", "posted"),
+    "heads",
     [
-        pytest.param(set(), True, id="label-not-yet-in-the-search-index"),
-        pytest.param(GitHubError("HTTP 502"), True, id="heads-unknown"),
-        pytest.param({"shared"}, False, id="left-to-report-project-ci-passed"),
+        pytest.param(set(), id="label-not-yet-in-the-search-index"),
+        pytest.param(GitHubError("HTTP 502"), id="heads-unknown"),
+        pytest.param({"shared"}, id="head-already-in-the-label-search"),
     ],
 )
 def test_run_reconcile_revokes_a_fork_success_in_the_run_that_releases_to_project_ci(
-    mock_project_ci_heads, client, tmp_path, heads, posted
+    mock_project_ci_heads, client, tmp_path, heads
 ):
     if isinstance(heads, Exception):
         mock_project_ci_heads.side_effect = heads
@@ -4135,7 +4171,7 @@ def test_run_reconcile_revokes_a_fork_success_in_the_run_that_releases_to_projec
     posted_calls = [
         c for c in client.set_status.call_args_list if c.kwargs.get("context") == CI_PASSED_CONTEXT
     ]
-    assert posted_calls == ([mock.call(1, "shared", *revoke, context=CI_PASSED_CONTEXT)] if posted else [])
+    assert posted_calls == [mock.call(1, "shared", *revoke, context=CI_PASSED_CONTEXT)]
 
 
 @pytest.mark.parametrize(
@@ -4205,16 +4241,15 @@ def test_report_project_ci_passed_revokes_a_pull_request_the_heads_search_missed
     client.set_status.assert_called_once_with(1, "sha1", *WAITING, context=CI_PASSED_CONTEXT)
 
 
-def test_run_reconcile_leaves_every_ci_passed_status_of_a_labelled_head_to_the_project_ci_pass(
+def test_run_reconcile_still_revokes_a_fork_success_on_a_labelled_head(
     mock_project_ci_heads, client, tmp_path
 ):
     mock_project_ci_heads.return_value = {"shared"}
+    revoke = ("pending", RUN_URL, "Fork CI result no longer trusted")
 
-    _run_reconcile_with_green_pull_requests(
-        client, tmp_path, 1, ci_passed=("pending", RUN_URL, "Fork CI result no longer trusted")
-    )
+    _run_reconcile_with_green_pull_requests(client, tmp_path, 1, ci_passed=revoke)
 
-    client.set_status.assert_not_called()
+    client.set_status.assert_called_once_with(1, "shared", *revoke, context=CI_PASSED_CONTEXT)
 
 
 @pytest.mark.parametrize("workflow_file", ["ci-amd.yml", "ci.yml", "ci-amd-arm.yml"])

@@ -292,6 +292,7 @@ class PullRequestSnapshot:
     current_status: tuple[str, str, str] | None = None
     status_created_at: datetime | None = None
     ci_passed_state: str | None = None
+    ci_passed_description: str | None = None
     ci_run_started_state: str | None = None
     # GateEvent.ci_run_at of a pilot's pull request created before they joined; set from its
     # `fork ci required` label by `mark_older_pilot_pull_request`.
@@ -601,8 +602,13 @@ def classify(
         _set_status(plan, pr, state.value, checks_url)
         # The pull request must not merge on the fork result once a maintainer moves it to project
         # CI. Revoked here, in the run that sees the label, rather than only by
-        # ``report_project_ci_passed``, whose search lags behind a new label by minutes.
-        if state == ForkState.RELEASED and pr.ci_passed_state == "success":
+        # ``report_project_ci_passed``, whose search lags behind a new label by minutes. A success
+        # that project CI earned (a retried release after that pass posted it) is kept.
+        if (
+            state == ForkState.RELEASED
+            and pr.ci_passed_state == "success"
+            and pr.ci_passed_description != CI_PASSED_PROJECT_DESCRIPTION
+        ):
             plan.ci_passed = ("pending", checks_url, CI_PASSED_WAITING_PROJECT_CI_DESCRIPTION)
         return plan
 
@@ -870,7 +876,7 @@ fragment PassTwoFields on PullRequest {
         oid
         status {
           context(name: "%(context)s") { state targetUrl description createdAt }
-          ciPassed: context(name: "%(ci_passed)s") { state }
+          ciPassed: context(name: "%(ci_passed)s") { state description }
           ciRunStarted: context(name: "%(ci_run_started)s") { state }
         }
       } } }
@@ -968,6 +974,7 @@ def parse_pull_request(node: dict[str, Any]) -> PullRequestSnapshot:
     current_status = None
     status_created_at = None
     ci_passed_state = None
+    ci_passed_description = None
     ci_run_started_state = None
     commits = (node.get("commits") or {}).get("nodes") or []
     head_status_unread = bool(commits) and commits[0]["commit"].get("oid") != node["headRefOid"]
@@ -975,6 +982,7 @@ def parse_pull_request(node: dict[str, Any]) -> PullRequestSnapshot:
         status = commits[0]["commit"].get("status") or {}
         if status.get("ciPassed"):
             ci_passed_state = status["ciPassed"]["state"].lower()
+            ci_passed_description = status["ciPassed"].get("description")
         if status.get("ciRunStarted"):
             ci_run_started_state = status["ciRunStarted"]["state"].lower()
         context = status.get("context")
@@ -1016,6 +1024,7 @@ def parse_pull_request(node: dict[str, Any]) -> PullRequestSnapshot:
         current_status=current_status,
         status_created_at=status_created_at,
         ci_passed_state=ci_passed_state,
+        ci_passed_description=ci_passed_description,
         ci_run_started_state=ci_run_started_state,
         marker=marker,
         marker_comment_id=marker_id,
@@ -2302,6 +2311,7 @@ def read_head_status(client: GitHubClient, repo: str, pr: PullRequestSnapshot) -
         ),
         status_created_at=parse_github_datetime(status.get("created_at") or "") if status else None,
         ci_passed_state=ci_passed["state"] if ci_passed else None,
+        ci_passed_description=ci_passed.get("description") if ci_passed else None,
         ci_run_started_state=ci_run_started["state"] if ci_run_started else None,
         head_status_unread=False,
     )
@@ -2691,11 +2701,15 @@ def run_reconcile(
                 head_shared_across_bases=pr.head_sha in shared_heads,
                 find_gate_change=functools.partial(gate_change_finder.find, pr),
             )
-            if plan.ci_passed and (
-                pr.head_sha in (project_ci_heads or ())
-                or (
-                    plan.ci_passed[0] == "success"
-                    and (project_ci_heads is None or not is_unchanged_without_project_ci(client, repo, pr))
+            # A revocation to `pending` always goes through: it is idempotent and must not depend on
+            # `report_project_ci_passed` succeeding later in this run.
+            if (
+                plan.ci_passed
+                and plan.ci_passed[0] == "success"
+                and (
+                    pr.head_sha in (project_ci_heads or ())
+                    or project_ci_heads is None
+                    or not is_unchanged_without_project_ci(client, repo, pr)
                 )
             ):
                 plan.ci_passed = None
