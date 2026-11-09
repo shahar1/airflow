@@ -38,7 +38,7 @@ def clean_db(session):
     session.execute(delete(TaskInstance))
 
 
-@time_machine.travel("2016-11-01")
+@time_machine.travel(datetime(2016, 11, 1))
 @pytest.mark.parametrize(
     ("logical_date", "is_met"),
     [
