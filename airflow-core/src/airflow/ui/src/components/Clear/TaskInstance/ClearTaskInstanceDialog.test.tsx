@@ -679,4 +679,30 @@ describe("ClearTaskInstanceDialog", () => {
       only_failed: false,
     });
   });
+
+  it("sends the original selection, not the kept rows, when force run is ticked", async () => {
+    const user = userEvent.setup();
+
+    affectedTasks.task_instances = [loopPass("pass-0", 0), loopPass("pass-2", 2)];
+
+    render(<ClearTaskInstanceDialog onClose={vi.fn()} open taskInstance={taskInstance} />, {
+      wrapper: Wrapper,
+    });
+
+    const rows = await screen.findAllByRole("row");
+
+    fireEvent.click(within(rows[1] as HTMLElement).getByRole("checkbox"));
+    await user.click(screen.getByRole("checkbox", { name: /options\.forceRun/iu }));
+
+    expect(within(screen.getAllByRole("row")[1] as HTMLElement).queryByRole("checkbox")).toBeNull();
+
+    await clickConfirm();
+
+    await waitFor(() => expect(mutateMock).toHaveBeenCalledTimes(1));
+    const [{ requestBody }] = mutateMock.mock.calls[0] as [{ requestBody: Record<string, unknown> }];
+
+    expect(requestBody).toMatchObject({ ignore_upstream_deps: true });
+    expect(requestBody).toHaveProperty("task_ids");
+    expect(requestBody).not.toHaveProperty("task_instance_ids");
+  });
 });

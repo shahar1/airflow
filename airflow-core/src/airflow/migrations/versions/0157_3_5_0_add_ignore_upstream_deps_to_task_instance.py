@@ -34,6 +34,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
+from airflow.migrations.utils import sqlite_rebuilds
+
 revision = "806e4be38d60"
 down_revision = "d8c6f3a129b0"
 branch_labels = None
@@ -51,5 +53,7 @@ def upgrade():
 
 def downgrade():
     """Remove ignore_upstream_deps from task_instance."""
-    with op.batch_alter_table("task_instance", schema=None) as batch_op:
+    # Dropping a column rebuilds the table on SQLite, unlike adding one, so the foreign keys of
+    # everything that points at task_instance have to be held off while the rows are copied.
+    with sqlite_rebuilds(op), op.batch_alter_table("task_instance", schema=None) as batch_op:
         batch_op.drop_column("ignore_upstream_deps")

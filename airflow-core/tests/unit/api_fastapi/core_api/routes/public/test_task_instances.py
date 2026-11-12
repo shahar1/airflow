@@ -4691,6 +4691,7 @@ class TestPostClearTaskInstances(TestTaskInstanceEndpoint):
             run_on_latest_version=False,
             whole_task_keys=set(),
             ignore_upstream_deps=False,
+            forced_ti_ids=None,
         )
 
     @mock.patch(
@@ -4759,6 +4760,102 @@ class TestPostClearTaskInstances(TestTaskInstanceEndpoint):
         )
         assert get_response.status_code == 200
         assert get_response.json()["ignore_upstream_deps"] is True
+
+    @pytest.mark.parametrize("with_loop", [False, True], ids=["plain", "loop-aware"])
+    def test_clear_taskinstance_ignore_upstream_deps_spares_setups_and_teardowns(
+        self, test_client, dag_maker, session, with_loop
+    ):
+        @task_group
+        def body():
+            MockOperator(task_id="work")
+
+        with dag_maker(f"force_run_setup_teardown_{with_loop}", serialized=True):
+            if with_loop:
+                create_loop(body, max_iterations=2)
+            setup_t = MockOperator(task_id="setup_t").as_setup()
+            normal_t = MockOperator(task_id="normal_t")
+            teardown_t = MockOperator(task_id="teardown_t").as_teardown(setups=setup_t)
+            setup_t >> normal_t >> teardown_t
+        dr = dag_maker.create_dagrun()
+        for ti in dr.task_instances:
+            ti.state = State.FAILED
+        session.commit()
+
+        response = test_client.post(
+            f"/dags/{dr.dag_id}/clearTaskInstances",
+            json={
+                "dag_run_id": dr.run_id,
+                "dry_run": False,
+                "only_failed": False,
+                "ignore_upstream_deps": True,
+                "task_ids": ["normal_t"],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        session.expire_all()
+        flags = dict(
+            session.execute(
+                select(TaskInstance.task_id, TaskInstance.ignore_upstream_deps).where(
+                    TaskInstance.dag_id == dr.dag_id,
+                    TaskInstance.task_id.in_(["setup_t", "normal_t", "teardown_t"]),
+                )
+            ).all()
+        )
+        assert flags == {"setup_t": False, "normal_t": True, "teardown_t": False}
+
+    @pytest.mark.parametrize(
+        ("run_on_latest_version", "latest_is_unmapped"),
+        [
+            pytest.param(False, False, id="run-version"),
+            pytest.param(True, False, id="latest-version"),
+            pytest.param(True, True, id="latest-version-unmapped"),
+        ],
+    )
+    def test_clear_taskinstance_ignore_upstream_deps_covers_whole_legacy_expansion(
+        self, test_client, dag_maker, session, run_on_latest_version, latest_is_unmapped
+    ):
+        dag_id = f"force_run_legacy_{run_on_latest_version}_{latest_is_unmapped}"
+        with dag_maker(dag_id=dag_id, serialized=True):
+            MockOperator.partial(task_id="mapped").expand(arg2=[1, 2])
+        dr = dag_maker.create_dagrun()
+        if latest_is_unmapped:
+            with dag_maker(dag_id=dag_id, serialized=True, session=session):
+                MockOperator(task_id="mapped")
+        session.execute(delete(TaskInstance).where(TaskInstance.dag_id == dr.dag_id))
+        session.execute(delete(DynamicRegion).where(DynamicRegion.dag_id == dr.dag_id))
+        tis = [
+            TaskInstance(
+                dag_maker.serialized_dag.get_task("mapped"),
+                run_id=dr.run_id,
+                dag_version_id=dr.created_dag_version_id,
+                region_index=index,
+                state=State.FAILED,
+            )
+            for index in range(2)
+        ]
+        session.add_all(tis)
+        session.commit()
+        selected_id = str(tis[0].id)
+
+        response = test_client.post(
+            f"/dags/{dr.dag_id}/clearTaskInstances",
+            json={
+                "dry_run": False,
+                "only_failed": False,
+                "dag_run_id": dr.run_id,
+                "task_instance_ids": [selected_id],
+                "whole_expansion_ids": [selected_id],
+                "run_on_latest_version": run_on_latest_version,
+                "ignore_upstream_deps": True,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        session.expire_all()
+        (replacement,) = session.scalars(select(TaskInstance).where(TaskInstance.dag_id == dr.dag_id)).all()
+        assert replacement.id not in {ti.id for ti in tis}
+        assert replacement.ignore_upstream_deps is True
 
     def test_clear_taskinstance_is_called_with_invalid_task_ids(self, test_client, session):
         """Test that dagrun is running when invalid task_ids are passed to clearTaskInstances API."""

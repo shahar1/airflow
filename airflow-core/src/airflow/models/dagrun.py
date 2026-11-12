@@ -1970,7 +1970,24 @@ class DagRun(Base, LoggingMixin):
                         # Indexes added here are normally waved through on the strength of the
                         # sibling that just passed its dependency check. A forced instance passed
                         # by skipping that check, so it cannot vouch for indexes the user never
-                        # selected: queue them for this loop's own evaluation instead.
+                        # selected: queue them for this loop's own evaluation instead. They are
+                        # forced too only when the whole expansion was, i.e. no index of it is left
+                        # unforced.
+                        if revised_tis and not session.scalar(
+                            select(TI.id)
+                            .where(
+                                TI.dag_id == self.dag_id,
+                                TI.run_id == self.run_id,
+                                TI.task_id == schedulable.task_id,
+                                TI.region_id == schedulable.region_id,
+                                TI.ignore_upstream_deps.is_(False),
+                                TI.state.is_distinct_from(TaskInstanceState.REMOVED),
+                                TI.id.not_in([ti.id for ti in revised_tis]),
+                            )
+                            .limit(1)
+                        ):
+                            for revised in revised_tis:
+                                revised.ignore_upstream_deps = True
                         additional_tis.extend(revised_tis)
                     else:
                         ready_tis.extend(revised_tis)
@@ -2099,7 +2116,9 @@ class DagRun(Base, LoggingMixin):
             tags={**self.stats_tags, "dag_id": self.dag_id},
         )
 
-    def reconcile_legacy_expansions(self, *, session: Session, dag_version_id: UUID | None = None) -> None:
+    def reconcile_legacy_expansions(
+        self, *, session: Session, dag_version_id: UUID | None = None, ignore_upstream_deps: bool = False
+    ) -> None:
         """
         Create the placeholder of a pre-region mapped expansion that a whole-task clear replaced.
 
@@ -2185,6 +2204,7 @@ class DagRun(Base, LoggingMixin):
             if not task.get_needs_expansion():
                 continue
             ti = TI(task, run_id=self.run_id, dag_version_id=version_id, region_id=region.id)
+            ti.ignore_upstream_deps = ignore_upstream_deps
             _add_and_prime_mapped_ti(ti, task, self, session=session)
         session.flush()
 

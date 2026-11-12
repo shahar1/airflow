@@ -462,6 +462,7 @@ def clear_task_instances(
     whole_task_keys: Collection[tuple[str, str, str]] = (),
     superseded_ti_ids: Collection[UUID] = (),
     ignore_upstream_deps: bool = False,
+    forced_ti_ids: Collection[UUID] | None = None,
 ) -> list[TaskInstance]:
     """
     Clear a set of task instances, but make sure the running ones get killed.
@@ -485,6 +486,8 @@ def clear_task_instances(
         are archived in place instead of receiving a successor.
     :param ignore_upstream_deps: re-run the instances even if their dependencies on other task
         instances are not met; stays set until the instance is cleared again.
+    :param forced_ti_ids: limits ``ignore_upstream_deps`` to these executions, so setups and
+        teardowns the clear pulled in keep their dependencies. ``None`` forces every cleared one.
 
     :meta private:
     """
@@ -530,10 +533,14 @@ def clear_task_instances(
         return latest_dag_versions[dag_id]
 
     cleared = []
+    forced_legacy_keys: set[tuple[str, str, str]] = set()
     for original in tis:
         ti = original if original in session else session.get(TaskInstance, original.id)
         if ti is None or ti.working_set is not True:
             raise ValueError("An archived task instance cannot be cleared")
+        force = ignore_upstream_deps and (forced_ti_ids is None or ti.id in forced_ti_ids)
+        if force and (ti.dag_id, ti.run_id, ti.task_id) in legacy_keys:
+            forced_legacy_keys.add((ti.dag_id, ti.run_id, ti.task_id))
         if ti.state in (TaskInstanceState.RUNNING, TaskInstanceState.RESTARTING):
             if prevent_running_task:
                 raise AirflowClearRunningTaskException(
@@ -542,7 +549,7 @@ def clear_task_instances(
                 # Prevents the task from re-running and clearing when prevent_running_task from the frontend and the tas is running is True.
 
             ti.state = TaskInstanceState.RESTARTING
-            ti.ignore_upstream_deps = ignore_upstream_deps
+            ti.ignore_upstream_deps = force
         # If a task is cleared when running and the prevent_running_task is false,
         # set its state to RESTARTING so that
         # the task is terminated and becomes eligible for retry.
@@ -598,7 +605,7 @@ def clear_task_instances(
                 # only go there.
                 ti.dag_version_id = dr.created_dag_version_id
             # After prepare_db_for_next_try, so the archived attempt keeps the finished try's own flag.
-            ti.ignore_upstream_deps = ignore_upstream_deps
+            ti.ignore_upstream_deps = force
             session.merge(ti)
         cleared.append(ti)
 
@@ -683,6 +690,17 @@ def clear_task_instances(
             select(DagRun).where(tuple_(DagRun.dag_id, DagRun.run_id).in_(legacy_run_keys))
         ):
             legacy_run.reconcile_legacy_expansions(session=session)
+        if forced_legacy_keys:
+            # The replacement can come from verify_integrity above as well as from the
+            # reconciliation, so the flag is set on whatever now stands in for the expansion.
+            for replacement in session.scalars(
+                select(TaskInstance).where(
+                    tuple_(TaskInstance.dag_id, TaskInstance.run_id, TaskInstance.task_id).in_(
+                        forced_legacy_keys
+                    )
+                )
+            ):
+                replacement.ignore_upstream_deps = True
     return cleared
 
 
@@ -952,6 +970,7 @@ def apply_loop_clear_scope(
     prevent_running_task: bool | None = None,
     whole_task_keys: Collection[tuple[str, str, str]] = (),
     ignore_upstream_deps: bool = False,
+    forced_ti_ids: Collection[UUID] | None = None,
 ) -> list[TaskInstance]:
     """Apply a planned clear while the caller holds its DagRun lock."""
     from airflow.exceptions import AirflowClearRunningTaskException
@@ -1005,6 +1024,7 @@ def apply_loop_clear_scope(
         prevent_running_task=prevent_running_task,
         whole_task_keys=whole_task_keys,
         ignore_upstream_deps=ignore_upstream_deps,
+        forced_ti_ids=forced_ti_ids,
     )
 
 
@@ -1853,7 +1873,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                 self.set_state(terminal_outcome, session=session)
             self.archive(reason="superseded", session=session)
             if self.region_id == SENTINEL_REGION_ID:
-                self.dag_run.reconcile_legacy_expansions(session=session)
+                # A restarting attempt carries the flag of the clear that replaced its expansion.
+                self.dag_run.reconcile_legacy_expansions(
+                    session=session, ignore_upstream_deps=self.ignore_upstream_deps
+                )
             return self
         if terminal_outcome is not None:
             raise ValueError("A terminal archival outcome requires a superseded execution")

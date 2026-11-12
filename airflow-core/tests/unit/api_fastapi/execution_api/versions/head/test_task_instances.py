@@ -5284,6 +5284,30 @@ class TestTISkipDownstreamRaceCondition:
         ti_downstream = dr.get_task_instance("downstream")
         assert ti_downstream.state == State.SKIPPED
 
+    def test_skip_downstream_spares_force_run_ti(self, client, session, dag_maker):
+        with dag_maker("skip_race_dag_force_run", session=session):
+            branch = EmptyOperator(task_id="branch")
+            downstream = EmptyOperator(task_id="downstream")
+            branch >> downstream
+        dr = dag_maker.create_dagrun(run_id="run")
+
+        ti_branch = dr.get_task_instance("branch")
+        ti_branch.set_state(State.SUCCESS)
+
+        ti_downstream = dr.get_task_instance("downstream")
+        ti_downstream.ignore_upstream_deps = True
+        session.merge(ti_downstream)
+        session.commit()
+
+        response = client.patch(
+            f"/execution/task-instances/{ti_branch.id}/skip-downstream",
+            json={"tasks": ["downstream"]},
+        )
+        assert response.status_code == 204
+
+        session.expire_all()
+        assert dr.get_task_instance("downstream").state is None
+
     def test_skip_downstream_still_skips_none_state_ti(self, client, session, dag_maker):
         with dag_maker("skip_race_dag_normal", session=session):
             branch = EmptyOperator(task_id="branch")

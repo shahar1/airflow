@@ -1256,6 +1256,20 @@ def post_clear_task_instances(
     if body.task_instance_ids is not None:
         if {ti.id for ti in task_instances} != set(body.task_instance_ids):
             raise HTTPException(status.HTTP_409_CONFLICT, "Selected task execution changed before clearing")
+    # Only the requested executions are forced. The setups and teardowns a clear pulls in keep
+    # their dependencies, or a teardown would run before the work it tears down.
+    forced_ti_ids: set[UUID] | None = None
+    if body.ignore_upstream_deps and body.task_instance_ids is not None:
+        forced_ti_ids = set(body.task_instance_ids)
+    elif body.ignore_upstream_deps and body.task_ids is not None:
+        forced_ti_ids = {
+            ti.id
+            for ti in task_instances
+            if ti.task_id in body.task_ids or (ti.task_id, resolver.public_map_index(ti)) in body.task_ids
+        }
+    forced_expansions = {
+        (ti.task_id, ti.region_id) for ti in task_instances if ti.id in body.whole_expansion_ids
+    }
     if loop_aware:
         selections: dict[tuple[str, str], list[TI]] = defaultdict(list)
         for ti in task_instances:
@@ -1299,6 +1313,10 @@ def post_clear_task_instances(
             .execution_options(populate_existing=True)
         ).all()
 
+    if forced_ti_ids is not None:
+        forced_ti_ids.update(
+            ti.id for ti in task_instances if (ti.task_id, ti.region_id) in forced_expansions
+        )
     dependent_clears = find_dependents(task_instances)
     if dry_run:
         task_instances = [*task_instances, *(ti for clear in dependent_clears for ti in clear.task_instances)]
@@ -1331,6 +1349,7 @@ def post_clear_task_instances(
                         prevent_running_task=body.prevent_running_task,
                         whole_task_keys=whole_task_keys,
                         ignore_upstream_deps=body.ignore_upstream_deps,
+                        forced_ti_ids=forced_ti_ids,
                     )
                 task_instances = cleared
             else:
@@ -1342,6 +1361,7 @@ def post_clear_task_instances(
                     prevent_running_task=body.prevent_running_task,
                     whole_task_keys=whole_task_keys,
                     ignore_upstream_deps=body.ignore_upstream_deps,
+                    forced_ti_ids=forced_ti_ids,
                 )
             if dependent_clears:
                 task_instances = [

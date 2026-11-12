@@ -1186,6 +1186,8 @@ def ti_skip_downstream(
             TI.working_set.is_(True),
             TI.id.in_(selected_ids),
             skippable_state_clause,
+            # A force run bypasses branch and ShortCircuit skips, including one decided after it.
+            TI.ignore_upstream_deps.is_(False),
         )
         .values(state=TaskInstanceState.SKIPPED, start_date=now, end_date=now)
         .execution_options(synchronize_session=False)

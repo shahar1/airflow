@@ -37,7 +37,7 @@ from airflow.models.dag import DagModel
 from airflow.models.dag_version import DagVersion
 from airflow.models.dagbag import DBDagBag
 from airflow.models.dagrun import DagRun, clear_partition_runs
-from airflow.models.dynamic_region import DynamicRegion
+from airflow.models.dynamic_region import SENTINEL_REGION_ID, DynamicRegion
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import (
     LoopClearScope,
@@ -225,6 +225,41 @@ def test_partition_clear_archives_legacy_expansion_once_across_batches(dag_maker
     assert len(archived) == 1200
     assert {ti.archived_reason for ti in archived} == {"superseded"}
     assert len(session.scalars(select(TI).where(TI.dag_id == dr.dag_id)).all()) == 1
+
+
+@pytest.mark.parametrize("running_index", [None, 0], ids=["all-finished", "one-running"])
+def test_force_run_reaches_replacement_of_legacy_expansion(dag_maker, session, running_index):
+    with dag_maker("legacy_force_run", serialized=True):
+        MockOperator.partial(task_id="mapped").expand(arg2=[1, 2])
+    dr = dag_maker.create_dagrun()
+    session.execute(delete(TI).where(TI.dag_id == dr.dag_id))
+    session.execute(delete(DynamicRegion).where(DynamicRegion.dag_id == dr.dag_id))
+    tis = [
+        TI(
+            dag_maker.serialized_dag.get_task("mapped"),
+            run_id=dr.run_id,
+            dag_version_id=dr.created_dag_version_id,
+            region_index=index,
+            state=State.RUNNING if index == running_index else State.FAILED,
+        )
+        for index in range(2)
+    ]
+    session.add_all(tis)
+    session.flush()
+
+    clear_task_instances(
+        tis,
+        session,
+        whole_task_keys={(dr.dag_id, dr.run_id, "mapped")},
+        ignore_upstream_deps=True,
+    )
+    if running_index is not None:
+        tis[running_index].complete_restart(session=session)
+    session.flush()
+
+    (placeholder,) = session.scalars(select(TI).where(TI.dag_id == dr.dag_id)).all()
+    assert placeholder.region_id != SENTINEL_REGION_ID
+    assert placeholder.ignore_upstream_deps is True
 
 
 @mock.patch("airflow.models.dagrun._TI_CHUNK_SIZE", 4)

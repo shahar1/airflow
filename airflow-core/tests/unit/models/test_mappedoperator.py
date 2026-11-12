@@ -347,12 +347,22 @@ def test_force_run_cannot_expand_a_mapped_task_without_values(dag_maker, session
     assert not [ti for ti in decision.schedulable_tis if ti.task_id == "mapped"]
 
 
-def test_force_run_does_not_wave_through_new_mapped_siblings(dag_maker, session):
+@pytest.mark.parametrize(
+    ("unforced_indexes", "expected_schedulable"),
+    [
+        pytest.param([1], {0}, id="one-index-forced"),
+        pytest.param([], {0, 1, 2}, id="whole-expansion-forced"),
+    ],
+)
+def test_force_run_forces_new_mapped_siblings_only_with_the_whole_expansion(
+    dag_maker, session, unforced_indexes, expected_schedulable
+):
     """A forced index must not push sibling indexes it causes to be created past their deps.
 
     Indexes added by ``_revise_map_indexes_if_mapped`` are normally waved straight through on the
     strength of the sibling that just passed its dependency check. A forced instance passes by
     skipping that check, so the siblings — which the user never selected — must be evaluated.
+    They are forced as well only when every index that already exists was forced.
     """
     with dag_maker(session=session, serialized=True) as dag:
         producer = BaseOperator(task_id="producer")
@@ -375,16 +385,25 @@ def test_force_run_does_not_wave_through_new_mapped_siblings(dag_maker, session)
     )
     forced.ignore_upstream_deps = True
     session.add(forced)
+    session.add_all(
+        TaskInstance(
+            dag.task_dict["mapped"],
+            run_id=dr.run_id,
+            map_index=index,
+            state=None,
+            dag_version_id=dag_version_id,
+        )
+        for index in unforced_indexes
+    )
     session.flush()
 
     schedulable = {
-        (ti.task_id, ti.map_index)
+        ti.map_index
         for ti in dr.task_instance_scheduling_decisions(session=session).schedulable_tis
+        if ti.task_id == "mapped"
     }
 
-    assert ("mapped", 0) in schedulable
-    assert ("mapped", 1) not in schedulable
-    assert ("mapped", 2) not in schedulable
+    assert schedulable == expected_schedulable
 
 
 def test_expand_mapped_task_failed_state_in_db(dag_maker, session):

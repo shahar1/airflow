@@ -278,22 +278,27 @@ Force run only bypasses the dependencies on *other task instances*. Before using
 * ``retry_delay`` and sensor ``poke_interval`` still apply, and a paused Dag is not unpaused.
 * Upstream tasks that never ran pushed no XComs: ``xcom_pull()`` and TaskFlow return-value
   arguments resolve to ``None``; an ``XComArg`` with a custom key raises ``XComNotFound`` and the
-  forced task fails immediately.
-* Only the selected task instance is forced. Downstream tasks that are already ``skipped`` or
-  ``upstream_failed`` stay that way unless you clear them too, and clearing them re-applies their
-  own trigger rules. Force run cannot be combined with the *Upstream* / *Downstream* options.
+  forced task fails immediately, unless the upstream has ``multiple_outputs``, where it resolves
+  to ``None`` too.
+* Only the selected task instance is forced. Setup and teardown tasks that the clear also selects
+  keep their dependencies, so a teardown still waits for the forced task. Downstream tasks that
+  are already ``skipped`` or ``upstream_failed`` stay that way unless you clear them too, and
+  clearing them re-applies their own trigger rules. Force run cannot be combined with the
+  *Upstream* / *Downstream* options.
 * Bypassing ``depends_on_past`` removes the ordering guarantee it exists for; incremental or
   non-idempotent tasks may double-count or leave gaps.
 * A mapped task can be forced before it is expanded, but only if the values it expands over already
   exist: forcing it expands it, and every resulting map index is forced too. If the upstream that
   produces those values did not succeed there is nothing to expand into, so the task is marked
-  ``upstream_failed`` whether or not it was forced; force that upstream first.
+  ``upstream_failed`` whether or not it was forced; force that upstream first. Map indexes that a
+  forced mapped task gains later are forced only if every index it already had was forced.
 * Force run is a clear: with ``reset_dag_runs=false`` on a finished Dag run the task is never
   scheduled. Combine it with ``only_failed=false``; a task blocked on its dependencies is not in
   the ``failed`` state and would not be selected.
 * The flag stays on the task instance until it is cleared again by any means, so retries of a
   forced try are forced too. Each try records the flag in the task instance history, and the
-  request is written to the audit log.
+  request is written to the audit log. Clearing a task while it is running is the exception: the
+  running try takes the flag of that clear, because it is the try being restarted.
 * It uses the same permission as clearing and marking task instances; anyone who can clear a task
   can force it.
 

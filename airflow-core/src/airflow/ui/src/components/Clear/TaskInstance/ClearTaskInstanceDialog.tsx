@@ -317,8 +317,13 @@ const ClearTaskInstanceDialog = (props: Props) => {
 
   // Loop clears expand on the server (later iterations, whole expansions), so the
   // affected list cannot be turned back into an explicit selection there.
-  const hasExclusions = !loopMode && excludedKeys.size > 0;
-  const keptTaskInstances = data.task_instances.filter((ti) => !excludedKeys.has(taskInstanceKey(ti)));
+  // A force run sends the original selection: a request rebuilt from the kept rows would list the
+  // setups and teardowns as selected, and the API forces every task instance it is given by id.
+  const canExclude = !loopMode && !forceRun;
+  const hasExclusions = canExclude && excludedKeys.size > 0;
+  const keptTaskInstances = hasExclusions
+    ? data.task_instances.filter((ti) => !excludedKeys.has(taskInstanceKey(ti)))
+    : data.task_instances;
 
   // The dry run already resolved the full affected set, so on confirm we send those
   // task instances explicitly (minus the unticked ones) with the graph-expansion flags
@@ -512,7 +517,7 @@ const ClearTaskInstanceDialog = (props: Props) => {
           affectedTasks={data}
           groupByRunId={!singleRun}
           note={note}
-          selection={loopMode ? undefined : { excludedKeys, onToggle: toggleTask }}
+          selection={canExclude ? { excludedKeys, onToggle: toggleTask } : undefined}
           setNote={setNote}
         />
       </Modal>
